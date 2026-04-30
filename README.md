@@ -556,8 +556,3 @@ and do not affect blink's MIT license except where noted.
 | Crate | Author(s) | Use in blink |
 | ----- | --------- | ------------ |
 | [webpki-roots](https://github.com/rustls/webpki-roots) | Mozilla / rustls contributors | Mozilla CA root certificates for FTPS |
-
-MPL-2.0 is a file-level copyleft license. It requires that modifications to
-the `webpki-roots` source files themselves be released under MPL-2.0, but
-does not affect code in other files or the blink MIT license. The
-`webpki-roots` source is available at the link above.
