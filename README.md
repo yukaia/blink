@@ -6,21 +6,7 @@ A cross-platform terminal SFTP / SCP / FTP / FTPS client with a three-pane TUI, 
 ![rust](https://img.shields.io/badge/rust-2021%20edition-orange)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
-```
-┌── blink ── ● user@host:22 (sftp) ──────────────────────────────────────┐
-│ LOCAL · active                          │ REMOTE                       │
-│  /home/me/Downloads                     │  /var/www/html               │
-│  ▸ docs                                 │  ▸ assets                    │
-│  ▸ projects                             │  ▸ blog                      │
-│    site.tar.gz          12.4 MB         │    index.html      4.2 KB    │
-│    notes.md             3 KB            │    favicon.png     1.8 KB    │
-└─────────────────────────────────────────┴──────────────────────────────┘
-┌── TRANSFERS · LOG ─────────────────────────────────────────────────────┐
-│  ↓ site.tar.gz       42% [████░░░░░░░░] 3.2 MB/s                       │
-│  ↓ blog-2025.tar.gz  87% [██████████░░] 8.1 MB/s                       │
-└────────────────────────────────────────────────────────────────────────┘
- [?] help  [↵] open  [⌫] up  [space] select  [^d] download  [v] view  [q] quit
-```
+![blink](images/main-menu.jpg)
 
 ## Features
 
