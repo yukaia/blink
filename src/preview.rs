@@ -60,6 +60,12 @@ pub fn detect(prefer: ImagePreviewMode) -> GraphicsProtocol {
     if term.contains("xterm") && env::var("XTERM_VERSION").is_ok() {
         return GraphicsProtocol::Sixel;
     }
+    // Windows Terminal (≥ 1.22) supports sixel and always sets WT_SESSION
+    // (a GUID) regardless of what the shell sets TERM to — including leaving
+    // it unset entirely when running under WSL.
+    if env::var("WT_SESSION").is_ok() {
+        return GraphicsProtocol::Sixel;
+    }
     GraphicsProtocol::None
 }
 
