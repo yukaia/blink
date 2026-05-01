@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 mod checkpoint;
 mod config;
 mod error;
+mod highlight;
 mod known_hosts;
 mod paths;
 mod preview;

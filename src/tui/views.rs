@@ -740,7 +740,7 @@ pub mod viewer {
                 f.render_widget(p, body);
             }
             ViewerKind::Text { lines, scroll } => {
-                render_text(f, body, app, lines, *scroll);
+                render_text(f, body, app, &viewer.name, lines, *scroll);
             }
             ViewerKind::Image { .. } => {
                 // Body is intentionally left blank — graphics escape codes are
@@ -776,35 +776,66 @@ pub mod viewer {
         );
     }
 
-    fn render_text(f: &mut Frame, area: Rect, app: &App, lines: &[String], scroll: usize) {
+    fn render_text(
+        f: &mut Frame,
+        area: Rect,
+        app: &App,
+        name: &str,
+        lines: &[String],
+        scroll: usize,
+    ) {
         let h = area.height as usize;
         if h == 0 || lines.is_empty() {
             return;
         }
         let start = scroll.min(lines.len().saturating_sub(1));
         let end = (start + h).min(lines.len());
-        let visible = &lines[start..end];
+        let lineno_width = end.to_string().len();
 
-        // Width of the line-number column.
-        let max_lineno = end;
-        let lineno_width = max_lineno.to_string().len();
+        let lang = crate::highlight::lang_for_name(name);
 
-        let rendered: Vec<Line> = visible
-            .iter()
-            .enumerate()
-            .map(|(i, line)| {
-                let n = start + i + 1;
-                Line::from(vec![
-                    Span::styled(
-                        format!("{:>width$} │ ", n, width = lineno_width),
-                        Style::default().fg(app.theme.dim),
-                    ),
-                    Span::styled(line.clone(), Style::default().fg(app.theme.fg)),
-                ])
-            })
-            .collect();
+        // Replay from line 0 so we know the carry-over state at `start`.
+        // Lines are bounded by MAX_PREVIEW_BYTES (1 MB) so this is fast.
+        let mut hl_state = crate::highlight::LineState::default();
+        for line in &lines[..start] {
+            let (_, ns) = crate::highlight::tokenize(lang, line, hl_state);
+            hl_state = ns;
+        }
+
+        let mut rendered = Vec::with_capacity(end - start);
+        for (i, line) in lines[start..end].iter().enumerate() {
+            let n = start + i + 1;
+            let (tokens, ns) = crate::highlight::tokenize(lang, line, hl_state);
+            hl_state = ns;
+
+            let mut spans = vec![Span::styled(
+                format!("{:>width$} │ ", n, width = lineno_width),
+                Style::default().fg(app.theme.dim),
+            )];
+            for (kind, text) in tokens {
+                spans.push(Span::styled(text, token_style(kind, app)));
+            }
+            rendered.push(Line::from(spans));
+        }
 
         f.render_widget(Paragraph::new(rendered), area);
+    }
+
+    fn token_style(kind: crate::highlight::TokenKind, app: &App) -> Style {
+        use crate::highlight::TokenKind;
+        match kind {
+            TokenKind::Keyword => Style::default()
+                .fg(app.theme.accent)
+                .add_modifier(Modifier::BOLD),
+            TokenKind::Type => Style::default().fg(app.theme.directory),
+            TokenKind::String => Style::default().fg(app.theme.success),
+            TokenKind::Comment => Style::default().fg(app.theme.dim),
+            TokenKind::Number => Style::default().fg(app.theme.warning),
+            TokenKind::Macro => Style::default()
+                .fg(app.theme.image)
+                .add_modifier(Modifier::BOLD),
+            TokenKind::Plain => Style::default().fg(app.theme.fg),
+        }
     }
 }
 
