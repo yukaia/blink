@@ -2,7 +2,6 @@
 
 A cross-platform terminal SFTP / SCP / FTP / FTPS client with a three-pane TUI, built using Claude.
 
-![status](https://img.shields.io/badge/status-feature--complete-brightgreen)
 ![rust](https://img.shields.io/badge/rust-2024%20edition-orange)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
