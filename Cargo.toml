@@ -5,7 +5,7 @@ edition = "2021"
 description = "A terminal SFTP/SCP/FTP/FTPS client with a three-pane TUI"
 license = "MIT"
 authors = ["blink contributors"]
-repository = "https://github.com/yourname/blink"
+repository = "https://github.com/yukaia/blink"
 readme = "README.md"
 
 [[bin]]
