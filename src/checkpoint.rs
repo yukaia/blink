@@ -372,7 +372,7 @@ impl Checkpoint {
                     .and_then(|d| d.as_bool())
                     .unwrap_or(false);
                 let status = if done { "done" } else { "pending" };
-                if let Value::Object(ref mut map) = job {
+                if let Value::Object(map) = job {
                     map.remove("done");
                     map.insert("status".to_string(), Value::String(status.to_string()));
                 }

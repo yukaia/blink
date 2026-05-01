@@ -144,7 +144,8 @@ async fn run_one(
         let mut last_t = Instant::now();
         let mut last_b: u64 = 0;
         let mut last_bps: u64 = 0;
-        while let Some(p) = prog_rx.recv().await {
+        loop {
+            let Some(p) = prog_rx.recv().await else { break };
             let now = Instant::now();
             let elapsed = now.duration_since(last_t);
             let bps = if elapsed.as_millis() >= SPEED_SAMPLE_MS {

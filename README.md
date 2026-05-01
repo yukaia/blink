@@ -3,7 +3,7 @@
 A cross-platform terminal SFTP / SCP / FTP / FTPS client with a three-pane TUI, built using Claude.
 
 ![status](https://img.shields.io/badge/status-feature--complete-brightgreen)
-![rust](https://img.shields.io/badge/rust-2021%20edition-orange)
+![rust](https://img.shields.io/badge/rust-2024%20edition-orange)
 ![license](https://img.shields.io/badge/license-MIT-blue)
 
 ![blink](images/main-menu.jpg)
@@ -79,7 +79,7 @@ the choice persisted to `config.ini` automatically.
 
 ### Prerequisites
 
-- **Rust 1.75+** with the 2021 edition
+- **Rust 1.85+** with the 2024 edition
 
 That's it. Every TLS-using dependency is pure Rust (rustls), so there's no
 need for `libssl-dev` or any other system TLS library on any platform.
@@ -342,10 +342,12 @@ Display caps at 1 MB.
 | Shell       | `sh`, `bash`, `zsh`, `fish`, `ps1`, `bat`                     |
 | Database    | `sql`                                                         |
 | Patches     | `diff`, `patch`                                               |
+| Release     | `nfo`                                                         |
 
-UTF-8 decoding is lossy — bytes that don't decode cleanly render as
-replacement characters rather than failing the viewer. So weird encodings
-won't crash, but won't necessarily look right either.
+Text decoding: NFO files are decoded as CP437 (DOS codepage 437), preserving
+box-drawing characters. All other text files are decoded as UTF-8 (lossy —
+unrecognised byte sequences render as replacement characters rather than
+failing the viewer).
 
 If you'd like another extension recognised, the allowlist is one match arm
 in `src/preview.rs::is_viewable_text`.
@@ -371,7 +373,7 @@ src/
 ├── transfer.rs          TransferManager: queue, state, progress events
 ├── transfer/
 │   └── dispatcher.rs    parallel slot dispatcher; per-job worker tasks
-├── preview.rs           kitty / sixel / iterm2 detection + render backends
+├── preview.rs           kitty / sixel / iterm2 detection + render backends; file classification; CP437 decoder for NFO files
 └── tui/
     ├── mod.rs           terminal init / restore + run loop
     ├── app.rs           App state machine + recursive walk planning

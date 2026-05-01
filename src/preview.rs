@@ -407,5 +407,42 @@ pub fn is_viewable_text(name: &str) -> bool {
             | "sql" | "csv" | "tsv"
             | "gitignore" | "gitattributes" | "editorconfig"
             | "diff" | "patch"
+            | "nfo"
     )
+}
+
+/// Returns `true` if the file is an NFO file (CP437-encoded release info).
+pub fn is_nfo_file(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".nfo")
+}
+
+/// Decode CP437-encoded bytes to a UTF-8 `String`.
+///
+/// NFO files use DOS codepage 437; bytes 0x80–0xFF map to box-drawing
+/// characters and other symbols that would otherwise appear as replacement
+/// characters under `from_utf8_lossy`.
+pub fn decode_cp437(bytes: &[u8]) -> String {
+    #[rustfmt::skip]
+    const MAP: [char; 128] = [
+        // 0x80–0x8F
+        'Ç','ü','é','â','ä','à','å','ç','ê','ë','è','ï','î','ì','Ä','Å',
+        // 0x90–0x9F
+        'É','æ','Æ','ô','ö','ò','û','ù','ÿ','Ö','Ü','¢','£','¥','₧','ƒ',
+        // 0xA0–0xAF
+        'á','í','ó','ú','ñ','Ñ','ª','º','¿','⌐','¬','½','¼','¡','«','»',
+        // 0xB0–0xBF
+        '░','▒','▓','│','┤','╡','╢','╖','╕','╣','║','╗','╝','╜','╛','┐',
+        // 0xC0–0xCF
+        '└','┴','┬','├','─','┼','╞','╟','╚','╔','╩','╦','╠','═','╬','╧',
+        // 0xD0–0xDF
+        '╨','╤','╥','╙','╘','╒','╓','╫','╪','┘','┌','█','▄','▌','▐','▀',
+        // 0xE0–0xEF
+        'α','ß','Γ','π','Σ','σ','µ','τ','Φ','Θ','Ω','δ','∞','φ','ε','∩',
+        // 0xF0–0xFF
+        '≡','±','≥','≤','⌠','⌡','÷','≈','°','∙','·','√','ⁿ','²','■','\u{00A0}',
+    ];
+    bytes
+        .iter()
+        .map(|&b| if b < 0x80 { b as char } else { MAP[(b - 0x80) as usize] })
+        .collect()
 }

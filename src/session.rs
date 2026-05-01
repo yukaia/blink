@@ -336,7 +336,8 @@ impl Session {
             if path.extension().and_then(|s| s.to_str()) != Some("ini") {
                 continue;
             }
-            match Self::load_from(&path) {
+            let load = Self::load_from(&path);
+            match load {
                 Ok(s) => out.push(s),
                 Err(e) => tracing::warn!(?path, "skipping bad session: {e}"),
             }
@@ -353,7 +354,8 @@ impl Session {
             if path.extension().and_then(|s| s.to_str()) != Some("ini") {
                 continue;
             }
-            if let Ok(s) = Self::load_from(&path) {
+            let load = Self::load_from(&path);
+            if let Ok(s) = load {
                 if s.name == name {
                     fs::remove_file(&path)?;
                     return Ok(());

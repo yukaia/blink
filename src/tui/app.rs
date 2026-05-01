@@ -2100,7 +2100,8 @@ impl App {
             let mut plan: Vec<PlannedJob> = Vec::new();
             for (local, remote, is_dir) in roots {
                 let chunk = if is_dir {
-                    match walk_local(&local, &remote).await {
+                    let walk = walk_local(&local, &remote).await;
+                    match walk {
                         Ok(p) => p,
                         Err(e) => {
                             let _ = tx.send(AppEvent::WalkFailed {
@@ -2511,7 +2512,8 @@ impl App {
                 let mut transport = t.lock().await;
                 for (remote, local, is_dir) in roots {
                     let chunk = if is_dir {
-                        match walk_remote(&mut **transport, &remote, &local).await {
+                        let walk = walk_remote(&mut **transport, &remote, &local).await;
+                        match walk {
                             Ok(p) => p,
                             Err(e) => {
                                 let _ = tx.send(AppEvent::WalkFailed {
@@ -3258,7 +3260,11 @@ impl App {
                     if viewer.name == name {
                         viewer.kind = match kind {
                             FileViewKind::Text => {
-                                let text = String::from_utf8_lossy(&bytes).into_owned();
+                                let text = if preview::is_nfo_file(&name) {
+                                    preview::decode_cp437(&bytes)
+                                } else {
+                                    String::from_utf8_lossy(&bytes).into_owned()
+                                };
                                 let lines: Vec<String> =
                                     text.lines().map(crate::error::sanitize_line).collect();
                                 ViewerKind::Text { lines, scroll: 0 }
@@ -3757,12 +3763,14 @@ async fn walk_local(
 
         let mut subdirs: Vec<(std::path::PathBuf, String)> = Vec::new();
 
-        while let Some(entry) = read.next_entry().await.map_err(|e| {
-            crate::error::BlinkError::transport(format!(
-                "readdir entry {}: {e}",
-                local_dir.display()
-            ))
-        })? {
+        loop {
+            let next = read.next_entry().await.map_err(|e| {
+                crate::error::BlinkError::transport(format!(
+                    "readdir entry {}: {e}",
+                    local_dir.display()
+                ))
+            })?;
+            let Some(entry) = next else { break };
             let meta = match entry.metadata().await {
                 Ok(m) => m,
                 Err(_) => continue, // unreadable entry; skip rather than fail walk

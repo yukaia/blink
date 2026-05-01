@@ -132,13 +132,13 @@ impl Handler for KnownHostsHandler {
             decision_tx,
         };
 
-        if let Some(tx) = self.event_tx.take() {
+        match self.event_tx.take() { Some(tx) => {
             if tx.send(event).is_err() {
                 return Ok(false);
             }
-        } else {
+        } _ => {
             return Ok(false);
-        }
+        }}
 
         let decision = match self.decision_rx.take() {
             Some(rx) => rx.await.unwrap_or(HostKeyDecision::Reject),
@@ -247,10 +247,10 @@ impl SftpTransport {
                     let mut succeeded = false;
                     let mut last_err: Option<String> = None;
                     for identity in identities {
-                        match handle
+                        let auth_result = handle
                             .authenticate_publickey_with(username, identity, &mut agent)
-                            .await
-                        {
+                            .await;
+                        match auth_result {
                             Ok(true) => {
                                 succeeded = true;
                                 break;
