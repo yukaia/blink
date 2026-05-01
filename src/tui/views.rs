@@ -346,6 +346,7 @@ pub mod help {
             kv("  /         ", "filter current directory by substring", key_s),
             kv("  F5        ", "refresh active pane", key_s),
             kv("  F2        ", "rename file or folder (remote pane)", key_s),
+            kv("  F7        ", "create new remote directory", key_s),
             kv("  shift+del ", "delete file or folder (remote pane)", key_s),
             Line::from(""),
             Line::from(Span::styled("  SESSION", acc_s)),
@@ -1053,6 +1054,76 @@ pub mod rename {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  [↵] rename    [esc] cancel    [^u] clear",
+            dim,
+        )));
+
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Mkdir (overlay over Main)
+// ---------------------------------------------------------------------------
+
+pub mod mkdir {
+    use super::*;
+
+    pub fn render(f: &mut Frame, app: &App) {
+        let area = f.area();
+        let modal = super::centered_rect(60, 24, area);
+        f.render_widget(Clear, modal);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(app.theme.border_active))
+            .title(Span::styled(
+                " new directory ",
+                Style::default()
+                    .fg(app.theme.border_active)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(modal);
+        f.render_widget(block, modal);
+
+        let dim = Style::default().fg(app.theme.dim);
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled("in: ", dim),
+                Span::styled(
+                    if app.remote.path.is_empty() {
+                        "/".to_string()
+                    } else {
+                        app.remote.path.clone()
+                    },
+                    dim,
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled("name: ", dim),
+                Span::styled(
+                    app.mkdir_input.as_str(),
+                    Style::default().fg(app.theme.fg),
+                ),
+                Span::styled("█", Style::default().fg(app.theme.border_active)),
+            ]),
+        ];
+        if let Some(err) = &app.mkdir_error {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("✗ {err}"),
+                    Style::default().fg(app.theme.error),
+                ),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  [↵] create    [esc] cancel    [^u] clear",
             dim,
         )));
 

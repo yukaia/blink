@@ -50,6 +50,8 @@ pub enum Screen {
     SaveSession,
     /// Modal over Main: rename a remote file or folder.
     Rename,
+    /// Modal over Main: create a new remote directory.
+    Mkdir,
     /// Modal over Main: confirm deletion of a remote file or folder.
     ConfirmDelete,
     /// Modal over Main: confirm overwriting an existing file (rename / upload).
@@ -533,6 +535,10 @@ pub struct App {
     pub rename_original: String,
     pub rename_error: Option<String>,
 
+    // Mkdir form
+    pub mkdir_input: String,
+    pub mkdir_error: Option<String>,
+
     // Delete confirmation
     pub pending_delete: Option<PendingDelete>,
 
@@ -631,6 +637,8 @@ impl App {
             rename_input: String::new(),
             rename_original: String::new(),
             rename_error: None,
+            mkdir_input: String::new(),
+            mkdir_error: None,
             pending_delete: None,
             pending_overwrite: None,
             app_event_tx: tx,
@@ -773,6 +781,10 @@ impl App {
                 crate::tui::views::main::render(f, self);
                 crate::tui::views::rename::render(f, self);
             }
+            Screen::Mkdir => {
+                crate::tui::views::main::render(f, self);
+                crate::tui::views::mkdir::render(f, self);
+            }
             Screen::ConfirmDelete => {
                 crate::tui::views::main::render(f, self);
                 crate::tui::views::confirm_delete::render(f, self);
@@ -883,6 +895,7 @@ impl App {
             Screen::Search => self.handle_search(key),
             Screen::SaveSession => self.handle_save_session(key),
             Screen::Rename => self.handle_rename(key),
+            Screen::Mkdir => self.handle_mkdir(key),
             Screen::ConfirmDelete => self.handle_confirm_delete(key),
             Screen::ConfirmOverwrite => self.handle_confirm_overwrite(key),
             Screen::Viewer => self.handle_viewer(key),
@@ -1397,6 +1410,11 @@ impl App {
                     self.open_rename();
                 }
             }
+            KeyCode::F(7) => {
+                if self.active_pane == Pane::Remote {
+                    self.open_mkdir();
+                }
+            }
             KeyCode::Delete if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 if self.active_pane == Pane::Remote {
                     self.open_delete();
@@ -1842,6 +1860,90 @@ impl App {
                 Err(e) => AppEvent::RenameFailed {
                     from,
                     to,
+                    error: e.to_string(),
+                },
+            };
+            let _ = tx.send(event);
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // Mkdir
+    // -------------------------------------------------------------------
+
+    fn open_mkdir(&mut self) {
+        if self.transport.is_none() {
+            self.push_log(LogLevel::Warn, "not connected".into());
+            return;
+        }
+        self.mkdir_input.clear();
+        self.mkdir_error = None;
+        self.screen = Screen::Mkdir;
+    }
+
+    fn handle_mkdir(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                self.mkdir_input.clear();
+                self.mkdir_error = None;
+                self.screen = Screen::Main;
+            }
+            KeyCode::Enter => self.submit_mkdir(),
+            KeyCode::Backspace => {
+                self.mkdir_input.pop();
+                self.mkdir_error = None;
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.mkdir_input.clear();
+                self.mkdir_error = None;
+            }
+            KeyCode::Char(c) => {
+                self.mkdir_input.push(c);
+                self.mkdir_error = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn submit_mkdir(&mut self) {
+        let name = self.mkdir_input.trim().to_string();
+        if name.is_empty() {
+            self.mkdir_error = Some("name cannot be empty".into());
+            return;
+        }
+        if name.contains('/') || name.contains('\\') {
+            self.mkdir_error = Some("name cannot contain path separators".into());
+            return;
+        }
+        if name == "." || name == ".." {
+            self.mkdir_error = Some("invalid directory name".into());
+            return;
+        }
+        let path = transport::join_remote(&self.remote.path, &name);
+        self.mkdir_input.clear();
+        self.mkdir_error = None;
+        self.screen = Screen::Main;
+        self.start_mkdir(path);
+    }
+
+    fn start_mkdir(&mut self, path: String) {
+        let Some(t) = self.transport.clone() else {
+            self.push_log(LogLevel::Warn, "not connected".into());
+            return;
+        };
+        let tx = self.app_event_tx.clone();
+        let label = path
+            .rsplit('/')
+            .find(|s| !s.is_empty())
+            .unwrap_or(&path)
+            .to_string();
+        self.push_log(LogLevel::Info, format!("mkdir: {label}"));
+        tokio::spawn(async move {
+            let mut transport = t.lock().await;
+            let event = match transport.mkdir(&path).await {
+                Ok(()) => AppEvent::MkdirDone { path },
+                Err(e) => AppEvent::MkdirFailed {
+                    path,
                     error: e.to_string(),
                 },
             };
@@ -3088,6 +3190,24 @@ impl App {
                     LogLevel::Error,
                     format!("rename {from} failed: {error}"),
                 );
+            }
+            AppEvent::MkdirDone { path } => {
+                let name = path
+                    .rsplit('/')
+                    .find(|s| !s.is_empty())
+                    .unwrap_or(&path)
+                    .to_string();
+                self.push_log(LogLevel::Success, format!("created: {name}"));
+                let dir = self.remote.path.clone();
+                self.refresh_remote_pane(dir);
+            }
+            AppEvent::MkdirFailed { path, error } => {
+                let name = path
+                    .rsplit('/')
+                    .find(|s| !s.is_empty())
+                    .unwrap_or(&path)
+                    .to_string();
+                self.push_log(LogLevel::Error, format!("mkdir {name} failed: {error}"));
             }
             AppEvent::Deleted { name } => {
                 self.push_log(LogLevel::Success, format!("deleted: {name}"));

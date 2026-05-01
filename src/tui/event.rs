@@ -66,6 +66,12 @@ pub enum AppEvent {
     /// A rename failed.
     RenameFailed { from: String, to: String, error: String },
 
+    /// A remote mkdir completed successfully.
+    MkdirDone { path: String },
+
+    /// A remote mkdir failed.
+    MkdirFailed { path: String, error: String },
+
     /// A delete completed successfully.
     Deleted { name: String },
 
