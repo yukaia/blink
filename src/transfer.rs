@@ -414,17 +414,16 @@ pub fn format_bytes(bytes: u64) -> String {
     const GB: f64 = 1024.0 * MB;
     let b = bytes as f64;
     if b >= GB {
-        format!("{:.1} GB", b / GB)
+        format!("{:.1} GiB", b / GB)
     } else if b >= MB {
-        format!("{:.1} MB", b / MB)
+        format!("{:.1} MiB", b / MB)
     } else if b >= KB {
-        format!("{:.0} KB", b / KB)
+        format!("{:.0} KiB", b / KB)
     } else {
         format!("{bytes} B")
     }
 }
 
-#[allow(dead_code)]
 pub fn format_eta(bytes_remaining: u64, bytes_per_sec: u64) -> String {
     if bytes_per_sec == 0 {
         return "—".into();

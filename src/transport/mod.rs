@@ -165,3 +165,65 @@ pub(crate) fn parent_remote(path: &str) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // join_remote
+    #[test]
+    fn join_appends_name() {
+        assert_eq!(join_remote("/home/user", "file.txt"), "/home/user/file.txt");
+    }
+
+    #[test]
+    fn join_trailing_slash_base() {
+        assert_eq!(join_remote("/home/user/", "file.txt"), "/home/user/file.txt");
+    }
+
+    #[test]
+    fn join_strips_leading_slash_from_name() {
+        assert_eq!(join_remote("/srv", "/etc/shadow"), "/srv/etc/shadow");
+    }
+
+    #[test]
+    fn join_rejects_dotdot_traversal() {
+        assert_eq!(join_remote("/srv/data", "../secret"), "/srv/data");
+    }
+
+    #[test]
+    fn join_rejects_embedded_dotdot() {
+        assert_eq!(join_remote("/srv/data", "a/../b"), "/srv/data");
+    }
+
+    #[test]
+    fn join_root_base() {
+        assert_eq!(join_remote("/", "etc"), "/etc");
+    }
+
+    // parent_remote
+    #[test]
+    fn parent_of_root_is_root() {
+        assert_eq!(parent_remote("/"), "/");
+    }
+
+    #[test]
+    fn parent_of_file_in_root() {
+        assert_eq!(parent_remote("/file.txt"), "/");
+    }
+
+    #[test]
+    fn parent_of_nested_path() {
+        assert_eq!(parent_remote("/home/user/docs"), "/home/user");
+    }
+
+    #[test]
+    fn parent_strips_trailing_slash() {
+        assert_eq!(parent_remote("/home/user/docs/"), "/home/user");
+    }
+
+    #[test]
+    fn parent_of_empty_is_root() {
+        assert_eq!(parent_remote(""), "/");
+    }
+}
+

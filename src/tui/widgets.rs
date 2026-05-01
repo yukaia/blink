@@ -264,7 +264,13 @@ pub mod bottom_pane {
         } else if job.bytes_per_sec == 0 {
             "—".to_string()
         } else {
-            crate::transfer::format_bytes_per_sec(job.bytes_per_sec)
+            let speed = crate::transfer::format_bytes_per_sec(job.bytes_per_sec);
+            let remaining = job.bytes_total.saturating_sub(job.bytes_done);
+            if remaining > 0 {
+                format!("{speed} ETA {}", crate::transfer::format_eta(remaining, job.bytes_per_sec))
+            } else {
+                speed
+            }
         };
 
         let percent_str = format!("{percent:3}%");

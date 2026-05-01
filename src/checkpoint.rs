@@ -442,3 +442,101 @@ impl Checkpoint {
         self.jobs.iter().filter(|j| j.is_done()).count()
     }
 }
+
+/// Print checkpoint info. Pass `clean` to remove completed/orphaned files,
+/// `force` to remove every file unconditionally.
+pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
+    use crate::session::Session;
+    use std::collections::HashSet;
+    use std::fs;
+
+    let dir = paths::checkpoints_dir()?;
+
+    let mut entries: Vec<std::path::PathBuf> = fs::read_dir(&dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    entries.sort();
+
+    if entries.is_empty() {
+        println!("no checkpoints found");
+        return Ok(());
+    }
+
+    let known_sessions: HashSet<String> = Session::list_all()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+
+    let mut removed = 0usize;
+    let mut kept = 0usize;
+
+    for path in &entries {
+        let cp = match Checkpoint::load_from(path) {
+            Ok(Some(cp)) => cp,
+            Ok(None) => continue,
+            Err(e) => {
+                eprintln!("warning: could not read {}: {e}", path.display());
+                continue;
+            }
+        };
+
+        let pending = cp.pending_count();
+        let done = cp.done_count();
+        let total = pending + done;
+        let orphaned = !known_sessions.contains(&cp.session);
+
+        let should_remove = force || (clean && (pending == 0 || orphaned));
+
+        if should_remove {
+            match fs::remove_file(path) {
+                Ok(()) => {
+                    let reason = if force {
+                        "forced"
+                    } else if pending == 0 {
+                        "completed"
+                    } else {
+                        "orphaned"
+                    };
+                    println!(
+                        "removed  {:<20}  {:<8}  {}/{} done  ({})",
+                        cp.session,
+                        cp.kind.as_str(),
+                        done,
+                        total,
+                        reason,
+                    );
+                    removed += 1;
+                }
+                Err(e) => {
+                    eprintln!("error: could not remove {}: {e}", path.display());
+                }
+            }
+        } else {
+            let flag = if orphaned { " [orphaned]" } else { "" };
+            println!(
+                "{:<20}  {:<8}  {}/{} done  ({} remaining){}",
+                cp.session,
+                cp.kind.as_str(),
+                done,
+                total,
+                pending,
+                flag,
+            );
+            kept += 1;
+        }
+    }
+
+    if clean || force {
+        println!();
+        println!("{removed} removed, {kept} kept");
+    } else if kept > 0 {
+        println!();
+        println!("Use `blink checkpoints --clean` to remove completed and orphaned checkpoints.");
+        println!("Use `blink checkpoints --force` to remove all checkpoint files.");
+    }
+
+    Ok(())
+}

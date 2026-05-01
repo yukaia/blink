@@ -469,3 +469,85 @@ fn validate_network_field(field: &str, value: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // validate_network_field
+    #[test]
+    fn network_field_clean_passes() {
+        assert!(validate_network_field("host", "example.com").is_ok());
+    }
+
+    #[test]
+    fn network_field_null_byte_rejected() {
+        assert!(validate_network_field("host", "evil\0host").is_err());
+    }
+
+    #[test]
+    fn network_field_newline_rejected() {
+        assert!(validate_network_field("host", "host\ninjection").is_err());
+    }
+
+    #[test]
+    fn network_field_carriage_return_rejected() {
+        assert!(validate_network_field("username", "user\rname").is_err());
+    }
+
+    // from_url
+    #[test]
+    fn from_url_sftp_full() {
+        let s = Session::from_url("sftp://bob@example.com:2222/var/www").unwrap();
+        assert_eq!(s.protocol, Protocol::Sftp);
+        assert_eq!(s.host, "example.com");
+        assert_eq!(s.port, 2222);
+        assert_eq!(s.username, "bob");
+        assert_eq!(s.remote_dir, "/var/www");
+    }
+
+    #[test]
+    fn from_url_default_port_sftp() {
+        let s = Session::from_url("sftp://host.example.com").unwrap();
+        assert_eq!(s.port, 22);
+    }
+
+    #[test]
+    fn from_url_ftp_default_port() {
+        let s = Session::from_url("ftp://files.example.com").unwrap();
+        assert_eq!(s.port, 21);
+        assert_eq!(s.protocol, Protocol::Ftp);
+    }
+
+    #[test]
+    fn from_url_missing_scheme_errors() {
+        assert!(Session::from_url("example.com").is_err());
+    }
+
+    #[test]
+    fn from_url_unknown_protocol_errors() {
+        assert!(Session::from_url("ssh://example.com").is_err());
+    }
+
+    #[test]
+    fn from_url_empty_host_errors() {
+        assert!(Session::from_url("sftp://").is_err());
+    }
+
+    #[test]
+    fn from_url_ipv6_bracketed() {
+        let s = Session::from_url("sftp://user@[::1]:2022/data").unwrap();
+        assert_eq!(s.host, "::1");
+        assert_eq!(s.port, 2022);
+    }
+
+    #[test]
+    fn from_url_bare_ipv6_errors() {
+        assert!(Session::from_url("sftp://::1/data").is_err());
+    }
+
+    #[test]
+    fn from_url_null_in_host_rejected() {
+        assert!(Session::from_url("sftp://evil\x00host/").is_err());
+    }
+}

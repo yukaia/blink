@@ -3006,6 +3006,7 @@ impl App {
                 self.transport = Some(Arc::new(Mutex::new(transport)));
                 self.transfer_manager = Some(manager);
                 self.dispatcher = Some(dispatcher);
+                let is_scp = session.protocol == crate::session::Protocol::Scp;
                 self.current_session = Some(session);
                 self.screen = Screen::Main;
                 self.active_pane = Pane::Remote;
@@ -3013,6 +3014,13 @@ impl App {
                     LogLevel::Success,
                     format!("connected · {parallelism} parallel slot(s)"),
                 );
+                if is_scp {
+                    self.push_log(
+                        LogLevel::Warn,
+                        "scp:// is routed through SFTP internally; \
+                         full file-manager operations are available".into(),
+                    );
+                }
                 self.refresh_remote_pane(remote_dir);
             }
             AppEvent::ConnectFailed(err) => {

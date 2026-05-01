@@ -138,3 +138,53 @@ pub(crate) fn sanitize_line(s: &str) -> String {
 }
 
 pub type Result<T> = std::result::Result<T, BlinkError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_clean_string_unchanged() {
+        let s = "hello world".to_string();
+        assert_eq!(sanitize(s), "hello world");
+    }
+
+    #[test]
+    fn sanitize_replaces_control_chars() {
+        let s = "hello\x1b[31mworld\x07".to_string();
+        let out = sanitize(s);
+        assert!(!out.contains('\x1b'), "ESC must be stripped");
+        assert!(!out.contains('\x07'), "BEL must be stripped");
+        assert!(out.contains("hello"), "printable chars kept");
+        assert!(out.contains("world"), "printable chars kept");
+    }
+
+    #[test]
+    fn sanitize_truncates_long_string() {
+        let long = "a".repeat(MAX_ERR_CHARS + 100);
+        let out = sanitize(long);
+        assert!(out.ends_with('…'), "truncated string must end with ellipsis");
+        assert!(out.chars().count() <= MAX_ERR_CHARS + 1);
+    }
+
+    #[test]
+    fn sanitize_exact_limit_not_truncated() {
+        let s = "b".repeat(MAX_ERR_CHARS);
+        let out = sanitize(s.clone());
+        assert_eq!(out, s);
+        assert!(!out.ends_with('…'));
+    }
+
+    #[test]
+    fn sanitize_line_preserves_tabs() {
+        let s = "col1\tcol2";
+        assert_eq!(sanitize_line(s), "col1\tcol2");
+    }
+
+    #[test]
+    fn sanitize_line_strips_control_not_tab() {
+        let s = "a\x01b\tc";
+        let out = sanitize_line(s);
+        assert_eq!(out, "a b\tc");
+    }
+}

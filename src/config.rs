@@ -115,6 +115,12 @@ impl Config {
                         "parallel_downloads must be an integer between 1 and {MAX_PARALLEL}: {v}"
                     ))
                 })?;
+                if n == 0 {
+                    tracing::warn!(
+                        "config: parallel_downloads = 0 is out of range; \
+                         clamped to 1"
+                    );
+                }
                 cfg.general.parallel_downloads = n.clamp(1, MAX_PARALLEL);
             }
             if let Some(v) = s.get("confirm_quit") {
@@ -201,5 +207,62 @@ fn parse_bool(s: &str) -> Result<bool> {
         _ => Err(BlinkError::config(
             "boolean value must be one of: true, false, yes, no, on, off, 1, 0",
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // parse_bool
+    #[test]
+    fn parse_bool_truthy_values() {
+        for s in &["1", "true", "yes", "on", "TRUE", "Yes", " on "] {
+            assert_eq!(parse_bool(s).unwrap(), true, "expected true for {s:?}");
+        }
+    }
+
+    #[test]
+    fn parse_bool_falsy_values() {
+        for s in &["0", "false", "no", "off", "FALSE", "No", " off "] {
+            assert_eq!(parse_bool(s).unwrap(), false, "expected false for {s:?}");
+        }
+    }
+
+    #[test]
+    fn parse_bool_invalid_errors() {
+        assert!(parse_bool("maybe").is_err());
+        assert!(parse_bool("").is_err());
+        assert!(parse_bool("2").is_err());
+    }
+
+    // validate_theme_name
+    #[test]
+    fn theme_name_valid() {
+        assert!(validate_theme_name("dracula").is_ok());
+        assert!(validate_theme_name("tokyo-night").is_ok());
+        assert!(validate_theme_name("my_theme.1").is_ok());
+    }
+
+    #[test]
+    fn theme_name_empty_errors() {
+        assert!(validate_theme_name("").is_err());
+    }
+
+    #[test]
+    fn theme_name_path_separator_errors() {
+        assert!(validate_theme_name("../../etc/passwd").is_err());
+        assert!(validate_theme_name("a/b").is_err());
+    }
+
+    #[test]
+    fn theme_name_dotdot_errors() {
+        assert!(validate_theme_name("..").is_err());
+        assert!(validate_theme_name("a..b").is_err());
+    }
+
+    #[test]
+    fn theme_name_null_byte_errors() {
+        assert!(validate_theme_name("evil\0theme").is_err());
     }
 }

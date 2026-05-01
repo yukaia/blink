@@ -112,6 +112,33 @@ fn sanitize_display(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_display_clean_borrows() {
+        let out = sanitize_display("hello");
+        assert_eq!(&*out, "hello");
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn sanitize_display_strips_control_chars() {
+        let out = sanitize_display("evil\x1b[31mred\x07");
+        assert!(!out.contains('\x1b'));
+        assert!(!out.contains('\x07'));
+        assert!(out.contains("evil"));
+        assert!(out.contains("red"));
+    }
+
+    #[test]
+    fn sanitize_display_null_byte_stripped() {
+        let out = sanitize_display("host\x00name");
+        assert!(!out.contains('\x00'));
+    }
+}
+
 fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter =
@@ -146,111 +173,5 @@ fn list_themes() -> Result<()> {
 }
 
 fn list_checkpoints(clean: bool, force: bool) -> Result<()> {
-    use crate::checkpoint::Checkpoint;
-
-    let dir = crate::paths::checkpoints_dir()?;
-
-    // Collect every .json file in the checkpoints directory. This catches
-    // orphaned files from renamed / deleted sessions and ad-hoc connects,
-    // which would be invisible if we only iterated saved sessions.
-    let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)?
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
-        .collect();
-    entries.sort();
-
-    if entries.is_empty() {
-        println!("no checkpoints found");
-        return Ok(());
-    }
-
-    // Build a set of known session names so we can flag orphans.
-    let known_sessions: std::collections::HashSet<String> = session::Session::list_all()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|s| s.name)
-        .collect();
-
-    let mut removed = 0usize;
-    let mut kept = 0usize;
-
-    for path in &entries {
-        let cp = match Checkpoint::load_from(path) {
-            Ok(Some(cp)) => cp,
-            Ok(None) => continue,
-            Err(e) => {
-                eprintln!(
-                    "warning: could not read {}: {e}",
-                    path.display()
-                );
-                continue;
-            }
-        };
-
-        let pending = cp.pending_count();
-        let done = cp.done_count();
-        let total = pending + done;
-        let orphaned = !known_sessions.contains(&cp.session);
-
-        // Determine whether this checkpoint should be removed.
-        let should_remove = force
-            || (clean && (pending == 0 || orphaned));
-
-        if should_remove {
-            match std::fs::remove_file(path) {
-                Ok(()) => {
-                    let reason = if force {
-                        "forced"
-                    } else if pending == 0 {
-                        "completed"
-                    } else {
-                        "orphaned"
-                    };
-                    println!(
-                        "removed  {:<20}  {:<8}  {}/{} done  ({})",
-                        cp.session,
-                        cp.kind.as_str(),
-                        done,
-                        total,
-                        reason,
-                    );
-                    removed += 1;
-                }
-                Err(e) => {
-                    eprintln!(
-                        "error: could not remove {}: {e}",
-                        path.display()
-                    );
-                }
-            }
-        } else {
-            let flag = if orphaned { " [orphaned]" } else { "" };
-            println!(
-                "{:<20}  {:<8}  {}/{} done  ({} remaining){}",
-                cp.session,
-                cp.kind.as_str(),
-                done,
-                total,
-                pending,
-                flag,
-            );
-            kept += 1;
-        }
-    }
-
-    if clean || force {
-        println!();
-        println!("{removed} removed, {kept} kept");
-    } else if kept > 0 {
-        println!();
-        println!(
-            "Use `blink checkpoints --clean` to remove completed and orphaned checkpoints."
-        );
-        println!(
-            "Use `blink checkpoints --force` to remove all checkpoint files."
-        );
-    }
-
-    Ok(())
+    crate::checkpoint::list_and_clean(clean, force)
 }
