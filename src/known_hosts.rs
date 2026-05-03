@@ -144,6 +144,7 @@ pub fn append(host: &str, key_type: &str, key_b64: &str) -> Result<()> {
 ///
 /// Used when the user explicitly replaces a key (not currently exposed in UI,
 /// but useful for programmatic cleanup and future "update key" flows).
+#[allow(dead_code)]
 pub fn remove_host(host: &str) -> Result<()> {
     let path = known_hosts_path()?;
 

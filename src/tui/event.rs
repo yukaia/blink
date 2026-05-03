@@ -31,6 +31,7 @@ pub enum WalkKind {
 pub enum Event {
     Key(KeyEvent),
     Tick,
+    #[allow(dead_code)]
     Resize(u16, u16),
     App(AppEvent),
 }
@@ -64,7 +65,7 @@ pub enum AppEvent {
     Renamed { from: String, to: String },
 
     /// A rename failed.
-    RenameFailed { from: String, to: String, error: String },
+    RenameFailed { from: String, #[allow(dead_code)] to: String, error: String },
 
     /// A remote mkdir completed successfully.
     MkdirDone { path: String },

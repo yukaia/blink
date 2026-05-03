@@ -21,6 +21,7 @@ pub enum BlinkError {
     #[error("theme not found: {0}")]
     ThemeNotFound(String),
 
+    #[allow(dead_code)]
     #[error("invalid path: {0}")]
     InvalidPath(PathBuf),
 
@@ -32,6 +33,7 @@ pub enum BlinkError {
 
     /// The server presented a host key that does not match the stored one.
     /// This is a hard error — possible man-in-the-middle attack.
+    #[allow(dead_code)]
     #[error(
         "host key mismatch for {host}: expected {stored_key_type} key, got {presented_key_type}. \
          If the server key was legitimately changed, remove the old entry from the known_hosts file."
@@ -44,6 +46,7 @@ pub enum BlinkError {
 
     /// The server's host key is not in the known-hosts file and the user
     /// rejected it (pressed `n` at the confirmation prompt).
+    #[allow(dead_code)]
     #[error("host key rejected by user for {0}")]
     HostKeyRejected(String),
 
@@ -53,6 +56,7 @@ pub enum BlinkError {
     #[error("transport error: {0}")]
     Transport(String),
 
+    #[allow(dead_code)]
     #[error("protocol `{0}` is not yet implemented")]
     NotImplemented(&'static str),
 
@@ -83,6 +87,7 @@ impl BlinkError {
     ///
     /// `presented_key_type` comes directly from the remote server and must be
     /// sanitized before it appears in an error message or the TUI.
+    #[allow(dead_code)]
     pub fn host_key_changed(
         host: impl Into<String>,
         stored_key_type: impl Into<String>,

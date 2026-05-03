@@ -28,8 +28,10 @@ pub struct RemoteEntry {
     pub name: String,
     pub kind: EntryKind,
     pub size: u64,
+    #[allow(dead_code)]
     pub modified: Option<chrono::DateTime<chrono::Utc>>,
     /// POSIX mode bits where available, else None (e.g. FTP).
+    #[allow(dead_code)]
     pub mode: Option<u32>,
 }
 
@@ -58,6 +60,7 @@ pub struct ProgressUpdate {
 #[async_trait]
 pub trait Transport: Send + Sync {
     /// Human-readable label, e.g. `Protocol::Sftp`.
+    #[allow(dead_code)]
     fn protocol(&self) -> Protocol;
 
     /// List entries in `remote_path`. Implementations must NOT include `.` or `..`.
@@ -192,6 +195,7 @@ pub(crate) mod mock {
     }
 
     impl MockTransport {
+        #[allow(dead_code)]
         pub fn new() -> Self {
             Self {
                 files: Arc::new(Mutex::new(HashMap::new())),
@@ -199,6 +203,7 @@ pub(crate) mod mock {
             }
         }
 
+        #[allow(dead_code)]
         pub fn with_file(self, path: &str, contents: &[u8]) -> Self {
             let mut parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("/");
             if parent.is_empty() {

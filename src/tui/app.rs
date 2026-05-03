@@ -520,6 +520,7 @@ pub struct App {
     pub local: PaneState,
     pub remote: PaneState,
     pub log: Vec<LogLine>,
+    #[allow(dead_code)]
     pub transfers: Vec<TransferJob>,
     /// Which page the bottom panel renders. Auto-updated when the user Tabs
     /// into Transfers or Log; otherwise sticky.

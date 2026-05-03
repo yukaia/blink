@@ -518,6 +518,7 @@ mod tests {
         tokenize(lang, line, LineState::default()).0.into_iter().map(|(k, _)| k).collect()
     }
 
+    #[allow(dead_code)]
     fn texts(lang: Lang, line: &str) -> Vec<String> {
         tokenize(lang, line, LineState::default()).0.into_iter().map(|(_, t)| t).collect()
     }

@@ -47,6 +47,7 @@ pub struct TransferJob {
 pub enum TransferState {
     Pending,
     Active,
+    #[allow(dead_code)]
     Paused,
     Complete,
     Failed(String),
@@ -56,6 +57,7 @@ pub enum TransferState {
 pub enum TransferEvent {
     Queued(TransferJob),
     Started(u64),
+    #[allow(dead_code)]
     Progress {
         id: u64,
         bytes_done: u64,
@@ -119,6 +121,7 @@ impl TransferManager {
 
     /// Adjust concurrency at runtime. New jobs honour the new limit; running
     /// jobs are not interrupted.
+    #[allow(dead_code)]
     pub fn set_parallelism(&self, n: u8) {
         let n = n.clamp(1, crate::config::MAX_PARALLEL);
         self.inner.lock().parallelism = n;
@@ -279,6 +282,7 @@ impl TransferManager {
         });
     }
 
+    #[allow(dead_code)]
     pub fn pending_jobs(&self) -> Vec<TransferJob> {
         self.inner
             .lock()

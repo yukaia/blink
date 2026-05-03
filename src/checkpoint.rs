@@ -189,6 +189,7 @@ impl CheckpointJob {
     }
 
     /// Returns the remote path for log messages.
+    #[allow(dead_code)]
     pub fn remote_path(&self) -> &str {
         match self {
             Self::Mkdir { remote_path, .. } => remote_path,
