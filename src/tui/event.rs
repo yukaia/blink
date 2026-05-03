@@ -16,16 +16,8 @@ use tokio::time::{interval, Interval};
 
 use crate::error::Result;
 use crate::preview::FileViewKind;
-use crate::transfer::TransferEvent;
+use crate::transfer::{Direction, TransferEvent};
 use crate::transport::{RemoteEntry, Transport};
-
-/// Discriminates between download and upload walks; consumed by the App when
-/// a [`AppEvent::WalkComplete`] / [`AppEvent::WalkFailed`] arrives.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WalkKind {
-    Download,
-    Upload,
-}
 
 /// Top-level event consumed by the App run loop.
 pub enum Event {
@@ -86,13 +78,13 @@ pub enum AppEvent {
     WalkComplete {
         plan: Vec<crate::tui::app::PlannedJob>,
         conflict_indices: Vec<usize>,
-        kind: WalkKind,
+        kind: Direction,
     },
 
     /// A recursive walk failed.
     WalkFailed {
         error: String,
-        kind: WalkKind,
+        kind: Direction,
     },
 
     /// File contents fetched for the viewer.

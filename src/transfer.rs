@@ -57,13 +57,9 @@ pub enum TransferState {
 pub enum TransferEvent {
     Queued(TransferJob),
     Started(u64),
-    #[allow(dead_code)]
-    Progress {
-        id: u64,
-        bytes_done: u64,
-        bytes_total: u64,
-        bytes_per_sec: u64,
-    },
+    /// Progress signal: a transfer made forward progress.
+    /// The UI reads actual byte counts from [`TransferManager::snapshot`].
+    Progress,
     Complete(u64),
     Failed {
         id: u64,
@@ -274,12 +270,7 @@ impl TransferManager {
                 j.bytes_per_sec = bytes_per_sec;
             }
         }
-        let _ = self.events.send(TransferEvent::Progress {
-            id,
-            bytes_done,
-            bytes_total,
-            bytes_per_sec,
-        });
+        let _ = self.events.send(TransferEvent::Progress);
     }
 
     #[allow(dead_code)]

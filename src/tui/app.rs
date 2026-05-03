@@ -19,9 +19,9 @@ use crate::error::Result;
 use crate::preview::{self, FileViewKind};
 use crate::session::{AuthMethod, Session};
 use crate::theme::Theme;
-use crate::transfer::{format_bytes, Dispatcher, TransferEvent, TransferJob, TransferManager};
+use crate::transfer::{format_bytes, Direction, Dispatcher, TransferEvent, TransferJob, TransferManager};
 use crate::transport::{self, EntryKind, RemoteEntry, Transport};
-use crate::tui::event::{AppEvent, Event, EventStream, WalkKind};
+use crate::tui::event::{AppEvent, Event, EventStream};
 use crate::tui::{TuiTerminal, TICK_INTERVAL};
 
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1400,10 +1400,10 @@ impl App {
             // haven't completed yet. 'r' resumes the download checkpoint,
             // 'R' resumes the upload checkpoint.
             KeyCode::Char('r') if self.active_pane == Pane::Transfers => {
-                self.resume_walk(WalkKind::Download);
+                self.resume_walk(Direction::Download);
             }
             KeyCode::Char('R') if self.active_pane == Pane::Transfers => {
-                self.resume_walk(WalkKind::Upload);
+                self.resume_walk(Direction::Upload);
             }
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.open_save_session();
@@ -2115,7 +2115,7 @@ impl App {
                         Err(e) => {
                             let _ = tx.send(AppEvent::WalkFailed {
                                 error: e.to_string(),
-                                kind: WalkKind::Upload,
+                                kind: Direction::Upload,
                             });
                             return;
                         }
@@ -2139,7 +2139,7 @@ impl App {
                     Err(e) => {
                         let _ = tx.send(AppEvent::WalkFailed {
                             error: e.to_string(),
-                            kind: WalkKind::Upload,
+                            kind: Direction::Upload,
                         });
                         return;
                     }
@@ -2148,7 +2148,7 @@ impl App {
             let _ = tx.send(AppEvent::WalkComplete {
                 plan,
                 conflict_indices,
-                kind: WalkKind::Upload,
+                kind: Direction::Upload,
             });
         });
     }
@@ -2160,7 +2160,7 @@ impl App {
     /// Before any jobs are enqueued, the plan is written to a checkpoint file
     /// so that a crash or forced quit mid-batch can be resumed with
     /// `--resume` (CLI) or the `r` key in the Transfers pane.
-    fn dispatch_plan(&mut self, plan: Vec<PlannedJob>, kind: WalkKind) {
+    fn dispatch_plan(&mut self, plan: Vec<PlannedJob>, kind: Direction) {
         let Some(manager) = self.transfer_manager.clone() else {
             return;
         };
@@ -2182,8 +2182,9 @@ impl App {
         // ---- checkpoint: write before first enqueue so the file exists
         // even if the app is killed on the first transfer. ---------------
         let ck_kind = match kind {
-            WalkKind::Upload => CheckpointKind::Upload,
-            WalkKind::Download => CheckpointKind::Download,
+            Direction::Upload => CheckpointKind::Upload,
+            Direction::Download => CheckpointKind::Download,
+            Direction::CreateDir => unreachable!(),
         };
         let session_name = self
             .current_session
@@ -2280,8 +2281,9 @@ impl App {
             }
         }
         let label = match kind {
-            WalkKind::Download => "downloads",
-            WalkKind::Upload => "uploads",
+            Direction::Download => "downloads",
+            Direction::Upload => "uploads",
+            Direction::CreateDir => unreachable!(),
         };
         self.push_log(
             LogLevel::Info,
@@ -2294,10 +2296,11 @@ impl App {
     ///
     /// Called from the `r` keybinding in the Transfers pane (or `--resume`
     /// at startup). Logs a message if there is nothing to resume.
-    pub fn resume_walk(&mut self, kind: WalkKind) {
+    pub fn resume_walk(&mut self, kind: Direction) {
         let ck_kind = match kind {
-            WalkKind::Upload => CheckpointKind::Upload,
-            WalkKind::Download => CheckpointKind::Download,
+            Direction::Upload => CheckpointKind::Upload,
+            Direction::Download => CheckpointKind::Download,
+            Direction::CreateDir => unreachable!(),
         };
         let session_name = self
             .current_session
@@ -2412,7 +2415,7 @@ impl App {
                 } else {
                     plan
                 };
-                self.dispatch_plan(final_plan, WalkKind::Download);
+                self.dispatch_plan(final_plan, Direction::Download);
             }
             OverwritePending::UploadPlan {
                 plan,
@@ -2423,7 +2426,7 @@ impl App {
                 } else {
                     plan
                 };
-                self.dispatch_plan(final_plan, WalkKind::Upload);
+                self.dispatch_plan(final_plan, Direction::Upload);
             }
         }
     }
@@ -2525,7 +2528,7 @@ impl App {
                             Err(e) => {
                                 let _ = tx.send(AppEvent::WalkFailed {
                                     error: e.to_string(),
-                                    kind: WalkKind::Download,
+                                    kind: Direction::Download,
                                 });
                                 return;
                             }
@@ -2548,7 +2551,7 @@ impl App {
             let _ = tx.send(AppEvent::WalkComplete {
                 plan,
                 conflict_indices,
-                kind: WalkKind::Download,
+                kind: Direction::Download,
             });
         });
     }
@@ -3238,14 +3241,15 @@ impl App {
                     self.dispatch_plan(plan, kind);
                 } else {
                     let pending = match kind {
-                        WalkKind::Download => OverwritePending::DownloadPlan {
+                        Direction::Download => OverwritePending::DownloadPlan {
                             plan,
                             conflict_indices,
                         },
-                        WalkKind::Upload => OverwritePending::UploadPlan {
+                        Direction::Upload => OverwritePending::UploadPlan {
                             plan,
                             conflict_indices,
                         },
+                        Direction::CreateDir => unreachable!(),
                     };
                     self.pending_overwrite = Some(pending);
                     self.screen = Screen::ConfirmOverwrite;
@@ -3253,8 +3257,9 @@ impl App {
             }
             AppEvent::WalkFailed { error, kind } => {
                 let label = match kind {
-                    WalkKind::Download => "downloads",
-                    WalkKind::Upload => "uploads",
+                    Direction::Download => "downloads",
+                    Direction::Upload => "uploads",
+                    Direction::CreateDir => unreachable!(),
                 };
                 self.push_log(
                     LogLevel::Error,
@@ -3394,7 +3399,7 @@ impl App {
                     );
                 }
             }
-            TransferEvent::Progress { .. } => {
+            TransferEvent::Progress => {
                 // Progress is tracked inside TransferManager; no per-tick log
                 // spam. A later pass can render an active-transfers strip in
                 // the header from `manager.snapshot()`.

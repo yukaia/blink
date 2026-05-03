@@ -17,7 +17,7 @@ use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::{load_secret_key, ssh_key};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::OpenFlags;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{self, BlinkError, Result};
@@ -178,6 +178,7 @@ impl Handler for KnownHostsHandler {
 pub struct SftpTransport {
     handle: Handle<KnownHostsHandler>,
     sftp: SftpSession,
+    buf: Vec<u8>,
 }
 
 impl SftpTransport {
@@ -306,7 +307,11 @@ impl SftpTransport {
             .await
             .map_err(|e| BlinkError::transport(format!("init sftp: {e}")))?;
 
-        Ok(Self { handle, sftp })
+        Ok(Self {
+            handle,
+            sftp,
+            buf: vec![0u8; 64 * 1024],
+        })
     }
 }
 
@@ -358,6 +363,14 @@ impl Transport for SftpTransport {
         local_path: &Path,
         progress: Option<mpsc::UnboundedSender<ProgressUpdate>>,
     ) -> Result<()> {
+        // Resume support: if a partial file exists, skip already-downloaded
+        // bytes so interrupted transfers can pick up where they left off.
+        let offset = tokio::fs::metadata(local_path)
+            .await
+            .ok()
+            .map(|m| m.len())
+            .unwrap_or(0);
+
         let mut remote = self
             .sftp
             .open_with_flags(remote_path, OpenFlags::READ)
@@ -372,19 +385,36 @@ impl Transport for SftpTransport {
             .and_then(|m| m.size)
             .unwrap_or(0);
 
+        // If the file changed server-side since the partial download started,
+        // start over — the existing bytes no longer match.
+        let offset = if offset <= total { offset } else { 0 };
+
+        if offset > 0 {
+            remote
+                .seek(SeekFrom::Start(offset))
+                .await
+                .map_err(|e| BlinkError::transport(format!("seek {remote_path}: {e}")))?;
+        }
+
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let mut local = tokio::fs::File::create(local_path).await?;
+        let mut local = if offset > 0 {
+            tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(local_path)
+                .await?
+        } else {
+            tokio::fs::File::create(local_path).await?
+        };
 
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut done: u64 = 0;
+        let mut done: u64 = offset;
         loop {
-            let n = remote.read(&mut buf).await?;
+            let n = remote.read(&mut self.buf).await?;
             if n == 0 {
                 break;
             }
-            local.write_all(&buf[..n]).await?;
+            local.write_all(&self.buf[..n]).await?;
             done += n as u64;
             if let Some(tx) = &progress {
                 let _ = tx.send(ProgressUpdate {
@@ -414,14 +444,13 @@ impl Transport for SftpTransport {
             .await
             .map_err(|e| BlinkError::transport(format!("open {remote_path}: {e}")))?;
 
-        let mut buf = vec![0u8; 64 * 1024];
         let mut done: u64 = 0;
         loop {
-            let n = local.read(&mut buf).await?;
+            let n = local.read(&mut self.buf).await?;
             if n == 0 {
                 break;
             }
-            remote.write_all(&buf[..n]).await?;
+            remote.write_all(&self.buf[..n]).await?;
             done += n as u64;
             if let Some(tx) = &progress {
                 let _ = tx.send(ProgressUpdate {

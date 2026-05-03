@@ -478,5 +478,110 @@ mod tests {
     fn parent_of_empty_is_root() {
         assert_eq!(parent_remote(""), "/");
     }
+
+    // -----------------------------------------------------------------------
+    // MockTransport tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn mock_list_empty() {
+        let mut m = mock::MockTransport::new();
+        let entries = m.list("/").await.unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mock_list_with_file() {
+        let mut m = mock::MockTransport::new().with_file("/hello.txt", b"world");
+        let entries = m.list("/").await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "hello.txt");
+        assert!(!entries[0].is_dir());
+        assert_eq!(entries[0].size, 5);
+    }
+
+    #[tokio::test]
+    async fn mock_list_with_dir() {
+        let mut m = mock::MockTransport::new();
+        m.mkdir("/subdir").await.unwrap();
+        let entries = m.list("/").await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "subdir");
+    }
+
+    #[tokio::test]
+    async fn mock_upload_and_download() {
+        let dir = std::env::temp_dir().join("blink-mock-test");
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let local = dir.join(format!("upload-{}", std::process::id()));
+
+        let mut m = mock::MockTransport::new();
+        tokio::fs::write(&local, b"hello from mock").await.unwrap();
+        m.upload(&local, "/remote.txt", None).await.unwrap();
+
+        let dest = dir.join("downloaded.txt");
+        m.download("/remote.txt", &dest, None).await.unwrap();
+        let data = tokio::fs::read(&dest).await.unwrap();
+        assert_eq!(data, b"hello from mock");
+
+        let _ = tokio::fs::remove_file(&local).await;
+        let _ = tokio::fs::remove_file(&dest).await;
+    }
+
+    #[tokio::test]
+    async fn mock_rename() {
+        let mut m = mock::MockTransport::new().with_file("/old.txt", b"data");
+        m.rename("/old.txt", "/new.txt").await.unwrap();
+        let entries = m.list("/").await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "new.txt");
+        assert!(m.metadata("/old.txt").await.unwrap().is_none());
+        assert!(m.metadata("/new.txt").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn mock_delete() {
+        let mut m = mock::MockTransport::new()
+            .with_file("/a.txt", b"aaa")
+            .with_file("/b.txt", b"bbb");
+        m.delete_file("/a.txt").await.unwrap();
+        let entries = m.list("/").await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "b.txt");
+    }
+
+    #[tokio::test]
+    async fn mock_delete_dir_recursive() {
+        let mut m = mock::MockTransport::new();
+        m.mkdir("/dir").await.unwrap();
+        let mut inner = mock::MockTransport::new();
+        inner.mkdir("/dir/sub").await.unwrap();
+        // Add a file inside the subdirectory via the shared transport
+        m = inner;
+        m.delete_dir("/dir", true).await.unwrap();
+        assert!(m.metadata("/dir").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn mock_read_to_bytes() {
+        let mut m = mock::MockTransport::new().with_file("/data.bin", b"\x00\x01\x02");
+        let bytes = m.read_to_bytes("/data.bin").await.unwrap();
+        assert_eq!(&bytes[..], &[0, 1, 2]);
+    }
+
+    #[tokio::test]
+    async fn mock_metadata_file() {
+        let mut m = mock::MockTransport::new().with_file("/f", b"12345");
+        let meta = m.metadata("/f").await.unwrap().unwrap();
+        assert_eq!(meta.name, "f");
+        assert!(meta.is_dir() == false);
+        assert_eq!(meta.size, 5);
+    }
+
+    #[tokio::test]
+    async fn mock_metadata_not_found() {
+        let mut m = mock::MockTransport::new();
+        assert!(m.metadata("/nope").await.unwrap().is_none());
+    }
 }
 
