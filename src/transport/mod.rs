@@ -7,7 +7,7 @@
 //! Everything else in the app (TUI, transfer manager, session model) talks to
 //! `Box<dyn Transport>`, not to a specific protocol.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -17,6 +17,7 @@ use crate::error::Result;
 use crate::session::{Protocol, Session};
 
 pub mod ftp;
+pub(crate) mod ftp_impl;
 pub mod ftps;
 pub mod scp;
 pub mod sftp;
@@ -162,6 +163,253 @@ pub(crate) fn parent_remote(path: &str) -> String {
         Some(("", _)) => "/".to_string(),
         Some((parent, _)) => parent.to_string(),
         None => "/".to_string(),
+    }
+}
+
+/// In-memory mock transport for testing transfer logic without a real server.
+///
+/// Stores files in a `HashMap<String, Vec<u8>>` keyed by remote path.
+/// Directory structure is implicit — any path can be listed if it was created
+/// via `mkdir`, and any path can hold a file via `upload`.
+#[cfg(test)]
+pub(crate) mod mock {
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use tokio::sync::mpsc;
+
+    use crate::error::Result;
+    use crate::session::Protocol;
+    use crate::transport::{EntryKind, ProgressUpdate, RemoteEntry, Transport};
+
+    #[derive(Debug, Clone)]
+    pub struct MockTransport {
+        files: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        dirs: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl MockTransport {
+        pub fn new() -> Self {
+            Self {
+                files: Arc::new(Mutex::new(HashMap::new())),
+                dirs: Arc::new(Mutex::new(vec!["/".to_string()])),
+            }
+        }
+
+        pub fn with_file(self, path: &str, contents: &[u8]) -> Self {
+            let mut parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("/");
+            if parent.is_empty() {
+                parent = "/";
+            }
+            self.dirs.lock().unwrap().push(parent.to_string());
+            self.files.lock().unwrap().insert(path.to_string(), contents.to_vec());
+            self
+        }
+    }
+
+    #[async_trait]
+    impl Transport for MockTransport {
+        fn protocol(&self) -> Protocol {
+            Protocol::Sftp
+        }
+
+        async fn list(&mut self, remote_path: &str) -> Result<Vec<RemoteEntry>> {
+            let p = if remote_path.ends_with('/') {
+                remote_path.to_string()
+            } else {
+                format!("{remote_path}/")
+            };
+            let files = self.files.lock().unwrap();
+            let dirs = self.dirs.lock().unwrap();
+
+            if !dirs.contains(&remote_path.to_string()) && remote_path != "/" {
+                return Err(crate::error::BlinkError::transport(format!(
+                    "no such directory: {remote_path}"
+                )));
+            }
+
+            let mut entries: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            for path in files.keys() {
+                if let Some(rest) = path.strip_prefix(&p) {
+                    if let Some(name) = rest.split('/').next() {
+                        if !name.is_empty() {
+                            entries.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+            for dir in dirs.iter() {
+                if let Some(rest) = dir.strip_prefix(&p) {
+                    if let Some(name) = rest.split('/').next() {
+                        if !name.is_empty() {
+                            entries.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+
+            let mut out = Vec::new();
+            for name in entries {
+                let is_dir = {
+                    let full = format!("{}{}", p, name);
+                    dirs.contains(&full)
+                };
+                let size = if is_dir {
+                    0
+                } else {
+                    let full = format!("{}{}", p, name);
+                    files.get(&full).map(|b| b.len() as u64).unwrap_or(0)
+                };
+                out.push(RemoteEntry {
+                    name,
+                    kind: if is_dir {
+                        EntryKind::Directory
+                    } else {
+                        EntryKind::File
+                    },
+                    size,
+                    modified: None,
+                    mode: None,
+                });
+            }
+            Ok(out)
+        }
+
+        async fn download(
+            &mut self,
+            remote_path: &str,
+            local_path: &Path,
+            progress: Option<mpsc::UnboundedSender<ProgressUpdate>>,
+        ) -> Result<()> {
+            let data = {
+                let files = self.files.lock().unwrap();
+                files
+                    .get(remote_path)
+                    .cloned()
+                    .ok_or_else(|| {
+                        crate::error::BlinkError::transport(format!(
+                            "file not found: {remote_path}"
+                        ))
+                    })?
+            };
+            if let Some(parent) = local_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(local_path, &data).await?;
+            if let Some(tx) = &progress {
+                let _ = tx.send(ProgressUpdate {
+                    bytes_done: data.len() as u64,
+                    bytes_total: data.len() as u64,
+                });
+            }
+            Ok(())
+        }
+
+        async fn upload(
+            &mut self,
+            local_path: &Path,
+            remote_path: &str,
+            _progress: Option<mpsc::UnboundedSender<ProgressUpdate>>,
+        ) -> Result<()> {
+            let data = tokio::fs::read(local_path).await?;
+            self.files
+                .lock()
+                .unwrap()
+                .insert(remote_path.to_string(), data);
+            Ok(())
+        }
+
+        async fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+            let mut files = self.files.lock().unwrap();
+            if let Some(data) = files.remove(from) {
+                files.insert(to.to_string(), data);
+                Ok(())
+            } else {
+                Err(crate::error::BlinkError::transport(format!(
+                    "file not found: {from}"
+                )))
+            }
+        }
+
+        async fn delete_file(&mut self, remote_path: &str) -> Result<()> {
+            self.files.lock().unwrap().remove(remote_path);
+            Ok(())
+        }
+
+        async fn delete_dir(&mut self, remote_path: &str, recursive: bool) -> Result<()> {
+            let mut dirs = self.dirs.lock().unwrap();
+            if recursive {
+                dirs.retain(|d| !d.starts_with(remote_path));
+                self.files.lock().unwrap().retain(|k, _| {
+                    !k.starts_with(remote_path)
+                });
+            } else {
+                dirs.retain(|d| d != remote_path);
+            }
+            Ok(())
+        }
+
+        async fn mkdir(&mut self, remote_path: &str) -> Result<()> {
+            self.dirs
+                .lock()
+                .unwrap()
+                .push(remote_path.to_string());
+            Ok(())
+        }
+
+        async fn metadata(&mut self, remote_path: &str) -> Result<Option<RemoteEntry>> {
+            let files = self.files.lock().unwrap();
+            let dirs = self.dirs.lock().unwrap();
+            if let Some(data) = files.get(remote_path) {
+                let name = remote_path
+                    .rsplit('/')
+                    .find(|s| !s.is_empty())
+                    .unwrap_or(remote_path)
+                    .to_string();
+                return Ok(Some(RemoteEntry {
+                    name,
+                    kind: EntryKind::File,
+                    size: data.len() as u64,
+                    modified: None,
+                    mode: None,
+                }));
+            }
+            if dirs.contains(&remote_path.to_string()) {
+                let name = remote_path
+                    .rsplit('/')
+                    .find(|s| !s.is_empty())
+                    .unwrap_or(remote_path)
+                    .to_string();
+                return Ok(Some(RemoteEntry {
+                    name,
+                    kind: EntryKind::Directory,
+                    size: 0,
+                    modified: None,
+                    mode: None,
+                }));
+            }
+            Ok(None)
+        }
+
+        async fn read_to_bytes(&mut self, remote_path: &str) -> Result<Bytes> {
+            let files = self.files.lock().unwrap();
+            files
+                .get(remote_path)
+                .cloned()
+                .map(Bytes::from)
+                .ok_or_else(|| {
+                    crate::error::BlinkError::transport(format!(
+                        "file not found: {remote_path}"
+                    ))
+                })
+        }
+
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
     }
 }
 

@@ -1335,22 +1335,30 @@ impl App {
             KeyCode::Tab => self.cycle_pane(true),
             KeyCode::BackTab => self.cycle_pane(false),
             KeyCode::Up => match self.active_pane {
-                Pane::Local | Pane::Remote => self.active_pane_mut().move_cursor(-1),
+                Pane::Local | Pane::Remote => {
+                    self.active_pane_mut().unwrap().move_cursor(-1)
+                }
                 Pane::Transfers => self.move_transfer_cursor(-1),
                 Pane::Log => {}
             },
             KeyCode::Down => match self.active_pane {
-                Pane::Local | Pane::Remote => self.active_pane_mut().move_cursor(1),
+                Pane::Local | Pane::Remote => {
+                    self.active_pane_mut().unwrap().move_cursor(1)
+                }
                 Pane::Transfers => self.move_transfer_cursor(1),
                 Pane::Log => {}
             },
             KeyCode::PageUp => match self.active_pane {
-                Pane::Local | Pane::Remote => self.active_pane_mut().move_cursor(-10),
+                Pane::Local | Pane::Remote => {
+                    self.active_pane_mut().unwrap().move_cursor(-10)
+                }
                 Pane::Transfers => self.move_transfer_cursor(-10),
                 Pane::Log => {}
             },
             KeyCode::PageDown => match self.active_pane {
-                Pane::Local | Pane::Remote => self.active_pane_mut().move_cursor(10),
+                Pane::Local | Pane::Remote => {
+                    self.active_pane_mut().unwrap().move_cursor(10)
+                }
                 Pane::Transfers => self.move_transfer_cursor(10),
                 Pane::Log => {}
             },
@@ -1377,8 +1385,8 @@ impl App {
                 Pane::Transfers | Pane::Log => {}
             },
             KeyCode::Char(' ') => {
-                if matches!(self.active_pane, Pane::Local | Pane::Remote) {
-                    self.active_pane_mut().toggle_selected();
+                if let Some(pane) = self.active_pane_mut() {
+                    pane.toggle_selected();
                 }
             }
             KeyCode::Char('c') if self.active_pane == Pane::Transfers => {
@@ -2419,13 +2427,11 @@ impl App {
         }
     }
 
-    fn active_pane_mut(&mut self) -> &mut PaneState {
+    fn active_pane_mut(&mut self) -> Option<&mut PaneState> {
         match self.active_pane {
-            Pane::Local => &mut self.local,
-            Pane::Remote => &mut self.remote,
-            // Transfers and Log have no PaneState; safe no-op target. Callers
-            // that care (Up/Down) branch on active_pane explicitly.
-            Pane::Transfers | Pane::Log => &mut self.local,
+            Pane::Local => Some(&mut self.local),
+            Pane::Remote => Some(&mut self.remote),
+            Pane::Transfers | Pane::Log => None,
         }
     }
 

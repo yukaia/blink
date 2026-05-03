@@ -428,8 +428,11 @@ pub fn format_eta(bytes_remaining: u64, bytes_per_sec: u64) -> String {
     if bytes_per_sec == 0 {
         return "—".into();
     }
-    let secs = bytes_remaining / bytes_per_sec;
-    let m = secs / 60;
-    let s = secs % 60;
+    let total_secs = bytes_remaining.max(1) / bytes_per_sec.max(1);
+    if total_secs == 0 {
+        return "0:01".into();
+    }
+    let m = total_secs / 60;
+    let s = total_secs % 60;
     format!("{m}:{s:02}")
 }

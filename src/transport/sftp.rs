@@ -132,17 +132,34 @@ impl Handler for KnownHostsHandler {
             decision_tx,
         };
 
-        match self.event_tx.take() { Some(tx) => {
-            if tx.send(event).is_err() {
-                return Ok(false);
+        let decision = match self.event_tx.take() {
+            Some(tx) => {
+                if tx.send(event).is_err() {
+                    return Ok(false);
+                }
+                // The TUI must respond within 60 seconds, otherwise reject
+                // to avoid hanging the connection indefinitely.
+                let decision = match self.decision_rx.take() {
+                    Some(rx) => match tokio::time::timeout(
+                        std::time::Duration::from_secs(60),
+                        rx,
+                    )
+                    .await
+                    {
+                        Ok(d) => d.unwrap_or(HostKeyDecision::Reject),
+                        Err(_) => {
+                            tracing::warn!(
+                                host = %self.host,
+                                "host-key decision timed out — rejecting"
+                            );
+                            HostKeyDecision::Reject
+                        }
+                    },
+                    None => HostKeyDecision::Reject,
+                };
+                decision
             }
-        } _ => {
-            return Ok(false);
-        }}
-
-        let decision = match self.decision_rx.take() {
-            Some(rx) => rx.await.unwrap_or(HostKeyDecision::Reject),
-            None => HostKeyDecision::Reject,
+            None => return Ok(false),
         };
 
         match decision {

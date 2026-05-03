@@ -144,9 +144,9 @@ impl Theme {
     /// sorted: the built-ins plus any `<n>.ini` files in the user's
     /// themes directory. Used for the in-app cycle hotkey.
     ///
-    /// Bad theme files (unreadable, missing `[colors]`, etc.) are silently
-    /// skipped — they'll never load anyway, so listing them would just
-    /// dead-end the cycle.
+    /// Theme files that fail to load are handled gracefully by `cycle_theme`
+    /// at use time, so we skip the per-file parse probe here and just list
+    /// the filenames. This avoids O(n) file I/O on every theme cycle.
     pub fn list_all_names() -> Vec<String> {
         use std::collections::BTreeSet;
         let mut set: BTreeSet<String> =
@@ -158,13 +158,8 @@ impl Theme {
                     if path.extension().and_then(|s| s.to_str()) != Some("ini") {
                         continue;
                     }
-                    // Quick validity probe: only list it if it actually parses.
-                    if Self::load_from(&path).is_ok() {
-                        if let Some(stem) =
-                            path.file_stem().and_then(|s| s.to_str())
-                        {
-                            set.insert(stem.to_string());
-                        }
+                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                        set.insert(stem.to_string());
                     }
                 }
             }

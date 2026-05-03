@@ -192,7 +192,9 @@ pub(crate) fn validate_theme_name(name: &str) -> Result<()> {
         ));
     }
     // Reject `..` anywhere in the name to block traversal via dots.
-    if name.split('/').any(|c| c == "..") || name.contains("..") {
+    // Path separators are already rejected above, so split-based checks
+    // are unnecessary; `contains` is sufficient.
+    if name.contains("..") {
         return Err(BlinkError::config(
             "theme name must not contain '..'",
         ));
