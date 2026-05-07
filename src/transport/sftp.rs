@@ -230,13 +230,7 @@ impl SftpTransport {
                     .map_err(|e| BlinkError::auth(e.to_string()))?
             }
             AuthMethod::Agent => {
-                #[cfg(target_os = "windows")]
-                {
-                    return Err(BlinkError::auth(
-                        "ssh-agent auth is not supported on Windows yet",
-                    ));
-                }
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(unix)]
                 {
                     let mut agent =
                         russh::keys::agent::client::AgentClient::connect_env()
@@ -251,6 +245,55 @@ impl SftpTransport {
                     if identities.is_empty() {
                         return Err(BlinkError::auth(
                             "ssh-agent has no identities loaded (try `ssh-add`)",
+                        ));
+                    }
+
+                    let mut succeeded = false;
+                    let mut last_err: Option<String> = None;
+                    for identity in identities {
+                        let auth_result = handle
+                            .authenticate_publickey_with(username, identity, &mut agent)
+                            .await;
+                        match auth_result {
+                            Ok(true) => {
+                                succeeded = true;
+                                break;
+                            }
+                            Ok(false) => {}
+                            Err(e) => last_err = Some(e.to_string()),
+                        }
+                    }
+                    if !succeeded {
+                        return Err(BlinkError::auth(format!(
+                            "ssh-agent: no identity accepted{}",
+                            last_err
+                                .map(|e| format!(" (last error: {e})"))
+                                .unwrap_or_default()
+                        )));
+                    }
+                    true
+                }
+                #[cfg(windows)]
+                {
+                    use russh::keys::agent::client::AgentClient;
+
+                    const OPENSSH_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
+
+                    let mut agent =
+                        match AgentClient::connect_named_pipe(OPENSSH_PIPE).await {
+                            Ok(a) => a.dynamic(),
+                            Err(_) => AgentClient::connect_pageant().await.dynamic(),
+                        };
+
+                    let identities = agent.request_identities().await.map_err(|e| {
+                        BlinkError::auth(format!(
+                            "ssh-agent: no agent found (tried OpenSSH pipe and Pageant): {e}"
+                        ))
+                    })?;
+                    if identities.is_empty() {
+                        return Err(BlinkError::auth(
+                            "ssh-agent has no identities loaded \
+                             (try `ssh-add` or load keys into Pageant)",
                         ));
                     }
 
