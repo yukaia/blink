@@ -28,7 +28,7 @@ A cross-platform terminal SFTP / SCP / FTP / FTPS client with a three-pane TUI, 
 
 - Three-pane TUI (local / remote, plus a switchable transfers/log panel)
 - Recursive **download** and **upload** with parallel slot dispatch
-- **Rename**, **delete files**, **delete directories** (recursive)
+- **Rename**, **create directories**, **delete files**, **delete directories** (recursive)
 - **Substring filter** per pane (`/`), persists across refresh
 - **Refresh** active pane (F5)
 - **Disconnect** and return to the session selector (`Ctrl-X`)
@@ -291,6 +291,7 @@ The full list lives in the in-app help overlay (`?`). Highlights:
 | `/`            | filter current pane                          |
 | `F5`           | refresh active pane                          |
 | `F2`           | rename (remote pane)                         |
+| `F7`           | create new remote directory                  |
 | `S-del` / `D`  | delete file or folder (remote pane)          |
 | `^s`           | save current session                         |
 | `^x`           | disconnect (return to selector)              |
@@ -363,12 +364,14 @@ src/
 ├── theme.rs             theme model + 7 built-ins + file loader
 ├── checkpoint.rs        walk-plan checkpointing: persist, update, and remove batch state
 ├── known_hosts.rs       SSH host-key store: check, append, and remove entries
+├── highlight.rs         syntax highlighter for the text viewer (single-pass, zero deps)
 ├── transport/           connection layer
 │   ├── mod.rs           Transport trait + factory + shared types
 │   ├── sftp.rs          SFTP via russh + russh-sftp
 │   ├── scp.rs           transparent SFTP wrapper (matches OpenSSH 9.0+)
 │   ├── ftp.rs           FTP via suppaftp tokio backend
-│   └── ftps.rs          FTPS via suppaftp + rustls (explicit TLS, pure Rust)
+│   ├── ftps.rs          FTPS via suppaftp + rustls (explicit TLS, pure Rust)
+│   └── ftp_impl.rs      shared macro that generates the Transport impl for FTP and FTPS
 ├── transfer.rs          TransferManager: queue, state, progress events
 ├── transfer/
 │   └── dispatcher.rs    parallel slot dispatcher; per-job worker tasks
