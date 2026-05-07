@@ -279,16 +279,21 @@ impl SftpTransport {
 
                     const OPENSSH_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
 
-                    let mut agent =
+                    let (mut agent, pipe_err) =
                         match AgentClient::connect_named_pipe(OPENSSH_PIPE).await {
-                            Ok(a) => a.dynamic(),
-                            Err(_) => AgentClient::connect_pageant().await.dynamic(),
+                            Ok(a) => (a.dynamic(), None),
+                            Err(e) => (AgentClient::connect_pageant().await.dynamic(), Some(e)),
                         };
 
                     let identities = agent.request_identities().await.map_err(|e| {
-                        BlinkError::auth(format!(
-                            "ssh-agent: no agent found (tried OpenSSH pipe and Pageant): {e}"
-                        ))
+                        let detail = match &pipe_err {
+                            Some(pe) => format!(
+                                "ssh-agent: no agent found \
+                                 (OpenSSH pipe error: {pe}; Pageant error: {e})"
+                            ),
+                            None => format!("ssh-agent request_identities: {e}"),
+                        };
+                        BlinkError::auth(detail)
                     })?;
                     if identities.is_empty() {
                         return Err(BlinkError::auth(
@@ -321,6 +326,12 @@ impl SftpTransport {
                         )));
                     }
                     true
+                }
+                #[cfg(not(any(unix, windows)))]
+                {
+                    return Err(BlinkError::auth(
+                        "ssh-agent auth is not supported on this platform",
+                    ));
                 }
             }
         };
