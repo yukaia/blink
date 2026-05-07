@@ -58,8 +58,6 @@ struct KnownHostsHandler {
     host: String,
     /// Sends unknown-key info to the TUI so a confirmation modal can appear.
     event_tx: Option<mpsc::UnboundedSender<crate::tui::event::AppEvent>>,
-    /// Receives the user's decision back from the TUI.
-    decision_rx: Option<oneshot::Receiver<HostKeyDecision>>,
 }
 
 #[async_trait]
@@ -122,7 +120,6 @@ impl Handler for KnownHostsHandler {
 
         // Unknown key: send the details to the TUI and await the user's call.
         let (decision_tx, decision_rx) = oneshot::channel();
-        self.decision_rx = Some(decision_rx);
 
         let event = crate::tui::event::AppEvent::HostKeyUnknown {
             host: self.host.clone(),
@@ -132,34 +129,30 @@ impl Handler for KnownHostsHandler {
             decision_tx,
         };
 
-        let decision = match self.event_tx.take() {
-            Some(tx) => {
-                if tx.send(event).is_err() {
-                    return Ok(false);
-                }
-                // The TUI must respond within 60 seconds, otherwise reject
-                // to avoid hanging the connection indefinitely.
-                let decision = match self.decision_rx.take() {
-                    Some(rx) => match tokio::time::timeout(
-                        std::time::Duration::from_secs(60),
-                        rx,
-                    )
-                    .await
-                    {
-                        Ok(d) => d.unwrap_or(HostKeyDecision::Reject),
-                        Err(_) => {
-                            tracing::warn!(
-                                host = %self.host,
-                                "host-key decision timed out — rejecting"
-                            );
-                            HostKeyDecision::Reject
-                        }
-                    },
-                    None => HostKeyDecision::Reject,
-                };
-                decision
-            }
+        let tx = match self.event_tx.take() {
+            Some(tx) => tx,
             None => return Ok(false),
+        };
+        if tx.send(event).is_err() {
+            return Ok(false);
+        }
+
+        // The TUI must respond within 60 seconds, otherwise reject
+        // to avoid hanging the connection indefinitely.
+        let decision = match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            decision_rx,
+        )
+        .await
+        {
+            Ok(d) => d.unwrap_or(HostKeyDecision::Reject),
+            Err(_) => {
+                tracing::warn!(
+                    host = %self.host,
+                    "host-key decision timed out — rejecting"
+                );
+                HostKeyDecision::Reject
+            }
         };
 
         match decision {
@@ -194,7 +187,6 @@ impl SftpTransport {
         let handler = KnownHostsHandler {
             host: host_key,
             event_tx: Some(app_event_tx),
-            decision_rx: None,
         };
 
         let mut handle = client::connect(config, addr.clone(), handler)
@@ -377,17 +369,32 @@ impl Transport for SftpTransport {
             .await
             .map_err(|e| BlinkError::transport(format!("open {remote_path}: {e}")))?;
 
-        let total = self
+        let reported_size = self
             .sftp
             .metadata(remote_path)
             .await
             .ok()
-            .and_then(|m| m.size)
-            .unwrap_or(0);
+            .and_then(|m| m.size);
 
-        // If the file changed server-side since the partial download started,
-        // start over — the existing bytes no longer match.
-        let offset = if offset <= total { offset } else { 0 };
+        let total = reported_size.unwrap_or(0);
+
+        // If the server reports the file size and the partial file is already
+        // larger, the file must have been replaced — restart from zero so we
+        // don't append garbage.  If the server does not report a size (None),
+        // we have no basis for comparison and trust the existing offset; not
+        // resetting avoids silently restarting every resumed FTP-style transfer.
+        let offset = match reported_size {
+            Some(server_size) if offset > server_size => {
+                tracing::warn!(
+                    remote = %remote_path,
+                    local_bytes = offset,
+                    server_bytes = server_size,
+                    "partial file is larger than server file — restarting download",
+                );
+                0
+            }
+            _ => offset,
+        };
 
         if offset > 0 {
             remote

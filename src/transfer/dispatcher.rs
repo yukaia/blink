@@ -27,10 +27,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Minimum interval between bytes-per-second recalculations, in ms.
 const SPEED_SAMPLE_MS: u128 = 250;
 
-/// Maximum time allowed for `transport::open` (TCP connect + SSH handshake +
-/// auth). A server that accepts the TCP connection but stalls the handshake
-/// can otherwise pin a worker slot indefinitely.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+use crate::transport::CONNECT_TIMEOUT;
 
 /// Handle to a running dispatcher.
 pub struct Dispatcher {

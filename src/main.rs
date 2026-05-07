@@ -141,11 +141,32 @@ mod tests {
 }
 
 fn init_tracing() {
+    use std::fs::OpenOptions;
     use tracing_subscriber::{fmt, EnvFilter};
+
     let filter =
-        EnvFilter::try_from_env("BLINK_LOG").unwrap_or_else(|_| EnvFilter::new("info"));
-    // Send logs to a sink while the TUI is up so they don't smear the screen.
-    // A future refinement: write to a file under paths::root_dir()/blink.log.
+        EnvFilter::try_from_env("BLINK_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
+
+    // If BLINK_LOG_FILE is set, write logs there; otherwise discard them so
+    // they don't smear the TUI. Example: BLINK_LOG_FILE=/tmp/blink.log BLINK_LOG=debug blink
+    if let Ok(log_path) = std::env::var("BLINK_LOG_FILE") {
+        if let Ok(file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            let _ = fmt()
+                .with_env_filter(filter)
+                .with_writer(move || {
+                    file.try_clone().expect("log file clone")
+                })
+                .with_ansi(false)
+                .try_init();
+            return;
+        }
+        eprintln!("warning: could not open BLINK_LOG_FILE={log_path}, logs discarded");
+    }
+
     let _ = fmt()
         .with_env_filter(filter)
         .with_writer(std::io::sink)

@@ -1,7 +1,7 @@
 [package]
 name = "blink"
-version = "0.1.6"
-edition = "2021"
+version = "0.1.7"
+edition = "2024"
 description = "A terminal SFTP/SCP/FTP/FTPS client with a three-pane TUI"
 license = "MIT"
 authors = ["blink contributors"]

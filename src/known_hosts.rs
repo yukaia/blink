@@ -109,8 +109,9 @@ fn check_in_str(raw: &str, host: &str, key_type: &str, key_b64: &str) -> Result<
 
 /// Append a new `host key_type key_b64` line to the known-hosts file.
 ///
-/// Creates the file if it does not exist. The operation is append-only so
-/// existing entries are never disturbed.
+/// Creates the file if it does not exist. If the host+key pair is already
+/// present (e.g., from a concurrent connection), the write is skipped so
+/// duplicate entries don't accumulate.
 pub fn append(host: &str, key_type: &str, key_b64: &str) -> Result<()> {
     // Reject characters that would corrupt the whitespace-delimited format or
     // allow a malicious server to inject trusted entries.
@@ -132,6 +133,20 @@ pub fn append(host: &str, key_type: &str, key_b64: &str) -> Result<()> {
     }
 
     let path = known_hosts_path()?;
+
+    // Skip the write if this exact entry already exists. This prevents
+    // duplicates from accumulating when two parallel connections to the same
+    // new host both call append() before either reads the (now-updated) file.
+    match read_bounded(&path) {
+        Ok(raw) => {
+            if matches!(check_in_str(&raw, host, key_type, key_b64), Ok(KeyStatus::Trusted)) {
+                return Ok(());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(BlinkError::from(e)),
+    }
+
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)

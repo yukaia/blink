@@ -88,17 +88,19 @@ impl Config {
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
-        // Enforce a size limit before reading so a large or malicious file
-        // doesn't exhaust memory.
-        let meta = fs::metadata(path)?;
-        if meta.len() > MAX_CONFIG_BYTES {
+        // Enforce a size limit before reading. Use the take() pattern (open
+        // then read) rather than metadata() + read_to_string() to avoid a
+        // TOCTOU race where the file grows between the two syscalls.
+        use std::io::Read as _;
+        let file = fs::File::open(path)?;
+        let mut raw = String::new();
+        file.take(MAX_CONFIG_BYTES + 1)
+            .read_to_string(&mut raw)?;
+        if raw.len() as u64 > MAX_CONFIG_BYTES {
             return Err(BlinkError::config(format!(
-                "config file is too large ({} bytes, limit is {MAX_CONFIG_BYTES})",
-                meta.len()
+                "config file is too large (limit is {MAX_CONFIG_BYTES} bytes)"
             )));
         }
-
-        let raw = fs::read_to_string(path)?;
         let ini = Ini::load_from_str(&raw)
             .map_err(|e| BlinkError::config(format!("{}: {e}", path.display())))?;
         let mut cfg = Self::default();

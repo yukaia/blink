@@ -24,7 +24,7 @@ use crate::transport::{self, EntryKind, RemoteEntry, Transport};
 use crate::tui::event::{AppEvent, Event, EventStream};
 use crate::tui::{TuiTerminal, TICK_INTERVAL};
 
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+use crate::transport::CONNECT_TIMEOUT;
 
 /// Which screen is the user currently looking at.
 #[derive(Debug, Clone, PartialEq, Eq)]

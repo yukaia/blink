@@ -28,9 +28,11 @@ pub struct RemoteEntry {
     pub name: String,
     pub kind: EntryKind,
     pub size: u64,
+    /// Populated by SFTP/SCP; `None` for FTP (protocol doesn't report it in LIST).
+    /// Not yet rendered in the file pane — reserved for a future column.
     #[allow(dead_code)]
     pub modified: Option<chrono::DateTime<chrono::Utc>>,
-    /// POSIX mode bits where available, else None (e.g. FTP).
+    /// POSIX mode bits; `None` for FTP. Reserved for a future permissions column.
     #[allow(dead_code)]
     pub mode: Option<u32>,
 }
@@ -55,6 +57,11 @@ pub struct ProgressUpdate {
     pub bytes_done: u64,
     pub bytes_total: u64,
 }
+
+/// Maximum time allowed for `transport::open` (TCP connect + SSH handshake +
+/// auth). Shared between the TUI initial-connect path and the dispatcher's
+/// per-job connect path so both enforce the same deadline.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// What every protocol implementation must provide.
 #[async_trait]
@@ -145,8 +152,11 @@ pub async fn open(
 /// rejected (returning `base` unchanged) to prevent upward traversal.
 pub(crate) fn join_remote(base: &str, name: &str) -> String {
     let name = name.trim_start_matches('/');
-    // Reject any dotdot component: "../secret" or "a/../b" both traverse up.
-    if name.split('/').any(|c| c == "..") {
+    // Reject `.` and `..` components: `..` traverses upward; `.` is a no-op
+    // but would produce paths like `/foo/./bar` that some servers don't
+    // normalise, and a server-controlled `.` in a name is almost always
+    // malicious.
+    if name.split('/').any(|c| c == ".." || c == ".") {
         return base.to_string();
     }
     if base.ends_with('/') {
@@ -446,6 +456,16 @@ mod tests {
     #[test]
     fn join_rejects_embedded_dotdot() {
         assert_eq!(join_remote("/srv/data", "a/../b"), "/srv/data");
+    }
+
+    #[test]
+    fn join_rejects_single_dot() {
+        assert_eq!(join_remote("/srv/data", "."), "/srv/data");
+    }
+
+    #[test]
+    fn join_rejects_embedded_single_dot() {
+        assert_eq!(join_remote("/srv/data", "a/./b"), "/srv/data");
     }
 
     #[test]

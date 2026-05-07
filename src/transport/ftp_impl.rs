@@ -194,52 +194,83 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     if let Some(parent) = local_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    let local_path = local_path.to_path_buf();
-    let progress_clone = progress.clone();
-    let total = stream.size(remote_path).await.unwrap_or(0) as u64;
-    let remote_path_owned = remote_path.to_string();
 
-    stream
-        .retr(&remote_path_owned, move |reader| {
-            let local_path = local_path.clone();
-            let progress = progress_clone.clone();
-            Box::pin(async move {
-                let mut file = tokio::fs::File::create(&local_path).await.map_err(|e| {
-                    suppaftp::FtpError::ConnectionError(std::io::Error::other(format!(
-                        "create {}: {e}",
-                        local_path.display()
-                    )))
-                })?;
-                let mut buf = vec![0u8; 64 * 1024];
-                let mut done: u64 = 0;
-                let mut reader = reader;
-                loop {
-                    let n = reader
-                        .read(&mut buf)
-                        .await
-                        .map_err(suppaftp::FtpError::ConnectionError)?;
-                    if n == 0 {
-                        break;
-                    }
-                    file.write_all(&buf[..n])
-                        .await
-                        .map_err(suppaftp::FtpError::ConnectionError)?;
-                    done += n as u64;
-                    if let Some(tx) = &progress {
-                        let _ = tx.send(ProgressUpdate {
-                            bytes_done: done,
-                            bytes_total: total,
-                        });
-                    }
-                }
-                file.flush()
-                    .await
-                    .map_err(suppaftp::FtpError::ConnectionError)?;
-                Ok(((), reader))
-            })
-        })
+    // Resume support: if a partial file exists seek to its end so interrupted
+    // transfers pick up where they left off (FTP REST command).
+    let offset = tokio::fs::metadata(local_path)
+        .await
+        .ok()
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let total = stream.size(remote_path).await.unwrap_or(0) as u64;
+
+    // If the partial file is larger than the server file, it's stale — restart.
+    let offset = if total > 0 && offset > total {
+        tracing::warn!(
+            remote = %remote_path,
+            local_bytes = offset,
+            server_bytes = total,
+            "FTP partial file is larger than server file — restarting download",
+        );
+        0
+    } else {
+        offset
+    };
+
+    if offset > 0 {
+        stream
+            .resume_transfer(offset as usize)
+            .await
+            .map_err(|e| BlinkError::transport(format!("rest {remote_path}: {e}")))?;
+    }
+
+    let mut reader = stream
+        .retr_as_stream(remote_path)
         .await
         .map_err(|e| BlinkError::transport(format!("retr {remote_path}: {e}")))?;
+
+    let mut local = if offset > 0 {
+        tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(local_path)
+            .await?
+    } else {
+        tokio::fs::File::create(local_path).await?
+    };
+
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut done: u64 = offset;
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .await
+            .map_err(|e| BlinkError::transport(format!("read {remote_path}: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        local
+            .write_all(&buf[..n])
+            .await
+            .map_err(|e| BlinkError::transport(format!("write {}: {e}", local_path.display())))?;
+        done += n as u64;
+        if let Some(tx) = &progress {
+            let _ = tx.send(ProgressUpdate {
+                bytes_done: done,
+                bytes_total: total,
+            });
+        }
+    }
+    local
+        .flush()
+        .await
+        .map_err(|e| BlinkError::transport(format!("flush {}: {e}", local_path.display())))?;
+
+    stream
+        .finalize_retr_stream(reader)
+        .await
+        .map_err(|e| BlinkError::transport(format!("finalize retr {remote_path}: {e}")))?;
+
     Ok(())
 }
 

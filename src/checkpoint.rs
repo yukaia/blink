@@ -269,8 +269,17 @@ impl Checkpoint {
     /// leaves the job in a state that triggers re-queue on resume rather than
     /// being silently skipped.
     pub fn mark_in_progress_and_save(&mut self, job_index: usize) -> Result<()> {
-        if let Some(j) = self.jobs.get_mut(job_index) {
-            j.mark_in_progress();
+        match self.jobs.get_mut(job_index) {
+            Some(j) => j.mark_in_progress(),
+            None => {
+                tracing::warn!(
+                    session = %self.session,
+                    job_index,
+                    total = self.jobs.len(),
+                    "mark_in_progress_and_save: job index out of bounds — checkpoint not updated",
+                );
+                return Ok(());
+            }
         }
         self.save()
     }
@@ -280,8 +289,17 @@ impl Checkpoint {
     /// Called from the `TransferEvent::Complete` handler after a successful
     /// transfer. Jobs that reach this state are skipped on resume.
     pub fn mark_done_and_save(&mut self, job_index: usize) -> Result<()> {
-        if let Some(j) = self.jobs.get_mut(job_index) {
-            j.mark_done();
+        match self.jobs.get_mut(job_index) {
+            Some(j) => j.mark_done(),
+            None => {
+                tracing::warn!(
+                    session = %self.session,
+                    job_index,
+                    total = self.jobs.len(),
+                    "mark_done_and_save: job index out of bounds — checkpoint not updated",
+                );
+                return Ok(());
+            }
         }
         self.save()
     }

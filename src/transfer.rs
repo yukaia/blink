@@ -47,8 +47,6 @@ pub struct TransferJob {
 pub enum TransferState {
     Pending,
     Active,
-    #[allow(dead_code)]
-    Paused,
     Complete,
     Failed(String),
 }
@@ -87,6 +85,13 @@ struct Inner {
     next_id: u64,
     next_batch_id: u64,
     jobs: Vec<TransferJob>,
+    /// Number of jobs currently in `Pending` state. Kept in sync with `jobs`
+    /// so `enqueue` can check the cap in O(1) instead of scanning the vec.
+    pending_count: usize,
+    /// Maps job id → index in `jobs` for O(1) lookups by id in `mark` and
+    /// `update_progress`. Jobs are never removed from `jobs`, so indices are
+    /// stable for the lifetime of the manager.
+    job_index: HashMap<u64, usize>,
     parallelism: u8,
     paused: bool,
     /// Abort handles for currently-running worker tasks, keyed by job id.
@@ -102,6 +107,8 @@ impl TransferManager {
             next_id: 1,
             next_batch_id: 1,
             jobs: Vec::new(),
+            pending_count: 0,
+            job_index: HashMap::new(),
             parallelism,
             paused: false,
             active: HashMap::new(),
@@ -210,12 +217,7 @@ impl TransferManager {
         let mut inner = self.inner.lock();
         // Cap the number of pending jobs so a large server directory listing
         // cannot grow the queue without bound and exhaust memory.
-        let pending = inner
-            .jobs
-            .iter()
-            .filter(|j| j.state == TransferState::Pending)
-            .count();
-        if pending >= MAX_QUEUED_JOBS {
+        if inner.pending_count >= MAX_QUEUED_JOBS {
             return None;
         }
         let id = inner.next_id;
@@ -231,7 +233,10 @@ impl TransferManager {
             state: TransferState::Pending,
             batch_id,
         };
+        let idx = inner.jobs.len();
         inner.jobs.push(job.clone());
+        inner.job_index.insert(id, idx);
+        inner.pending_count += 1;
         let _ = self.events.send(TransferEvent::Queued(job));
         Some(id)
     }
@@ -240,8 +245,13 @@ impl TransferManager {
     pub fn mark(&self, id: u64, state: TransferState) {
         {
             let mut inner = self.inner.lock();
-            if let Some(j) = inner.jobs.iter_mut().find(|j| j.id == id) {
+            if let Some(&idx) = inner.job_index.get(&id) {
+                let j = &mut inner.jobs[idx];
+                let was_pending = j.state == TransferState::Pending;
                 j.state = state.clone();
+                if was_pending {
+                    inner.pending_count = inner.pending_count.saturating_sub(1);
+                }
             }
         }
         match state {
@@ -264,7 +274,8 @@ impl TransferManager {
         let bytes_done = bytes_done.min(bytes_total);
         {
             let mut inner = self.inner.lock();
-            if let Some(j) = inner.jobs.iter_mut().find(|j| j.id == id) {
+            if let Some(&idx) = inner.job_index.get(&id) {
+                let j = &mut inner.jobs[idx];
                 j.bytes_done = bytes_done;
                 j.bytes_total = bytes_total;
                 j.bytes_per_sec = bytes_per_sec;
@@ -294,17 +305,15 @@ impl TransferManager {
     pub fn take_next_pending(&self) -> Option<TransferJob> {
         let cloned = {
             let mut inner = self.inner.lock();
-            match inner
+            // Find the index of the first pending job, then update state and
+            // pending_count in separate steps to satisfy the borrow checker.
+            let idx = inner
                 .jobs
-                .iter_mut()
-                .find(|j| j.state == TransferState::Pending)
-            {
-                Some(j) => {
-                    j.state = TransferState::Active;
-                    j.clone()
-                }
-                None => return None,
-            }
+                .iter()
+                .position(|j| j.state == TransferState::Pending)?;
+            inner.jobs[idx].state = TransferState::Active;
+            inner.pending_count = inner.pending_count.saturating_sub(1);
+            inner.jobs[idx].clone()
         };
         let _ = self.events.send(TransferEvent::Started(cloned.id));
         Some(cloned)
