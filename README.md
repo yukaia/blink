@@ -16,8 +16,9 @@ A cross-platform terminal SFTP / SCP / FTP / FTPS client with a three-pane TUI, 
 - **FTP** with anonymous and password auth
 - **FTPS** with explicit TLS (RFC 4217) via rustls — pure Rust, no system
   TLS library needed
-- **ssh-agent** auth on Unix (uses `$SSH_AUTH_SOCK`); Windows ssh-agent
-  support is deferred — see [Honest Caveats](#honest-caveats)
+- **ssh-agent** auth on Unix (uses `$SSH_AUTH_SOCK`); on Windows, the
+  built-in OpenSSH agent (`\\.\pipe\openssh-ssh-agent`) is tried first,
+  falling back to Pageant
 - **Host-key verification** for SFTP/SCP — unknown keys trigger an
   interactive prompt (accept & save / trust once / reject); changed keys are
   hard-rejected with a clear warning. Keys are stored in
@@ -486,11 +487,6 @@ A few things worth knowing before you use this in anger:
   all TLS certificate verification — suitable for self-signed dev servers,
   never for production. There is no option to add a custom CA root without
   recompiling.
-- **ssh-agent on Windows is not supported.** The Unix path uses
-  `$SSH_AUTH_SOCK`; Windows would need separate plumbing for the OpenSSH
-  named pipe (and/or Pageant), which the russh 0.49 entry point doesn't
-  handle uniformly. Trying agent auth on Windows surfaces a clear error.
-  Use SSH key auth instead — works the same on Windows.
 - **Passwords are held in memory** for the duration of the connected
   session. Each parallel transfer slot opens its own connection, so the
   dispatcher needs credentials to handshake each one. If that's not
