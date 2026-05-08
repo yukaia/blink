@@ -116,10 +116,9 @@ pub struct Session {
     pub theme: Option<String>,
     /// Skip TLS certificate validation when this is true.
     ///
-    /// Currently consulted only by the FTPS transport. SFTP/SCP do their own
-    /// host-key trust separately (TODO: surface the same setting there once
-    /// known_hosts handling lands). Defaults to false; the user has to opt in
-    /// per session.
+    /// Consulted only by the FTPS transport; SFTP/SCP use the known-hosts
+    /// file for host-key trust and do not use this flag. Defaults to false;
+    /// the user has to opt in per session.
     ///
     /// **Dangerous.** Disables the protections TLS is supposed to give you.
     /// The UI flags it in red.
