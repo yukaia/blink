@@ -168,6 +168,49 @@ impl Handler for KnownHostsHandler {
     }
 }
 
+/// Attempt authentication against every identity in the agent.
+/// Returns `Ok(true)` on success, `Ok(false)` if no identity was accepted.
+/// Using a generic `S` avoids `Box<dyn AgentStream>` in the state machine,
+/// which lets the Rust compiler verify the `Send` bound for all code paths.
+#[cfg(windows)]
+async fn try_agent_identities<S>(
+    handle: &mut Handle<KnownHostsHandler>,
+    username: &str,
+    agent: &mut russh::keys::agent::client::AgentClient<S>,
+) -> Result<bool>
+where
+    S: russh::keys::agent::client::AgentStream
+        + tokio::io::AsyncRead
+        + tokio::io::AsyncWrite
+        + Unpin
+        + Send
+        + 'static,
+{
+    let identities = agent
+        .request_identities()
+        .await
+        .map_err(|e| BlinkError::auth(format!("ssh-agent request_identities: {e}")))?;
+    if identities.is_empty() {
+        return Err(BlinkError::auth(
+            "ssh-agent has no identities loaded (try `ssh-add` or load keys into Pageant)",
+        ));
+    }
+
+    for identity in identities {
+        match handle
+            .authenticate_publickey_with(username, identity, agent)
+            .await
+        {
+            Ok(true) => return Ok(true),
+            Ok(false) => {}
+            Err(e) => {
+                tracing::debug!("ssh-agent identity rejected: {e}");
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub struct SftpTransport {
     handle: Handle<KnownHostsHandler>,
     sftp: SftpSession,
@@ -279,51 +322,29 @@ impl SftpTransport {
 
                     const OPENSSH_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
 
-                    let (mut agent, pipe_err) =
+                    let succeeded =
                         match AgentClient::connect_named_pipe(OPENSSH_PIPE).await {
-                            Ok(a) => (a.dynamic(), None),
-                            Err(e) => (AgentClient::connect_pageant().await.dynamic(), Some(e)),
-                        };
-
-                    let identities = agent.request_identities().await.map_err(|e| {
-                        let detail = match &pipe_err {
-                            Some(pe) => format!(
-                                "ssh-agent: no agent found \
-                                 (OpenSSH pipe error: {pe}; Pageant error: {e})"
-                            ),
-                            None => format!("ssh-agent request_identities: {e}"),
-                        };
-                        BlinkError::auth(detail)
-                    })?;
-                    if identities.is_empty() {
-                        return Err(BlinkError::auth(
-                            "ssh-agent has no identities loaded \
-                             (try `ssh-add` or load keys into Pageant)",
-                        ));
-                    }
-
-                    let mut succeeded = false;
-                    let mut last_err: Option<String> = None;
-                    for identity in identities {
-                        let auth_result = handle
-                            .authenticate_publickey_with(username, identity, &mut agent)
-                            .await;
-                        match auth_result {
-                            Ok(true) => {
-                                succeeded = true;
-                                break;
+                            Ok(mut agent) => {
+                                try_agent_identities(&mut handle, username, &mut agent)
+                                    .await?
                             }
-                            Ok(false) => {}
-                            Err(e) => last_err = Some(e.to_string()),
-                        }
-                    }
+                            Err(pipe_err) => {
+                                let mut agent = AgentClient::connect_pageant().await;
+                                try_agent_identities(&mut handle, username, &mut agent)
+                                    .await
+                                    .map_err(|e| {
+                                        BlinkError::auth(format!(
+                                            "ssh-agent: no agent found \
+                                             (OpenSSH pipe error: {pipe_err}; {e})"
+                                        ))
+                                    })?
+                            }
+                        };
+
                     if !succeeded {
-                        return Err(BlinkError::auth(format!(
-                            "ssh-agent: no identity accepted{}",
-                            last_err
-                                .map(|e| format!(" (last error: {e})"))
-                                .unwrap_or_default()
-                        )));
+                        return Err(BlinkError::auth(
+                            "ssh-agent: no identity accepted",
+                        ));
                     }
                     true
                 }
