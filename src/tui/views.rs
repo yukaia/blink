@@ -1908,7 +1908,6 @@ pub mod confirm_disconnect {
 
 pub mod confirm_host_key {
     use super::*;
-    use crate::known_hosts::display_key;
 
     pub fn render(f: &mut Frame, app: &App) {
         let area = f.area();
@@ -1927,11 +1926,10 @@ pub mod confirm_host_key {
         let inner = block.inner(modal);
         f.render_widget(block, modal);
 
-        let (host, key_type, key_b64, fingerprint) = match app.pending_host_key.as_ref() {
+        let (host, key_type, fingerprint) = match app.pending_host_key.as_ref() {
             Some(phk) => (
                 phk.host.as_str(),
                 phk.key_type.as_str(),
-                phk.key_b64.as_str(),
                 phk.fingerprint.as_str(),
             ),
             None => return,
@@ -1957,13 +1955,6 @@ pub mod confirm_host_key {
             Line::from(vec![
                 Span::styled("  Fingerprint: ", Style::default().fg(app.theme.dim)),
                 Span::styled(fingerprint, Style::default().fg(app.theme.accent)),
-            ]),
-            Line::from(vec![
-                Span::styled("  Key (trunc): ", Style::default().fg(app.theme.dim)),
-                Span::styled(
-                    display_key(key_b64),
-                    Style::default().fg(app.theme.dim),
-                ),
             ]),
             Line::from(""),
             Line::from(

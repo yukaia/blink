@@ -102,10 +102,10 @@ pub enum AppEvent {
     /// resolved (by sending a [`crate::transport::sftp::HostKeyDecision`])
     /// before the connect task can proceed.
     HostKeyUnknown {
-        /// `host:port` string, matching the known-hosts file key format.
+        /// Display form of the host (bare for the default SSH port,
+        /// `[host]:port` otherwise) — used only for the modal label.
         host: String,
         key_type: String,
-        key_b64: String,
         /// SHA-256 fingerprint for display (e.g. `SHA256:abc123…`).
         fingerprint: String,
         decision_tx: tokio::sync::oneshot::Sender<crate::transport::sftp::HostKeyDecision>,

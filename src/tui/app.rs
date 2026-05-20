@@ -301,7 +301,6 @@ pub struct PendingDelete {
 pub struct PendingHostKey {
     pub host: String,
     pub key_type: String,
-    pub key_b64: String,
     pub fingerprint: String,
     /// One-shot sender; consumed exactly once when the user decides.
     pub decision_tx: Option<tokio::sync::oneshot::Sender<crate::transport::sftp::HostKeyDecision>>,
@@ -3326,14 +3325,12 @@ impl App {
             AppEvent::HostKeyUnknown {
                 host,
                 key_type,
-                key_b64,
                 fingerprint,
                 decision_tx,
             } => {
                 self.pending_host_key = Some(PendingHostKey {
                     host,
                     key_type,
-                    key_b64,
                     fingerprint,
                     decision_tx: Some(decision_tx),
                 });

@@ -54,10 +54,26 @@ pub enum HostKeyDecision {
 /// - If the host is unknown → send a prompt event to the TUI and wait for the
 ///   user's decision on `decision_rx`.
 struct KnownHostsHandler {
-    /// `host:port` string used as the lookup key in the known-hosts file.
+    /// Hostname used for known-hosts lookup. Stored as the user typed it;
+    /// `known_hosts` does its own case-folding.
     host: String,
+    /// Port the user connected to; combined with `host` to form the
+    /// known-hosts lookup key (`host` for port 22, `[host]:port` otherwise).
+    port: u16,
     /// Sends unknown-key info to the TUI so a confirmation modal can appear.
     event_tx: Option<mpsc::UnboundedSender<crate::tui::event::AppEvent>>,
+}
+
+impl KnownHostsHandler {
+    /// Human-readable form of the host, used in TUI prompts and log lines.
+    /// Matches the canonical known-hosts form for consistency.
+    fn display_host(&self) -> String {
+        if self.port == 22 {
+            self.host.clone()
+        } else {
+            format!("[{}]:{}", self.host, self.port)
+        }
+    }
 }
 
 #[async_trait]
@@ -83,11 +99,13 @@ impl Handler for KnownHostsHandler {
                 .to_string(),
         );
 
-        match known_hosts::check(&self.host, &key_type, &key_b64) {
+        let display_host = self.display_host();
+
+        match known_hosts::check(&self.host, self.port, &key_type, &key_b64) {
             Ok(KeyStatus::Trusted) => return Ok(true),
             Ok(KeyStatus::Changed { stored_key_type, .. }) => {
                 tracing::warn!(
-                    host = %self.host,
+                    host = %display_host,
                     stored = %stored_key_type,
                     presented = %key_type,
                     "host key mismatch — rejecting connection",
@@ -95,7 +113,7 @@ impl Handler for KnownHostsHandler {
                 // Send the changed-key event so the TUI can surface a clear
                 // error message rather than a generic connect failure.
                 let event = crate::tui::event::AppEvent::HostKeyChanged {
-                    host: self.host.clone(),
+                    host: display_host,
                     stored_key_type,
                     presented_key_type: key_type,
                     fingerprint,
@@ -110,7 +128,7 @@ impl Handler for KnownHostsHandler {
                 // cannot verify the host key, so reject the connection rather
                 // than prompting the user (which would be fail-open).
                 tracing::error!(
-                    host = %self.host,
+                    host = %display_host,
                     "known_hosts read error — rejecting connection: {e}"
                 );
                 return Ok(false);
@@ -122,9 +140,8 @@ impl Handler for KnownHostsHandler {
         let (decision_tx, decision_rx) = oneshot::channel();
 
         let event = crate::tui::event::AppEvent::HostKeyUnknown {
-            host: self.host.clone(),
+            host: display_host.clone(),
             key_type: key_type.clone(),
-            key_b64: key_b64.clone(),
             fingerprint,
             decision_tx,
         };
@@ -157,7 +174,7 @@ impl Handler for KnownHostsHandler {
 
         match decision {
             HostKeyDecision::AcceptAndSave => {
-                if let Err(e) = known_hosts::append(&self.host, &key_type, &key_b64) {
+                if let Err(e) = known_hosts::append(&self.host, self.port, &key_type, &key_b64) {
                     tracing::warn!("could not save host key: {e}");
                 }
                 Ok(true)
@@ -225,10 +242,10 @@ impl SftpTransport {
     ) -> Result<Self> {
         let config = Arc::new(client::Config::default());
         let addr = format!("{}:{}", session.host, session.port);
-        let host_key = addr.clone();
 
         let handler = KnownHostsHandler {
-            host: host_key,
+            host: session.host.clone(),
+            port: session.port,
             event_tx: Some(app_event_tx),
         };
 
