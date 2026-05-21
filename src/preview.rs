@@ -5,11 +5,12 @@
 //! files into text / image / unsupported for the viewer.
 
 use std::env;
+use std::fmt;
 use std::io::{Cursor, Write};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use image::ImageFormat;
+use image::{ImageError, ImageFormat, ImageReader, Limits};
 
 use crate::config::ImagePreviewMode;
 
@@ -69,12 +70,57 @@ pub fn detect(prefer: ImagePreviewMode) -> GraphicsProtocol {
     GraphicsProtocol::None
 }
 
+/// What can go wrong rendering an image preview.
+///
+/// Carried back to the caller so the viewer can surface a useful message
+/// instead of a blank pane (`Vec::new()` was the old failure signal).
+#[derive(Debug)]
+pub enum PreviewError {
+    /// Image dimensions or memory footprint exceeded our limits before any
+    /// allocation happened. Distinct from a decode failure because the user
+    /// can sometimes recover (smaller image, larger limit).
+    TooLarge,
+    /// `image::ImageReader::decode` failed — bad bytes, unsupported codec,
+    /// truncated download, etc. Message is short and already sanitised.
+    Decode(String),
+    /// Re-encoding the scaled RGBA buffer as PNG (kitty / iterm2 path) or
+    /// as sixel failed. Should not happen in practice but we surface a real
+    /// message rather than collapsing to an empty pane.
+    Encode(String),
+    /// The terminal panel is zero cells wide or tall. Nothing to render;
+    /// callers usually just skip silently.
+    EmptyPanel,
+}
+
+impl fmt::Display for PreviewError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLarge => {
+                write!(f, "image too large for preview")
+            }
+            Self::Decode(msg) => write!(f, "image decode failed: {msg}"),
+            Self::Encode(msg) => write!(f, "image encode failed: {msg}"),
+            Self::EmptyPanel => write!(f, "viewer panel has no room"),
+        }
+    }
+}
+
 /// What every graphics-protocol implementation must provide.
 pub trait PreviewBackend {
     /// Render `image_bytes` (PNG/JPEG/etc.) into the area at terminal cell
-    /// `(col, row)` with size `(cols, rows)`. Returns the raw byte sequence to
-    /// write to the terminal. `(col, row)` are 0-indexed.
-    fn render(&self, image_bytes: &[u8], col: u16, row: u16, cols: u16, rows: u16) -> Vec<u8>;
+    /// `(col, row)` with size `(cols, rows)`. Returns the raw byte sequence
+    /// to write to the terminal. `(col, row)` are 0-indexed.
+    ///
+    /// `Err` propagates a structured reason — the viewer surfaces it as a
+    /// log line instead of leaving the user with a blank pane.
+    fn render(
+        &self,
+        image_bytes: &[u8],
+        col: u16,
+        row: u16,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Vec<u8>, PreviewError>;
 }
 
 /// Approximate cell-to-pixel ratio used when the terminal doesn't report its
@@ -83,14 +129,19 @@ pub trait PreviewBackend {
 const FALLBACK_PX_PER_COL: u32 = 10;
 const FALLBACK_PX_PER_ROW: u32 = 20;
 
-/// Maximum width or height (in pixels) accepted after decoding a remote image.
+/// Maximum width or height (in pixels) accepted for a previewed image.
 ///
-/// A highly-compressed image (e.g. a 10 MB PNG that declares 16 000 × 16 000
-/// pixels) would otherwise allocate hundreds of megabytes of RGBA data inside
-/// `image::load_from_memory` and then trigger an expensive Lanczos3 resample.
 /// 4096 px per side is far beyond any terminal preview panel and keeps the
-/// worst-case post-decode buffer under ~64 MiB.
+/// worst-case post-decode buffer under ~64 MiB at RGBA8. Passed to
+/// `image::io::Limits` so the decoder rejects the file before allocating
+/// the full pixel buffer — a 10 MB PNG declaring 16k × 16k can no longer
+/// consume ~1 GiB before being checked.
 const MAX_IMAGE_DIMENSION: u32 = 4096;
+
+/// Hard cap on bytes the image decoder is allowed to allocate. Strict
+/// upper bound on `MAX_IMAGE_DIMENSION² × 4` (RGBA), with headroom for
+/// intermediate buffers a decoder may briefly own.
+const MAX_IMAGE_ALLOC: u64 = 128 * 1024 * 1024;
 
 /// Query the terminal for cell pixel dimensions.
 ///
@@ -136,19 +187,31 @@ fn scale_for_cells(
     row: u16,
     cols: u16,
     rows: u16,
-) -> Option<ScaledForCells> {
+) -> Result<ScaledForCells, PreviewError> {
     if cols == 0 || rows == 0 {
-        return None;
+        return Err(PreviewError::EmptyPanel);
     }
     let (px_per_col, px_per_row) = cell_pixels();
-    let img = image::load_from_memory(image_bytes).ok()?;
 
-    // Reject images that exceed the dimension cap. We cannot check dimensions
-    // before load_from_memory (no lazy-decode API), but we can fail fast here
-    // to avoid the expensive Lanczos3 resample and subsequent allocations.
-    if img.width() > MAX_IMAGE_DIMENSION || img.height() > MAX_IMAGE_DIMENSION {
-        return None;
-    }
+    // Use ImageReader with explicit limits so a hostile image cannot OOM us
+    // before we get a chance to look at its dimensions: a highly-compressed
+    // PNG declaring 16k × 16k would otherwise allocate ~1 GiB inside
+    // `load_from_memory` and only THEN be rejected by an after-the-fact
+    // size check. With `max_image_width/height` set, the decoder fails
+    // fast on the header.
+    let mut reader = ImageReader::new(Cursor::new(image_bytes))
+        .with_guessed_format()
+        .map_err(|e| PreviewError::Decode(e.to_string()))?;
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_IMAGE_ALLOC);
+    reader.limits(limits);
+    let img = match reader.decode() {
+        Ok(img) => img,
+        Err(ImageError::Limits(_)) => return Err(PreviewError::TooLarge),
+        Err(e) => return Err(PreviewError::Decode(e.to_string())),
+    };
 
     let (iw, ih) = (img.width().max(1), img.height().max(1));
 
@@ -177,7 +240,7 @@ fn scale_for_cells(
     let offset_x = cols.saturating_sub(used_w_cells) / 2;
     let offset_y = rows.saturating_sub(used_h_cells) / 2;
 
-    Some(ScaledForCells {
+    Ok(ScaledForCells {
         rgba: resized.into_raw(),
         width_px: scaled_w,
         height_px: scaled_h,
@@ -206,20 +269,22 @@ fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, imag
 pub struct KittyBackend;
 
 impl PreviewBackend for KittyBackend {
-    fn render(&self, image_bytes: &[u8], col: u16, row: u16, cols: u16, rows: u16) -> Vec<u8> {
-        let scaled = match scale_for_cells(image_bytes, col, row, cols, rows) {
-            Some(s) => s,
-            None => return Vec::new(),
-        };
-        let png = match encode_png_rgba(&scaled.rgba, scaled.width_px, scaled.height_px) {
-            Ok(b) => b,
-            Err(_) => return Vec::new(),
-        };
+    fn render(
+        &self,
+        image_bytes: &[u8],
+        col: u16,
+        row: u16,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Vec<u8>, PreviewError> {
+        let scaled = scale_for_cells(image_bytes, col, row, cols, rows)?;
+        let png = encode_png_rgba(&scaled.rgba, scaled.width_px, scaled.height_px)
+            .map_err(|e| PreviewError::Encode(e.to_string()))?;
 
         let b64 = BASE64.encode(&png);
         let chunks: Vec<&[u8]> = b64.as_bytes().chunks(4096).collect();
         if chunks.is_empty() {
-            return Vec::new();
+            return Err(PreviewError::Encode("empty PNG payload".into()));
         }
 
         let mut out = Vec::with_capacity(b64.len() + 256);
@@ -246,7 +311,7 @@ impl PreviewBackend for KittyBackend {
             out.extend_from_slice(chunk);
             out.extend_from_slice(b"\x1b\\");
         }
-        out
+        Ok(out)
     }
 }
 
@@ -254,15 +319,17 @@ impl PreviewBackend for KittyBackend {
 pub struct Iterm2Backend;
 
 impl PreviewBackend for Iterm2Backend {
-    fn render(&self, image_bytes: &[u8], col: u16, row: u16, cols: u16, rows: u16) -> Vec<u8> {
-        let scaled = match scale_for_cells(image_bytes, col, row, cols, rows) {
-            Some(s) => s,
-            None => return Vec::new(),
-        };
-        let png = match encode_png_rgba(&scaled.rgba, scaled.width_px, scaled.height_px) {
-            Ok(b) => b,
-            Err(_) => return Vec::new(),
-        };
+    fn render(
+        &self,
+        image_bytes: &[u8],
+        col: u16,
+        row: u16,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Vec<u8>, PreviewError> {
+        let scaled = scale_for_cells(image_bytes, col, row, cols, rows)?;
+        let png = encode_png_rgba(&scaled.rgba, scaled.width_px, scaled.height_px)
+            .map_err(|e| PreviewError::Encode(e.to_string()))?;
         let b64 = BASE64.encode(&png);
         let mut out = Vec::with_capacity(b64.len() + 128);
         let _ = write!(
@@ -276,7 +343,7 @@ impl PreviewBackend for Iterm2Backend {
             "\x1b]1337;File=inline=1;width={};height={};preserveAspectRatio=1:{b64}\x07",
             scaled.cells_w, scaled.cells_h
         );
-        out
+        Ok(out)
     }
 }
 
@@ -286,21 +353,24 @@ impl PreviewBackend for Iterm2Backend {
 pub struct SixelBackend;
 
 impl PreviewBackend for SixelBackend {
-    fn render(&self, image_bytes: &[u8], col: u16, row: u16, cols: u16, rows: u16) -> Vec<u8> {
-        let scaled = match scale_for_cells(image_bytes, col, row, cols, rows) {
-            Some(s) => s,
-            None => return Vec::new(),
-        };
+    fn render(
+        &self,
+        image_bytes: &[u8],
+        col: u16,
+        row: u16,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Vec<u8>, PreviewError> {
+        let scaled = scale_for_cells(image_bytes, col, row, cols, rows)?;
 
         let sixel_image = icy_sixel::SixelImage::from_rgba(
             scaled.rgba,
             scaled.width_px as usize,
             scaled.height_px as usize,
         );
-        let sixel_str = match sixel_image.encode() {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
+        let sixel_str = sixel_image
+            .encode()
+            .map_err(|e| PreviewError::Encode(format!("{e:?}")))?;
 
         let mut out = Vec::with_capacity(sixel_str.len() + 16);
         let _ = write!(
@@ -310,7 +380,7 @@ impl PreviewBackend for SixelBackend {
             scaled.display_col.saturating_add(1)
         );
         out.extend_from_slice(sixel_str.as_bytes());
-        out
+        Ok(out)
     }
 }
 

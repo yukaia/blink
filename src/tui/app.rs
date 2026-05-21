@@ -3021,15 +3021,14 @@ impl App {
             }
         };
 
-        let escape = backend.render(bytes, body_x, body_y, body_w, body_h);
-        if escape.is_empty() {
-            self.push_log(
-                LogLevel::Warn,
-                "image render produced no output (decode failed or sixel stub)".into(),
-            );
-            self.image_needs_redraw = false;
-            return Ok(());
-        }
+        let escape = match backend.render(bytes, body_x, body_y, body_w, body_h) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.push_log(LogLevel::Warn, format!("image preview: {e}"));
+                self.image_needs_redraw = false;
+                return Ok(());
+            }
+        };
 
         use std::io::Write;
         let mut stdout = std::io::stdout();
