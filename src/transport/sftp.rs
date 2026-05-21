@@ -282,7 +282,17 @@ impl SftpTransport {
                         )));
                     }
                 };
-                let kp = PrivateKeyWithHashAlg::new(Arc::new(kp), None)
+                // RSA keys: request rsa-sha2-512 explicitly. OpenSSH 8.8+
+                // (Sept 2021) disables ssh-rsa (SHA-1) by default, so leaving
+                // `None` here would silently fail against modern servers.
+                // Non-RSA keys keep `None`, which lets russh pick the right
+                // hash for the key type (e.g. Ed25519 has no hash to choose).
+                let hash_alg = if matches!(kp.algorithm(), ssh_key::Algorithm::Rsa { .. }) {
+                    Some(ssh_key::HashAlg::Sha512)
+                } else {
+                    None
+                };
+                let kp = PrivateKeyWithHashAlg::new(Arc::new(kp), hash_alg)
                     .map_err(|e| BlinkError::auth(format!("key algorithm: {e}")))?;
                 handle
                     .authenticate_publickey(username, kp)
