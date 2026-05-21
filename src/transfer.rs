@@ -70,7 +70,11 @@ pub enum TransferEvent {
 /// Upper bound on the number of pending (not-yet-started) jobs the queue
 /// will accept. Prevents a malicious server directory listing from causing
 /// unbounded memory growth via recursive download planning.
-const MAX_QUEUED_JOBS: usize = 100_000;
+///
+/// Also consulted by the TUI walkers (`walk_remote` / `walk_local`) so the
+/// out-of-memory check fires *before* the full plan is materialised, not
+/// after.
+pub(crate) const MAX_QUEUED_JOBS: usize = 100_000;
 
 /// Manages a queue of jobs and a configurable concurrency cap.
 ///

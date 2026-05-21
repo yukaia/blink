@@ -19,7 +19,10 @@ use crate::error::Result;
 use crate::preview::{self, FileViewKind};
 use crate::session::{AuthMethod, Session};
 use crate::theme::Theme;
-use crate::transfer::{format_bytes, Direction, Dispatcher, TransferEvent, TransferJob, TransferManager};
+use crate::transfer::{
+    format_bytes, Direction, Dispatcher, TransferEvent, TransferJob, TransferManager,
+    MAX_QUEUED_JOBS,
+};
 use crate::transport::{self, EntryKind, RemoteEntry, Transport};
 use crate::tui::event::{AppEvent, Event, EventStream};
 use crate::tui::{TuiTerminal, TICK_INTERVAL};
@@ -3754,6 +3757,17 @@ async fn walk_remote(
         vec![(remote_root.to_string(), local_root.to_path_buf())];
 
     while let Some((remote_dir, local_dir)) = stack.pop() {
+        // Guard against pathological remote trees (or a `proc`-like FS) that
+        // would otherwise OOM the walker before the dispatcher's pending-job
+        // cap ever fires. Stop early with a real error so the user gets a
+        // useful message instead of a process killed by the OOM killer.
+        if out.len() > MAX_QUEUED_JOBS {
+            return Err(crate::error::BlinkError::transport(format!(
+                "recursive walk exceeded {MAX_QUEUED_JOBS} jobs — \
+                 narrow the source or run separate transfers",
+            )));
+        }
+
         // Ensure the local dir exists ahead of file writes. (The download
         // worker also does create_dir_all on the parent, but doing it here
         // means an empty remote dir still produces a real local dir.)
@@ -3839,6 +3853,14 @@ async fn walk_local(
         vec![(local_root.to_path_buf(), remote_root.to_string())];
 
     while let Some((local_dir, remote_dir)) = stack.pop() {
+        // Same cap as `walk_remote`: bail before the plan becomes unbounded.
+        if out.len() > MAX_QUEUED_JOBS {
+            return Err(crate::error::BlinkError::transport(format!(
+                "recursive walk exceeded {MAX_QUEUED_JOBS} jobs — \
+                 narrow the source or run separate transfers",
+            )));
+        }
+
         // Mkdir the destination ahead of any files inside.
         out.push(PlannedJob::Mkdir {
             remote_path: remote_dir.clone(),
