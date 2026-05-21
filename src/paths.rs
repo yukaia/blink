@@ -46,7 +46,7 @@ pub fn checkpoints_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn base_dir() -> Result<PathBuf> {
     if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
@@ -65,6 +65,34 @@ fn base_dir() -> Result<PathBuf> {
         return Err(BlinkError::config("$HOME must be an absolute path"));
     }
     Ok(home_path.join(".config").join(APP_DIR_NAME))
+}
+
+#[cfg(target_os = "macos")]
+fn base_dir() -> Result<PathBuf> {
+    // macOS convention is `$HOME/Library/Application Support/<App>`. Honour
+    // XDG_CONFIG_HOME if the user has explicitly set it (some cross-platform
+    // Mac users prefer the XDG layout), otherwise fall back to the standard
+    // location — which is what the README documents.
+    if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
+        if !xdg.is_empty() {
+            let p = PathBuf::from(&xdg);
+            if !p.is_absolute() {
+                return Err(BlinkError::config(
+                    "XDG_CONFIG_HOME must be an absolute path",
+                ));
+            }
+            return Ok(p.join(APP_DIR_NAME));
+        }
+    }
+    let home = env::var("HOME").map_err(|_| BlinkError::config("$HOME is not set"))?;
+    let home_path = PathBuf::from(&home);
+    if !home_path.is_absolute() {
+        return Err(BlinkError::config("$HOME must be an absolute path"));
+    }
+    Ok(home_path
+        .join("Library")
+        .join("Application Support")
+        .join(APP_DIR_NAME))
 }
 
 #[cfg(target_os = "windows")]
