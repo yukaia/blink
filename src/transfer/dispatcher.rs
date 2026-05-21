@@ -44,7 +44,9 @@ impl Dispatcher {
     /// iteration — no restart needed.
     ///
     /// `password` is optional and shared (via `Arc`) across all worker tasks.
-    /// It is reused for both password auth and as the SSH key passphrase.
+    /// It's wrapped in `Zeroizing` so the underlying allocation is wiped
+    /// when the last reference drops — i.e., when the dispatcher shuts
+    /// down. Reused for both password auth and as the SSH key passphrase.
     ///
     /// `app_event_tx` is forwarded to each worker's transport connection so
     /// the SFTP host-key handler can send events to the TUI. In practice the
@@ -53,7 +55,7 @@ impl Dispatcher {
     pub fn spawn(
         manager: TransferManager,
         session: Session,
-        password: Option<String>,
+        password: Option<zeroize::Zeroizing<String>>,
         app_event_tx: mpsc::UnboundedSender<crate::tui::event::AppEvent>,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -79,7 +81,7 @@ impl Dispatcher {
 async fn run_loop(
     manager: TransferManager,
     session: Session,
-    password: Option<Arc<String>>,
+    password: Option<Arc<zeroize::Zeroizing<String>>>,
     shutdown: Arc<AtomicBool>,
     app_event_tx: mpsc::UnboundedSender<crate::tui::event::AppEvent>,
 ) {
@@ -125,7 +127,7 @@ async fn run_loop(
 async fn run_one(
     manager: TransferManager,
     session: Session,
-    password: Option<Arc<String>>,
+    password: Option<Arc<zeroize::Zeroizing<String>>>,
     app_event_tx: mpsc::UnboundedSender<crate::tui::event::AppEvent>,
     job: TransferJob,
 ) {

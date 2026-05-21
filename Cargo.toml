@@ -59,6 +59,10 @@ icy_sixel = "0.5"
 # Cert fingerprint hashing for FTPS pinning
 sha2 = { version = "0.10", default-features = false }
 
+# Wipe passwords from memory on drop so a long-lived process doesn't leave
+# the credential in the heap after the auth window has closed.
+zeroize = "1"
+
 # Misc
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 bytes = "1"

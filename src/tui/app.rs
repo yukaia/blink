@@ -578,7 +578,12 @@ pub struct App {
     /// Cached for the duration of the connected session so the dispatcher
     /// can open new connections per parallel slot. Cleared on disconnect /
     /// quit / connect failure / user cancel.
-    pending_password: Option<String>,
+    ///
+    /// Wrapped in `Zeroizing` so the underlying allocation is wiped when
+    /// the field is reassigned to `None` or the `App` is dropped — a
+    /// long-lived blink process doesn't keep the credential live on the
+    /// heap after the auth window closes.
+    pending_password: Option<zeroize::Zeroizing<String>>,
     pub transfer_manager: Option<TransferManager>,
     dispatcher: Option<Dispatcher>,
 
@@ -1315,7 +1320,7 @@ impl App {
                     self.screen = Screen::SessionSelect;
                     return;
                 };
-                let password = std::mem::take(&mut self.password_input);
+                let password = zeroize::Zeroizing::new(std::mem::take(&mut self.password_input));
                 self.pending_password = Some(password.clone());
                 self.start_connect(session, Some(password));
             }
@@ -1356,7 +1361,7 @@ impl App {
                     self.screen = Screen::SessionSelect;
                     return;
                 };
-                let passphrase = std::mem::take(&mut self.passphrase_input);
+                let passphrase = zeroize::Zeroizing::new(std::mem::take(&mut self.passphrase_input));
                 self.passphrase_attempted = true;
                 self.passphrase_error = None;
                 // Cache for the dispatcher: parallel transfers re-open the
@@ -3078,7 +3083,11 @@ impl App {
     /// Spawn a connect task. The result lands as `AppEvent::Connected` /
     /// `AppEvent::ConnectFailed` / `AppEvent::ConnectKeyNeedsPassphrase` and
     /// is processed by [`handle_app_event`].
-    fn start_connect(&mut self, session: Session, password: Option<String>) {
+    fn start_connect(
+        &mut self,
+        session: Session,
+        password: Option<zeroize::Zeroizing<String>>,
+    ) {
         self.push_log(
             LogLevel::Info,
             format!(
@@ -3095,9 +3104,13 @@ impl App {
         let tx = self.app_event_tx.clone();
         let tx_for_transport = self.app_event_tx.clone();
         tokio::spawn(async move {
+            // Borrow as &str just for the duration of the connect; the
+            // Zeroizing<String> is moved into this task and zeroes on drop
+            // when the future returns.
+            let pw_borrow = password.as_ref().map(|p| p.as_str());
             let result = match tokio::time::timeout(
                 CONNECT_TIMEOUT,
-                transport::open(&session, password.as_deref(), tx_for_transport),
+                transport::open(&session, pw_borrow, tx_for_transport),
             )
             .await
             {
