@@ -122,6 +122,36 @@ fn create_app_dir(path: &Path) -> Result<()> {
     }
 }
 
+/// Fsync the parent directory of `path` so that a recent rename into it is
+/// crash-durable.
+///
+/// On Linux, ext4/xfs/btrfs all require the parent directory's inode to be
+/// synced for a `rename()` to survive a power loss — without it, the journal
+/// can roll back the rename even though it returned Ok.
+///
+/// On Windows the call is a no-op: opening a directory handle works but
+/// `sync_all()` on it isn't part of the durability contract there; the
+/// filesystem journals rename through its own ordering rules.
+pub fn sync_parent_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent() {
+            // Empty parent means a bare filename in the cwd — nothing useful
+            // to sync.
+            if !parent.as_os_str().is_empty() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 /// Default local working directory: the user's home dir.
 ///
 /// Falls back to the filesystem root rather than a relative path so that the

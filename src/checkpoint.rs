@@ -241,15 +241,30 @@ impl Checkpoint {
         Ok(paths::checkpoints_dir()?.join(format!("{safe_name}-{}.json", kind.as_str())))
     }
 
-    /// Atomically write `content` to `path` via a `.tmp` sibling + rename.
+    /// Atomically and durably write `content` to `path` via a `.tmp` sibling
+    /// + rename.
     ///
-    /// Using rename instead of overwriting in-place means a crash mid-write
-    /// never produces a truncated file: the old checkpoint stays intact until
-    /// the new one is fully flushed.
+    /// The full pattern is:
+    ///   1. write tempfile, flush, `sync_all` (data is on the platter)
+    ///   2. rename tempfile over the destination
+    ///   3. `sync_all` the parent directory (rename is journaled) — Unix only;
+    ///      Windows journals rename through its own filesystem semantics.
+    ///
+    /// Without (1), a power loss between rename and the filesystem journal
+    /// commit can leave the destination as a zero-byte file (the rename is
+    /// visible, the data isn't). Without (3), the rename itself can be
+    /// rolled back on power loss even though it returned Ok.
     fn atomic_write(path: &Path, content: &str) -> Result<()> {
+        use std::io::Write as _;
+
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, content)?;
+        {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(content.as_bytes())?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, path)?;
+        paths::sync_parent_dir(path)?;
         Ok(())
     }
 

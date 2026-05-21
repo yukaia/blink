@@ -213,8 +213,17 @@ impl Session {
             }
         }
 
-        ini.write_to_file(&tmp)?;
+        // Atomic + durable write: tempfile → sync_all → rename → fsync the
+        // parent directory. Without the syncs, a power loss between rename
+        // and the filesystem's journal commit can leave a zero-byte session
+        // file or revert the rename entirely. See [`paths::sync_parent_dir`].
+        {
+            let mut f = fs::File::create(&tmp)?;
+            ini.write_to(&mut f)?;
+            f.sync_all()?;
+        }
         fs::rename(&tmp, &path)?;
+        paths::sync_parent_dir(&path)?;
         Ok(())
     }
 
