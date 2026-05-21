@@ -740,8 +740,8 @@ pub mod viewer {
                 );
                 f.render_widget(p, body);
             }
-            ViewerKind::Text { lines, scroll } => {
-                render_text(f, body, app, &viewer.name, lines, *scroll);
+            ViewerKind::Text { lines, tokens, scroll } => {
+                render_text(f, body, app, lines, tokens, *scroll);
             }
             ViewerKind::Image { .. } => {
                 // Body is intentionally left blank — graphics escape codes are
@@ -763,7 +763,7 @@ pub mod viewer {
 
         // Hint strip at the bottom.
         let hint_text = match &viewer.kind {
-            ViewerKind::Text { lines, scroll } => format!(
+            ViewerKind::Text { lines, scroll, .. } => format!(
                 "  line {}/{}    [↑↓] scroll  [pgup/pgdn] page  [g/G] top/bottom  [q/esc] close",
                 scroll.saturating_add(1).min(lines.len().max(1)),
                 lines.len(),
@@ -781,40 +781,31 @@ pub mod viewer {
         f: &mut Frame,
         area: Rect,
         app: &App,
-        name: &str,
         lines: &[String],
+        tokens: &[Vec<(crate::highlight::TokenKind, String)>],
         scroll: usize,
     ) {
         let h = area.height as usize;
         if h == 0 || lines.is_empty() {
             return;
         }
+        // `tokens` is built once at ViewLoaded time and must stay aligned
+        // with `lines`. Guard against a future refactor that drifts them.
+        debug_assert_eq!(lines.len(), tokens.len());
+
         let start = scroll.min(lines.len().saturating_sub(1));
         let end = (start + h).min(lines.len());
         let lineno_width = end.to_string().len();
 
-        let lang = crate::highlight::lang_for_name(name);
-
-        // Replay from line 0 so we know the carry-over state at `start`.
-        // Lines are bounded by MAX_PREVIEW_BYTES (1 MB) so this is fast.
-        let mut hl_state = crate::highlight::LineState::default();
-        for line in &lines[..start] {
-            let (_, ns) = crate::highlight::tokenize(lang, line, hl_state);
-            hl_state = ns;
-        }
-
         let mut rendered = Vec::with_capacity(end - start);
-        for (i, line) in lines[start..end].iter().enumerate() {
+        for (i, line_tokens) in tokens[start..end].iter().enumerate() {
             let n = start + i + 1;
-            let (tokens, ns) = crate::highlight::tokenize(lang, line, hl_state);
-            hl_state = ns;
-
             let mut spans = vec![Span::styled(
                 format!("{:>width$} │ ", n, width = lineno_width),
                 Style::default().fg(app.theme.dim),
             )];
-            for (kind, text) in tokens {
-                spans.push(Span::styled(text, token_style(kind, app)));
+            for (kind, text) in line_tokens {
+                spans.push(Span::styled(text.clone(), token_style(*kind, app)));
             }
             rendered.push(Line::from(spans));
         }

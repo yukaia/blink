@@ -240,8 +240,17 @@ pub struct Viewer {
 pub enum ViewerKind {
     /// Fetch in flight.
     Loading,
-    /// Decoded text, with the current scroll offset (top visible line).
-    Text { lines: Vec<String>, scroll: usize },
+    /// Decoded text with one-shot syntax tokenisation alongside.
+    ///
+    /// `tokens` is computed once at load time; every subsequent frame just
+    /// reads `tokens[start..end]` instead of re-tokenising the whole prefix
+    /// (the viewer redraws on the 100 ms TUI tick, so an un-cached approach
+    /// for a 10k-line file at the bottom was ~10k tokenize calls per frame).
+    Text {
+        lines: Vec<String>,
+        tokens: Vec<Vec<(crate::highlight::TokenKind, String)>>,
+        scroll: usize,
+    },
     /// Raw image bytes, ready to be emitted by a [`crate::preview::PreviewBackend`].
     Image { bytes: Bytes },
     /// Anything we can't render: too big, unknown extension, fetch failed.
@@ -2961,7 +2970,7 @@ impl App {
 
     fn viewer_scroll(&mut self, delta: isize) {
         if let Some(viewer) = self.viewer.as_mut() {
-            if let ViewerKind::Text { lines, scroll } = &mut viewer.kind {
+            if let ViewerKind::Text { lines, scroll, .. } = &mut viewer.kind {
                 let max = lines.len().saturating_sub(1);
                 let next = (*scroll as isize + delta).max(0) as usize;
                 *scroll = next.min(max);
@@ -2971,7 +2980,7 @@ impl App {
 
     fn viewer_scroll_to(&mut self, target: usize) {
         if let Some(viewer) = self.viewer.as_mut() {
-            if let ViewerKind::Text { lines, scroll } = &mut viewer.kind {
+            if let ViewerKind::Text { lines, scroll, .. } = &mut viewer.kind {
                 let max = lines.len().saturating_sub(1);
                 *scroll = target.min(max);
             }
@@ -3336,7 +3345,12 @@ impl App {
                                 };
                                 let lines: Vec<String> =
                                     text.lines().map(crate::error::sanitize_line).collect();
-                                ViewerKind::Text { lines, scroll: 0 }
+                                let tokens = tokenize_lines(&name, &lines);
+                                ViewerKind::Text {
+                                    lines,
+                                    tokens,
+                                    scroll: 0,
+                                }
                             }
                             FileViewKind::Image => {
                                 // Only enter Image state if a graphics backend
@@ -3694,6 +3708,26 @@ fn build_remote_pane_entries(remote_entries: &[RemoteEntry], path: &str) -> Vec<
         });
     }
     out.extend(entries);
+    out
+}
+
+/// Tokenise every line of a file once, at view-load time, so per-frame
+/// rendering becomes an array lookup instead of replaying the highlighter
+/// from line 0. The viewer redraws on the 100 ms TUI tick — without this
+/// cache, a 10k-line file scrolled to the bottom does ~10k tokenize calls
+/// per frame just to reach the visible region.
+fn tokenize_lines(
+    name: &str,
+    lines: &[String],
+) -> Vec<Vec<(crate::highlight::TokenKind, String)>> {
+    let lang = crate::highlight::lang_for_name(name);
+    let mut state = crate::highlight::LineState::default();
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        let (tokens, ns) = crate::highlight::tokenize(lang, line, state);
+        state = ns;
+        out.push(tokens);
+    }
     out
 }
 
