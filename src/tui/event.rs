@@ -92,7 +92,7 @@ pub enum AppEvent {
     /// counts entries deliberately omitted from the plan because they were
     /// symbolic links.
     WalkComplete {
-        plan: Vec<crate::tui::app::PlannedJob>,
+        plan: Vec<crate::tui::plan::PlannedJob>,
         conflict_indices: Vec<usize>,
         symlinks_skipped: usize,
         kind: Direction,

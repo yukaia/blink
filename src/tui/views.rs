@@ -1202,7 +1202,8 @@ pub mod confirm_delete {
 
 pub mod confirm_overwrite {
     use super::*;
-    use crate::tui::app::{OverwritePending, PlannedJob};
+    use crate::tui::app::OverwritePending;
+    use crate::tui::plan::PlannedJob;
 
     pub fn render(f: &mut Frame, app: &App) {
         let area = f.area();
