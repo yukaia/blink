@@ -234,13 +234,29 @@ pub struct SftpTransport {
     buf: Vec<u8>,
 }
 
+/// SSH-layer keepalive interval. The russh session sends a global request
+/// at this cadence; if the peer drops the connection or the network
+/// silently dies, the next [`KEEPALIVE_MAX`] unanswered probes
+/// (~`interval × max`) tear the session down with an error instead of
+/// pinning the worker indefinitely.
+///
+/// Without this, only `connect+auth` had a deadline — a stalled `read_dir`
+/// or `read` mid-walk would wait on the underlying TCP keepalive (often
+/// many minutes on Linux) before erroring.
+const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const KEEPALIVE_MAX: usize = 3;
+
 impl SftpTransport {
     pub async fn connect(
         session: &Session,
         password: Option<&str>,
         app_event_tx: mpsc::UnboundedSender<crate::tui::event::AppEvent>,
     ) -> Result<Self> {
-        let config = Arc::new(client::Config::default());
+        let config = Arc::new(client::Config {
+            keepalive_interval: Some(KEEPALIVE_INTERVAL),
+            keepalive_max: KEEPALIVE_MAX,
+            ..client::Config::default()
+        });
         let addr = format!("{}:{}", session.host, session.port);
 
         let handler = KnownHostsHandler {
