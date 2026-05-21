@@ -149,11 +149,24 @@ impl Config {
     }
 
     /// Serialize and write `config.ini` atomically (write to `.tmp`, rename).
+    ///
+    /// Load-modify-save (rather than rebuild-from-scratch) so user-added
+    /// keys and sections — forward-compat options, experimental flags,
+    /// hand-edited comments inside `rust-ini`'s tolerance — survive a
+    /// theme cycle or any other write triggered by the app. Without this,
+    /// every `t` keystroke silently dropped anything blink didn't recognise.
     pub fn save(&self) -> Result<()> {
         let path = paths::config_file()?;
         let tmp = path.with_extension("tmp");
 
-        let mut ini = Ini::new();
+        // Start from the file on disk so unknown sections / keys round-trip.
+        // If the file doesn't exist or won't parse, fall back to a fresh
+        // INI — we still produce a syntactically valid config.
+        let mut ini = match fs::read_to_string(&path) {
+            Ok(raw) => Ini::load_from_str(&raw).unwrap_or_else(|_| Ini::new()),
+            Err(_) => Ini::new(),
+        };
+
         ini.with_section(Some("general"))
             .set("theme", &self.general.theme)
             .set(
@@ -172,8 +185,15 @@ impl Config {
             },
         );
 
-        ini.write_to_file(&tmp)?;
+        // Atomic + durable write — same pattern as session / checkpoint:
+        // tempfile → sync_all → rename → fsync parent dir.
+        {
+            let mut f = fs::File::create(&tmp)?;
+            ini.write_to(&mut f)?;
+            f.sync_all()?;
+        }
         fs::rename(&tmp, &path)?;
+        paths::sync_parent_dir(&path)?;
         Ok(())
     }
 }
