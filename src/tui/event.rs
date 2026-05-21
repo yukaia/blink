@@ -54,6 +54,19 @@ pub enum AppEvent {
     /// A directory listing failed.
     ListFailed { path: String, error: String },
 
+    /// A local directory enumeration completed successfully. Mirror of
+    /// `Listed` for the local pane: read_dir + per-entry metadata is
+    /// non-trivial on NFS/SMB mounts, so we run it on a worker task and
+    /// post the result back here.
+    LocalListed {
+        path: String,
+        entries: Vec<crate::tui::app::PaneEntry>,
+    },
+
+    /// Local directory enumeration failed (typically permission denied or
+    /// the path was removed). The pane shows just the `..` entry.
+    LocalListFailed { path: String, error: String },
+
     /// A rename completed successfully.
     Renamed { from: String, to: String },
 

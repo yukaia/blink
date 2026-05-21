@@ -2072,7 +2072,7 @@ pub mod host_key_changed {
             Line::from(""),
             Line::from(
                 Span::styled(
-                    "[any key] dismiss",
+                    "[enter/esc/q] dismiss",
                     Style::default().fg(app.theme.dim),
                 )
             ).alignment(Alignment::Center),

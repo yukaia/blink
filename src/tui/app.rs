@@ -318,6 +318,19 @@ pub struct PendingHostKey {
     pub decision_tx: Option<tokio::sync::oneshot::Sender<crate::transport::sftp::HostKeyDecision>>,
 }
 
+impl Drop for PendingHostKey {
+    /// If this state is dropped without a decision being sent (e.g. a future
+    /// refactor takes the modal state on an error path without resolving the
+    /// oneshot), default-deny: the connect task receives Reject and unwinds
+    /// cleanly instead of blocking forever on the receiver. Fail-closed
+    /// matches the rest of the host-key flow.
+    fn drop(&mut self) {
+        if let Some(tx) = self.decision_tx.take() {
+            let _ = tx.send(crate::transport::sftp::HostKeyDecision::Reject);
+        }
+    }
+}
+
 /// State for the host-key-changed error modal.
 #[derive(Debug, Clone)]
 pub struct HostKeyChangedInfo {
@@ -884,10 +897,20 @@ impl App {
             Screen::ConfirmDisconnect => self.handle_confirm_disconnect(key),
             Screen::ConfirmHostKey => self.handle_confirm_host_key(key),
             Screen::HostKeyChanged => {
-                // Any key dismisses the error and returns to session select.
-                self.host_key_changed_info = None;
-                self.pending_session = None;
-                self.screen = Screen::SessionSelect;
+                // Only explicit dismiss keys close this screen — `any key
+                // dismisses` lets a fast typist hammer past the MITM warning
+                // before they've read it. Make them stop and acknowledge.
+                match key.code {
+                    KeyCode::Enter
+                    | KeyCode::Esc
+                    | KeyCode::Char('q')
+                    | KeyCode::Char('Q') => {
+                        self.host_key_changed_info = None;
+                        self.pending_session = None;
+                        self.screen = Screen::SessionSelect;
+                    }
+                    _ => {}
+                }
             }
             Screen::SessionSelect => self.handle_session_select(key),
             Screen::NewSession => self.handle_new_session(key),
@@ -3237,6 +3260,25 @@ impl App {
                     format!("list {path} failed: {error}"),
                 );
             }
+            AppEvent::LocalListed { path, entries } => {
+                // Stale guard: user may have navigated again before the
+                // read_dir returned.
+                if path != self.local.path {
+                    return;
+                }
+                self.local.set_entries(entries);
+            }
+            AppEvent::LocalListFailed { path, error } => {
+                // Stale guard same as above — don't blame the new path for
+                // the old path's failure.
+                if path != self.local.path {
+                    return;
+                }
+                self.push_log(
+                    LogLevel::Error,
+                    format!("local list {path} failed: {error}"),
+                );
+            }
             AppEvent::Renamed { from, to } => {
                 let from_name = from
                     .rsplit('/')
@@ -3626,16 +3668,46 @@ impl App {
         });
     }
 
+    /// Kick off a local `read_dir` task. The result arrives as
+    /// `AppEvent::LocalListed` / `LocalListFailed`.
+    ///
+    /// Why async: `read_dir` + per-entry `metadata()` is fast on a local
+    /// SSD but can stall for seconds on an NFS, SMB, or sshfs mount.
+    /// Doing it inline on the UI thread froze the entire event loop —
+    /// keystrokes, redraws, transfer-event drain, the lot. Now the work
+    /// runs on tokio's blocking pool and the UI keeps ticking.
     fn refresh_local_pane(&mut self) {
-        let path = std::path::PathBuf::from(&self.local.path);
-        let mut entries = vec![PaneEntry {
+        let path = self.local.path.clone();
+        // Show just `..` immediately so the user sees the navigation
+        // landed even before the read_dir finishes.
+        self.local.set_entries(vec![PaneEntry {
             name: "..".into(),
             is_dir: true,
             size: 0,
             selected: false,
             previewable_image: false,
-        }];
-        if let Ok(read) = std::fs::read_dir(&path) {
+        }]);
+
+        let tx = self.app_event_tx.clone();
+        tokio::task::spawn_blocking(move || {
+            let pb = std::path::PathBuf::from(&path);
+            let mut entries = vec![PaneEntry {
+                name: "..".into(),
+                is_dir: true,
+                size: 0,
+                selected: false,
+                previewable_image: false,
+            }];
+            let read = match std::fs::read_dir(&pb) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::LocalListFailed {
+                        path,
+                        error: e.to_string(),
+                    });
+                    return;
+                }
+            };
             for entry in read.flatten() {
                 let meta = match entry.metadata() {
                     Ok(m) => m,
@@ -3644,21 +3716,22 @@ impl App {
                 let name = entry.file_name().to_string_lossy().to_string();
                 let is_dir = meta.is_dir();
                 entries.push(PaneEntry {
-                    previewable_image: !is_dir && crate::preview::is_previewable_image(&name),
+                    previewable_image: !is_dir
+                        && crate::preview::is_previewable_image(&name),
                     name,
                     is_dir,
                     size: if is_dir { 0 } else { meta.len() },
                     selected: false,
                 });
             }
-        }
-        // Directories first, then alpha within each group.
-        entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.name.cmp(&b.name),
+            // Directories first, then alpha within each group.
+            entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.name.cmp(&b.name),
+            });
+            let _ = tx.send(AppEvent::LocalListed { path, entries });
         });
-        self.local.set_entries(entries);
     }
 
     // -------------------------------------------------------------------
