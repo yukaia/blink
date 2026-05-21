@@ -457,9 +457,15 @@ impl Transport for SftpTransport {
         local_path: &Path,
         progress: Option<mpsc::UnboundedSender<ProgressUpdate>>,
     ) -> Result<()> {
-        // Resume support: if a partial file exists, skip already-downloaded
-        // bytes so interrupted transfers can pick up where they left off.
-        let offset = tokio::fs::metadata(local_path)
+        // Stream into `<local>.part` and rename onto the final path only on
+        // success. This keeps the user's existing file (if any) untouched
+        // until the download is fully complete and fsynced, and isolates
+        // partial bytes from a previous attempt under a recognisable suffix.
+        let part = super::part_path(local_path);
+
+        // Resume support: if a partial `.part` exists, skip the bytes it
+        // already holds so interrupted transfers pick up where they left off.
+        let offset = tokio::fs::metadata(&part)
             .await
             .ok()
             .map(|m| m.len())
@@ -493,6 +499,9 @@ impl Transport for SftpTransport {
                     server_bytes = server_size,
                     "partial file is larger than server file — restarting download",
                 );
+                // Drop the stale `.part` so the OpenOptions below truncate
+                // from a clean state.
+                let _ = tokio::fs::remove_file(&part).await;
                 0
             }
             _ => offset,
@@ -511,10 +520,10 @@ impl Transport for SftpTransport {
         let mut local = if offset > 0 {
             tokio::fs::OpenOptions::new()
                 .append(true)
-                .open(local_path)
+                .open(&part)
                 .await?
         } else {
-            tokio::fs::File::create(local_path).await?
+            tokio::fs::File::create(&part).await?
         };
 
         let mut done: u64 = offset;
@@ -532,7 +541,14 @@ impl Transport for SftpTransport {
                 });
             }
         }
+        // Flush + fsync the .part so its bytes are durable, then atomically
+        // rename onto the final path. Drop the handle first; renaming an
+        // open file is fine on Unix but tokio's tempfile/rename pairing is
+        // simpler when the source is closed.
         local.flush().await?;
+        local.sync_all().await?;
+        drop(local);
+        tokio::fs::rename(&part, local_path).await?;
         Ok(())
     }
 

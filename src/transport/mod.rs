@@ -7,7 +7,7 @@
 //! Everything else in the app (TUI, transfer manager, session model) talks to
 //! `Box<dyn Transport>`, not to a specific protocol.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -15,6 +15,23 @@ use tokio::sync::mpsc;
 
 use crate::error::Result;
 use crate::session::{Protocol, Session};
+
+/// The on-disk path a download writes to while it's in flight.
+///
+/// We always stream into `<final>.part` and rename onto the final name only
+/// once the transfer has completed and been fsynced. That way:
+///
+/// - An interrupted download leaves the partial bytes under a distinguishable
+///   suffix instead of next to the user's pre-existing real file.
+/// - Resume code can identify the partial unambiguously (the bare final
+///   filename never holds half a download).
+/// - On power loss after rename, the parent-directory fsync in
+///   [`crate::paths::sync_parent_dir`] guarantees the rename is durable.
+pub(crate) fn part_path(local: &Path) -> PathBuf {
+    let mut s = local.as_os_str().to_owned();
+    s.push(".part");
+    PathBuf::from(s)
+}
 
 pub mod ftp;
 pub(crate) mod ftp_impl;
@@ -454,6 +471,32 @@ pub(crate) mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // part_path
+    #[test]
+    fn part_path_appends_suffix() {
+        assert_eq!(
+            part_path(Path::new("/tmp/file.iso")),
+            PathBuf::from("/tmp/file.iso.part")
+        );
+    }
+
+    #[test]
+    fn part_path_preserves_compound_extensions() {
+        // foo.tar.gz -> foo.tar.gz.part (not foo.tar.part)
+        assert_eq!(
+            part_path(Path::new("/tmp/archive.tar.gz")),
+            PathBuf::from("/tmp/archive.tar.gz.part")
+        );
+    }
+
+    #[test]
+    fn part_path_with_no_extension() {
+        assert_eq!(
+            part_path(Path::new("/tmp/README")),
+            PathBuf::from("/tmp/README.part")
+        );
+    }
 
     // join_remote
     #[test]

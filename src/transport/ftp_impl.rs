@@ -195,9 +195,13 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    // Resume support: if a partial file exists seek to its end so interrupted
-    // transfers pick up where they left off (FTP REST command).
-    let offset = tokio::fs::metadata(local_path)
+    // Stream into `<local>.part` and rename on success — see
+    // [`crate::transport::part_path`] for the rationale.
+    let part = super::part_path(local_path);
+
+    // Resume support: if a partial `.part` exists, seek to its end so
+    // interrupted transfers pick up where they left off (FTP REST command).
+    let offset = tokio::fs::metadata(&part)
         .await
         .ok()
         .map(|m| m.len())
@@ -213,6 +217,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
             server_bytes = total,
             "FTP partial file is larger than server file — restarting download",
         );
+        let _ = tokio::fs::remove_file(&part).await;
         0
     } else {
         offset
@@ -233,10 +238,10 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     let mut local = if offset > 0 {
         tokio::fs::OpenOptions::new()
             .append(true)
-            .open(local_path)
+            .open(&part)
             .await?
     } else {
-        tokio::fs::File::create(local_path).await?
+        tokio::fs::File::create(&part).await?
     };
 
     let mut buf = vec![0u8; 64 * 1024];
@@ -252,7 +257,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
         local
             .write_all(&buf[..n])
             .await
-            .map_err(|e| BlinkError::transport(format!("write {}: {e}", local_path.display())))?;
+            .map_err(|e| BlinkError::transport(format!("write {}: {e}", part.display())))?;
         done += n as u64;
         if let Some(tx) = &progress {
             let _ = tx.send(ProgressUpdate {
@@ -264,12 +269,23 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     local
         .flush()
         .await
-        .map_err(|e| BlinkError::transport(format!("flush {}: {e}", local_path.display())))?;
+        .map_err(|e| BlinkError::transport(format!("flush {}: {e}", part.display())))?;
+    local
+        .sync_all()
+        .await
+        .map_err(|e| BlinkError::transport(format!("sync {}: {e}", part.display())))?;
+    drop(local);
 
     stream
         .finalize_retr_stream(reader)
         .await
         .map_err(|e| BlinkError::transport(format!("finalize retr {remote_path}: {e}")))?;
+
+    // Only rename once the server confirmed the transfer; otherwise a
+    // truncated response could leave a corrupted "complete" file in place.
+    tokio::fs::rename(&part, local_path)
+        .await
+        .map_err(|e| BlinkError::transport(format!("rename {}: {e}", local_path.display())))?;
 
     Ok(())
 }
