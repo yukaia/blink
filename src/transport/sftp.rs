@@ -682,9 +682,24 @@ impl Transport for SftpTransport {
     }
 
     async fn metadata(&mut self, remote_path: &str) -> Result<Option<RemoteEntry>> {
+        use russh_sftp::client::error::Error as SftpError;
+        use russh_sftp::protocol::StatusCode;
+        // `Ok(None)` means "this path does not exist on the server" — only
+        // the NoSuchFile status maps there. Everything else (permission
+        // denied, connection dropped, unexpected packet) is a real failure
+        // that has to propagate; collapsing it to "not found" was masking
+        // mid-walk connection drops as "the file disappeared", which was
+        // both wrong and confusing in the TUI log.
         let attrs = match self.sftp.metadata(remote_path).await {
             Ok(a) => a,
-            Err(_) => return Ok(None),
+            Err(SftpError::Status(s)) if s.status_code == StatusCode::NoSuchFile => {
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(BlinkError::transport(format!(
+                    "metadata {remote_path}: {e}"
+                )));
+            }
         };
         let kind = if attrs.is_dir() {
             EntryKind::Directory

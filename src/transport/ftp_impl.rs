@@ -423,9 +423,22 @@ pub async fn ftp_metadata<T: TokioTlsStream + Send>(
         None => (".".to_string(), remote_path.to_string()),
     };
 
+    // Only treat "parent directory unavailable" (550) as "file does not
+    // exist"; every other FtpError (connection drop, secure-channel
+    // failure, unexpected response code) is a real failure that needs to
+    // propagate. Without this, mid-walk connection drops were being
+    // misreported as "the file disappeared".
+    use suppaftp::{FtpError, Status};
     let lines = match stream.list(Some(&parent)).await {
         Ok(l) => l,
-        Err(_) => return Ok(None),
+        Err(FtpError::UnexpectedResponse(resp)) if resp.status == Status::FileUnavailable => {
+            return Ok(None);
+        }
+        Err(e) => {
+            return Err(BlinkError::transport(format!(
+                "metadata list {parent}: {e}"
+            )));
+        }
     };
     for line in lines {
         if line.starts_with("total ") {
