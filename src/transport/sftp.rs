@@ -634,7 +634,17 @@ impl Transport for SftpTransport {
                         }
                         let child = super::join_remote(&path, &name);
                         let attrs = e.metadata();
-                        if attrs.is_dir() {
+                        // is_symlink() before is_dir(): some SFTP servers
+                        // report symlink-to-directory entries with both
+                        // bits set. If we recursed into one, we'd walk
+                        // outside the subtree the user asked to delete
+                        // (and possibly outside the connection's chroot).
+                        // Treat any symlink as a leaf and unlink it.
+                        if attrs.is_symlink() {
+                            self.sftp.remove_file(&child).await.map_err(|err| {
+                                BlinkError::transport(format!("remove {child}: {err}"))
+                            })?;
+                        } else if attrs.is_dir() {
                             to_recurse.push(Op::Visit(child));
                         } else {
                             self.sftp.remove_file(&child).await.map_err(|err| {

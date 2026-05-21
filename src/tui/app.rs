@@ -2121,11 +2121,15 @@ impl App {
             // Phase 1: build the plan from local FS walks. Files become a
             // single Upload job; directories unfold into mkdirs + uploads.
             let mut plan: Vec<PlannedJob> = Vec::new();
+            let mut symlinks_skipped: usize = 0;
             for (local, remote, is_dir) in roots {
                 let chunk = if is_dir {
                     let walk = walk_local(&local, &remote).await;
                     match walk {
-                        Ok(p) => p,
+                        Ok(r) => {
+                            symlinks_skipped += r.symlinks_skipped;
+                            r.plan
+                        }
                         Err(e) => {
                             let _ = tx.send(AppEvent::WalkFailed {
                                 error: e.to_string(),
@@ -2162,6 +2166,7 @@ impl App {
             let _ = tx.send(AppEvent::WalkComplete {
                 plan,
                 conflict_indices,
+                symlinks_skipped,
                 kind: Direction::Upload,
             });
         });
@@ -2532,13 +2537,17 @@ impl App {
             // for downloads — local mkdirs are handled inside walk_remote)
             // plus per-file Download jobs.
             let mut plan: Vec<PlannedJob> = Vec::new();
+            let mut symlinks_skipped: usize = 0;
             {
                 let mut transport = t.lock().await;
                 for (remote, local, is_dir) in roots {
                     let chunk = if is_dir {
                         let walk = walk_remote(&mut **transport, &remote, &local).await;
                         match walk {
-                            Ok(p) => p,
+                            Ok(r) => {
+                                symlinks_skipped += r.symlinks_skipped;
+                                r.plan
+                            }
                             Err(e) => {
                                 let _ = tx.send(AppEvent::WalkFailed {
                                     error: e.to_string(),
@@ -2565,6 +2574,7 @@ impl App {
             let _ = tx.send(AppEvent::WalkComplete {
                 plan,
                 conflict_indices,
+                symlinks_skipped,
                 kind: Direction::Download,
             });
         });
@@ -3269,8 +3279,16 @@ impl App {
             AppEvent::WalkComplete {
                 plan,
                 conflict_indices,
+                symlinks_skipped,
                 kind,
             } => {
+                if symlinks_skipped > 0 {
+                    let noun = if symlinks_skipped == 1 { "symlink" } else { "symlinks" };
+                    self.push_log(
+                        LogLevel::Info,
+                        format!("skipped {symlinks_skipped} {noun} during walk"),
+                    );
+                }
                 if conflict_indices.is_empty() {
                     self.dispatch_plan(plan, kind);
                 } else {
@@ -3706,12 +3724,22 @@ fn name_for_job(job: &TransferJob) -> String {
 ///
 /// Transport-level errors propagate; partial trees are NOT fixed up here —
 /// the caller surfaces a `WalkFailed` log line and the user can retry.
+/// Output of a recursive walk: the flat job plan plus a count of symlinks
+/// that were deliberately skipped. The caller surfaces the skip count in
+/// the TUI log so the user knows the plan is shorter than the tree.
+#[derive(Debug, Default)]
+pub struct WalkResult {
+    pub plan: Vec<PlannedJob>,
+    pub symlinks_skipped: usize,
+}
+
 async fn walk_remote(
     transport: &mut dyn Transport,
     remote_root: &str,
     local_root: &std::path::Path,
-) -> Result<Vec<PlannedJob>> {
+) -> Result<WalkResult> {
     let mut out: Vec<PlannedJob> = Vec::new();
+    let mut symlinks_skipped: usize = 0;
     // Always mkdir the root itself first so the local destination exists
     // before any files inside try to land in it. The transport mkdir is
     // for the remote side, but downloads need local mkdirs — handle those
@@ -3759,11 +3787,25 @@ async fn walk_remote(
                 EntryKind::Directory => {
                     subdirs.push((remote_child, local_child));
                 }
-                EntryKind::File | EntryKind::Symlink | EntryKind::Other => {
-                    // Treat symlinks as files: we'll fetch whatever they point at.
-                    // Other-kinds (sockets, devices) are rare on download targets;
-                    // including them here lets the transport surface a real error
-                    // rather than silently skipping data.
+                EntryKind::Symlink => {
+                    // Skip symlinks in recursive download. Following a
+                    // server-resolved symlink would let a hostile or
+                    // misconfigured remote land bytes outside the chosen
+                    // destination tree (think a symlink named "passwd"
+                    // pointing at /etc/passwd) or loop forever on an A→B→A
+                    // cycle. Single-file View / Download of a symlink still
+                    // works because the user explicitly selected it.
+                    symlinks_skipped += 1;
+                    tracing::debug!(
+                        remote = %remote_child,
+                        "skipping remote symlink in recursive download",
+                    );
+                }
+                EntryKind::File | EntryKind::Other => {
+                    // Other-kinds (sockets, devices) are rare on download
+                    // targets; including them here lets the transport
+                    // surface a real error rather than silently skipping
+                    // data the user might have wanted.
                     out.push(PlannedJob::Download {
                         remote_path: remote_child,
                         local_path: local_child,
@@ -3776,7 +3818,10 @@ async fn walk_remote(
             stack.push(sub);
         }
     }
-    Ok(out)
+    Ok(WalkResult {
+        plan: out,
+        symlinks_skipped,
+    })
 }
 
 /// Walk a local subtree rooted at `local_root` and produce a flat plan of
@@ -3785,8 +3830,9 @@ async fn walk_remote(
 async fn walk_local(
     local_root: &std::path::Path,
     remote_root: &str,
-) -> Result<Vec<PlannedJob>> {
+) -> Result<WalkResult> {
     let mut out: Vec<PlannedJob> = Vec::new();
+    let mut symlinks_skipped: usize = 0;
 
     // Iterative DFS. Stack holds (local_path_to_visit, remote_path_dest).
     let mut stack: Vec<(std::path::PathBuf, String)> =
@@ -3815,32 +3861,45 @@ async fn walk_local(
                 ))
             })?;
             let Some(entry) = next else { break };
-            let meta = match entry.metadata().await {
-                Ok(m) => m,
+            // file_type() reports symlinks BEFORE following them; metadata()
+            // resolves them and would mask a symlink-to-dir as a regular dir.
+            // Read both so we can act on the unfollowed type.
+            let file_type = match entry.file_type().await {
+                Ok(t) => t,
                 Err(_) => continue, // unreadable entry; skip rather than fail walk
             };
+            if file_type.is_symlink() {
+                symlinks_skipped += 1;
+                tracing::debug!(
+                    local = %entry.path().display(),
+                    "skipping local symlink in recursive upload",
+                );
+                continue;
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             let local_child = entry.path();
             let remote_child = transport::join_remote(&remote_dir, &name);
 
-            if meta.is_dir() {
+            if file_type.is_dir() {
                 subdirs.push((local_child, remote_child));
-            } else if meta.is_file() {
+            } else if file_type.is_file() {
                 out.push(PlannedJob::Upload {
                     local_path: local_child,
                     remote_path: remote_child,
                 });
             }
-            // Symlinks / other types: skip silently for uploads. Following
-            // them would be ambiguous (relative target? pointing outside
-            // the source tree?) and they're rare for upload payloads.
+            // Other types (sockets, FIFOs, block/char devices) are skipped
+            // silently — they have no meaningful upload payload.
         }
 
         for sub in subdirs.into_iter().rev() {
             stack.push(sub);
         }
     }
-    Ok(out)
+    Ok(WalkResult {
+        plan: out,
+        symlinks_skipped,
+    })
 }
 
 /// Local-FS conflict probe for download plans. Iterates every Download job

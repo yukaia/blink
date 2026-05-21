@@ -75,10 +75,13 @@ pub enum AppEvent {
     /// A recursive walk finished. The plan is a flat list of jobs to enqueue
     /// in order: directory creations come before any files inside them.
     /// `conflict_indices` lists positions in `plan` whose destination already
-    /// exists (file-only; mkdirs are silently merged).
+    /// exists (file-only; mkdirs are silently merged). `symlinks_skipped`
+    /// counts entries deliberately omitted from the plan because they were
+    /// symbolic links.
     WalkComplete {
         plan: Vec<crate::tui::app::PlannedJob>,
         conflict_indices: Vec<usize>,
+        symlinks_skipped: usize,
         kind: Direction,
     },
 
