@@ -502,9 +502,10 @@ impl Session {
         let protocol: Protocol = proto_str.parse()?;
 
         // Split off the path (everything from the first '/') so the authority
-        // portion contains only `[user@]host[:port]`.
+        // portion contains only `[user@]host[:port]`. Decode the path here so
+        // names like `path%20with%20spaces` survive into the remote_dir.
         let (authority, remote_dir) = match rest.find('/') {
-            Some(i) => (&rest[..i], rest[i..].to_string()),
+            Some(i) => (&rest[..i], percent_decode(&rest[i..], "remote path")?),
             None => (rest, "/".to_string()),
         };
 
@@ -512,6 +513,21 @@ impl Session {
             Some((u, h)) => (u.to_string(), h),
             None => (String::new(), authority),
         };
+
+        // RFC 3986 §3.2.1 deprecates `user:password@` userinfo: passwords in
+        // URLs end up in shell history, process listings, and well-meaning
+        // tooling that prints "what you typed" without redacting. Reject the
+        // form outright and point the user at the interactive prompt.
+        if username.contains(':') {
+            return Err(BlinkError::config(
+                "password in URL is not supported — drop the `:password` and \
+                 you'll be prompted for it at connect time",
+            ));
+        }
+
+        // Percent-decode the username AFTER the password check so the check
+        // sees the raw colon (an encoded `%3A` would still be a password).
+        let username = percent_decode(&username, "username")?;
 
         let (host, port) = if hostport.starts_with('[') {
             // Bracketed IPv6 literal: [::1] or [::1]:22
@@ -572,6 +588,54 @@ impl Session {
             accept_invalid_certs: false,
             cert_sha256: None,
         })
+    }
+}
+
+/// Decode `%xx` percent-escapes in a URL component into a UTF-8 string.
+///
+/// Rejects malformed escapes (`%`, `%X`, `%XY` where X/Y aren't hex) and
+/// escapes that don't form valid UTF-8 — silently passing through invalid
+/// bytes would let a malicious URL inject names that look different
+/// rendered in the TUI than they do as bytes on the wire.
+fn percent_decode(s: &str, field: &str) -> Result<String> {
+    // Common case: no `%`. Skip the byte walk.
+    if !s.contains('%') {
+        return Ok(s.to_string());
+    }
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        if i + 2 >= bytes.len() {
+            return Err(BlinkError::config(format!(
+                "incomplete percent-escape in {field}"
+            )));
+        }
+        let hi = hex_digit(bytes[i + 1]).ok_or_else(|| {
+            BlinkError::config(format!("invalid percent-escape in {field}"))
+        })?;
+        let lo = hex_digit(bytes[i + 2]).ok_or_else(|| {
+            BlinkError::config(format!("invalid percent-escape in {field}"))
+        })?;
+        out.push((hi << 4) | lo);
+        i += 3;
+    }
+    String::from_utf8(out).map_err(|_| {
+        BlinkError::config(format!("percent-escape decodes to invalid UTF-8 in {field}"))
+    })
+}
+
+fn hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -668,6 +732,54 @@ mod tests {
     #[test]
     fn from_url_null_in_host_rejected() {
         assert!(Session::from_url("sftp://evil\x00host/").is_err());
+    }
+
+    #[test]
+    fn from_url_rejects_password_in_url() {
+        let err = Session::from_url("sftp://alice:hunter2@host/").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("password") || msg.contains("prompt"),
+            "error should explain password is not allowed: {msg}"
+        );
+    }
+
+    #[test]
+    fn from_url_percent_decodes_path() {
+        let s = Session::from_url("sftp://host/var/www%20html").unwrap();
+        assert_eq!(s.remote_dir, "/var/www html");
+    }
+
+    #[test]
+    fn from_url_percent_decodes_username() {
+        // Common case: encoded `@` so the literal `alice@corp` becomes the user
+        // without splitting the authority twice.
+        let s = Session::from_url("sftp://alice%40corp@host/").unwrap();
+        assert_eq!(s.username, "alice@corp");
+    }
+
+    #[test]
+    fn from_url_rejects_invalid_percent_escape() {
+        assert!(Session::from_url("sftp://host/path%XYZ").is_err());
+        assert!(Session::from_url("sftp://host/path%").is_err());
+        assert!(Session::from_url("sftp://host/path%2").is_err());
+    }
+
+    #[test]
+    fn from_url_rejects_percent_escape_to_invalid_utf8() {
+        // 0xC3 0x28 is invalid UTF-8 (start of multi-byte but bad continuation).
+        assert!(Session::from_url("sftp://host/%C3%28").is_err());
+    }
+
+    #[test]
+    fn from_url_encoded_colon_decodes_into_username() {
+        // The password-in-URL check runs against the literal bytes before
+        // percent-decoding. An encoded `%3A` makes it into the username
+        // verbatim. Safe: the colon is just an ordinary character in the
+        // SSH username field; the server treats the whole string as the
+        // user identity and either accepts it or returns auth-failed.
+        let s = Session::from_url("sftp://alice%3Aworld@host/").unwrap();
+        assert_eq!(s.username, "alice:world");
     }
 
     #[test]
