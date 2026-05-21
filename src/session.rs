@@ -146,7 +146,36 @@ impl Session {
         Self::name_to_filename(&self.name)
     }
 
+    /// Map the session's logical name to its on-disk filename.
+    ///
+    /// Path-unsafe characters collapse to `_` for filesystem hygiene, so two
+    /// distinct names ("my prod" and "my_prod") would otherwise produce
+    /// identical sanitized stems and silently clobber each other on save.
+    /// Append the first eight hex chars of `sha256(name)` to disambiguate;
+    /// the suffix is derived from the raw name (no sanitisation), so it's
+    /// stable per logical name across sanitisation collisions.
     fn name_to_filename(name: &str) -> String {
+        use sha2::{Digest, Sha256};
+        let safe: String = name
+            .chars()
+            .map(|c| match c {
+                '\0' | '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' ' => '_',
+                c => c,
+            })
+            .collect();
+        let hash = Sha256::digest(name.as_bytes());
+        let mut suffix = String::with_capacity(8);
+        for b in &hash[..4] {
+            use std::fmt::Write as _;
+            let _ = write!(&mut suffix, "{b:02x}");
+        }
+        format!("{safe}-{suffix}.ini")
+    }
+
+    /// Filename written by older blink versions (sanitized stem only, no
+    /// hash suffix). Kept around so [`save`] can clean up the legacy file
+    /// the first time a pre-existing session is re-saved.
+    fn legacy_name_to_filename(name: &str) -> String {
         let safe: String = name
             .chars()
             .map(|c| match c {
@@ -224,6 +253,30 @@ impl Session {
         }
         fs::rename(&tmp, &path)?;
         paths::sync_parent_dir(&path)?;
+
+        // Migration: older blink versions wrote at `<sanitized>.ini` with no
+        // hash suffix. After a successful save under the new name, remove
+        // the legacy file IF it exists AND it loads as a session with the
+        // same logical name. We don't blow away an arbitrary file with the
+        // same stem — only the one we previously wrote ourselves.
+        let legacy = paths::sessions_dir()?.join(Self::legacy_name_to_filename(&self.name));
+        if legacy != path && legacy.exists() {
+            match Self::load_from(&legacy) {
+                Ok(prev) if prev.name == self.name => {
+                    if let Err(e) = fs::remove_file(&legacy) {
+                        tracing::warn!(
+                            path = %legacy.display(),
+                            "could not remove legacy session file: {e}",
+                        );
+                    }
+                }
+                _ => {
+                    // Either the legacy file doesn't parse as a session or
+                    // its name field doesn't match — not ours, leave it.
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -615,5 +668,26 @@ mod tests {
     #[test]
     fn from_url_null_in_host_rejected() {
         assert!(Session::from_url("sftp://evil\x00host/").is_err());
+    }
+
+    #[test]
+    fn name_to_filename_disambiguates_sanitised_collisions() {
+        // "my prod" and "my_prod" sanitise to the same stem; the hash
+        // suffix must distinguish them so two saves don't clobber each
+        // other.
+        let a = Session::name_to_filename("my prod");
+        let b = Session::name_to_filename("my_prod");
+        assert_ne!(a, b, "{a} vs {b}");
+        assert!(a.starts_with("my_prod-"));
+        assert!(b.starts_with("my_prod-"));
+    }
+
+    #[test]
+    fn name_to_filename_stable_per_logical_name() {
+        // Hash is derived from the raw name (pre-sanitisation), so the
+        // SAME logical name always produces the SAME filename.
+        let a = Session::name_to_filename("production");
+        let b = Session::name_to_filename("production");
+        assert_eq!(a, b);
     }
 }

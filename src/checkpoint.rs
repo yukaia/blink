@@ -252,7 +252,14 @@ impl Checkpoint {
     // -----------------------------------------------------------------------
 
     /// Derive the checkpoint file path for a given session + direction.
+    ///
+    /// Two distinct session names ("my prod" vs "my_prod") would otherwise
+    /// collapse to the same sanitised stem and silently overwrite each
+    /// other's checkpoint. Append the first eight hex chars of
+    /// `sha256(session)` to disambiguate; the suffix derives from the raw
+    /// session name (no sanitisation), so it's stable per logical name.
     fn path_for(session: &str, kind: CheckpointKind) -> Result<PathBuf> {
+        use sha2::{Digest, Sha256};
         let safe_name: String = session
             .chars()
             .map(|c| match c {
@@ -261,7 +268,14 @@ impl Checkpoint {
                 c => c,
             })
             .collect();
-        Ok(paths::checkpoints_dir()?.join(format!("{safe_name}-{}.json", kind.as_str())))
+        let hash = Sha256::digest(session.as_bytes());
+        let mut suffix = String::with_capacity(8);
+        for b in &hash[..4] {
+            use std::fmt::Write as _;
+            let _ = write!(&mut suffix, "{b:02x}");
+        }
+        Ok(paths::checkpoints_dir()?
+            .join(format!("{safe_name}-{suffix}-{}.json", kind.as_str())))
     }
 
     /// Atomically and durably write `content` to `path` via a `.tmp` sibling
