@@ -2234,8 +2234,11 @@ impl App {
             })
             .collect();
 
-        let checkpoint = Checkpoint::new(&session_name, ck_kind, ck_jobs);
-        if let Err(e) = checkpoint.save() {
+        let mut checkpoint = Checkpoint::new(&session_name, ck_kind, ck_jobs);
+        // First save is critical — it persists the entire plan before any I/O
+        // starts. Use flush() (unconditional) rather than flush_if_due()
+        // because there's no "previous save" to debounce against.
+        if let Err(e) = checkpoint.flush() {
             self.push_log(
                 LogLevel::Warn,
                 format!("checkpoint save failed (resume unavailable): {e}"),
@@ -3434,14 +3437,16 @@ impl App {
                 self.push_log(LogLevel::Info, format!("queued: {}", job.remote_path));
             }
             TransferEvent::Started(id) => {
-                // Write `in_progress` to disk before the transfer does any
-                // I/O. A crash between here and the `Complete` write leaves
-                // the job as `in_progress`, which causes it to be re-queued
-                // on resume rather than silently skipped.
+                // Flip the in-memory state to `in_progress`; the actual disk
+                // write is debounced. A crash before the next flush means the
+                // job is re-queued on resume (its file-on-disk state still
+                // says `pending`) — which is the same safe outcome as a
+                // crash mid-transfer, just at a different moment.
                 if let Some(cp_idx) = self.checkpoint_job_map.get(&id).copied() {
                     if let Some(cp) = self.active_checkpoint.as_mut() {
-                        if let Err(e) = cp.mark_in_progress_and_save(cp_idx) {
-                            tracing::warn!(id, cp_idx, "checkpoint in_progress write failed: {e}");
+                        cp.mark_in_progress(cp_idx);
+                        if let Err(e) = cp.flush_if_due() {
+                            tracing::warn!(id, cp_idx, "checkpoint in_progress flush failed: {e}");
                         }
                     }
                 }
@@ -3458,19 +3463,15 @@ impl App {
                 // the header from `manager.snapshot()`.
             }
             TransferEvent::Complete(id) => {
-                // Mark the job done in the checkpoint before updating the log
-                // so the file is consistent even if we crash immediately after.
+                // Update in-memory state and either debounce-save (still more
+                // work pending) or delete the file (every job is done).
                 if let Some(cp_idx) = self.checkpoint_job_map.get(&id).copied() {
                     if let Some(cp) = self.active_checkpoint.as_mut() {
-                        if let Err(e) = cp.mark_done_and_save(cp_idx) {
-                            // Non-fatal: the user can still re-transfer the
-                            // failed job, they just can't resume from the
-                            // checkpoint for this specific entry.
-                            tracing::warn!(id, cp_idx, "checkpoint update failed: {e}");
-                        }
-                        // When every job is done, remove the checkpoint file
-                        // so a subsequent `r` press doesn't try to resume
-                        // a completed batch.
+                        cp.mark_done(cp_idx);
+                        // When every job is done, drop the checkpoint file
+                        // entirely so a subsequent `r` press doesn't try to
+                        // resume a completed batch. Skip the debounced write
+                        // — there's no point flushing right before deleting.
                         if cp.pending_count() == 0 {
                             let session = cp.session.clone();
                             let kind = cp.kind;
@@ -3479,6 +3480,10 @@ impl App {
                             if let Err(e) = Checkpoint::remove(&session, kind) {
                                 tracing::warn!("could not remove completed checkpoint: {e}");
                             }
+                        } else if let Err(e) = cp.flush_if_due() {
+                            // Non-fatal: a missed mark just causes that job
+                            // to be re-run on resume, never silently skipped.
+                            tracing::warn!(id, cp_idx, "checkpoint flush failed: {e}");
                         }
                     }
                 }
@@ -3517,6 +3522,16 @@ impl App {
                 // safe: partial downloads are overwritten, mkdir is
                 // idempotent. If the batch was explicitly discarded via
                 // batch-cancel, `active_checkpoint` is already None.
+                //
+                // Force-flush here so the most recent batch of Done marks
+                // hits disk: the user is likely to react to the failure by
+                // killing or quitting blink, and we don't want them losing
+                // a debounce-window of completed-job state.
+                if let Some(cp) = self.active_checkpoint.as_mut() {
+                    if let Err(e) = cp.flush() {
+                        tracing::warn!(id, "checkpoint flush after failure failed: {e}");
+                    }
+                }
 
                 let label = lookup(id)
                     .map(|j| j.remote_path)
