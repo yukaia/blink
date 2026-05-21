@@ -274,8 +274,15 @@ impl TransferManager {
 
     pub fn update_progress(&self, id: u64, bytes_done: u64, bytes_total: u64, bytes_per_sec: u64) {
         // Clamp so a server reporting bytes_done > bytes_total cannot overflow
-        // the progress bar or cause panics in percentage arithmetic.
-        let bytes_done = bytes_done.min(bytes_total);
+        // the progress bar. Only clamp when we actually know the total —
+        // an FTP server that doesn't report SIZE leaves bytes_total at 0,
+        // and clamping against that would peg the progress display at 0%
+        // for the entire transfer.
+        let bytes_done = if bytes_total > 0 {
+            bytes_done.min(bytes_total)
+        } else {
+            bytes_done
+        };
         {
             let mut inner = self.inner.lock();
             if let Some(&idx) = inner.job_index.get(&id) {
