@@ -1154,6 +1154,20 @@ impl App {
             }
         };
 
+        // Preserve the pinned cert hash only when host, port, and the trust
+        // bypass are all unchanged. A change to any of those means the
+        // previous pin is no longer meaningful (different target or the
+        // user is switching to normal CA verification), so we clear it and
+        // let the next connect TOFU.
+        let cert_sha256 = if form.accept_invalid_certs
+            && original.host == host
+            && original.port == port
+        {
+            original.cert_sha256.clone()
+        } else {
+            None
+        };
+
         let updated = Session {
             name: name.clone(),
             protocol: original.protocol.clone(),
@@ -1170,6 +1184,7 @@ impl App {
             parallel_downloads,
             theme: original.theme.clone(),
             accept_invalid_certs: form.accept_invalid_certs,
+            cert_sha256,
         };
 
         match updated.save() {
@@ -3059,12 +3074,32 @@ impl App {
 
     fn handle_app_event(&mut self, event: AppEvent) {
         match event {
-            AppEvent::Connected(transport) => {
+            AppEvent::Connected(connected) => {
                 // Stale guard: user may have cancelled before connect resolved.
-                let Some(session) = self.pending_session.take() else {
-                    drop(transport);
+                let Some(mut session) = self.pending_session.take() else {
+                    drop(connected.transport);
                     return;
                 };
+
+                // FTPS TOFU: the verifier observed a new leaf-cert pin.
+                // Persist it onto the session so subsequent connects (and
+                // dispatcher workers spawned below) require the same cert.
+                if let Some(new_pin) = connected.new_cert_pin {
+                    session.cert_sha256 = Some(new_pin);
+                    if let Err(e) = session.save() {
+                        self.push_log(
+                            LogLevel::Warn,
+                            format!("could not save FTPS cert pin: {e}"),
+                        );
+                    } else {
+                        self.push_log(
+                            LogLevel::Info,
+                            format!("pinned FTPS certificate for `{}`", session.name),
+                        );
+                    }
+                }
+
+                let transport = connected.transport;
                 let remote_dir = session.remote_dir.clone();
                 let password = self.pending_password.clone();
                 // Successful connect — clear any leftover passphrase state.

@@ -121,6 +121,17 @@ pub trait Transport: Send + Sync {
     async fn close(&mut self) -> Result<()>;
 }
 
+/// Result of [`open`]: the live transport plus any side-channel info the
+/// caller may want to persist back onto the session.
+pub struct Connected {
+    pub transport: Box<dyn Transport>,
+    /// Hex SHA-256 of the FTPS server's leaf certificate, set only when an
+    /// FTPS connect with `accept_invalid_certs=true` captured a new pin
+    /// (TOFU). The caller should write this into `session.cert_sha256` and
+    /// save the session.
+    pub new_cert_pin: Option<String>,
+}
+
 /// Build the right transport for `session`. The password (if any) must be
 /// resolved by the caller before this is invoked — we never store it on disk.
 ///
@@ -130,17 +141,29 @@ pub async fn open(
     session: &Session,
     password: Option<&str>,
     app_event_tx: mpsc::UnboundedSender<crate::tui::event::AppEvent>,
-) -> Result<Box<dyn Transport>> {
-    match session.protocol {
-        Protocol::Sftp => Ok(Box::new(
-            sftp::SftpTransport::connect(session, password, app_event_tx).await?,
-        )),
-        Protocol::Scp => Ok(Box::new(
-            scp::ScpTransport::connect(session, password, app_event_tx).await?,
-        )),
-        Protocol::Ftp => Ok(Box::new(ftp::FtpTransport::connect(session, password).await?)),
-        Protocol::Ftps => Ok(Box::new(ftps::FtpsTransport::connect(session, password).await?)),
-    }
+) -> Result<Connected> {
+    let (transport, new_cert_pin): (Box<dyn Transport>, Option<String>) = match session.protocol {
+        Protocol::Sftp => (
+            Box::new(sftp::SftpTransport::connect(session, password, app_event_tx).await?),
+            None,
+        ),
+        Protocol::Scp => (
+            Box::new(scp::ScpTransport::connect(session, password, app_event_tx).await?),
+            None,
+        ),
+        Protocol::Ftp => (
+            Box::new(ftp::FtpTransport::connect(session, password).await?),
+            None,
+        ),
+        Protocol::Ftps => {
+            let (t, pin) = ftps::FtpsTransport::connect(session, password).await?;
+            (Box::new(t), pin)
+        }
+    };
+    Ok(Connected {
+        transport,
+        new_cert_pin,
+    })
 }
 
 /// Join a remote base path and a name, normalising the slash.

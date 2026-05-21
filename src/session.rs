@@ -114,15 +114,29 @@ pub struct Session {
     pub parallel_downloads: Option<u8>,
     /// Per-session theme override.
     pub theme: Option<String>,
-    /// Skip TLS certificate validation when this is true.
+    /// Skip TLS chain-of-trust validation when this is true.
     ///
     /// Consulted only by the FTPS transport; SFTP/SCP use the known-hosts
     /// file for host-key trust and do not use this flag. Defaults to false;
     /// the user has to opt in per session.
     ///
-    /// **Dangerous.** Disables the protections TLS is supposed to give you.
-    /// The UI flags it in red.
+    /// When this is enabled, blink still verifies the cert's hostname (SAN /
+    /// CN must match `host`) and the handshake signature, and it pins the
+    /// leaf cert SHA-256 in [`cert_sha256`] on the first connect — so future
+    /// connections to the same host must present the same cert. Disabling
+    /// chain trust only removes the CA-authority requirement.
     pub accept_invalid_certs: bool,
+
+    /// Pinned leaf-certificate SHA-256, hex-encoded (lowercase).
+    ///
+    /// Populated automatically on the first successful FTPS connect with
+    /// [`accept_invalid_certs`] enabled. Subsequent connects to the same
+    /// session require this exact certificate; if the server's cert hash
+    /// differs, the connection is rejected.
+    ///
+    /// Has no effect when [`accept_invalid_certs`] is false (normal CA
+    /// verification is used instead).
+    pub cert_sha256: Option<String>,
 }
 
 impl Session {
@@ -188,12 +202,15 @@ impl Session {
         if let Some(theme) = &self.theme {
             ini.with_section(Some("appearance")).set("theme", theme);
         }
-        // Only persist when the user has explicitly opted in. Default-false
-        // sessions don't get a [tls] section at all, which keeps existing
-        // session files unchanged on save.
+        // Only persist a [tls] section when the user has opted in. Default
+        // sessions don't get one, which keeps existing session files
+        // unchanged on save.
         if self.accept_invalid_certs {
-            ini.with_section(Some("tls"))
-                .set("accept_invalid_certs", "true");
+            let mut tls = ini.with_section(Some("tls"));
+            tls.set("accept_invalid_certs", "true");
+            if let Some(pin) = &self.cert_sha256 {
+                tls.set("cert_sha256", pin);
+            }
         }
 
         ini.write_to_file(&tmp)?;
@@ -301,8 +318,8 @@ impl Session {
             None => None,
         };
 
-        let accept_invalid_certs = ini
-            .section(Some("tls"))
+        let tls_section = ini.section(Some("tls"));
+        let accept_invalid_certs = tls_section
             .and_then(|s| s.get("accept_invalid_certs"))
             .map(|v| {
                 matches!(
@@ -311,6 +328,25 @@ impl Session {
                 )
             })
             .unwrap_or(false);
+        let cert_sha256 = tls_section
+            .and_then(|s| s.get("cert_sha256"))
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(|v| {
+                // Reject anything but lowercase hex of length 64. Be strict —
+                // a malformed pin would either silently accept the wrong cert
+                // (uppercase mismatch in eq_ignore_case is fine, but garbage
+                // characters would slip through). Normalize to lowercase.
+                let lower = v.to_ascii_lowercase();
+                if lower.len() == 64 && lower.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    Ok(lower)
+                } else {
+                    Err(BlinkError::config(
+                        "tls.cert_sha256 must be 64 lowercase hex characters",
+                    ))
+                }
+            })
+            .transpose()?;
 
         Ok(Self {
             name,
@@ -324,6 +360,7 @@ impl Session {
             parallel_downloads,
             theme,
             accept_invalid_certs,
+            cert_sha256,
         })
     }
 
@@ -471,6 +508,7 @@ impl Session {
             parallel_downloads: None,
             theme: None,
             accept_invalid_certs: false,
+            cert_sha256: None,
         })
     }
 }

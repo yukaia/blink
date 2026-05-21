@@ -17,7 +17,7 @@ use tokio::time::{interval, Interval};
 use crate::error::Result;
 use crate::preview::FileViewKind;
 use crate::transfer::{Direction, TransferEvent};
-use crate::transport::{RemoteEntry, Transport};
+use crate::transport::RemoteEntry;
 
 /// Top-level event consumed by the App run loop.
 pub enum Event {
@@ -34,9 +34,10 @@ pub enum Event {
 /// carries an owned `Box<dyn Transport>` that can't sensibly be cloned, and
 /// debug-formatting a transport is meaningless.
 pub enum AppEvent {
-    /// A connect task completed successfully. The payload is the freshly
-    /// opened transport, ready to be used.
-    Connected(Box<dyn Transport>),
+    /// A connect task completed successfully. The payload carries the freshly
+    /// opened transport and, for FTPS with TOFU, the new cert pin the caller
+    /// should persist onto the session.
+    Connected(crate::transport::Connected),
 
     /// A connect task failed.
     ConnectFailed(String),

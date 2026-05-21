@@ -1,6 +1,18 @@
 //! FTPS transport — explicit TLS over the FTP control channel via rustls.
+//!
+//! ## Trust model
+//!
+//! - `accept_invalid_certs = false` (default): standard CA chain
+//!   verification via webpki-roots. No pinning involved.
+//! - `accept_invalid_certs = true`: CA chain trust is bypassed, but the
+//!   server's certificate must still match the configured hostname
+//!   (SAN/CN), and the handshake signature must verify against the
+//!   cert's public key. The leaf certificate SHA-256 is pinned in the
+//!   session on the first connect; subsequent connects to the same
+//!   session must present the same cert. This mirrors how SSH host-key
+//!   trust works for SFTP.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use suppaftp::rustls::{ClientConfig, RootCertStore};
 use suppaftp::tokio::{AsyncRustlsConnector, AsyncRustlsFtpStream};
@@ -16,7 +28,15 @@ pub struct FtpsTransport {
 }
 
 impl FtpsTransport {
-    pub async fn connect(session: &Session, password: Option<&str>) -> Result<Self> {
+    /// Connect, perform the TLS upgrade, and log in.
+    ///
+    /// Returns the transport and, in the pinning (TOFU) case only, the
+    /// SHA-256 of the leaf certificate so the caller can persist it on
+    /// the session.
+    pub async fn connect(
+        session: &Session,
+        password: Option<&str>,
+    ) -> Result<(Self, Option<String>)> {
         if !matches!(session.auth, AuthMethod::Password) {
             return Err(BlinkError::auth(
                 "FTPS only supports password (or anonymous) auth",
@@ -28,12 +48,20 @@ impl FtpsTransport {
             .await
             .map_err(|e| BlinkError::connect(format!("ftps connect to {addr}: {e}")))?;
 
+        // Used by the pinning verifier to publish the leaf cert hash back
+        // to this function after the TLS handshake completes. Only set on
+        // a TOFU connect (no pin previously stored); on a pin-match connect
+        // it stays None and no save is triggered.
+        let captured_pin: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
         let config = if session.accept_invalid_certs {
+            let verifier = pinning::PinningVerifier::new(
+                session.cert_sha256.clone(),
+                Arc::clone(&captured_pin),
+            );
             ClientConfig::builder()
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(
-                    no_verification::NoVerification,
-                ))
+                .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth()
         } else {
             let root_store = RootCertStore::from_iter(
@@ -44,13 +72,15 @@ impl FtpsTransport {
                 .with_no_client_auth()
         };
 
-        let connector = AsyncRustlsConnector::from(
-            tokio_rustls::TlsConnector::from(Arc::new(config)),
-        );
+        let connector =
+            AsyncRustlsConnector::from(tokio_rustls::TlsConnector::from(Arc::new(config)));
         let mut stream = plain
             .into_secure(connector, &session.host)
             .await
             .map_err(|e| BlinkError::connect(format!("ftps tls upgrade: {e}")))?;
+
+        // Handshake succeeded — extract any pin the verifier captured.
+        let new_pin = captured_pin.lock().ok().and_then(|mut g| g.take());
 
         let (user, pw) = if session.username.is_empty() {
             ("anonymous", "anonymous@")
@@ -68,74 +98,150 @@ impl FtpsTransport {
             .await
             .map_err(|e| BlinkError::transport(format!("set binary: {e}")))?;
 
-        Ok(Self { stream })
+        Ok((Self { stream }, new_pin))
     }
 }
 
 ftp_impl::delegate_ftp_transport!(FtpsTransport, Ftps);
 
-/// "Trust everything" certificate verifier for FTPS.
-mod no_verification {
-    use std::sync::Arc;
+/// Certificate verifier used when `accept_invalid_certs = true`.
+///
+/// Always:
+/// - Verifies the server's hostname against the cert SAN/CN.
+/// - Verifies handshake signatures against the cert's public key, using
+///   the ring crypto provider already pulled in by rustls-ring.
+///
+/// For the leaf cert:
+/// - If a pin is stored: requires an exact SHA-256 match (hex,
+///   case-insensitive).
+/// - If no pin is stored: captures the cert hash so the caller can
+///   persist it (Trust On First Use).
+mod pinning {
+    use std::sync::{Arc, Mutex};
 
+    use sha2::{Digest, Sha256};
     use suppaftp::rustls::client::danger::{
         HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
     };
+    use suppaftp::rustls::client::verify_server_name;
+    use suppaftp::rustls::crypto::{
+        self, WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature,
+    };
     use suppaftp::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use suppaftp::rustls::{DigitallySignedStruct, SignatureScheme};
+    use suppaftp::rustls::server::ParsedCertificate;
+    use suppaftp::rustls::{DigitallySignedStruct, Error as TlsError, SignatureScheme};
 
-    #[derive(Debug)]
-    pub struct NoVerification;
+    pub struct PinningVerifier {
+        expected_pin: Option<String>,
+        captured_pin: Arc<Mutex<Option<String>>>,
+        sig_algs: WebPkiSupportedAlgorithms,
+    }
 
-    impl ServerCertVerifier for NoVerification {
+    impl std::fmt::Debug for PinningVerifier {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("PinningVerifier")
+                .field("has_pin", &self.expected_pin.is_some())
+                .finish()
+        }
+    }
+
+    impl PinningVerifier {
+        pub fn new(
+            expected_pin: Option<String>,
+            captured_pin: Arc<Mutex<Option<String>>>,
+        ) -> Self {
+            let sig_algs = crypto::ring::default_provider().signature_verification_algorithms;
+            Self {
+                expected_pin,
+                captured_pin,
+                sig_algs,
+            }
+        }
+    }
+
+    impl ServerCertVerifier for PinningVerifier {
         fn verify_server_cert(
             &self,
-            _end_entity: &CertificateDer<'_>,
+            end_entity: &CertificateDer<'_>,
             _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
+            server_name: &ServerName<'_>,
             _ocsp_response: &[u8],
             _now: UnixTime,
-        ) -> std::result::Result<ServerCertVerified, suppaftp::rustls::Error> {
-            Ok(ServerCertVerified::assertion())
+        ) -> Result<ServerCertVerified, TlsError> {
+            // Hostname binding is mandatory regardless of trust mode —
+            // bypassing chain validation must not bypass the SAN check.
+            let cert = ParsedCertificate::try_from(end_entity)?;
+            verify_server_name(&cert, server_name)?;
+
+            // Compute leaf cert SHA-256, hex-encoded lowercase.
+            let mut hasher = Sha256::new();
+            hasher.update(end_entity.as_ref());
+            let hash = to_hex(&hasher.finalize());
+
+            match &self.expected_pin {
+                Some(expected) => {
+                    if expected.eq_ignore_ascii_case(&hash) {
+                        Ok(ServerCertVerified::assertion())
+                    } else {
+                        Err(TlsError::General(format!(
+                            "FTPS certificate pin mismatch: stored {expected}, server presented {hash}. \
+                             Edit the session to clear the pin if the change is legitimate."
+                        )))
+                    }
+                }
+                None => {
+                    if let Ok(mut g) = self.captured_pin.lock() {
+                        *g = Some(hash);
+                    }
+                    Ok(ServerCertVerified::assertion())
+                }
+            }
         }
 
         fn verify_tls12_signature(
             &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> std::result::Result<HandshakeSignatureValid, suppaftp::rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            verify_tls12_signature(message, cert, dss, &self.sig_algs)
         }
 
         fn verify_tls13_signature(
             &self,
-            _message: &[u8],
-            _cert: &CertificateDer<'_>,
-            _dss: &DigitallySignedStruct,
-        ) -> std::result::Result<HandshakeSignatureValid, suppaftp::rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
+            message: &[u8],
+            cert: &CertificateDer<'_>,
+            dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, TlsError> {
+            verify_tls13_signature(message, cert, dss, &self.sig_algs)
         }
 
         fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            vec![
-                SignatureScheme::RSA_PKCS1_SHA1,
-                SignatureScheme::ECDSA_SHA1_Legacy,
-                SignatureScheme::RSA_PKCS1_SHA256,
-                SignatureScheme::ECDSA_NISTP256_SHA256,
-                SignatureScheme::RSA_PKCS1_SHA384,
-                SignatureScheme::ECDSA_NISTP384_SHA384,
-                SignatureScheme::RSA_PKCS1_SHA512,
-                SignatureScheme::ECDSA_NISTP521_SHA512,
-                SignatureScheme::RSA_PSS_SHA256,
-                SignatureScheme::RSA_PSS_SHA384,
-                SignatureScheme::RSA_PSS_SHA512,
-                SignatureScheme::ED25519,
-                SignatureScheme::ED448,
-            ]
+            self.sig_algs.supported_schemes()
         }
     }
 
-    #[allow(dead_code)]
-    fn _arc_anchor(_: Arc<NoVerification>) {}
+    fn to_hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = write!(&mut out, "{b:02x}");
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::to_hex;
+
+        #[test]
+        fn hex_lowercase() {
+            assert_eq!(to_hex(&[0x00, 0xff, 0xab]), "00ffab");
+        }
+
+        #[test]
+        fn hex_empty() {
+            assert_eq!(to_hex(&[]), "");
+        }
+    }
 }

@@ -167,12 +167,16 @@ async fn run_one(
         // A stalling server (connects but never completes the SSH handshake)
         // would otherwise pin this worker slot for the lifetime of the TCP
         // session. Enforce a hard deadline on connect + auth.
-        let mut transport = tokio::time::timeout(
+        // Workers always inherit the session's pinned cert (set by the
+        // initial UI connect); they don't re-TOFU, so we discard
+        // `new_cert_pin` here.
+        let connected = tokio::time::timeout(
             CONNECT_TIMEOUT,
             transport::open(&session, pw, app_event_tx),
         )
         .await
         .map_err(|_| BlinkError::connect("connection timed out"))??;
+        let mut transport = connected.transport;
         let outcome = match job.direction {
             crate::transfer::Direction::Download => {
                 transport
