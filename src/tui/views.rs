@@ -434,7 +434,7 @@ pub mod confirm_quit {
 
 pub mod confirm_cancel {
     use super::*;
-    use crate::tui::app::PendingCancel;
+    use crate::tui::state::PendingCancel;
 
     pub fn render(f: &mut Frame, app: &App) {
         let area = f.area();
@@ -682,7 +682,7 @@ pub mod connection {
 
 pub mod viewer {
     use super::*;
-    use crate::tui::app::ViewerKind;
+    use crate::tui::state::ViewerKind;
 
     pub fn render(f: &mut Frame, app: &App) {
         let area = f.area();
@@ -1202,8 +1202,8 @@ pub mod confirm_delete {
 
 pub mod confirm_overwrite {
     use super::*;
-    use crate::tui::app::OverwritePending;
     use crate::tui::plan::PlannedJob;
+    use crate::tui::state::OverwritePending;
 
     pub fn render(f: &mut Frame, app: &App) {
         let area = f.area();
@@ -1388,7 +1388,7 @@ pub mod confirm_overwrite {
 
 pub mod edit_session {
     use super::*;
-    use crate::tui::app::EditField;
+    use crate::tui::state::EditField;
 
     pub fn render(f: &mut Frame, app: &App) {
         let area = f.area();

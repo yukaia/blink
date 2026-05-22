@@ -60,7 +60,7 @@ pub enum AppEvent {
     /// post the result back here.
     LocalListed {
         path: String,
-        entries: Vec<crate::tui::app::PaneEntry>,
+        entries: Vec<crate::tui::state::PaneEntry>,
     },
 
     /// Local directory enumeration failed (typically permission denied or

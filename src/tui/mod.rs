@@ -18,6 +18,7 @@ use crate::theme::Theme;
 pub mod app;
 pub mod event;
 pub mod plan;
+pub mod state;
 pub mod views;
 pub mod widgets;
 
