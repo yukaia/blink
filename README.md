@@ -185,21 +185,35 @@ the Connection screen for key and agent auth.
 
 Files live in platform-appropriate locations:
 
-| Path          | Linux / macOS                              | Windows                                      |
-| ------------- | ------------------------------------------ | -------------------------------------------- |
-| Global config | `$XDG_CONFIG_HOME/blink/config.ini` (or `~/.config/blink/`) | `%USERPROFILE%\Documents\blink\config.ini`   |
-| Sessions      | `~/.config/blink/sessions/`                | `%USERPROFILE%\Documents\blink\sessions\`    |
-| Themes        | `~/.config/blink/themes/`                  | `%USERPROFILE%\Documents\blink\themes\`      |
-| Known hosts   | `~/.config/blink/known_hosts`              | `%USERPROFILE%\Documents\blink\known_hosts`  |
-| Checkpoints   | `~/.config/blink/checkpoints/`             | `%USERPROFILE%\Documents\blink\checkpoints\` |
+| Path          | Linux                                                            | macOS                                                | Windows                                       |
+| ------------- | ---------------------------------------------------------------- | ---------------------------------------------------- | --------------------------------------------- |
+| Global config | `$XDG_CONFIG_HOME/blink/config.ini` (else `~/.config/blink/`) | `~/Library/Application Support/blink/config.ini`  | `%USERPROFILE%\Documents\blink\config.ini`   |
+| Sessions      | `~/.config/blink/sessions/`                                       | `~/Library/Application Support/blink/sessions/`       | `%USERPROFILE%\Documents\blink\sessions\`     |
+| Themes        | `~/.config/blink/themes/`                                         | `~/Library/Application Support/blink/themes/`         | `%USERPROFILE%\Documents\blink\themes\`       |
+| Known hosts   | `~/.config/blink/known_hosts`                                     | `~/Library/Application Support/blink/known_hosts`     | `%USERPROFILE%\Documents\blink\known_hosts`   |
+| Checkpoints   | `~/.config/blink/checkpoints/`                                    | `~/Library/Application Support/blink/checkpoints/`    | `%USERPROFILE%\Documents\blink\checkpoints\`  |
+
+macOS honours `XDG_CONFIG_HOME` if explicitly set; otherwise it follows the
+platform's `Library/Application Support` convention.
 
 ### `known_hosts` — SSH host key store
 
 blink maintains its own known-hosts file separate from `~/.ssh/known_hosts`.
-The format is identical to OpenSSH: one entry per line, `hostname:port key-type base64-key`.
+The on-disk format matches OpenSSH: one entry per line, `hostname key-type
+base64-key`. The hostname is stored as a bare lowercased host for the
+default SSH port and `[host]:port` for any other port — exactly as OpenSSH
+writes it. Hashed (`|1|salt|hash`) entries from `HashKnownHosts=yes` aren't
+supported; blink only reads files it wrote itself. Files written by older
+blink versions in the `host:port` form are still accepted on lookup, so
+upgrades don't force re-verification.
 
-When connecting via SFTP or SCP for the first time, blink shows a prompt with
-the server's fingerprint and three choices:
+Match semantics also follow OpenSSH: a host with both an ed25519 and an
+rsa entry is normal multi-algorithm behaviour, not a mismatch. The
+"changed key" hard-reject fires only when the *same* keytype on file
+has a different key blob.
+
+When connecting via SFTP or SCP for the first time, blink shows a prompt
+with the server's SHA-256 fingerprint and three choices:
 
 | Key | Action |
 | --- | ------ |
@@ -207,9 +221,15 @@ the server's fingerprint and three choices:
 | `t` | Trust once — accept for this session only, don't save |
 | `n` / Esc | Reject — abort the connection |
 
-If a host's key changes after being saved, blink hard-rejects the connection
-and shows a warning screen. To reconnect after a legitimate key rotation,
-remove the old entry from the known-hosts file manually and reconnect.
+If a host's key changes after being saved, blink hard-rejects the
+connection and shows a warning screen that only `Enter` / `Esc` / `q`
+dismisses (so a held key can't blow past the warning). To reconnect after
+a legitimate key rotation, remove the old entry from the known-hosts file
+manually and reconnect.
+
+Concurrent appends from two blink processes accepting the same new host
+are serialised through an exclusive advisory file lock, so two parallel
+connects can't write duplicate or interleaved lines.
 
 ### `config.ini` — global
 
@@ -246,12 +266,18 @@ parallel_downloads = 4      ; optional override
 theme = tokyo-night         ; optional override
 
 [tls]
-accept_invalid_certs = false  ; FTPS only; default false. true skips cert
-                              ; validation — use only for self-signed dev
-                              ; servers, never for production.
+accept_invalid_certs = false  ; FTPS only; default false. true switches
+                              ; from CA-chain validation to TOFU pinning:
+                              ; hostname is still verified, the handshake
+                              ; signature is still verified, and the
+                              ; cert SHA-256 is pinned on first connect.
+cert_sha256 = abc123…         ; auto-populated by the TOFU pin above; do
+                              ; not edit by hand. Clear it (delete the
+                              ; line) if the legitimate cert rotates.
 ```
 
-Passwords are never written to disk.
+Passwords are never written to disk; in-memory copies are wiped with
+`zeroize` when the connected session ends.
 
 ### `themes/<name>.ini` — user themes
 
@@ -359,30 +385,41 @@ in `src/preview.rs::is_viewable_text`.
 src/
 ├── main.rs              entrypoint, CLI parsing, terminal lifecycle
 ├── error.rs             one error enum to rule them all
-├── paths.rs             platform-specific config / session / theme / checkpoint dirs
-├── config.rs            global config.ini load / save
+├── paths.rs             platform config / session / theme / checkpoint dirs; sync_parent_dir helper
+├── config.rs            global config.ini load / save (preserves unknown keys)
 ├── session.rs           per-session .ini load / save / list / URL parser
 ├── theme.rs             theme model + 7 built-ins + file loader
-├── checkpoint.rs        walk-plan checkpointing: persist, update, and remove batch state
-├── known_hosts.rs       SSH host-key store: check, append, and remove entries
+├── checkpoint.rs        walk-plan checkpointing: persist, update, remove batch state; debounced fsync writes
+├── known_hosts.rs       SSH host-key store: check / append / remove, OpenSSH-style matching, file lock
 ├── highlight.rs         syntax highlighter for the text viewer (single-pass, zero deps)
 ├── transport/           connection layer
-│   ├── mod.rs           Transport trait + factory + shared types
-│   ├── sftp.rs          SFTP via russh + russh-sftp
+│   ├── mod.rs           Transport trait + factory + Connected struct + part_path helper
+│   ├── sftp.rs          SFTP via russh + russh-sftp (SSH keepalive, rsa-sha2-512)
 │   ├── scp.rs           transparent SFTP wrapper (matches OpenSSH 9.0+)
 │   ├── ftp.rs           FTP via suppaftp tokio backend
-│   ├── ftps.rs          FTPS via suppaftp + rustls (explicit TLS, pure Rust)
+│   ├── ftps.rs          FTPS via suppaftp + rustls; pinning verifier (hostname + signature + cert pin)
 │   └── ftp_impl.rs      shared macro that generates the Transport impl for FTP and FTPS
-├── transfer.rs          TransferManager: queue, state, progress events
+├── transfer.rs          TransferManager: queue, state, progress events; MAX_QUEUED_JOBS cap
 ├── transfer/
-│   └── dispatcher.rs    parallel slot dispatcher; per-job worker tasks
-├── preview.rs           kitty / sixel / iterm2 detection + render backends; file classification; CP437 decoder for NFO files
+│   └── dispatcher.rs    parallel slot dispatcher; per-job worker tasks; zeroized password
+├── preview.rs           kitty / sixel / iterm2 backends; FileViewKind classification; CP437 NFO decoder
 └── tui/
-    ├── mod.rs           terminal init / restore + run loop
-    ├── app.rs           App state machine + recursive walk planning
+    ├── mod.rs           terminal init / restore + top-level run wrappers
     ├── event.rs         keyboard / app-event multiplexer
+    ├── plan.rs          recursive walk planner: PlannedJob, WalkResult, walk_remote / walk_local, conflict probes
+    ├── state.rs         per-modal / per-pane / per-form state types (PaneState, Viewer, PendingHostKey, EditSessionForm, …)
     ├── views.rs         render functions per screen / overlay
-    └── widgets.rs       file pane, bottom panel, status bar, transfer strip
+    ├── widgets.rs       file pane, bottom panel, status bar, transfer strip
+    └── app/             the App state machine, split by responsibility
+        ├── mod.rs       struct + new / with_session / run + draw + handle_key dispatcher + connect / disconnect / push_log
+        ├── handlers.rs  per-screen key handlers (one impl App block, all handle_* methods)
+        ├── events.rs    handle_app_event + handle_transfer_event (background-task drain)
+        ├── checkpoint_glue.rs  dispatch_plan / resume_walk / discard_active_checkpoint
+        ├── transfers.rs orchestration: enqueue / walk-spawn / confirm overwrite → dispatch
+        ├── actions.rs   modal openers + submitters + async kickoffs (rename / mkdir / delete / edit-session / search / save-session)
+        ├── panes.rs     pane navigation, cursor, refresh (refresh_local_pane runs on the blocking pool)
+        ├── controls.rs  cancel / pause / theme controls + active_jobs snapshot
+        └── viewer.rs    file viewer (text + image), tokenisation cache, after_draw image-redraw hook
 ```
 
 The trait boundaries that matter for extension:
@@ -410,15 +447,29 @@ terminal. The following properties are enforced in the current codebase.
 ### Protocol
 
 - **SFTP / SCP host-key verification** — unknown keys trigger an interactive
-  prompt; a changed key is a hard rejection with a warning screen. Keys are
-  stored in OpenSSH format under `~/.config/blink/known_hosts`.
+  prompt; a changed key is a hard rejection with a warning screen that
+  only `Enter` / `Esc` / `q` dismisses. Keys are stored in OpenSSH format.
+  Matching follows OpenSSH `(host, keytype)` semantics: multi-algorithm
+  hosts (an ed25519 *and* an rsa entry) coexist normally; "changed key"
+  only fires when the same keytype has a different blob.
+- **SFTP RSA auth uses rsa-sha2-512.** ssh-rsa with SHA-1 has been disabled
+  by default in OpenSSH 8.8+ (September 2021); blink negotiates the
+  modern hash so RSA users don't get an opaque "rejected by server"
+  against any current OpenSSH.
+- **SSH keepalive at 30 s × 3.** An authenticated session with a dead TCP
+  underneath tears down in ~90 s instead of waiting on the OS keepalive
+  (which can run into minutes).
 - **FTPS** — explicit TLS only (RFC 4217), verified against the Mozilla CA
-  bundle via rustls (pure Rust, no system OpenSSL). Certificate verification
-  can be bypassed per-session with `accept_invalid_certs`, but only through an
-  explicit UI opt-in labelled with a ⚠ warning.
-- **30-second connect timeout** — applied to both the primary connection and
-  every parallel worker connection. A server that accepts the TCP socket but
-  stalls the handshake cannot pin connections indefinitely.
+  bundle via rustls (pure Rust, no system OpenSSL).
+- **FTPS hostname + signature verification are mandatory.** Even when
+  `accept_invalid_certs = true` bypasses CA-chain trust, the cert's SAN
+  must still match the configured hostname and the handshake signature
+  must still verify against the cert's public key. The flag also enables
+  TOFU pinning: the leaf cert SHA-256 is recorded in the session on the
+  first connect; subsequent connects require an exact match.
+- **30-second connect timeout** — applied to both the primary connection
+  and every parallel worker connection. A server that accepts the TCP
+  socket but stalls the handshake cannot pin connections indefinitely.
 
 ### Terminal injection prevention
 
@@ -440,6 +491,18 @@ sequence starters) with spaces before being stored or rendered:
 - **Remote path injection** — `join_remote()` strips leading `/` from
   server-supplied names and rejects any `..` component, preventing a server
   from escaping the working directory via path construction.
+- **Recursive walks skip symlinks by default.** A server-side symlink
+  named `passwd` pointing at `/etc/passwd` won't get fetched into the
+  user's destination tree, and an A→B→A symlink cycle can't loop the
+  walker. Single-file `View` of a symlink still works — that's an
+  explicit per-file action.
+- **SFTP recursive delete unlinks symlinks rather than following them.**
+  Some SFTP servers report symlink-to-directory entries with both
+  `is_dir` and `is_symlink` set; a recursive `delete_dir(true)` that
+  followed those could delete files outside the chosen subtree.
+- **Password-in-URL is rejected.** `sftp://alice:hunter2@host/` errors
+  with a pointer at the interactive prompt rather than smuggling the
+  password into the username field and into shell history.
 
 ### Resource limits
 
@@ -447,30 +510,55 @@ sequence starters) with spaces before being stored or rendered:
 | -------- | ----- |
 | Text file preview read | 1 MB (at preview detection; 10 MB at transport) |
 | Image file preview read | 10 MB (at preview detection and transport) |
-| Decoded image dimensions | 4096 × 4096 px |
+| Image decoder pre-decode dimension cap | 4096 × 4096 px |
+| Image decoder max allocation | 128 MiB (enforced *before* full pixel-buffer alloc) |
 | Transfer job queue | 100,000 jobs |
+| Recursive walk plan | 100,000 jobs (bails before materialising the whole tree) |
 | Error string length | 512 characters |
 | Session / config / theme files | 64 KiB each |
 | Checkpoint files | 10 MiB |
 | Known-hosts file | 1 MiB |
 
-Transport-layer read caps are enforced independently of server-reported file
-sizes, so a server that lies in its directory listing cannot bypass them.
+Transport-layer read caps are enforced independently of server-reported
+file sizes, so a server that lies in its directory listing cannot bypass
+them. The image decoder limit is set via `image::Limits` so the decoder
+refuses oversized declarations on the header rather than after the full
+RGBA buffer is already allocated.
 
 ### Credential handling
 
-- Passwords and SSH key passphrases are held in memory only for the duration
-  of the connected session and are never written to disk.
+- Passwords and SSH key passphrases are held in memory only for the
+  duration of the connected session and are never written to disk.
+- In-memory copies are wrapped in `zeroize::Zeroizing<String>` so the
+  underlying allocation is wiped when the credential is dropped (cleared
+  on disconnect / quit / connect failure). A long-running blink process
+  doesn't leave the credential greppable in core dumps after the auth
+  window has closed.
 - Each parallel worker slot opens its own authenticated connection and
-  receives the cached credentials; no shared state crosses task boundaries.
+  receives the cached credentials; no shared state crosses task
+  boundaries.
 
 ### Config and session file safety
 
-- Session, config, and checkpoint files are written atomically (write to
-  `.tmp` sibling, then `rename`) to avoid truncated files on crash.
-- Config directories are created with mode 0700 on Unix (not world-readable).
-- Path-traversal and null-byte validation is applied when loading session and
-  theme names from disk.
+- Session, config, and checkpoint files are written with the full
+  atomic-and-durable pattern: tempfile → `sync_all` → rename →
+  `sync_all` on the parent directory. Without the syncs, a power loss
+  between rename and the filesystem journal commit can leave a
+  zero-byte file or roll the rename back. (Unix only; on Windows the
+  filesystem journals rename through its own ordering rules.)
+- Checkpoint writes during a hot transfer batch are debounced at 250 ms
+  so a 100k-job batch doesn't generate ~200k full plan rewrites. Any
+  lost mark on a crash just causes the affected job to be re-queued on
+  resume — never silently skipped.
+- Downloads write to a `<local>.part` sibling and rename onto the final
+  name only after `flush` + `sync_all`. The user's existing file (if any)
+  isn't truncated until the new download has fsynced cleanly.
+- Config directories are created with mode 0700 on Unix (not
+  world-readable).
+- `Config::save` round-trips unknown INI keys, so hand-edited or
+  forward-compat options aren't silently dropped on a theme cycle.
+- Path-traversal and null-byte validation is applied when loading
+  session and theme names from disk.
 
 ## Honest caveats
 
@@ -483,21 +571,32 @@ A few things worth knowing before you use this in anger:
 - **FTPS uses the embedded Mozilla CA bundle** (`webpki-roots`) for trust
   anchors rather than the system trust store. Self-signed certs and
   privately-rooted CAs aren't trusted by default. The per-session
-  `accept_invalid_certs` toggle (visible in the edit-session form) bypasses
-  all TLS certificate verification — suitable for self-signed dev servers,
-  never for production. There is no option to add a custom CA root without
+  `accept_invalid_certs` toggle (visible in the edit-session form)
+  switches from CA-chain trust to TOFU pinning: the cert hash is
+  recorded on the first connect and subsequent connects require an exact
+  match. Hostname binding and handshake-signature verification stay on
+  in both modes. There is no option to add a custom CA root without
   recompiling.
 - **Passwords are held in memory** for the duration of the connected
-  session. Each parallel transfer slot opens its own connection, so the
-  dispatcher needs credentials to handshake each one. If that's not
-  acceptable for your threat model, use SSH key auth or ssh-agent
-  instead — the key file (or the agent's identity store) stays put and
-  no in-memory copy of the secret is needed.
+  session, but the allocation is zeroised on drop. Each parallel
+  transfer slot opens its own connection, so the dispatcher needs
+  credentials to handshake each one. If that's not acceptable for your
+  threat model, use SSH key auth or ssh-agent instead — the key file
+  (or the agent's identity store) stays put and no in-memory copy of
+  the secret is needed.
 - **Cancellation cascades at both the single-job and batch level.** `c`
   cancels the selected transfer; `C` cancels every active and queued job
   in the same recursive batch. There is no partial-tree cancel (e.g.
   cancelling only a specific subdirectory within a larger walk).
-- **Walk checkpoints survive a clean exit but not a hard kill of a running transfer.** The checkpoint file is written before each batch starts and updated as jobs complete. Jobs are marked `in_progress` when the dispatcher picks them up and `done` when they finish. A crash mid-transfer leaves the job as `in_progress`, which causes it to be re-queued on resume. Retries are safe: partial downloads are overwritten and `mkdir` is idempotent.
+- **Walk checkpoints survive a clean exit *and* most hard kills.** The
+  initial plan is written with `flush()` (synchronous) before any job
+  runs. Per-job state changes are debounced at 250 ms — a crash within
+  that window leaves the affected job in its previous state on resume,
+  which is the same safe outcome as a crash mid-transfer (Pending →
+  re-queued, InProgress → re-queued, Done → re-run). Partial downloads
+  live at `<name>.part`; the final name is only created via rename
+  after fsync. `mkdir` is idempotent on the remote side, so re-runs are
+  safe across the board.
 - **Transfers don't auto-refresh the local pane.** Use F5 to refresh after
   downloads complete.
 
@@ -543,6 +642,9 @@ and do not affect blink's MIT license except where noted.
 | [image](https://github.com/image-rs/image) | image-rs contributors | Image decoding (PNG, JPEG, GIF, WebP) |
 | [base64](https://github.com/marshallpierce/rust-base64) | Marshall Pierce et al. | Base64 encoding for image preview |
 | [chrono](https://github.com/chronotope/chrono) | chronotope contributors | Date / time formatting |
+| [sha2](https://github.com/RustCrypto/hashes) | RustCrypto contributors | SHA-256 for known-hosts disambiguation and FTPS cert pins |
+| [zeroize](https://github.com/RustCrypto/utils/tree/master/zeroize) | RustCrypto contributors | Wipe in-memory passwords on drop |
+| [fs4](https://github.com/al8n/fs4-rs) | fs4 contributors | Cross-platform advisory file locks (known_hosts append) |
 
 ### Apache-2.0
 
