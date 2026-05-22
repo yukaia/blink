@@ -13,7 +13,7 @@ use ratatui::layout::Rect;
 use ratatui::Frame;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::checkpoint::{Checkpoint, CheckpointJob, CheckpointKind, JobStatus};
+use crate::checkpoint::Checkpoint;
 use crate::config::Config;
 use crate::error::Result;
 use crate::preview::{self, FileViewKind};
@@ -253,6 +253,7 @@ pub struct App {
     autoconnect: Option<Session>,
 }
 
+mod checkpoint_glue;
 mod events;
 mod handlers;
 
@@ -855,24 +856,6 @@ impl App {
         self.screen = Screen::ConfirmCancel;
     }
 
-    /// Remove the active checkpoint from memory and delete its file on disk.
-    ///
-    /// Called when a whole batch is cancelled (user pressed `C` and confirmed)
-    /// or when a transfer fails in a way that makes the batch unresumable.
-    /// Soft-failures (e.g. the file was already removed) are logged at `warn`
-    /// and do not abort other work.
-    fn discard_active_checkpoint(&mut self) {
-        if let Some(cp) = self.active_checkpoint.take() {
-            self.checkpoint_job_map.clear();
-            if let Err(e) = Checkpoint::remove(&cp.session, cp.kind) {
-                self.push_log(
-                    LogLevel::Warn,
-                    format!("could not remove checkpoint file: {e}"),
-                );
-            }
-        }
-    }
-
     // -------------------------------------------------------------------
     // Disconnect (return to the session selector)
     // -------------------------------------------------------------------
@@ -1268,221 +1251,6 @@ impl App {
                 kind: Direction::Upload,
             });
         });
-    }
-
-    /// Convert a [`PlannedJob`] sequence into queued transfer jobs. Mkdirs
-    /// land first via `enqueue_mkdir`; files via `enqueue_download` /
-    /// `enqueue_upload`. The dispatcher's parallelism then takes over.
-    ///
-    /// Before any jobs are enqueued, the plan is written to a checkpoint file
-    /// so that a crash or forced quit mid-batch can be resumed with
-    /// `--resume` (CLI) or the `r` key in the Transfers pane.
-    fn dispatch_plan(&mut self, plan: Vec<PlannedJob>, kind: Direction) {
-        let Some(manager) = self.transfer_manager.clone() else {
-            return;
-        };
-
-        // Only allocate a batch id when there's actually a batch — i.e.
-        // more than one file job (mkdirs alone don't count). Single-file
-        // plans get the no-batch path so the existing single-job cancel
-        // covers them; allocating a batch id would just be noise.
-        let file_count = plan
-            .iter()
-            .filter(|j| !matches!(j, PlannedJob::Mkdir { .. }))
-            .count();
-        let batch_id = if file_count > 1 || plan.len() > 1 {
-            Some(manager.allocate_batch_id())
-        } else {
-            None
-        };
-
-        // ---- checkpoint: write before first enqueue so the file exists
-        // even if the app is killed on the first transfer. ---------------
-        let ck_kind = match kind {
-            Direction::Upload => CheckpointKind::Upload,
-            Direction::Download => CheckpointKind::Download,
-            Direction::CreateDir => unreachable!(),
-        };
-        let session_name = self
-            .current_session
-            .as_ref()
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| "default".to_string());
-
-        let ck_jobs: Vec<CheckpointJob> = plan
-            .iter()
-            .map(|pj| match pj {
-                PlannedJob::Mkdir { remote_path } => CheckpointJob::Mkdir {
-                    remote_path: remote_path.clone(),
-                    status: JobStatus::Pending,
-                },
-                PlannedJob::Download { remote_path, local_path } => CheckpointJob::Download {
-                    remote_path: remote_path.clone(),
-                    local_path: local_path.clone(),
-                    status: JobStatus::Pending,
-                },
-                PlannedJob::Upload { local_path, remote_path } => CheckpointJob::Upload {
-                    local_path: local_path.clone(),
-                    remote_path: remote_path.clone(),
-                    status: JobStatus::Pending,
-                },
-            })
-            .collect();
-
-        let mut checkpoint = Checkpoint::new(&session_name, ck_kind, ck_jobs);
-        // First save is critical — it persists the entire plan before any I/O
-        // starts. Use flush() (unconditional) rather than flush_if_due()
-        // because there's no "previous save" to debounce against.
-        if let Err(e) = checkpoint.flush() {
-            self.push_log(
-                LogLevel::Warn,
-                format!("checkpoint save failed (resume unavailable): {e}"),
-            );
-        }
-        self.active_checkpoint = Some(checkpoint);
-        self.checkpoint_job_map.clear();
-        // ---------------------------------------------------------------
-
-        let mut dirs = 0usize;
-        let mut files = 0usize;
-        for (cp_idx, job) in plan.into_iter().enumerate() {
-            let job_id = match (job, batch_id) {
-                (PlannedJob::Mkdir { remote_path }, Some(b)) => {
-                    dirs += 1;
-                    manager.enqueue_mkdir_batched(remote_path, b)
-                }
-                (PlannedJob::Mkdir { remote_path }, None) => {
-                    dirs += 1;
-                    manager.enqueue_mkdir(remote_path)
-                }
-                (
-                    PlannedJob::Download {
-                        remote_path,
-                        local_path,
-                    },
-                    Some(b),
-                ) => {
-                    files += 1;
-                    manager.enqueue_download_batched(remote_path, local_path, b)
-                }
-                (
-                    PlannedJob::Download {
-                        remote_path,
-                        local_path,
-                    },
-                    None,
-                ) => {
-                    files += 1;
-                    manager.enqueue_download(remote_path, local_path)
-                }
-                (
-                    PlannedJob::Upload {
-                        local_path,
-                        remote_path,
-                    },
-                    Some(b),
-                ) => {
-                    files += 1;
-                    manager.enqueue_upload_batched(local_path, remote_path, b)
-                }
-                (
-                    PlannedJob::Upload {
-                        local_path,
-                        remote_path,
-                    },
-                    None,
-                ) => {
-                    files += 1;
-                    manager.enqueue_upload(local_path, remote_path)
-                }
-            };
-            if let Some(id) = job_id {
-                self.checkpoint_job_map.insert(id, cp_idx);
-            }
-        }
-        let label = match kind {
-            Direction::Download => "downloads",
-            Direction::Upload => "uploads",
-            Direction::CreateDir => unreachable!(),
-        };
-        self.push_log(
-            LogLevel::Info,
-            format!("queued {label}: {files} file(s) + {dirs} folder(s)"),
-        );
-    }
-
-    /// Dispatch a *resumed* plan: load the checkpoint for `kind`, skip jobs
-    /// already marked done, and enqueue only the remaining ones.
-    ///
-    /// Called from the `r` keybinding in the Transfers pane (or `--resume`
-    /// at startup). Logs a message if there is nothing to resume.
-    pub fn resume_walk(&mut self, kind: Direction) {
-        let ck_kind = match kind {
-            Direction::Upload => CheckpointKind::Upload,
-            Direction::Download => CheckpointKind::Download,
-            Direction::CreateDir => unreachable!(),
-        };
-        let session_name = self
-            .current_session
-            .as_ref()
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| "default".to_string());
-
-        let checkpoint = match Checkpoint::load(&session_name, ck_kind) {
-            Ok(Some(cp)) => cp,
-            Ok(None) => {
-                self.push_log(LogLevel::Warn, "no checkpoint found to resume".into());
-                return;
-            }
-            Err(e) => {
-                self.push_log(LogLevel::Error, format!("checkpoint load failed: {e}"));
-                return;
-            }
-        };
-
-        let pending = checkpoint.pending_count();
-        let done = checkpoint.done_count();
-        if pending == 0 {
-            self.push_log(
-                LogLevel::Info,
-                "checkpoint is already complete — nothing to resume".into(),
-            );
-            let _ = Checkpoint::remove(&session_name, ck_kind);
-            return;
-        }
-
-        self.push_log(
-            LogLevel::Info,
-            format!(
-                "resuming {}: skipping {done} already-done, re-queuing {pending}",
-                ck_kind.as_str()
-            ),
-        );
-
-        // Rebuild a PlannedJob list from the undone entries only.
-        let resume_plan: Vec<PlannedJob> = checkpoint
-            .jobs
-            .iter()
-            .filter(|j| j.needs_resume())
-            .map(|j| match j {
-                CheckpointJob::Mkdir { remote_path, .. } => PlannedJob::Mkdir {
-                    remote_path: remote_path.clone(),
-                },
-                CheckpointJob::Download { remote_path, local_path, .. } => PlannedJob::Download {
-                    remote_path: remote_path.clone(),
-                    local_path: local_path.clone(),
-                },
-                CheckpointJob::Upload { local_path, remote_path, .. } => PlannedJob::Upload {
-                    local_path: local_path.clone(),
-                    remote_path: remote_path.clone(),
-                },
-            })
-            .collect();
-
-        // dispatch_plan overwrites the checkpoint with a fresh plan covering
-        // only the re-queued jobs, all starting as `pending`. They will
-        // transition through `in_progress` → `done` as they run.
-        self.dispatch_plan(resume_plan, kind);
     }
 
     // -------------------------------------------------------------------
