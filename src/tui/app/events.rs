@@ -292,7 +292,7 @@ impl App {
                                 };
                                 let lines: Vec<String> =
                                     text.lines().map(crate::error::sanitize_line).collect();
-                                let tokens = super::tokenize_lines(&name, &lines);
+                                let tokens = super::viewer::tokenize_lines(&name, &lines);
                                 ViewerKind::Text {
                                     lines,
                                     tokens,
