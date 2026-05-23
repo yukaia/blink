@@ -161,7 +161,13 @@ impl EventStream {
     pub async fn next(&mut self) -> Result<Event> {
         loop {
             tokio::select! {
-                _ = self.tick.tick() => return Ok(Event::Tick),
+                // Bias the arms so keystrokes and app events drain before
+                // the tick. Without this, a burst of app events under
+                // sustained keypress can be starved by tokio's default
+                // pseudo-random arm selection — the symptom is laggy
+                // keyboard response while a recursive walk is feeding
+                // events. Ordering: key → app → tick.
+                biased;
                 ev = self.crossterm.next() => {
                     match ev {
                         Some(Ok(CrosstermEvent::Key(k))) => {
@@ -179,6 +185,7 @@ impl EventStream {
                     }
                 }
                 Some(ev) = self.app.recv() => return Ok(Event::App(ev)),
+                _ = self.tick.tick() => return Ok(Event::Tick),
             }
         }
     }

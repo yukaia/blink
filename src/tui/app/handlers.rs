@@ -20,6 +20,34 @@ use crate::tui::state::{EditField, PendingCancel, ViewerKind};
 
 use super::{App, LogLevel, Pane, Screen};
 
+/// Apply a single text-editing keystroke to `buf` and report whether the
+/// buffer changed.
+///
+/// Handles Backspace (delete one char), Ctrl+U (clear the buffer), and
+/// any printable Char (append). Anything else returns false, letting the
+/// caller's match handle navigation / submit / cancel keys above the
+/// fallthrough arm that invokes this.
+///
+/// Centralises the input-editing semantics so adding (e.g.) Ctrl+W
+/// later is one change site instead of eight.
+fn apply_text_edit(buf: &mut String, key: &KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Backspace => {
+            buf.pop();
+            true
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            buf.clear();
+            true
+        }
+        KeyCode::Char(c) => {
+            buf.push(c);
+            true
+        }
+        _ => false,
+    }
+}
+
 impl App {
     pub(super) fn handle_session_select(&mut self, key: KeyEvent) {
         match key.code {
@@ -102,19 +130,11 @@ impl App {
                     }
                 }
             }
-            KeyCode::Backspace => {
-                self.new_session_input.pop();
-                self.new_session_error = None;
+            _ => {
+                if apply_text_edit(&mut self.new_session_input, &key) {
+                    self.new_session_error = None;
+                }
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.new_session_input.clear();
-                self.new_session_error = None;
-            }
-            KeyCode::Char(c) => {
-                self.new_session_input.push(c);
-                self.new_session_error = None;
-            }
-            _ => {}
         }
     }
 
@@ -151,31 +171,15 @@ impl App {
                     }
                 }
             }
-            KeyCode::Backspace => {
+            _ => {
                 if let Some(f) = self.edit_session_form.as_mut() {
                     if let Some(v) = f.current_value_mut() {
-                        v.pop();
-                        f.error = None;
+                        if apply_text_edit(v, &key) {
+                            f.error = None;
+                        }
                     }
                 }
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if let Some(f) = self.edit_session_form.as_mut() {
-                    if let Some(v) = f.current_value_mut() {
-                        v.clear();
-                        f.error = None;
-                    }
-                }
-            }
-            KeyCode::Char(c) => {
-                if let Some(f) = self.edit_session_form.as_mut() {
-                    if let Some(v) = f.current_value_mut() {
-                        v.push(c);
-                        f.error = None;
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
@@ -232,16 +236,9 @@ impl App {
                 self.pending_password = Some(password.clone());
                 self.start_connect(session, Some(password));
             }
-            KeyCode::Backspace => {
-                self.password_input.pop();
+            _ => {
+                apply_text_edit(&mut self.password_input, &key);
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.password_input.clear();
-            }
-            KeyCode::Char(c) => {
-                self.password_input.push(c);
-            }
-            _ => {}
         }
     }
 
@@ -277,19 +274,11 @@ impl App {
                 self.pending_password = Some(passphrase.clone());
                 self.start_connect(session, Some(passphrase));
             }
-            KeyCode::Backspace => {
-                self.passphrase_input.pop();
-                self.passphrase_error = None;
+            _ => {
+                if apply_text_edit(&mut self.passphrase_input, &key) {
+                    self.passphrase_error = None;
+                }
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.passphrase_input.clear();
-                self.passphrase_error = None;
-            }
-            KeyCode::Char(c) => {
-                self.passphrase_input.push(c);
-                self.passphrase_error = None;
-            }
-            _ => {}
         }
     }
 
@@ -526,19 +515,11 @@ impl App {
                 self.screen = Screen::Main;
             }
             KeyCode::Enter => self.submit_rename(),
-            KeyCode::Backspace => {
-                self.rename_input.pop();
-                self.rename_error = None;
+            _ => {
+                if apply_text_edit(&mut self.rename_input, &key) {
+                    self.rename_error = None;
+                }
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.rename_input.clear();
-                self.rename_error = None;
-            }
-            KeyCode::Char(c) => {
-                self.rename_input.push(c);
-                self.rename_error = None;
-            }
-            _ => {}
         }
     }
 
@@ -550,19 +531,11 @@ impl App {
                 self.screen = Screen::Main;
             }
             KeyCode::Enter => self.submit_mkdir(),
-            KeyCode::Backspace => {
-                self.mkdir_input.pop();
-                self.mkdir_error = None;
+            _ => {
+                if apply_text_edit(&mut self.mkdir_input, &key) {
+                    self.mkdir_error = None;
+                }
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.mkdir_input.clear();
-                self.mkdir_error = None;
-            }
-            KeyCode::Char(c) => {
-                self.mkdir_input.push(c);
-                self.mkdir_error = None;
-            }
-            _ => {}
         }
     }
 
@@ -627,19 +600,11 @@ impl App {
             KeyCode::Down => self.move_search_cursor(1),
             KeyCode::PageUp => self.move_search_cursor(-10),
             KeyCode::PageDown => self.move_search_cursor(10),
-            KeyCode::Backspace => {
-                self.search_input.pop();
-                self.apply_search_filter();
+            _ => {
+                if apply_text_edit(&mut self.search_input, &key) {
+                    self.apply_search_filter();
+                }
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.search_input.clear();
-                self.apply_search_filter();
-            }
-            KeyCode::Char(c) => {
-                self.search_input.push(c);
-                self.apply_search_filter();
-            }
-            _ => {}
         }
     }
 
@@ -689,19 +654,11 @@ impl App {
                     }
                 }
             }
-            KeyCode::Backspace => {
-                self.save_session_input.pop();
-                self.save_session_error = None;
+            _ => {
+                if apply_text_edit(&mut self.save_session_input, &key) {
+                    self.save_session_error = None;
+                }
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.save_session_input.clear();
-                self.save_session_error = None;
-            }
-            KeyCode::Char(c) => {
-                self.save_session_input.push(c);
-                self.save_session_error = None;
-            }
-            _ => {}
         }
     }
 

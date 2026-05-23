@@ -109,7 +109,13 @@ pub mod file_pane {
             } else {
                 crate::transfer::format_bytes(e.size)
             };
-            let used: usize = row.iter().map(|s| s.content.chars().count()).sum();
+            // `Span::width()` returns the *display* width via
+            // `unicode-width`, so a CJK / emoji name in the file pane is
+            // padded based on cells it actually occupies, not on character
+            // count. The previous `chars().count()` re-counted on every
+            // frame for every visible row; this is the cached
+            // unicode-width sum the rest of ratatui already uses.
+            let used: usize = row.iter().map(|s| s.width()).sum();
             let avail = list_area.width as usize;
             let pad = avail.saturating_sub(used + size_str.chars().count() + 2);
             row.push(Span::raw(" ".repeat(pad)));
@@ -374,7 +380,7 @@ pub mod bottom_pane {
         let start = total.saturating_sub(h);
 
         let mut lines = Vec::with_capacity(area.height as usize);
-        for entry in &app.log[start..] {
+        for entry in app.log.range(start..) {
             let ts = entry.time.format("%H:%M:%S").to_string();
             let level_color = match entry.level {
                 LogLevel::Info => app.theme.dim,

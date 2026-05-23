@@ -163,7 +163,7 @@ pub struct App {
     pub transport: Option<SharedTransport>,
     pub local: PaneState,
     pub remote: PaneState,
-    pub log: Vec<LogLine>,
+    pub log: std::collections::VecDeque<LogLine>,
     #[allow(dead_code)]
     pub transfers: Vec<TransferJob>,
     /// Which page the bottom panel renders. Auto-updated when the user Tabs
@@ -288,7 +288,7 @@ impl App {
             transport: None,
             local,
             remote: PaneState::empty(),
-            log: Vec::new(),
+            log: std::collections::VecDeque::new(),
             transfers: Vec::new(),
             bottom_pane: BottomPane::Log,
             transfer_cursor: 0,
@@ -693,14 +693,15 @@ impl App {
     // -------------------------------------------------------------------
 
     pub fn push_log(&mut self, level: LogLevel, message: String) {
-        self.log.push(LogLine {
+        self.log.push_back(LogLine {
             time: chrono::Local::now(),
             level,
             message,
         });
-        if self.log.len() > 500 {
-            let drop_n = self.log.len() - 500;
-            self.log.drain(0..drop_n);
+        // VecDeque pop_front is O(1); the old Vec drain(0..n) shifted every
+        // remaining element down by N on every overflow.
+        while self.log.len() > 500 {
+            self.log.pop_front();
         }
     }
 }
