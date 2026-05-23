@@ -56,13 +56,12 @@ macro_rules! delegate_ftp_transport {
             }
 
             async fn rename(&mut self, from: &str, to: &str) -> $crate::error::Result<()> {
+                let label = format!("{from} -> {to}");
                 self.stream
                     .rename(from, to)
                     .await
                     .map_err(|e| {
-                        $crate::error::BlinkError::transport(format!(
-                            "rename {from} -> {to}: {e}"
-                        ))
+                        $crate::transport::error_map::map_ftp("rename", &label, e)
                     })
             }
 
@@ -74,9 +73,7 @@ macro_rules! delegate_ftp_transport {
                     .rm(remote_path)
                     .await
                     .map_err(|e| {
-                        $crate::error::BlinkError::transport(format!(
-                            "dele {remote_path}: {e}"
-                        ))
+                        $crate::transport::error_map::map_ftp("dele", remote_path, e)
                     })
             }
 
@@ -139,6 +136,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::error::{self, BlinkError, Result};
+use crate::transport::error_map::map_ftp;
 use crate::transport::{EntryKind, ProgressUpdate, RemoteEntry};
 
 const MAX_PREVIEW_BYTES: u64 = 10_000_000;
@@ -150,7 +148,7 @@ pub async fn ftp_list<T: TokioTlsStream + Send>(
     let lines = stream
         .list(Some(remote_path))
         .await
-        .map_err(|e| BlinkError::transport(format!("list {remote_path}: {e}")))?;
+        .map_err(|e| map_ftp("list", remote_path, e))?;
 
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
@@ -227,13 +225,13 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
         stream
             .resume_transfer(offset as usize)
             .await
-            .map_err(|e| BlinkError::transport(format!("rest {remote_path}: {e}")))?;
+            .map_err(|e| map_ftp("rest", remote_path, e))?;
     }
 
     let mut reader = stream
         .retr_as_stream(remote_path)
         .await
-        .map_err(|e| BlinkError::transport(format!("retr {remote_path}: {e}")))?;
+        .map_err(|e| map_ftp("retr", remote_path, e))?;
 
     let mut local = if offset > 0 {
         tokio::fs::OpenOptions::new()
@@ -279,7 +277,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     stream
         .finalize_retr_stream(reader)
         .await
-        .map_err(|e| BlinkError::transport(format!("finalize retr {remote_path}: {e}")))?;
+        .map_err(|e| map_ftp("finalize retr", remote_path, e))?;
 
     // Only rename once the server confirmed the transfer; otherwise a
     // truncated response could leave a corrupted "complete" file in place.
@@ -302,7 +300,7 @@ pub async fn ftp_upload<T: TokioTlsStream + Send>(
     let mut writer = stream
         .put_with_stream(remote_path)
         .await
-        .map_err(|e| BlinkError::transport(format!("stor {remote_path}: {e}")))?;
+        .map_err(|e| map_ftp("stor", remote_path, e))?;
 
     let mut buf = vec![0u8; 64 * 1024];
     let mut done: u64 = 0;
@@ -330,7 +328,7 @@ pub async fn ftp_upload<T: TokioTlsStream + Send>(
     stream
         .finalize_put_stream(writer)
         .await
-        .map_err(|e| BlinkError::transport(format!("finalize put: {e}")))?;
+        .map_err(|e| map_ftp("finalize put", remote_path, e))?;
     Ok(())
 }
 
@@ -343,7 +341,7 @@ pub async fn ftp_delete_dir<T: TokioTlsStream + Send>(
         return stream
             .rmdir(remote_path)
             .await
-            .map_err(|e| BlinkError::transport(format!("rmd {remote_path}: {e}")));
+            .map_err(|e| map_ftp("rmd", remote_path, e));
     }
 
     enum Op {
@@ -354,9 +352,10 @@ pub async fn ftp_delete_dir<T: TokioTlsStream + Send>(
     while let Some(op) = stack.pop() {
         match op {
             Op::Visit(path) => {
-                let lines = stream.list(Some(&path)).await.map_err(|e| {
-                    BlinkError::transport(format!("list {path}: {e}"))
-                })?;
+                let lines = stream
+                    .list(Some(&path))
+                    .await
+                    .map_err(|e| map_ftp("list", &path, e))?;
                 stack.push(Op::Remove(path.clone()));
                 let mut subdirs: Vec<Op> = Vec::new();
                 for line in lines {
@@ -375,9 +374,10 @@ pub async fn ftp_delete_dir<T: TokioTlsStream + Send>(
                     if parsed.is_directory() {
                         subdirs.push(Op::Visit(child));
                     } else {
-                        stream.rm(&child).await.map_err(|e| {
-                            BlinkError::transport(format!("dele {child}: {e}"))
-                        })?;
+                        stream
+                            .rm(&child)
+                            .await
+                            .map_err(|e| map_ftp("dele", &child, e))?;
                     }
                 }
                 for op in subdirs.into_iter().rev() {
@@ -388,7 +388,7 @@ pub async fn ftp_delete_dir<T: TokioTlsStream + Send>(
                 stream
                     .rmdir(&path)
                     .await
-                    .map_err(|e| BlinkError::transport(format!("rmd {path}: {e}")))?;
+                    .map_err(|e| map_ftp("rmd", &path, e))?;
             }
         }
     }
@@ -410,7 +410,7 @@ pub async fn ftp_mkdir<T: TokioTlsStream + Send>(
     stream
         .mkdir(remote_path)
         .await
-        .map_err(|e| BlinkError::transport(format!("mkd {remote_path}: {e}")))
+        .map_err(|e| map_ftp("mkd", remote_path, e))
 }
 
 pub async fn ftp_metadata<T: TokioTlsStream + Send>(
@@ -423,22 +423,16 @@ pub async fn ftp_metadata<T: TokioTlsStream + Send>(
         None => (".".to_string(), remote_path.to_string()),
     };
 
-    // Only treat "parent directory unavailable" (550) as "file does not
-    // exist"; every other FtpError (connection drop, secure-channel
-    // failure, unexpected response code) is a real failure that needs to
-    // propagate. Without this, mid-walk connection drops were being
-    // misreported as "the file disappeared".
-    use suppaftp::{FtpError, Status};
+    // Only treat NotFound as "file does not exist"; every other FtpError
+    // (connection drop, secure-channel failure, unexpected response code)
+    // is a real failure that needs to propagate. Without this, mid-walk
+    // connection drops were being misreported as "the file disappeared".
     let lines = match stream.list(Some(&parent)).await {
         Ok(l) => l,
-        Err(FtpError::UnexpectedResponse(resp)) if resp.status == Status::FileUnavailable => {
-            return Ok(None);
-        }
-        Err(e) => {
-            return Err(BlinkError::transport(format!(
-                "metadata list {parent}: {e}"
-            )));
-        }
+        Err(e) => match map_ftp("metadata list", &parent, e) {
+            BlinkError::NotFound(_) => return Ok(None),
+            err => return Err(err),
+        },
     };
     for line in lines {
         if line.starts_with("total ") {
@@ -495,6 +489,6 @@ pub async fn ftp_read_to_bytes<T: TokioTlsStream + Send + 'static>(
             })
         })
         .await
-        .map_err(|e| BlinkError::transport(format!("retr {remote_path}: {e}")))?;
+        .map_err(|e| map_ftp("retr", remote_path, e))?;
     Ok(Bytes::from(buf))
 }

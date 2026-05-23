@@ -53,6 +53,25 @@ pub enum BlinkError {
     #[error("connection failed: {0}")]
     Connect(String),
 
+    /// Remote path doesn't exist. Distinct from `Transport(...)` so callers
+    /// can short-circuit (e.g. metadata probes that want to return
+    /// `Ok(None)`, or retry loops that should bail instead of backing off).
+    #[error("not found: {0}")]
+    NotFound(String),
+
+    /// Remote rejected the operation for permission / policy reasons. SFTP
+    /// `PermissionDenied` (status 3) and FTP `550 Permission denied` /
+    /// `533 Action denied for policy reasons` end up here.
+    #[error("permission denied: {0}")]
+    Permission(String),
+
+    /// The underlying connection is gone — TCP reset, TLS torn down,
+    /// SSH session closed, FTP control channel dropped. Distinct from
+    /// `Transport(...)` so a UI layer can render this as "lost
+    /// connection" rather than a generic protocol error.
+    #[error("connection lost: {0}")]
+    Disconnected(String),
+
     #[error("transport error: {0}")]
     Transport(String),
 
@@ -76,6 +95,15 @@ impl BlinkError {
     }
     pub fn connect<S: Into<String>>(msg: S) -> Self {
         Self::Connect(sanitize(msg.into()))
+    }
+    pub fn not_found<S: Into<String>>(msg: S) -> Self {
+        Self::NotFound(sanitize(msg.into()))
+    }
+    pub fn permission<S: Into<String>>(msg: S) -> Self {
+        Self::Permission(sanitize(msg.into()))
+    }
+    pub fn disconnected<S: Into<String>>(msg: S) -> Self {
+        Self::Disconnected(sanitize(msg.into()))
     }
     pub fn session_not_found<S: Into<String>>(name: S) -> Self {
         Self::SessionNotFound(sanitize(name.into()))

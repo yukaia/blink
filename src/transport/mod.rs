@@ -33,6 +33,7 @@ pub(crate) fn part_path(local: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+pub(crate) mod error_map;
 pub mod ftp;
 pub(crate) mod ftp_impl;
 pub mod ftps;

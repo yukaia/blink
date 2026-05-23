@@ -23,6 +23,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::error::{self, BlinkError, Result};
 use crate::known_hosts::{self, KeyStatus};
 use crate::session::{AuthMethod, Protocol, Session};
+use crate::transport::error_map::map_sftp;
 use crate::transport::{EntryKind, ProgressUpdate, RemoteEntry, Transport};
 
 /// Cap on bytes read by `read_to_bytes` — matches the image preview limit.
@@ -436,7 +437,7 @@ impl Transport for SftpTransport {
             .sftp
             .read_dir(remote_path)
             .await
-            .map_err(|e| BlinkError::transport(format!("readdir {remote_path}: {e}")))?;
+            .map_err(|e| map_sftp("readdir", remote_path, e))?;
 
         let mut out = Vec::new();
         for e in entries {
@@ -491,7 +492,7 @@ impl Transport for SftpTransport {
             .sftp
             .open_with_flags(remote_path, OpenFlags::READ)
             .await
-            .map_err(|e| BlinkError::transport(format!("open {remote_path}: {e}")))?;
+            .map_err(|e| map_sftp("open", remote_path, e))?;
 
         let reported_size = self
             .sftp
@@ -527,7 +528,7 @@ impl Transport for SftpTransport {
             remote
                 .seek(SeekFrom::Start(offset))
                 .await
-                .map_err(|e| BlinkError::transport(format!("seek {remote_path}: {e}")))?;
+                .map_err(|e| map_sftp("seek", remote_path, e.into()))?;
         }
 
         if let Some(parent) = local_path.parent() {
@@ -583,7 +584,7 @@ impl Transport for SftpTransport {
                 OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
             )
             .await
-            .map_err(|e| BlinkError::transport(format!("open {remote_path}: {e}")))?;
+            .map_err(|e| map_sftp("open", remote_path, e))?;
 
         let mut done: u64 = 0;
         loop {
@@ -605,17 +606,22 @@ impl Transport for SftpTransport {
     }
 
     async fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        // The mapper takes a single `path` for its message; combine
+        // from→to so the user can see both endpoints. NotFound /
+        // PermissionDenied classification still applies — usually
+        // against the source path.
+        let label = format!("{from} -> {to}");
         self.sftp
             .rename(from, to)
             .await
-            .map_err(|e| BlinkError::transport(format!("rename {from} -> {to}: {e}")))
+            .map_err(|e| map_sftp("rename", &label, e))
     }
 
     async fn delete_file(&mut self, remote_path: &str) -> Result<()> {
         self.sftp
             .remove_file(remote_path)
             .await
-            .map_err(|e| BlinkError::transport(format!("remove {remote_path}: {e}")))
+            .map_err(|e| map_sftp("remove", remote_path, e))
     }
 
     async fn delete_dir(&mut self, remote_path: &str, recursive: bool) -> Result<()> {
@@ -624,7 +630,7 @@ impl Transport for SftpTransport {
                 .sftp
                 .remove_dir(remote_path)
                 .await
-                .map_err(|e| BlinkError::transport(format!("rmdir {remote_path}: {e}")));
+                .map_err(|e| map_sftp("rmdir", remote_path, e));
         }
 
         enum Op {
@@ -636,9 +642,11 @@ impl Transport for SftpTransport {
         while let Some(op) = stack.pop() {
             match op {
                 Op::Visit(path) => {
-                    let entries = self.sftp.read_dir(&path).await.map_err(|e| {
-                        BlinkError::transport(format!("readdir {path}: {e}"))
-                    })?;
+                    let entries = self
+                        .sftp
+                        .read_dir(&path)
+                        .await
+                        .map_err(|e| map_sftp("readdir", &path, e))?;
 
                     stack.push(Op::Remove(path.clone()));
 
@@ -657,15 +665,17 @@ impl Transport for SftpTransport {
                         // (and possibly outside the connection's chroot).
                         // Treat any symlink as a leaf and unlink it.
                         if attrs.is_symlink() {
-                            self.sftp.remove_file(&child).await.map_err(|err| {
-                                BlinkError::transport(format!("remove {child}: {err}"))
-                            })?;
+                            self.sftp
+                                .remove_file(&child)
+                                .await
+                                .map_err(|err| map_sftp("remove", &child, err))?;
                         } else if attrs.is_dir() {
                             to_recurse.push(Op::Visit(child));
                         } else {
-                            self.sftp.remove_file(&child).await.map_err(|err| {
-                                BlinkError::transport(format!("remove {child}: {err}"))
-                            })?;
+                            self.sftp
+                                .remove_file(&child)
+                                .await
+                                .map_err(|err| map_sftp("remove", &child, err))?;
                         }
                     }
                     for op in to_recurse.into_iter().rev() {
@@ -673,9 +683,10 @@ impl Transport for SftpTransport {
                     }
                 }
                 Op::Remove(path) => {
-                    self.sftp.remove_dir(&path).await.map_err(|e| {
-                        BlinkError::transport(format!("rmdir {path}: {e}"))
-                    })?;
+                    self.sftp
+                        .remove_dir(&path)
+                        .await
+                        .map_err(|e| map_sftp("rmdir", &path, e))?;
                 }
             }
         }
@@ -694,28 +705,22 @@ impl Transport for SftpTransport {
         self.sftp
             .create_dir(remote_path)
             .await
-            .map_err(|e| BlinkError::transport(format!("mkdir {remote_path}: {e}")))
+            .map_err(|e| map_sftp("mkdir", remote_path, e))
     }
 
     async fn metadata(&mut self, remote_path: &str) -> Result<Option<RemoteEntry>> {
-        use russh_sftp::client::error::Error as SftpError;
-        use russh_sftp::protocol::StatusCode;
         // `Ok(None)` means "this path does not exist on the server" — only
-        // the NoSuchFile status maps there. Everything else (permission
+        // a NotFound classification maps there. Everything else (permission
         // denied, connection dropped, unexpected packet) is a real failure
         // that has to propagate; collapsing it to "not found" was masking
         // mid-walk connection drops as "the file disappeared", which was
         // both wrong and confusing in the TUI log.
         let attrs = match self.sftp.metadata(remote_path).await {
             Ok(a) => a,
-            Err(SftpError::Status(s)) if s.status_code == StatusCode::NoSuchFile => {
-                return Ok(None);
-            }
-            Err(e) => {
-                return Err(BlinkError::transport(format!(
-                    "metadata {remote_path}: {e}"
-                )));
-            }
+            Err(e) => match map_sftp("metadata", remote_path, e) {
+                BlinkError::NotFound(_) => return Ok(None),
+                err => return Err(err),
+            },
         };
         let kind = if attrs.is_dir() {
             EntryKind::Directory
@@ -747,7 +752,7 @@ impl Transport for SftpTransport {
             .sftp
             .open_with_flags(remote_path, OpenFlags::READ)
             .await
-            .map_err(|e| BlinkError::transport(format!("open {remote_path}: {e}")))?;
+            .map_err(|e| map_sftp("open", remote_path, e))?;
         let mut buf = Vec::new();
         remote.take(MAX_PREVIEW_BYTES + 1).read_to_end(&mut buf).await?;
         if buf.len() as u64 > MAX_PREVIEW_BYTES {
