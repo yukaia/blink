@@ -214,9 +214,10 @@ async fn run_one(
 
     match result {
         Ok(()) => manager.mark(id, TransferState::Complete),
-        // Sanitize before storing: BlinkError::Other wraps arbitrary anyhow
-        // chains whose inner messages may not have passed through a sanitizing
-        // constructor and could contain server-controlled text.
+        // Defense-in-depth: re-sanitize at the storage boundary. Every BlinkError
+        // constructor already sanitizes its payload, but `Io(e)` and any future
+        // variant whose Display could pull in unsanitized text would slip past
+        // otherwise — and this state string ends up rendered in the TUI.
         Err(e) => manager.mark(id, TransferState::Failed(error::sanitize(e.to_string()))),
     }
 }

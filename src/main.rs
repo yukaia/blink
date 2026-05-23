@@ -16,7 +16,7 @@ mod transport;
 mod tui;
 
 use crate::config::Config;
-use crate::error::Result;
+use crate::error::{sanitize_display, Result};
 use crate::theme::Theme;
 
 #[derive(Parser, Debug)]
@@ -99,44 +99,6 @@ async fn main() -> Result<()> {
             tui::run_with_session(config, theme, session).await
         }
         Some(Command::Checkpoints { clean, force }) => list_checkpoints(clean, force),
-    }
-}
-
-/// Strip control characters from user-supplied strings before printing them to
-/// the terminal. This prevents ANSI escape sequences embedded in session
-/// names, usernames, or hostnames from injecting terminal commands.
-fn sanitize_display(s: &str) -> std::borrow::Cow<'_, str> {
-    if s.chars().all(|c| !c.is_control()) {
-        std::borrow::Cow::Borrowed(s)
-    } else {
-        std::borrow::Cow::Owned(s.chars().filter(|c| !c.is_control()).collect())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sanitize_display_clean_borrows() {
-        let out = sanitize_display("hello");
-        assert_eq!(&*out, "hello");
-        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
-    }
-
-    #[test]
-    fn sanitize_display_strips_control_chars() {
-        let out = sanitize_display("evil\x1b[31mred\x07");
-        assert!(!out.contains('\x1b'));
-        assert!(!out.contains('\x07'));
-        assert!(out.contains("evil"));
-        assert!(out.contains("red"));
-    }
-
-    #[test]
-    fn sanitize_display_null_byte_stripped() {
-        let out = sanitize_display("host\x00name");
-        assert!(!out.contains('\x00'));
     }
 }
 

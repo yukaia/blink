@@ -45,7 +45,6 @@ clap = { version = "4", features = ["derive"] }
 
 # Errors
 thiserror = "2"
-anyhow = "1"
 
 # Logging
 tracing = "0.1"

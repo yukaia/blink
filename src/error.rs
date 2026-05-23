@@ -1,5 +1,6 @@
 //! One error enum used throughout blink.
 
+use std::borrow::Cow;
 use std::io;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -78,9 +79,6 @@ pub enum BlinkError {
     #[allow(dead_code)]
     #[error("protocol `{0}` is not yet implemented")]
     NotImplemented(&'static str),
-
-    #[error("internal error: {0}")]
-    Other(#[from] anyhow::Error),
 }
 
 impl BlinkError {
@@ -170,6 +168,22 @@ pub(crate) fn sanitize_line(s: &str) -> String {
         .collect()
 }
 
+/// Strip control characters from a user-supplied string before printing it
+/// directly to the terminal (e.g. CLI warnings, session listings).
+///
+/// Returns the input unchanged (as `Cow::Borrowed`) when it has no control
+/// characters, avoiding an allocation on the common case. Otherwise replaces
+/// control characters with a space — same policy as [`sanitize`], so a name
+/// like `host\x00name` becomes `host name` rather than silently collapsing to
+/// `hostname`.
+pub(crate) fn sanitize_display(s: &str) -> Cow<'_, str> {
+    if s.chars().all(|c| !c.is_control()) {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect())
+    }
+}
+
 pub type Result<T> = std::result::Result<T, BlinkError>;
 
 #[cfg(test)]
@@ -219,5 +233,28 @@ mod tests {
         let s = "a\x01b\tc";
         let out = sanitize_line(s);
         assert_eq!(out, "a b\tc");
+    }
+
+    #[test]
+    fn sanitize_display_clean_borrows() {
+        let out = sanitize_display("hello");
+        assert_eq!(&*out, "hello");
+        assert!(matches!(out, Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn sanitize_display_replaces_control_chars() {
+        let out = sanitize_display("evil\x1b[31mred\x07");
+        assert!(!out.contains('\x1b'));
+        assert!(!out.contains('\x07'));
+        assert!(out.contains("evil"));
+        assert!(out.contains("red"));
+        assert!(matches!(out, Cow::Owned(_)));
+    }
+
+    #[test]
+    fn sanitize_display_null_byte_replaced_with_space() {
+        let out = sanitize_display("host\x00name");
+        assert_eq!(&*out, "host name");
     }
 }
