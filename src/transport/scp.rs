@@ -21,20 +21,27 @@
 //! embedded systems, ancient routers); for those, a future revision could
 //! add a real wire-protocol implementation gated on a session option, and
 //! it would slot in here without touching anything else.
-
-use std::path::Path;
+//!
+//! ## Why the macro
+//!
+//! Every method on `Transport` for `ScpTransport` is a one-liner that calls
+//! the corresponding method on `self.inner` (an [`SftpTransport`]). Writing
+//! that out method-for-method invites drift: someone adds a pre-condition
+//! check to `SftpTransport::mkdir` and the SCP wrapper silently misses it,
+//! or the two grow incompatible argument lists during a refactor without
+//! the trait catching it. The [`delegate_inner_transport!`] macro forces
+//! the body of each method to be exactly `self.inner.METHOD(args).await`
+//! so there is no opportunity for the wrapper to introduce its own logic.
 
 use async_trait::async_trait;
-use bytes::Bytes;
-use tokio::sync::mpsc;
 
 use crate::error::Result;
-use crate::session::{Protocol, Session};
+use crate::session::Session;
 use crate::transport::sftp::SftpTransport;
-use crate::transport::{ProgressUpdate, RemoteEntry, Transport};
 
-/// Wraps an [`SftpTransport`] and reports its protocol as [`Protocol::Scp`].
-/// Every other method delegates verbatim.
+/// Wraps an [`SftpTransport`] and reports its protocol as
+/// [`crate::session::Protocol::Scp`]. Every other method delegates verbatim
+/// via [`delegate_inner_transport!`].
 pub struct ScpTransport {
     inner: SftpTransport,
 }
@@ -50,59 +57,97 @@ impl ScpTransport {
     }
 }
 
-#[async_trait]
-impl Transport for ScpTransport {
-    fn protocol(&self) -> Protocol {
-        Protocol::Scp
-    }
+/// Generate a [`Transport`](crate::transport::Transport) impl that forwards
+/// every method to `self.inner.METHOD(...).await`.
+///
+/// `$ty` must have a field `inner` whose type itself implements
+/// [`Transport`](crate::transport::Transport) (currently only
+/// [`SftpTransport`]). `$proto_variant` is the
+/// [`Protocol`](crate::session::Protocol) variant the wrapper should report
+/// from `protocol()`.
+///
+/// Behavioural drift is impossible by construction: the macro never inspects
+/// arguments, so any change to the inner type's behaviour propagates through
+/// untouched.
+macro_rules! delegate_inner_transport {
+    ($ty:ty, $proto_variant:ident) => {
+        #[async_trait]
+        impl $crate::transport::Transport for $ty {
+            fn protocol(&self) -> $crate::session::Protocol {
+                $crate::session::Protocol::$proto_variant
+            }
 
-    async fn list(&mut self, remote_path: &str) -> Result<Vec<RemoteEntry>> {
-        self.inner.list(remote_path).await
-    }
+            async fn list(
+                &mut self,
+                remote_path: &str,
+            ) -> $crate::error::Result<Vec<$crate::transport::RemoteEntry>> {
+                self.inner.list(remote_path).await
+            }
 
-    async fn download(
-        &mut self,
-        remote_path: &str,
-        local_path: &Path,
-        progress: Option<mpsc::UnboundedSender<ProgressUpdate>>,
-    ) -> Result<()> {
-        self.inner.download(remote_path, local_path, progress).await
-    }
+            async fn download(
+                &mut self,
+                remote_path: &str,
+                local_path: &std::path::Path,
+                progress: Option<
+                    tokio::sync::mpsc::UnboundedSender<$crate::transport::ProgressUpdate>,
+                >,
+            ) -> $crate::error::Result<()> {
+                self.inner.download(remote_path, local_path, progress).await
+            }
 
-    async fn upload(
-        &mut self,
-        local_path: &Path,
-        remote_path: &str,
-        progress: Option<mpsc::UnboundedSender<ProgressUpdate>>,
-    ) -> Result<()> {
-        self.inner.upload(local_path, remote_path, progress).await
-    }
+            async fn upload(
+                &mut self,
+                local_path: &std::path::Path,
+                remote_path: &str,
+                progress: Option<
+                    tokio::sync::mpsc::UnboundedSender<$crate::transport::ProgressUpdate>,
+                >,
+            ) -> $crate::error::Result<()> {
+                self.inner.upload(local_path, remote_path, progress).await
+            }
 
-    async fn rename(&mut self, from: &str, to: &str) -> Result<()> {
-        self.inner.rename(from, to).await
-    }
+            async fn rename(&mut self, from: &str, to: &str) -> $crate::error::Result<()> {
+                self.inner.rename(from, to).await
+            }
 
-    async fn delete_file(&mut self, remote_path: &str) -> Result<()> {
-        self.inner.delete_file(remote_path).await
-    }
+            async fn delete_file(
+                &mut self,
+                remote_path: &str,
+            ) -> $crate::error::Result<()> {
+                self.inner.delete_file(remote_path).await
+            }
 
-    async fn delete_dir(&mut self, remote_path: &str, recursive: bool) -> Result<()> {
-        self.inner.delete_dir(remote_path, recursive).await
-    }
+            async fn delete_dir(
+                &mut self,
+                remote_path: &str,
+                recursive: bool,
+            ) -> $crate::error::Result<()> {
+                self.inner.delete_dir(remote_path, recursive).await
+            }
 
-    async fn mkdir(&mut self, remote_path: &str) -> Result<()> {
-        self.inner.mkdir(remote_path).await
-    }
+            async fn mkdir(&mut self, remote_path: &str) -> $crate::error::Result<()> {
+                self.inner.mkdir(remote_path).await
+            }
 
-    async fn metadata(&mut self, remote_path: &str) -> Result<Option<RemoteEntry>> {
-        self.inner.metadata(remote_path).await
-    }
+            async fn metadata(
+                &mut self,
+                remote_path: &str,
+            ) -> $crate::error::Result<Option<$crate::transport::RemoteEntry>> {
+                self.inner.metadata(remote_path).await
+            }
 
-    async fn read_to_bytes(&mut self, remote_path: &str) -> Result<Bytes> {
-        self.inner.read_to_bytes(remote_path).await
-    }
+            async fn read_to_bytes(
+                &mut self,
+                remote_path: &str,
+            ) -> $crate::error::Result<bytes::Bytes> {
+                self.inner.read_to_bytes(remote_path).await
+            }
 
-    async fn close(&mut self) -> Result<()> {
-        self.inner.close().await
-    }
+            async fn close(&mut self) -> $crate::error::Result<()> {
+                self.inner.close().await
+            }
+        }
+    };
 }
+
+delegate_inner_transport!(ScpTransport, Scp);
