@@ -351,7 +351,9 @@ fn scan_string(chars: &[char], from: usize, quote: char) -> (usize, bool) {
     let mut i = from;
     while i < chars.len() {
         if chars[i] == '\\' {
-            i += 2;
+            // A bare trailing backslash before EOL would push i past the
+            // end; cap it so callers can still slice [pos..i] safely.
+            i = (i + 2).min(chars.len());
             continue;
         }
         if chars[i] == quote {
@@ -752,5 +754,110 @@ mod tests {
             .map(|(_, t)| t.as_str())
             .collect();
         assert!(types.contains(&"name"));
+    }
+
+    // ── Pathological / edge inputs ───────────────────────────────────────────
+    //
+    // Regression coverage for inputs that previously panicked or silently
+    // mis-tokenised. Where current behaviour is "good enough but not perfect"
+    // (raw strings, byte-prefixed literals), tests document it explicitly so
+    // any future cleanup is intentional.
+
+    #[test]
+    fn rust_string_trailing_backslash_does_not_panic() {
+        // Before the fix, scan_string would advance i past chars.len() on a
+        // trailing `\`, and the caller's slice would panic. The roundtrip
+        // invariant exercises both the scanner and the slice.
+        let line = r#"let s = "abc\"#;
+        roundtrip(Lang::Rust, line);
+    }
+
+    #[test]
+    fn rust_char_trailing_backslash_does_not_panic() {
+        // Same hazard via the single-quote string path (Rust char literal).
+        let line = r"let c = '\";
+        roundtrip(Lang::Rust, line);
+    }
+
+    #[test]
+    fn rust_only_backslash_inside_quotes_does_not_panic() {
+        // Two-char string body: just one backslash. Unterminated.
+        let line = "\"\\";
+        roundtrip(Lang::Rust, line);
+    }
+
+    #[test]
+    fn rust_escaped_quote_then_eol_does_not_panic() {
+        // `\"` consumes both chars, leaving no closing quote.
+        let line = r#""abc\""#;
+        roundtrip(Lang::Rust, line);
+    }
+
+    #[test]
+    fn rust_byte_char_with_hex_escape() {
+        // b'\xff' — the byte-prefix `b` tokenises as Plain, then the char
+        // literal is a String span. The backslash-x-f-f escape is consumed
+        // by scan_string's escape rule.
+        let line = r"let n = b'\xff';";
+        roundtrip(Lang::Rust, line);
+        let (spans, _) = tokenize(Lang::Rust, line, LineState::default());
+        let str_span = spans
+            .iter()
+            .find(|(k, _)| *k == TokenKind::String)
+            .expect("byte char must tokenise as String");
+        assert_eq!(str_span.1, r"'\xff'");
+    }
+
+    #[test]
+    fn rust_byte_string_b_prefix() {
+        // b"hello" — `b` is currently tokenised as a separate Plain span
+        // rather than being absorbed into the String. Documented behaviour.
+        let line = r#"let bs = b"hello";"#;
+        roundtrip(Lang::Rust, line);
+        let (spans, _) = tokenize(Lang::Rust, line, LineState::default());
+        let str_span = spans
+            .iter()
+            .find(|(k, _)| *k == TokenKind::String)
+            .expect("byte string body must tokenise as String");
+        assert_eq!(str_span.1, r#""hello""#);
+    }
+
+    #[test]
+    fn rust_raw_string_documented_split() {
+        // r"hello" — the `r` prefix is currently tokenised as a Plain
+        // identifier and the `"hello"` portion as a String. Acceptable.
+        let line = r##"let r = r"hello";"##;
+        roundtrip(Lang::Rust, line);
+        let (spans, _) = tokenize(Lang::Rust, line, LineState::default());
+        let strings: Vec<&str> = spans
+            .iter()
+            .filter(|(k, _)| *k == TokenKind::String)
+            .map(|(_, t)| t.as_str())
+            .collect();
+        assert!(strings.iter().any(|s| s.contains("hello")));
+    }
+
+    #[test]
+    fn rust_raw_string_with_hash_documented_partial() {
+        // r#"hello"# — known limitation: only the inner `"..."` portion is
+        // captured; the leading `r#` and trailing `#` fall to Plain. The
+        // important invariant is that we don't panic and we round-trip.
+        let line = r####"let raw = r#"con"tains"#;"####;
+        roundtrip(Lang::Rust, line);
+    }
+
+    #[test]
+    fn empty_string_literal_does_not_panic() {
+        let line = r#"let s = "";"#;
+        roundtrip(Lang::Rust, line);
+        let (spans, _) = tokenize(Lang::Rust, line, LineState::default());
+        assert!(spans.iter().any(|(k, t)| *k == TokenKind::String && t == "\"\""));
+    }
+
+    #[test]
+    fn rust_unterminated_string_does_not_panic() {
+        // Open-quote-no-close: scan_string returns the whole tail as String.
+        let line = r#"println!("oops"#;
+        roundtrip(Lang::Rust, line);
     }
 }
