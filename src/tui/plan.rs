@@ -39,7 +39,7 @@ pub enum PlannedJob {
 /// Output of a recursive walk: the flat job plan plus a count of symlinks
 /// that were deliberately skipped. The caller surfaces the skip count in
 /// the TUI log so the user knows the plan is shorter than the tree.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct WalkResult {
     pub plan: Vec<PlannedJob>,
     pub symlinks_skipped: usize,
@@ -120,12 +120,9 @@ pub async fn walk_remote(
             if entry.name == "." || entry.name == ".." {
                 continue;
             }
-            let safe_name = match safe_local_name(&entry.name) {
-                Some(n) => n,
-                None => {
-                    tracing::warn!("skipping remote entry with unsafe name: {:?}", entry.name);
-                    continue;
-                }
+            let Some(safe_name) = safe_local_name(&entry.name) else {
+                tracing::warn!("skipping remote entry with unsafe name: {:?}", entry.name);
+                continue;
             };
             let remote_child = transport::join_remote(&remote_dir, &entry.name);
             let local_child = local_dir.join(safe_name);
@@ -160,9 +157,7 @@ pub async fn walk_remote(
             }
         }
 
-        for sub in subdirs.into_iter().rev() {
-            stack.push(sub);
-        }
+        stack.extend(subdirs.into_iter().rev());
     }
     Ok(WalkResult {
         plan: out,
@@ -237,9 +232,7 @@ pub async fn walk_local(local_root: &Path, remote_root: &str) -> Result<WalkResu
             // silently — they have no meaningful upload payload.
         }
 
-        for sub in subdirs.into_iter().rev() {
-            stack.push(sub);
-        }
+        stack.extend(subdirs.into_iter().rev());
     }
     Ok(WalkResult {
         plan: out,
