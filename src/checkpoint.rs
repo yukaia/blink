@@ -44,7 +44,7 @@
 //! On resume:
 //! - `done`        → skipped (already transferred successfully)
 //! - `in_progress` → re-queued (the transfer was interrupted; partial files
-//!                   are safe to overwrite)
+//!   are safe to overwrite)
 //! - `pending`     → re-queued (never started)
 //!
 //! ## Crash safety
@@ -123,9 +123,11 @@ impl CheckpointKind {
 /// crash always leaves a recoverable state on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum JobStatus {
     /// Job has not been handed to the dispatcher yet (or was re-queued after
     /// a resume).
+    #[default]
     Pending,
     /// The dispatcher has started this job but it has not yet completed. If
     /// the process is killed in this state, the job will be re-queued on
@@ -135,11 +137,6 @@ pub enum JobStatus {
     Done,
 }
 
-impl Default for JobStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
 
 /// One entry in the persisted plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]

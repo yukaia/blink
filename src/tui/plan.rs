@@ -258,11 +258,10 @@ pub async fn walk_local(local_root: &Path, remote_root: &str) -> Result<WalkResu
 pub async fn find_download_conflicts(plan: &[PlannedJob]) -> Vec<usize> {
     let mut conflicts = Vec::new();
     for (i, job) in plan.iter().enumerate() {
-        if let PlannedJob::Download { local_path, .. } = job {
-            if tokio::fs::metadata(local_path).await.is_ok() {
+        if let PlannedJob::Download { local_path, .. } = job
+            && tokio::fs::metadata(local_path).await.is_ok() {
                 conflicts.push(i);
             }
-        }
     }
     conflicts
 }

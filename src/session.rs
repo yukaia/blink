@@ -453,12 +453,11 @@ impl Session {
         // Fast path: try the expected filename directly. This is O(1) for the
         // common case where the name maps uniquely to its sanitized filename.
         let candidate = dir.join(Self::name_to_filename(name));
-        if let Ok(s) = Self::load_from(&candidate) {
-            if s.name == name {
+        if let Ok(s) = Self::load_from(&candidate)
+            && s.name == name {
                 fs::remove_file(&candidate)?;
                 return Ok(());
             }
-        }
 
         // Fallback scan: needed when two distinct names produce the same
         // sanitized filename (e.g. "my session" and "my_session").
@@ -471,12 +470,11 @@ impl Session {
             if path.extension().and_then(|s| s.to_str()) != Some("ini") {
                 continue;
             }
-            if let Ok(s) = Self::load_from(&path) {
-                if s.name == name {
+            if let Ok(s) = Self::load_from(&path)
+                && s.name == name {
                     fs::remove_file(&path)?;
                     return Ok(());
                 }
-            }
         }
         Err(BlinkError::session_not_found(name))
     }

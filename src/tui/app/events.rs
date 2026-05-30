@@ -281,8 +281,8 @@ impl App {
             }
             AppEvent::ViewLoaded { name, kind, bytes } => {
                 let mut needs_redraw = false;
-                if let Some(viewer) = self.viewer.as_mut() {
-                    if viewer.name == name {
+                if let Some(viewer) = self.viewer.as_mut()
+                    && viewer.name == name {
                         viewer.kind = match kind {
                             FileViewKind::Text => {
                                 let text = if preview::is_nfo_file(&name) {
@@ -326,18 +326,16 @@ impl App {
                             }
                         };
                     }
-                }
                 if needs_redraw {
                     self.image_needs_redraw = true;
                 }
             }
             AppEvent::ViewFailed { name, error } => {
-                if let Some(viewer) = self.viewer.as_mut() {
-                    if viewer.name == name {
+                if let Some(viewer) = self.viewer.as_mut()
+                    && viewer.name == name {
                         viewer.kind =
                             ViewerKind::Unsupported(format!("read failed: {error}"));
                     }
-                }
                 self.push_log(LogLevel::Error, format!("view {name} failed: {error}"));
             }
             AppEvent::Transfer(ev) => self.handle_transfer_event(ev),
@@ -402,14 +400,13 @@ impl App {
                 // job is re-queued on resume (its file-on-disk state still
                 // says `pending`) — which is the same safe outcome as a
                 // crash mid-transfer, just at a different moment.
-                if let Some(cp_idx) = self.checkpoint_job_map.get(&id).copied() {
-                    if let Some(cp) = self.active_checkpoint.as_mut() {
+                if let Some(cp_idx) = self.checkpoint_job_map.get(&id).copied()
+                    && let Some(cp) = self.active_checkpoint.as_mut() {
                         cp.mark_in_progress(cp_idx);
                         if let Err(e) = cp.flush_if_due() {
                             tracing::warn!(id, cp_idx, "checkpoint in_progress flush failed: {e}");
                         }
                     }
-                }
                 if let Some(j) = lookup(id) {
                     self.push_log(
                         LogLevel::Info,
@@ -425,8 +422,8 @@ impl App {
             TransferEvent::Complete(id) => {
                 // Update in-memory state and either debounce-save (still more
                 // work pending) or delete the file (every job is done).
-                if let Some(cp_idx) = self.checkpoint_job_map.get(&id).copied() {
-                    if let Some(cp) = self.active_checkpoint.as_mut() {
+                if let Some(cp_idx) = self.checkpoint_job_map.get(&id).copied()
+                    && let Some(cp) = self.active_checkpoint.as_mut() {
                         cp.mark_done(cp_idx);
                         // When every job is done, drop the checkpoint file
                         // entirely so a subsequent `r` press doesn't try to
@@ -446,7 +443,6 @@ impl App {
                             tracing::warn!(id, cp_idx, "checkpoint flush failed: {e}");
                         }
                     }
-                }
                 if let Some(j) = lookup(id) {
                     self.push_log(
                         LogLevel::Success,
@@ -487,11 +483,10 @@ impl App {
                 // hits disk: the user is likely to react to the failure by
                 // killing or quitting blink, and we don't want them losing
                 // a debounce-window of completed-job state.
-                if let Some(cp) = self.active_checkpoint.as_mut() {
-                    if let Err(e) = cp.flush() {
+                if let Some(cp) = self.active_checkpoint.as_mut()
+                    && let Err(e) = cp.flush() {
                         tracing::warn!(id, "checkpoint flush after failure failed: {e}");
                     }
-                }
 
                 let label = lookup(id)
                     .map(|j| j.remote_path)

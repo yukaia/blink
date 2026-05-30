@@ -136,17 +136,15 @@ impl BlinkError {
 /// stripped. Strings exceeding the character limit are truncated with `…`.
 pub(crate) fn sanitize(s: String) -> String {
     let mut out = String::with_capacity(s.len().min(MAX_ERR_CHARS + 4));
-    let mut count = 0usize;
     let mut truncated = false;
 
-    for ch in s.chars() {
+    for (count, ch) in s.chars().enumerate() {
         if count >= MAX_ERR_CHARS {
             truncated = true;
             break;
         }
         // Replace control characters (covers ESC and all ANSI sequence starters).
         out.push(if ch.is_control() { ' ' } else { ch });
-        count += 1;
     }
 
     if truncated {

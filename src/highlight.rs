@@ -278,7 +278,7 @@ pub fn tokenize(lang: Lang, line: &str, mut state: LineState) -> (Vec<(TokenKind
         // Number: digits, 0x hex, float with optional exponent.
         if ch.is_ascii_digit()
             || (ch == '.'
-                && chars.get(pos + 1).map_or(false, |c| c.is_ascii_digit()))
+                && chars.get(pos + 1).is_some_and(|c| c.is_ascii_digit()))
         {
             let end = scan_number(&chars, pos);
             emit(&mut spans, TokenKind::Number, &chars[pos..end]);
@@ -305,7 +305,7 @@ pub fn tokenize(lang: Lang, line: &str, mut state: LineState) -> (Vec<(TokenKind
             // YAML key: word immediately followed by ':'
             if lang == Lang::Yaml && chars.get(id_end) == Some(&':') {
                 let after_colon = chars.get(id_end + 1);
-                if after_colon.map_or(true, |&c| c == ' ' || c == '\t') {
+                if after_colon.is_none_or(|&c| c == ' ' || c == '\t') {
                     emit(&mut spans, TokenKind::Type, &chars[pos..id_end]);
                     pos = id_end;
                     continue;
@@ -381,7 +381,7 @@ fn scan_number(chars: &[char], from: usize) -> usize {
     }
     if i < chars.len()
         && chars[i] == '.'
-        && chars.get(i + 1).map_or(false, |c| c.is_ascii_digit())
+        && chars.get(i + 1).is_some_and(|c| c.is_ascii_digit())
     {
         i += 1;
         while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '_') {
@@ -501,12 +501,11 @@ fn emit(spans: &mut Vec<(TokenKind, String)>, kind: TokenKind, chars: &[char]) {
         return;
     }
     let text: String = chars.iter().collect();
-    if let Some(last) = spans.last_mut() {
-        if last.0 == kind {
+    if let Some(last) = spans.last_mut()
+        && last.0 == kind {
             last.1.push_str(&text);
             return;
         }
-    }
     spans.push((kind, text));
 }
 

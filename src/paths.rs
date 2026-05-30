@@ -48,8 +48,8 @@ pub fn checkpoints_dir() -> Result<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn base_dir() -> Result<PathBuf> {
-    if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
+    if let Ok(xdg) = env::var("XDG_CONFIG_HOME")
+        && !xdg.is_empty() {
             let p = PathBuf::from(&xdg);
             if !p.is_absolute() {
                 return Err(BlinkError::config(
@@ -58,7 +58,6 @@ fn base_dir() -> Result<PathBuf> {
             }
             return Ok(p.join(APP_DIR_NAME));
         }
-    }
     let home = env::var("HOME").map_err(|_| BlinkError::config("$HOME is not set"))?;
     let home_path = PathBuf::from(&home);
     if !home_path.is_absolute() {

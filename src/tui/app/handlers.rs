@@ -51,16 +51,14 @@ fn apply_text_edit(buf: &mut String, key: &KeyEvent) -> bool {
 impl App {
     pub(super) fn handle_session_select(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Up => {
-                if self.session_cursor > 0 {
+            KeyCode::Up
+                if self.session_cursor > 0 => {
                     self.session_cursor -= 1;
                 }
-            }
-            KeyCode::Down => {
-                if self.session_cursor + 1 < self.sessions.len() {
+            KeyCode::Down
+                if self.session_cursor + 1 < self.sessions.len() => {
                     self.session_cursor += 1;
                 }
-            }
             KeyCode::Enter => {
                 let Some(s) = self.sessions.get(self.session_cursor).cloned() else {
                     return;
@@ -172,13 +170,11 @@ impl App {
                 }
             }
             _ => {
-                if let Some(f) = self.edit_session_form.as_mut() {
-                    if let Some(v) = f.current_value_mut() {
-                        if apply_text_edit(v, &key) {
+                if let Some(f) = self.edit_session_form.as_mut()
+                    && let Some(v) = f.current_value_mut()
+                        && apply_text_edit(v, &key) {
                             f.error = None;
                         }
-                    }
-                }
             }
         }
     }
@@ -365,28 +361,24 @@ impl App {
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.start_selected_uploads();
             }
-            KeyCode::F(2) => {
-                if self.active_pane == Pane::Remote {
+            KeyCode::F(2)
+                if self.active_pane == Pane::Remote => {
                     self.open_rename();
                 }
-            }
-            KeyCode::F(7) => {
-                if self.active_pane == Pane::Remote {
+            KeyCode::F(7)
+                if self.active_pane == Pane::Remote => {
                     self.open_mkdir();
                 }
-            }
-            KeyCode::Delete if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                if self.active_pane == Pane::Remote {
+            KeyCode::Delete if key.modifiers.contains(KeyModifiers::SHIFT)
+                && self.active_pane == Pane::Remote => {
                     self.open_delete();
                 }
-            }
             // 'D' (uppercase) as an alternative to Shift+Delete for terminals
             // that don't pass that combo cleanly.
-            KeyCode::Char('D') => {
-                if self.active_pane == Pane::Remote {
+            KeyCode::Char('D')
+                if self.active_pane == Pane::Remote => {
                     self.open_delete();
                 }
-            }
             KeyCode::Char('p') => {
                 self.toggle_pause();
             }
@@ -404,11 +396,10 @@ impl App {
             KeyCode::F(5) => {
                 self.refresh_active_pane();
             }
-            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                if self.transport.is_some() {
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL)
+                && self.transport.is_some() => {
                     self.screen = Screen::ConfirmDisconnect;
                 }
-            }
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.previous_screen = Screen::Main;
                 self.screen = Screen::ConfirmQuit;
@@ -488,11 +479,10 @@ impl App {
         };
 
         if let Some(decision) = decision {
-            if let Some(mut phk) = self.pending_host_key.take() {
-                if let Some(tx) = phk.decision_tx.take() {
+            if let Some(mut phk) = self.pending_host_key.take()
+                && let Some(tx) = phk.decision_tx.take() {
                     let _ = tx.send(decision);
                 }
-            }
             // Return to the Connection screen while we wait for the connect
             // task to proceed (or fail). The task is still blocked on the
             // oneshot; it will resume now that we've sent the decision.

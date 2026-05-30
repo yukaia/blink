@@ -154,8 +154,8 @@ impl App {
             Ok(()) => {
                 // If the rename succeeded, drop the old `.ini` file. We do
                 // this AFTER save so a save failure doesn't lose the original.
-                if name != form.original_name {
-                    if let Err(e) = Session::delete(&form.original_name) {
+                if name != form.original_name
+                    && let Err(e) = Session::delete(&form.original_name) {
                         // Soft-failure: the new session is saved, but the old
                         // file stayed behind. Surface as a warn rather than
                         // failing the whole edit.
@@ -166,7 +166,6 @@ impl App {
                             ),
                         );
                     }
-                }
                 self.sessions = Session::list_all().unwrap_or_default();
                 // Keep the cursor pointed at the freshly-edited session if
                 // we can find it, otherwise clamp.

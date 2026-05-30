@@ -103,22 +103,20 @@ impl App {
     }
 
     pub(super) fn viewer_scroll(&mut self, delta: isize) {
-        if let Some(viewer) = self.viewer.as_mut() {
-            if let ViewerKind::Text { lines, scroll, .. } = &mut viewer.kind {
+        if let Some(viewer) = self.viewer.as_mut()
+            && let ViewerKind::Text { lines, scroll, .. } = &mut viewer.kind {
                 let max = lines.len().saturating_sub(1);
                 let next = (*scroll as isize + delta).max(0) as usize;
                 *scroll = next.min(max);
             }
-        }
     }
 
     pub(super) fn viewer_scroll_to(&mut self, target: usize) {
-        if let Some(viewer) = self.viewer.as_mut() {
-            if let ViewerKind::Text { lines, scroll, .. } = &mut viewer.kind {
+        if let Some(viewer) = self.viewer.as_mut()
+            && let ViewerKind::Text { lines, scroll, .. } = &mut viewer.kind {
                 let max = lines.len().saturating_sub(1);
                 *scroll = target.min(max);
             }
-        }
     }
 
     /// Called after each `terminal.draw` to emit graphics escape sequences

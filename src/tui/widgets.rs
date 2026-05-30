@@ -74,7 +74,7 @@ pub mod file_pane {
         let h = list_area.height as usize;
         let len = state.entries.len();
         let cursor = state.cursor.min(len.saturating_sub(1));
-        let window_start = if cursor + 1 > h { cursor + 1 - h } else { 0 };
+        let window_start = (cursor + 1).saturating_sub(h);
         let window_end = (window_start + h).min(len);
 
         let mut lines = Vec::with_capacity(window_end.saturating_sub(window_start));

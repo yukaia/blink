@@ -151,14 +151,13 @@ const MAX_IMAGE_ALLOC: u64 = 128 * 1024 * 1024;
 /// correctly. When the report comes back as zero (some old terminals, the
 /// Windows console host) we fall back to a reasonable default.
 pub fn cell_pixels() -> (u32, u32) {
-    if let Ok(ws) = crossterm::terminal::window_size() {
-        if ws.columns > 0 && ws.rows > 0 && ws.width > 0 && ws.height > 0 {
+    if let Ok(ws) = crossterm::terminal::window_size()
+        && ws.columns > 0 && ws.rows > 0 && ws.width > 0 && ws.height > 0 {
             return (
                 (ws.width as u32 / ws.columns as u32).max(1),
                 (ws.height as u32 / ws.rows as u32).max(1),
             );
         }
-    }
     (FALLBACK_PX_PER_COL, FALLBACK_PX_PER_ROW)
 }
 

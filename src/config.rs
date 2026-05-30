@@ -129,8 +129,8 @@ impl Config {
                 cfg.general.confirm_quit = parse_bool(v)?;
             }
         }
-        if let Some(s) = ini.section(Some("terminal")) {
-            if let Some(v) = s.get("image_preview") {
+        if let Some(s) = ini.section(Some("terminal"))
+            && let Some(v) = s.get("image_preview") {
                 cfg.terminal.image_preview = match v.trim().to_ascii_lowercase().as_str() {
                     "auto" => ImagePreviewMode::Auto,
                     "kitty" => ImagePreviewMode::Kitty,
@@ -144,7 +144,6 @@ impl Config {
                     }
                 };
             }
-        }
         Ok(cfg)
     }
 

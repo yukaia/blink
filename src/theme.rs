@@ -151,8 +151,8 @@ impl Theme {
         use std::collections::BTreeSet;
         let mut set: BTreeSet<String> =
             BUILTIN_NAMES.iter().map(|s| s.to_string()).collect();
-        if let Ok(dir) = paths::themes_dir() {
-            if let Ok(read) = std::fs::read_dir(&dir) {
+        if let Ok(dir) = paths::themes_dir()
+            && let Ok(read) = std::fs::read_dir(&dir) {
                 for entry in read.flatten() {
                     let path = entry.path();
                     if path.extension().and_then(|s| s.to_str()) != Some("ini") {
@@ -163,7 +163,6 @@ impl Theme {
                     }
                 }
             }
-        }
         set.into_iter().collect()
     }
 }
