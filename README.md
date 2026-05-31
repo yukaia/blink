@@ -33,10 +33,10 @@ A cross-platform terminal SFTP / SCP / FTP / FTPS client with a three-pane TUI, 
 - **Substring filter** per pane (`/`), persists across refresh
 - **Refresh** active pane (F5)
 - **Disconnect** and return to the session selector (`Ctrl-X`)
-- **View** text files inline (scrollable, line-numbered) — control and
-  ANSI escape characters are stripped before display to prevent terminal
-  injection; see [Supported viewer formats](#supported-viewer-formats) for
-  the recognised extensions
+- **View** text files inline (scrollable, line-numbered, syntax-highlighted) —
+  control and ANSI escape characters are stripped before display to prevent
+  terminal injection; see [Supported viewer formats](#supported-viewer-formats)
+  for the recognised extensions
 - **View** images via [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/),
   [sixel](https://en.wikipedia.org/wiki/Sixel), and iTerm2 inline images —
   auto-detected, aspect-preserving, terminal-cell-aware scaling
@@ -342,7 +342,7 @@ guessed by content sniffing.
 
 ### Images (any of the three supported terminal graphics protocols)
 
-`.png`, `.jpg` / `.jpeg`, `.gif`, `.webp`, `.bmp`
+`.png`, `.jpg` / `.jpeg`, `.gif`, `.webp`
 
 Display caps at 10 MB to keep encode time bounded.
 
@@ -395,10 +395,11 @@ src/
 ├── transport/           connection layer
 │   ├── mod.rs           Transport trait + factory + Connected struct + part_path helper
 │   ├── sftp.rs          SFTP via russh + russh-sftp (SSH keepalive, rsa-sha2-512)
-│   ├── scp.rs           transparent SFTP wrapper (matches OpenSSH 9.0+)
+│   ├── scp.rs           transparent SFTP wrapper (matches OpenSSH 9.0+); delegates via the delegate_inner_transport! macro
 │   ├── ftp.rs           FTP via suppaftp tokio backend
 │   ├── ftps.rs          FTPS via suppaftp + rustls; pinning verifier (hostname + signature + cert pin)
-│   └── ftp_impl.rs      shared macro that generates the Transport impl for FTP and FTPS
+│   ├── ftp_impl.rs      shared macro that generates the Transport impl for FTP and FTPS
+│   └── error_map.rs     maps russh-sftp / suppaftp errors to typed BlinkError variants (NotFound / Permission / Disconnected)
 ├── transfer.rs          TransferManager: queue, state, progress events; MAX_QUEUED_JOBS cap
 ├── transfer/
 │   └── dispatcher.rs    parallel slot dispatcher; per-job worker tasks; zeroized password
@@ -638,7 +639,6 @@ and do not affect blink's MIT license except where noted.
 | [directories](https://github.com/dirs-dev/directories-rs) | Simon Ochsenreither | Platform config-dir paths |
 | [clap](https://github.com/clap-rs/clap) | clap contributors | CLI argument parsing |
 | [thiserror](https://github.com/dtolnay/thiserror) | David Tolnay | Error derive macro |
-| [anyhow](https://github.com/dtolnay/anyhow) | David Tolnay | Error context chaining |
 | [image](https://github.com/image-rs/image) | image-rs contributors | Image decoding (PNG, JPEG, GIF, WebP) |
 | [base64](https://github.com/marshallpierce/rust-base64) | Marshall Pierce et al. | Base64 encoding for image preview |
 | [chrono](https://github.com/chronotope/chrono) | chronotope contributors | Date / time formatting |

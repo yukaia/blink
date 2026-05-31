@@ -433,7 +433,7 @@ pub fn detect_view_kind(name: &str, size: u64) -> FileViewKind {
 /// can preview.
 pub fn is_previewable_image(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]
+    [".png", ".jpg", ".jpeg", ".gif", ".webp"]
         .iter()
         .any(|ext| lower.ends_with(ext))
 }
