@@ -44,6 +44,11 @@ A cross-platform terminal SFTP / SCP / FTP / FTPS client with a three-pane TUI, 
 ### Transfers
 
 - Parallel slot dispatcher (configurable globally; per-session override)
+- **Pipelined SFTP streams** — each transfer keeps multiple read/write
+  requests in flight at once instead of waiting a full round-trip per
+  chunk, so a single stream is bandwidth-bound rather than latency-bound
+  (the way OpenSSH's own `sftp` client works). This stacks on top of the
+  parallel slot dispatcher for high aggregate throughput
 - Live transfer strip with bytes, percentage, MB/s
 - **Pause / resume** all transfers (`p`)
 - **Cancel** individual in-flight transfers (`c`)
