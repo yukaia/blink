@@ -1107,3 +1107,323 @@ mod tests {
         assert_eq!(read_local_full(&mut src, &mut buf).await.unwrap(), 0);
     }
 }
+
+/// End-to-end test of the real pipelined [`SftpTransport`] download/upload
+/// paths against an in-process russh SSH server fronting a russh-sftp server.
+/// No external SSH daemon is required. The server answers reads in short
+/// slices to exercise `read_full`'s short-read re-request loop, and the test
+/// files are larger than the in-flight window so ordered reassembly is
+/// genuinely stressed.
+#[cfg(test)]
+mod integration {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use russh::server::{Auth, Msg, Session as ServerSession};
+    use russh::{Channel, ChannelId};
+    use russh_sftp::protocol::{
+        Attrs, Data, FileAttributes, Handle as SftpHandle, OpenFlags, Status, StatusCode, Version,
+    };
+    use tokio::sync::Mutex;
+
+    use super::{HostKeyDecision, SftpTransport};
+    use crate::session::{AuthMethod, Protocol, Session};
+    use crate::transport::Transport;
+    use crate::tui::event::AppEvent;
+
+    /// Path -> file contents, shared by every SFTP channel on the connection.
+    type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
+    /// Cap on bytes returned per read reply. Smaller than the transfer chunk so
+    /// each chunk needs several reads, exercising the short-read handling.
+    const SHORT_READ: usize = 60_000;
+
+    // ---- SSH server side ------------------------------------------------
+
+    struct SshServer {
+        channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
+        store: Store,
+    }
+
+    #[async_trait]
+    impl russh::server::Handler for SshServer {
+        type Error = russh::Error;
+
+        async fn auth_password(&mut self, _u: &str, _p: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            channel: Channel<Msg>,
+            _session: &mut ServerSession,
+        ) -> Result<bool, Self::Error> {
+            self.channels.lock().await.insert(channel.id(), channel);
+            Ok(true)
+        }
+
+        async fn subsystem_request(
+            &mut self,
+            id: ChannelId,
+            name: &str,
+            session: &mut ServerSession,
+        ) -> Result<(), Self::Error> {
+            if name == "sftp" {
+                let channel = self
+                    .channels
+                    .lock()
+                    .await
+                    .remove(&id)
+                    .expect("channel was registered on open");
+                session.channel_success(id)?;
+                let sftp = SftpServer {
+                    store: self.store.clone(),
+                };
+                // Spawn instead of awaiting: blink opens a second channel for
+                // the pipelined transfer session, and awaiting the sftp loop
+                // here would block the SSH event loop from ever servicing it.
+                tokio::spawn(russh_sftp::server::run(channel.into_stream(), sftp));
+            } else {
+                session.channel_failure(id)?;
+            }
+            Ok(())
+        }
+    }
+
+    // ---- SFTP server side (minimal, in-memory) --------------------------
+
+    struct SftpServer {
+        store: Store,
+    }
+
+    fn ok_status(id: u32) -> Status {
+        Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".to_string(),
+            language_tag: "en-US".to_string(),
+        }
+    }
+
+    impl russh_sftp::server::Handler for SftpServer {
+        type Error = StatusCode;
+
+        fn unimplemented(&self) -> StatusCode {
+            StatusCode::OpUnsupported
+        }
+
+        async fn init(
+            &mut self,
+            _version: u32,
+            _extensions: HashMap<String, String>,
+        ) -> Result<Version, Self::Error> {
+            Ok(Version::new())
+        }
+
+        async fn open(
+            &mut self,
+            id: u32,
+            filename: String,
+            pflags: OpenFlags,
+            _attrs: FileAttributes,
+        ) -> Result<SftpHandle, Self::Error> {
+            let mut store = self.store.lock().await;
+            if pflags.contains(OpenFlags::WRITE) {
+                // CREATE | TRUNCATE semantics for the upload path.
+                store.insert(filename.clone(), Vec::new());
+            } else if !store.contains_key(&filename) {
+                return Err(StatusCode::NoSuchFile);
+            }
+            Ok(SftpHandle { id, handle: filename })
+        }
+
+        async fn close(&mut self, id: u32, _handle: String) -> Result<Status, Self::Error> {
+            Ok(ok_status(id))
+        }
+
+        async fn read(
+            &mut self,
+            id: u32,
+            handle: String,
+            offset: u64,
+            len: u32,
+        ) -> Result<Data, Self::Error> {
+            let store = self.store.lock().await;
+            let content = store.get(&handle).ok_or(StatusCode::NoSuchFile)?;
+            let off = offset as usize;
+            if off >= content.len() {
+                return Err(StatusCode::Eof);
+            }
+            // Deliberately short: forces the client to re-request the rest.
+            let want = (len as usize).min(SHORT_READ);
+            let end = (off + want).min(content.len());
+            Ok(Data {
+                id,
+                data: content[off..end].to_vec(),
+            })
+        }
+
+        async fn write(
+            &mut self,
+            id: u32,
+            handle: String,
+            offset: u64,
+            data: Vec<u8>,
+        ) -> Result<Status, Self::Error> {
+            let mut store = self.store.lock().await;
+            let content = store.get_mut(&handle).ok_or(StatusCode::NoSuchFile)?;
+            let off = offset as usize;
+            let end = off + data.len();
+            if content.len() < end {
+                content.resize(end, 0);
+            }
+            content[off..end].copy_from_slice(&data);
+            Ok(ok_status(id))
+        }
+
+        async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
+            let store = self.store.lock().await;
+            let size = store.get(&handle).map(|c| c.len() as u64).unwrap_or(0);
+            Ok(Attrs {
+                id,
+                attrs: FileAttributes {
+                    size: Some(size),
+                    ..Default::default()
+                },
+            })
+        }
+
+        async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+            self.fstat(id, path).await
+        }
+    }
+
+    /// Deterministic pseudo-random bytes (xorshift64) so the test is
+    /// reproducible without pulling in an RNG dependency.
+    fn pseudo_random(n: usize) -> Vec<u8> {
+        let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+        (0..n)
+            .map(|_| {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                (s & 0xff) as u8
+            })
+            .collect()
+    }
+
+    async fn start_server(store: Store) -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = Arc::new(russh::server::Config {
+            keys: vec![
+                russh::keys::PrivateKey::random(
+                    &mut russh::keys::ssh_key::rand_core::OsRng,
+                    russh::keys::Algorithm::Ed25519,
+                )
+                .unwrap(),
+            ],
+            ..Default::default()
+        });
+
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let cfg = config.clone();
+                let handler = SshServer {
+                    channels: Arc::new(Mutex::new(HashMap::new())),
+                    store: store.clone(),
+                };
+                tokio::spawn(async move {
+                    // RunningSession is dropped here; the session task it spawns
+                    // keeps running (a dropped JoinHandle detaches, not aborts).
+                    let _ = russh::server::run_stream(cfg, socket, handler).await;
+                });
+            }
+        });
+        port
+    }
+
+    async fn connect(port: u16) -> SftpTransport {
+        let session = Session {
+            name: "it".to_string(),
+            protocol: Protocol::Sftp,
+            host: "127.0.0.1".to_string(),
+            port,
+            username: "tester".to_string(),
+            remote_dir: "/".to_string(),
+            local_dir: None,
+            auth: AuthMethod::Password,
+            parallel_downloads: None,
+            theme: None,
+            accept_invalid_certs: false,
+            cert_sha256: None,
+        };
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let mut fut = Box::pin(SftpTransport::connect(&session, Some("pw"), ev_tx));
+        loop {
+            tokio::select! {
+                res = &mut fut => return res.expect("connect should succeed"),
+                Some(ev) = ev_rx.recv() => {
+                    // First connect to this ephemeral host is always an unknown
+                    // key; trust it for the session so the handshake proceeds.
+                    if let AppEvent::HostKeyUnknown { decision_tx, .. } = ev {
+                        let _ = decision_tx.send(HostKeyDecision::AcceptOnce);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pipelined_download_upload_preserve_bytes() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+
+        // Both files span more than the 16-wide in-flight window and are not
+        // chunk-aligned, so ordered reassembly and the final partial chunk are
+        // both exercised.
+        let download_bytes = pseudo_random(17 * super::TRANSFER_CHUNK + 137);
+        store
+            .lock()
+            .await
+            .insert("/download.bin".to_string(), download_bytes.clone());
+
+        let port = start_server(store.clone()).await;
+        let mut transport = connect(port).await;
+
+        // ---- download ----
+        let dl_dst = std::env::temp_dir().join(format!("blink-it-dl-{port}.bin"));
+        let _ = tokio::fs::remove_file(&dl_dst).await;
+        let _ = tokio::fs::remove_file(crate::transport::part_path(&dl_dst)).await;
+
+        transport
+            .download("/download.bin", &dl_dst, None)
+            .await
+            .expect("download should succeed");
+        let got = tokio::fs::read(&dl_dst).await.unwrap();
+        assert_eq!(got.len(), download_bytes.len(), "downloaded size mismatch");
+        assert!(got == download_bytes, "downloaded bytes mismatch");
+        let _ = tokio::fs::remove_file(&dl_dst).await;
+
+        // ---- upload ----
+        let upload_bytes = pseudo_random(19 * super::TRANSFER_CHUNK + 4096);
+        let ul_src = std::env::temp_dir().join(format!("blink-it-ul-{port}.bin"));
+        tokio::fs::write(&ul_src, &upload_bytes).await.unwrap();
+
+        transport
+            .upload(&ul_src, "/uploaded.bin", None)
+            .await
+            .expect("upload should succeed");
+        let stored = store
+            .lock()
+            .await
+            .get("/uploaded.bin")
+            .cloned()
+            .expect("uploaded file should be present");
+        assert_eq!(stored.len(), upload_bytes.len(), "uploaded size mismatch");
+        assert!(stored == upload_bytes, "uploaded bytes mismatch");
+        let _ = tokio::fs::remove_file(&ul_src).await;
+
+        let _ = transport.close().await;
+    }
+}
