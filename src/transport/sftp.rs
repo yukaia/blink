@@ -12,12 +12,15 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::{FuturesUnordered, StreamExt};
 use russh::client::{self, Handle, Handler};
 use russh::keys::key::PrivateKeyWithHashAlg;
 use russh::keys::{load_secret_key, ssh_key};
-use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::OpenFlags;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use russh_sftp::client::error::Error as SftpError;
+use russh_sftp::client::rawsession::Limits;
+use russh_sftp::client::{RawSftpSession, SftpSession};
+use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{self, BlinkError, Result};
@@ -232,8 +235,37 @@ where
 pub struct SftpTransport {
     handle: Handle<KnownHostsHandler>,
     sftp: SftpSession,
-    buf: Vec<u8>,
+    /// Lazily-opened second SFTP channel used solely for pipelined byte
+    /// transfers; all control ops stay on `sftp`. Opened on the first
+    /// download/upload and reused for the connection's lifetime.
+    transfer: Option<Transfer>,
 }
+
+/// A dedicated SFTP session for bulk transfers, plus the per-direction request
+/// sizes negotiated with the server and whether it supports `fsync`.
+struct Transfer {
+    raw: Arc<RawSftpSession>,
+    read_chunk: usize,
+    write_chunk: usize,
+    fsync: bool,
+}
+
+/// Maximum bytes per SFTP read/write request. Matches russh-sftp's own default
+/// cap (255 KiB); a smaller negotiated server limit clamps it further.
+const TRANSFER_CHUNK: usize = 261_120;
+
+/// Number of SFTP read/write requests kept in flight at once. A single SFTP
+/// stream without pipelining is RTT-bound — one request per network
+/// round-trip — so throughput collapses on anything but a LAN. Overlapping N
+/// requests makes single-stream transfers bandwidth-bound instead, the way
+/// OpenSSH's own sftp client does.
+const TRANSFER_CONCURRENCY: usize = 16;
+
+/// Advertised SSH channel receive window. Must comfortably exceed
+/// `TRANSFER_CHUNK * TRANSFER_CONCURRENCY` (~4 MiB) so pipelined downloads
+/// aren't throttled by flow control before the requests can overlap. This is
+/// an upper bound on in-flight data, not a preallocation.
+const CHANNEL_WINDOW: u32 = 16 * 1024 * 1024;
 
 /// SSH-layer keepalive interval. The russh session sends a global request
 /// at this cadence; if the peer drops the connection or the network
@@ -256,6 +288,7 @@ impl SftpTransport {
         let config = Arc::new(client::Config {
             keepalive_interval: Some(KEEPALIVE_INTERVAL),
             keepalive_max: KEEPALIVE_MAX,
+            window_size: CHANNEL_WINDOW,
             ..client::Config::default()
         });
         let addr = format!("{}:{}", session.host, session.port);
@@ -421,9 +454,254 @@ impl SftpTransport {
         Ok(Self {
             handle,
             sftp,
-            buf: vec![0u8; 64 * 1024],
+            transfer: None,
         })
     }
+
+    /// Open (once) and return the dedicated transfer session. A second SFTP
+    /// channel is used so the high-level `sftp` session keeps serving control
+    /// ops untouched, while bulk transfers drive `RawSftpSession` directly —
+    /// the only way to issue the concurrent, pipelined reads/writes that make
+    /// a single stream fast.
+    async fn transfer_session(&mut self) -> Result<&Transfer> {
+        if self.transfer.is_none() {
+            let channel = self
+                .handle
+                .channel_open_session()
+                .await
+                .map_err(|e| BlinkError::transport(format!("open transfer session: {e}")))?;
+            channel
+                .request_subsystem(true, "sftp")
+                .await
+                .map_err(|e| BlinkError::transport(format!("request sftp: {e}")))?;
+            let mut raw = RawSftpSession::new(channel.into_stream());
+            let version = raw
+                .init()
+                .await
+                .map_err(|e| BlinkError::transport(format!("init sftp: {e}")))?;
+
+            let fsync = version
+                .extensions
+                .get("fsync@openssh.com")
+                .is_some_and(|v| v == "1");
+
+            // Clamp our request size to whatever the server advertises so a
+            // peer with tighter limits than the 255 KiB default doesn't reject
+            // oversized reads/writes.
+            let mut read_chunk = TRANSFER_CHUNK;
+            let mut write_chunk = TRANSFER_CHUNK;
+            if version
+                .extensions
+                .get("limits@openssh.com")
+                .is_some_and(|v| v == "1")
+                && let Ok(ext) = raw.limits().await
+            {
+                let limits = Limits::from(ext);
+                if let Some(r) = limits.read_len {
+                    read_chunk = read_chunk.min(r as usize);
+                }
+                if let Some(w) = limits.write_len {
+                    write_chunk = write_chunk.min(w as usize);
+                }
+                raw.set_limits(Arc::new(limits));
+            }
+
+            self.transfer = Some(Transfer {
+                raw: Arc::new(raw),
+                read_chunk: read_chunk.max(1),
+                write_chunk: write_chunk.max(1),
+                fsync,
+            });
+        }
+        Ok(self.transfer.as_ref().unwrap())
+    }
+}
+
+/// Read the byte range `[offset, offset + len)` fully into a `Vec`, looping to
+/// absorb short reads (SFTP servers may return fewer bytes than requested).
+/// A reply shorter than `len` that isn't itself short — or an `Eof` status —
+/// marks end-of-file, so the returned `Vec` may be shorter than `len` only at
+/// the end of the file.
+async fn read_full(
+    raw: &RawSftpSession,
+    handle: &str,
+    label: &str,
+    offset: u64,
+    len: u32,
+) -> Result<Vec<u8>> {
+    let mut buf = Vec::with_capacity(len as usize);
+    let mut pos = offset;
+    let mut remaining = len;
+    while remaining > 0 {
+        match raw.read(handle, pos, remaining).await {
+            Ok(data) => {
+                if data.data.is_empty() {
+                    break;
+                }
+                let n = data.data.len();
+                buf.extend_from_slice(&data.data);
+                pos += n as u64;
+                remaining = remaining.saturating_sub(n as u32);
+            }
+            Err(SftpError::Status(s)) if s.status_code == StatusCode::Eof => break,
+            Err(e) => return Err(map_sftp("read", label, e)),
+        }
+    }
+    Ok(buf)
+}
+
+/// Yield `(offset, len)` request specs tiling `[start, end)` in `chunk`-sized
+/// pieces. Lazy so a multi-GB file doesn't materialise a giant Vec.
+fn chunk_offsets(start: u64, end: u64, chunk: usize) -> impl Iterator<Item = (u64, u32)> {
+    let chunk = chunk.max(1) as u64;
+    let mut off = start;
+    std::iter::from_fn(move || {
+        if off >= end {
+            return None;
+        }
+        let len = chunk.min(end - off);
+        let spec = (off, len as u32);
+        off += len;
+        Some(spec)
+    })
+}
+
+/// Pipelined download: keep `concurrency` range reads in flight at once and
+/// write their results to `local` in order. When the server reports a size we
+/// tile the range and overlap the requests; otherwise we fall back to a
+/// sequential read-until-EOF.
+#[allow(clippy::too_many_arguments)]
+async fn pipelined_download(
+    raw: &Arc<RawSftpSession>,
+    handle: &str,
+    label: &str,
+    start: u64,
+    size: Option<u64>,
+    chunk: usize,
+    concurrency: usize,
+    local: &mut tokio::fs::File,
+    total: u64,
+    progress: &Option<mpsc::UnboundedSender<ProgressUpdate>>,
+) -> Result<()> {
+    let mut done = start;
+
+    if let Some(end) = size {
+        let mut stream = futures::stream::iter(chunk_offsets(start, end, chunk))
+            .map(|(off, len)| {
+                let raw = Arc::clone(raw);
+                let handle = handle.to_string();
+                let label = label.to_string();
+                async move { read_full(&raw, &handle, &label, off, len).await }
+            })
+            .buffered(concurrency);
+
+        while let Some(chunk) = stream.next().await {
+            let data = chunk?;
+            if data.is_empty() {
+                break;
+            }
+            local.write_all(&data).await?;
+            done += data.len() as u64;
+            if let Some(tx) = progress {
+                let _ = tx.send(ProgressUpdate {
+                    bytes_done: done,
+                    bytes_total: total,
+                });
+            }
+        }
+        drop(stream);
+    }
+
+    // Drain anything past the reported size: a file that grew mid-transfer
+    // would otherwise be silently truncated, and this is the whole transfer
+    // when the size was unknown. Usually a single read that returns EOF.
+    loop {
+        let data = read_full(raw, handle, label, done, chunk as u32).await?;
+        if data.is_empty() {
+            break;
+        }
+        local.write_all(&data).await?;
+        done += data.len() as u64;
+        if let Some(tx) = progress {
+            let _ = tx.send(ProgressUpdate {
+                bytes_done: done,
+                bytes_total: total.max(done),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Fill `buf` from `src`, looping over short reads until full or EOF. Returns
+/// the number of bytes read (`< buf.len()` only at EOF).
+async fn read_local_full<R: tokio::io::AsyncRead + Unpin>(
+    src: &mut R,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = src.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
+}
+
+/// Pipelined upload: read the local file in chunks and keep `concurrency`
+/// writes in flight. Writes carry explicit offsets, so completion order is
+/// irrelevant to correctness; progress reports cumulative acknowledged bytes.
+#[allow(clippy::too_many_arguments)]
+async fn pipelined_upload(
+    raw: &Arc<RawSftpSession>,
+    handle: &str,
+    label: &str,
+    local: &mut tokio::fs::File,
+    chunk: usize,
+    concurrency: usize,
+    total: u64,
+    progress: &Option<mpsc::UnboundedSender<ProgressUpdate>>,
+) -> Result<()> {
+    let chunk = chunk.max(1);
+    let mut inflight = FuturesUnordered::new();
+    let mut offset = 0u64;
+    let mut done = 0u64;
+    let mut eof = false;
+
+    while !eof || !inflight.is_empty() {
+        while !eof && inflight.len() < concurrency {
+            let mut buf = vec![0u8; chunk];
+            let n = read_local_full(local, &mut buf).await?;
+            if n == 0 {
+                eof = true;
+                break;
+            }
+            buf.truncate(n);
+            let off = offset;
+            offset += n as u64;
+            let raw = Arc::clone(raw);
+            let handle = handle.to_string();
+            let label = label.to_string();
+            inflight.push(async move {
+                raw.write(handle, off, buf)
+                    .await
+                    .map(|_| n as u64)
+                    .map_err(|e| map_sftp("write", &label, e))
+            });
+        }
+
+        if let Some(res) = inflight.next().await {
+            done += res?;
+            if let Some(tx) = progress {
+                let _ = tx.send(ProgressUpdate {
+                    bytes_done: done,
+                    bytes_total: total,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -482,24 +760,27 @@ impl Transport for SftpTransport {
 
         // Resume support: if a partial `.part` exists, skip the bytes it
         // already holds so interrupted transfers pick up where they left off.
-        let offset = tokio::fs::metadata(&part)
+        let existing = tokio::fs::metadata(&part)
             .await
             .ok()
             .map(|m| m.len())
             .unwrap_or(0);
 
-        let mut remote = self
-            .sftp
-            .open_with_flags(remote_path, OpenFlags::READ)
-            .await
-            .map_err(|e| map_sftp("open", remote_path, e))?;
+        let xfer = self.transfer_session().await?;
+        let raw = Arc::clone(&xfer.raw);
+        let read_chunk = xfer.read_chunk;
 
-        let reported_size = self
-            .sftp
-            .metadata(remote_path)
+        let remote_handle = raw
+            .open(remote_path, OpenFlags::READ, FileAttributes::default())
+            .await
+            .map_err(|e| map_sftp("open", remote_path, e))?
+            .handle;
+
+        let reported_size = raw
+            .fstat(&remote_handle)
             .await
             .ok()
-            .and_then(|m| m.size);
+            .and_then(|a| a.attrs.size);
 
         let total = reported_size.unwrap_or(0);
 
@@ -509,10 +790,10 @@ impl Transport for SftpTransport {
         // we have no basis for comparison and trust the existing offset; not
         // resetting avoids silently restarting every resumed FTP-style transfer.
         let offset = match reported_size {
-            Some(server_size) if offset > server_size => {
+            Some(server_size) if existing > server_size => {
                 tracing::warn!(
                     remote = %remote_path,
-                    local_bytes = offset,
+                    local_bytes = existing,
                     server_bytes = server_size,
                     "partial file is larger than server file — restarting download",
                 );
@@ -521,15 +802,8 @@ impl Transport for SftpTransport {
                 let _ = tokio::fs::remove_file(&part).await;
                 0
             }
-            _ => offset,
+            _ => existing,
         };
-
-        if offset > 0 {
-            remote
-                .seek(SeekFrom::Start(offset))
-                .await
-                .map_err(|e| map_sftp("seek", remote_path, e.into()))?;
-        }
 
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -543,21 +817,22 @@ impl Transport for SftpTransport {
             tokio::fs::File::create(&part).await?
         };
 
-        let mut done: u64 = offset;
-        loop {
-            let n = remote.read(&mut self.buf).await?;
-            if n == 0 {
-                break;
-            }
-            local.write_all(&self.buf[..n]).await?;
-            done += n as u64;
-            if let Some(tx) = &progress {
-                let _ = tx.send(ProgressUpdate {
-                    bytes_done: done,
-                    bytes_total: total,
-                });
-            }
-        }
+        let result = pipelined_download(
+            &raw,
+            &remote_handle,
+            remote_path,
+            offset,
+            reported_size,
+            read_chunk,
+            TRANSFER_CONCURRENCY,
+            &mut local,
+            total,
+            &progress,
+        )
+        .await;
+        let _ = raw.close(&remote_handle).await;
+        result?;
+
         // Flush + fsync the .part so its bytes are durable, then atomically
         // rename onto the final path. Drop the handle first; renaming an
         // open file is fine on Unix but tokio's tempfile/rename pairing is
@@ -577,32 +852,41 @@ impl Transport for SftpTransport {
     ) -> Result<()> {
         let total = tokio::fs::metadata(local_path).await?.len();
         let mut local = tokio::fs::File::open(local_path).await?;
-        let mut remote = self
-            .sftp
-            .open_with_flags(
+
+        let xfer = self.transfer_session().await?;
+        let raw = Arc::clone(&xfer.raw);
+        let write_chunk = xfer.write_chunk;
+        let do_fsync = xfer.fsync;
+
+        let remote_handle = raw
+            .open(
                 remote_path,
                 OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+                FileAttributes::default(),
             )
             .await
-            .map_err(|e| map_sftp("open", remote_path, e))?;
+            .map_err(|e| map_sftp("open", remote_path, e))?
+            .handle;
 
-        let mut done: u64 = 0;
-        loop {
-            let n = local.read(&mut self.buf).await?;
-            if n == 0 {
-                break;
-            }
-            remote.write_all(&self.buf[..n]).await?;
-            done += n as u64;
-            if let Some(tx) = &progress {
-                let _ = tx.send(ProgressUpdate {
-                    bytes_done: done,
-                    bytes_total: total,
-                });
-            }
+        let result = pipelined_upload(
+            &raw,
+            &remote_handle,
+            remote_path,
+            &mut local,
+            write_chunk,
+            TRANSFER_CONCURRENCY,
+            total,
+            &progress,
+        )
+        .await;
+
+        // Durably flush before closing, but only when the server advertised
+        // fsync support — otherwise the extended request is just rejected.
+        if result.is_ok() && do_fsync {
+            let _ = raw.fsync(&remote_handle).await;
         }
-        remote.flush().await?;
-        Ok(())
+        let _ = raw.close(&remote_handle).await;
+        result
     }
 
     async fn rename(&mut self, from: &str, to: &str) -> Result<()> {
@@ -767,5 +1051,59 @@ impl Transport for SftpTransport {
             .disconnect(russh::Disconnect::ByApplication, "bye", "")
             .await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{chunk_offsets, read_local_full};
+
+    #[test]
+    fn chunk_offsets_splits_evenly() {
+        let v: Vec<_> = chunk_offsets(0, 1000, 250).collect();
+        assert_eq!(v, vec![(0, 250), (250, 250), (500, 250), (750, 250)]);
+    }
+
+    #[test]
+    fn chunk_offsets_handles_remainder() {
+        let v: Vec<_> = chunk_offsets(0, 900, 250).collect();
+        assert_eq!(v, vec![(0, 250), (250, 250), (500, 250), (750, 150)]);
+    }
+
+    #[test]
+    fn chunk_offsets_respects_resume_start() {
+        let v: Vec<_> = chunk_offsets(300, 800, 250).collect();
+        assert_eq!(v, vec![(300, 250), (550, 250)]);
+    }
+
+    #[test]
+    fn chunk_offsets_empty_when_start_at_or_past_end() {
+        assert!(chunk_offsets(500, 500, 250).next().is_none());
+        assert!(chunk_offsets(600, 500, 250).next().is_none());
+    }
+
+    // The contiguity invariant: every byte of [0, end) is covered exactly once,
+    // with no gaps or overlaps. A violation here corrupts a downloaded file.
+    #[test]
+    fn chunk_offsets_tile_contiguously() {
+        let end = 1_000_003u64;
+        let mut expected = 0u64;
+        for (off, len) in chunk_offsets(0, end, 261_120) {
+            assert_eq!(off, expected, "gap or overlap between chunks");
+            assert!(len > 0);
+            expected += len as u64;
+        }
+        assert_eq!(expected, end, "chunks must cover the whole range");
+    }
+
+    #[tokio::test]
+    async fn read_local_full_fills_then_reports_eof() {
+        let mut src = std::io::Cursor::new(vec![7u8; 1000]);
+        let mut buf = vec![0u8; 400];
+
+        assert_eq!(read_local_full(&mut src, &mut buf).await.unwrap(), 400);
+        assert_eq!(read_local_full(&mut src, &mut buf).await.unwrap(), 400);
+        assert_eq!(read_local_full(&mut src, &mut buf).await.unwrap(), 200);
+        assert_eq!(read_local_full(&mut src, &mut buf).await.unwrap(), 0);
     }
 }
