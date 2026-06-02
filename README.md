@@ -92,6 +92,40 @@ cargo build --release
 
 The binary lands in `target/release/blink`.
 
+### Static Linux binary (portable, glibc-free)
+
+A normal `cargo build --release` produces a binary dynamically linked
+against your build machine's glibc. Running it on a host with an older
+glibc fails with errors like `version 'GLIBC_2.39' not found` — common on
+appliances such as TrueNAS SCALE, older Debian/Ubuntu, or any distro you
+don't control.
+
+Because every dependency is pure Rust, blink builds cleanly against musl
+into a **fully static binary with zero libc dependency** that runs on any
+x86-64 Linux regardless of its glibc version.
+
+```sh
+# One-time setup
+rustup target add x86_64-unknown-linux-musl
+# Debian / Ubuntu
+sudo apt install musl-tools
+# Fedora / RHEL
+sudo dnf install musl-gcc musl-libc-static
+
+# Build
+cargo build --release --target x86_64-unknown-linux-musl
+```
+
+Output: `target/x86_64-unknown-linux-musl/release/blink` — a static-PIE
+executable (`ldd` reports `statically linked`).
+
+The musl C compiler (`musl-gcc`) is required because a couple of crypto
+dependencies (`aws-lc-rs`, `ring`) compile C code. The repo's
+`.cargo/config.toml` already points the musl target at `musl-gcc` and sets
+the matching `CC`, so no environment variables are needed — the command
+above works as-is and leaves your normal `cargo build` for local dev
+untouched.
+
 ### Cross-platform notes
 
 - Linux and Windows are the two officially-tested targets

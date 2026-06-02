@@ -1,0 +1,11 @@
+# Static musl build settings so the release binary has zero glibc dependency
+# and runs on any x86-64 Linux (e.g. TrueNAS SCALE) regardless of its glibc.
+#
+#   cargo build --release --target x86_64-unknown-linux-musl
+#
+# The musl C compiler is required because crypto deps (aws-lc-rs, ring) build C.
+[target.x86_64-unknown-linux-musl]
+linker = "musl-gcc"
+
+[env]
+CC_x86_64_unknown_linux_musl = "musl-gcc"
