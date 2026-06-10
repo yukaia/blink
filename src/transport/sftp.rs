@@ -1325,7 +1325,10 @@ mod integration {
             .collect()
     }
 
-    async fn start_server(store: Store) -> u16 {
+    /// Start the in-process SSH+SFTP server. Returns the bound port and a
+    /// counter of accepted TCP connections (used to assert that the
+    /// dispatcher's connection pool actually reuses connections).
+    async fn start_server(store: Store) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let config = Arc::new(russh::server::Config {
@@ -1339,8 +1342,11 @@ mod integration {
             ..Default::default()
         });
 
+        let connects = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connects_l = Arc::clone(&connects);
         tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
+                connects_l.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let cfg = config.clone();
                 let handler = SshServer {
                     channels: Arc::new(Mutex::new(HashMap::new())),
@@ -1353,7 +1359,7 @@ mod integration {
                 });
             }
         });
-        port
+        (port, connects)
     }
 
     async fn connect(port: u16) -> SftpTransport {
@@ -1400,7 +1406,7 @@ mod integration {
             .await
             .insert("/download.bin".to_string(), download_bytes.clone());
 
-        let port = start_server(store.clone()).await;
+        let (port, _connects) = start_server(store.clone()).await;
         let mut transport = connect(port).await;
 
         // ---- download ----
@@ -1437,5 +1443,108 @@ mod integration {
         let _ = tokio::fs::remove_file(&ul_src).await;
 
         let _ = transport.close().await;
+    }
+
+    /// The dispatcher's connection pool must reuse one connection across
+    /// sequential jobs instead of opening a fresh SSH session per job.
+    /// Two downloads at parallelism 1 run strictly back-to-back, so the
+    /// server must see exactly one TCP connection.
+    #[tokio::test]
+    async fn dispatcher_reuses_pooled_connection_across_jobs() {
+        use crate::transfer::{Dispatcher, TransferEvent, TransferManager};
+        use crate::tui::event::AppEvent;
+
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/a.bin".to_string(), pseudo_random(100_000));
+        store
+            .lock()
+            .await
+            .insert("/b.bin".to_string(), pseudo_random(100_000));
+
+        let (port, connects) = start_server(store).await;
+
+        let session = Session {
+            name: "disp".to_string(),
+            protocol: Protocol::Sftp,
+            host: "127.0.0.1".to_string(),
+            port,
+            username: "tester".to_string(),
+            remote_dir: "/".to_string(),
+            local_dir: None,
+            auth: AuthMethod::Password,
+            parallel_downloads: None,
+            theme: None,
+            accept_invalid_certs: false,
+            cert_sha256: None,
+        };
+
+        let dir = std::env::temp_dir().join(format!("blink-disp-{port}"));
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let a_dst = dir.join("a.bin");
+        let b_dst = dir.join("b.bin");
+        for f in [&a_dst, &b_dst] {
+            let _ = tokio::fs::remove_file(f).await;
+            let _ = tokio::fs::remove_file(crate::transport::part_path(f)).await;
+        }
+
+        let (manager, mut events_rx) = TransferManager::new(1);
+        manager
+            .enqueue_download("/a.bin".to_string(), a_dst.clone())
+            .expect("queue a");
+        manager
+            .enqueue_download("/b.bin".to_string(), b_dst.clone())
+            .expect("queue b");
+
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let dispatcher = Dispatcher::spawn(
+            manager.clone(),
+            session,
+            Some(zeroize::Zeroizing::new("pw".to_string())),
+            ev_tx,
+        );
+
+        // Drive both event streams: answer host-key prompts (the ephemeral
+        // test host is always unknown) and count completed transfers.
+        let mut completed = 0usize;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                tokio::select! {
+                    Some(ev) = ev_rx.recv() => {
+                        if let AppEvent::HostKeyUnknown { decision_tx, .. } = ev {
+                            let _ = decision_tx.send(HostKeyDecision::AcceptOnce);
+                        }
+                    }
+                    Some(te) = events_rx.recv() => match te {
+                        TransferEvent::Complete(_) => {
+                            completed += 1;
+                            if completed == 2 {
+                                break;
+                            }
+                        }
+                        TransferEvent::Failed { error, .. } => {
+                            panic!("transfer failed: {error}");
+                        }
+                        _ => {}
+                    },
+                }
+            }
+        })
+        .await
+        .expect("both downloads should complete within 30s");
+
+        dispatcher.shutdown().await;
+
+        assert_eq!(
+            connects.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "second job should reuse the pooled connection, not reconnect"
+        );
+
+        for f in [&a_dst, &b_dst] {
+            let _ = tokio::fs::remove_file(f).await;
+        }
     }
 }
