@@ -242,12 +242,15 @@ pub struct SftpTransport {
 }
 
 /// A dedicated SFTP session for bulk transfers, plus the per-direction request
-/// sizes negotiated with the server and whether it supports `fsync`.
+/// sizes negotiated with the server and which extensions it supports.
 struct Transfer {
     raw: Arc<RawSftpSession>,
     read_chunk: usize,
     write_chunk: usize,
     fsync: bool,
+    /// Server supports `posix-rename@openssh.com` (rename that atomically
+    /// replaces an existing target). Used to finalize uploads.
+    posix_rename: bool,
 }
 
 /// Maximum bytes per SFTP read/write request. Matches russh-sftp's own default
@@ -484,6 +487,10 @@ impl SftpTransport {
                 .extensions
                 .get("fsync@openssh.com")
                 .is_some_and(|v| v == "1");
+            let posix_rename = version
+                .extensions
+                .get("posix-rename@openssh.com")
+                .is_some_and(|v| v == "1");
 
             // Clamp our request size to whatever the server advertises so a
             // peer with tighter limits than the 255 KiB default doesn't reject
@@ -511,6 +518,7 @@ impl SftpTransport {
                 read_chunk: read_chunk.max(1),
                 write_chunk: write_chunk.max(1),
                 fsync,
+                posix_rename,
             });
         }
         Ok(self.transfer.as_ref().unwrap())
@@ -659,6 +667,55 @@ async fn read_local_full<R: tokio::io::AsyncRead + Unpin>(
         filled += n;
     }
     Ok(filled)
+}
+
+/// Move `part` onto `dest`, replacing `dest` if it exists.
+///
+/// Prefers the `posix-rename@openssh.com` extension, which replaces the
+/// target atomically. Without it, SFTP v3 `RENAME` fails on an existing
+/// target, so the fallback is: try the plain rename (covers the common
+/// no-target case), and when it's refused, remove the target and rename
+/// again. That fallback has a non-atomic window, but it only ever exposes
+/// "old file present" or "old file gone, complete new file at `part`" —
+/// never a truncated file under the final name.
+async fn finalize_remote_rename(
+    raw: &RawSftpSession,
+    posix_rename: bool,
+    part: &str,
+    dest: &str,
+) -> Result<()> {
+    if posix_rename {
+        // Payload is two SSH strings (u32 BE length + bytes): oldpath, newpath.
+        let mut data = Vec::with_capacity(8 + part.len() + dest.len());
+        for s in [part, dest] {
+            data.extend_from_slice(&(s.len() as u32).to_be_bytes());
+            data.extend_from_slice(s.as_bytes());
+        }
+        use russh_sftp::protocol::Packet;
+        return match raw.extended("posix-rename@openssh.com", data).await {
+            Ok(Packet::Status(s)) if s.status_code == StatusCode::Ok => Ok(()),
+            Ok(Packet::Status(s)) => {
+                Err(map_sftp("posix-rename", dest, SftpError::Status(s)))
+            }
+            Ok(_) => Err(BlinkError::transport(format!(
+                "posix-rename {dest}: unexpected reply packet"
+            ))),
+            Err(e) => Err(map_sftp("posix-rename", dest, e)),
+        };
+    }
+
+    if raw.rename(part, dest).await.is_ok() {
+        return Ok(());
+    }
+    match raw.remove(dest).await {
+        Ok(_) => {}
+        Err(SftpError::Status(s)) if s.status_code == StatusCode::NoSuchFile => {}
+        Err(e) => return Err(map_sftp("remove", dest, e)),
+    }
+    raw.rename(part, dest)
+        .await
+        .map(|_| ())
+        .map_err(|e| map_sftp("rename", dest, e))
 }
 
 /// Pipelined upload: read the local file in chunks and keep `concurrency`
@@ -869,15 +926,22 @@ impl Transport for SftpTransport {
         let raw = Arc::clone(&xfer.raw);
         let write_chunk = xfer.write_chunk;
         let do_fsync = xfer.fsync;
+        let posix_rename = xfer.posix_rename;
+
+        // Stream into `<remote>.part` and rename onto the final name only
+        // on success — the remote mirror of the download path. An
+        // interrupted or failed upload must never leave a truncated file
+        // under the destination name.
+        let part = format!("{remote_path}.part");
 
         let remote_handle = raw
             .open(
-                remote_path,
+                &part,
                 OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
                 FileAttributes::default(),
             )
             .await
-            .map_err(|e| map_sftp("open", remote_path, e))?
+            .map_err(|e| map_sftp("open", &part, e))?
             .handle;
 
         let result = pipelined_upload(
@@ -898,7 +962,17 @@ impl Transport for SftpTransport {
             let _ = raw.fsync(&remote_handle).await;
         }
         let _ = raw.close(&remote_handle).await;
-        result
+
+        match result {
+            Ok(()) => finalize_remote_rename(&raw, posix_rename, &part, remote_path).await,
+            Err(e) => {
+                // Uploads don't resume, so a partial has no future value —
+                // remove it best-effort so failed uploads don't litter the
+                // server. (Pointless on Disconnected, harmless to try.)
+                let _ = raw.remove(&part).await;
+                Err(e)
+            }
+        }
     }
 
     async fn rename(&mut self, from: &str, to: &str) -> Result<()> {
@@ -1309,6 +1383,37 @@ mod integration {
         async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
             self.fstat(id, path).await
         }
+
+        async fn rename(
+            &mut self,
+            id: u32,
+            oldpath: String,
+            newpath: String,
+        ) -> Result<Status, Self::Error> {
+            let mut store = self.store.lock().await;
+            // SFTP v3 semantics: RENAME fails when the target exists. This
+            // deliberately exercises the client's remove-then-rename
+            // fallback for upload finalization.
+            if store.contains_key(&newpath) {
+                return Err(StatusCode::Failure);
+            }
+            match store.remove(&oldpath) {
+                Some(data) => {
+                    store.insert(newpath, data);
+                    Ok(ok_status(id))
+                }
+                None => Err(StatusCode::NoSuchFile),
+            }
+        }
+
+        async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
+            let mut store = self.store.lock().await;
+            if store.remove(&filename).is_some() {
+                Ok(ok_status(id))
+            } else {
+                Err(StatusCode::NoSuchFile)
+            }
+        }
     }
 
     /// Deterministic pseudo-random bytes (xorshift64) so the test is
@@ -1440,6 +1545,32 @@ mod integration {
             .expect("uploaded file should be present");
         assert_eq!(stored.len(), upload_bytes.len(), "uploaded size mismatch");
         assert!(stored == upload_bytes, "uploaded bytes mismatch");
+        assert!(
+            !store.lock().await.contains_key("/uploaded.bin.part"),
+            "temporary .part must be renamed away after a successful upload"
+        );
+
+        // ---- upload over an existing remote file ----
+        // The test server enforces SFTP v3 rename semantics (fails when the
+        // target exists), so this exercises the remove-then-rename fallback
+        // that finalizes an overwriting upload.
+        let replacement = pseudo_random(3 * super::TRANSFER_CHUNK + 99);
+        tokio::fs::write(&ul_src, &replacement).await.unwrap();
+        transport
+            .upload(&ul_src, "/uploaded.bin", None)
+            .await
+            .expect("overwriting upload should succeed");
+        let stored = store
+            .lock()
+            .await
+            .get("/uploaded.bin")
+            .cloned()
+            .expect("uploaded file should be present");
+        assert!(stored == replacement, "overwritten bytes mismatch");
+        assert!(
+            !store.lock().await.contains_key("/uploaded.bin.part"),
+            "temporary .part must be renamed away after an overwriting upload"
+        );
         let _ = tokio::fs::remove_file(&ul_src).await;
 
         let _ = transport.close().await;

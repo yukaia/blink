@@ -593,6 +593,17 @@ RGBA buffer is already allocated.
 - Downloads write to a `<local>.part` sibling and rename onto the final
   name only after `flush` + `sync_all`. The user's existing file (if any)
   isn't truncated until the new download has fsynced cleanly.
+- Uploads mirror this on the remote side: bytes stream into
+  `<remote>.part` and the final name is only created by rename after the
+  upload completes (and fsyncs, where the server supports
+  `fsync@openssh.com`). SFTP uses `posix-rename@openssh.com` for an
+  atomic replace when the server offers it; otherwise (and on FTP/FTPS,
+  where overwrite-on-rename is server-dependent) the target is removed
+  and the rename retried — that window can expose "old file gone, new
+  file still at `.part`", but never a truncated file under the final
+  name. An upload interrupted by a hard kill or dropped connection can
+  leave a stale `<remote>.part` behind; re-running the upload reuses
+  (truncates) it.
 - Config directories are created with mode 0700 on Unix (not
   world-readable).
 - `Config::save` round-trips unknown INI keys, so hand-edited or

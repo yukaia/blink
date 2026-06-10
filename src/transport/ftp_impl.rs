@@ -331,7 +331,14 @@ pub async fn ftp_upload<T: TokioTlsStream + Send>(
     let total = tokio::fs::metadata(local_path).await?.len();
     let mut local = tokio::fs::File::open(local_path).await?;
 
-    let mut writer = timed_ftp("stor", remote_path, stream.put_with_stream(remote_path)).await?;
+    // Stream into `<remote>.part` and rename onto the final name only on
+    // success, so an interrupted upload never leaves a truncated file under
+    // the destination name. A failed upload may leave the `.part` behind:
+    // after a data-channel error the control channel's state is uncertain,
+    // so we don't risk further commands to clean it up.
+    let part = format!("{remote_path}.part");
+
+    let mut writer = timed_ftp("stor", &part, stream.put_with_stream(&part)).await?;
 
     let mut buf = vec![0u8; 64 * 1024];
     let mut done: u64 = 0;
@@ -356,7 +363,23 @@ pub async fn ftp_upload<T: TokioTlsStream + Send>(
         .flush()
         .await
         .map_err(|e| BlinkError::transport(format!("flush: {e}")))?;
-    timed_ftp("finalize put", remote_path, stream.finalize_put_stream(writer)).await?;
+    timed_ftp("finalize put", &part, stream.finalize_put_stream(writer)).await?;
+
+    // Move the fully-stored `.part` onto the final name. Whether RNTO
+    // replaces an existing target is server-dependent: try the rename
+    // first, and when it's refused, delete the target and retry once.
+    if let Err(first_err) = timed_ftp("rename", remote_path, stream.rename(part.as_str(), remote_path)).await {
+        // A dead control channel won't recover by retrying.
+        if matches!(first_err, BlinkError::Disconnected(_)) {
+            return Err(first_err);
+        }
+        match timed_ftp("dele", remote_path, stream.rm(remote_path)).await {
+            Ok(()) => {}
+            Err(BlinkError::NotFound(_)) => {}
+            Err(e) => return Err(e),
+        }
+        timed_ftp("rename", remote_path, stream.rename(part.as_str(), remote_path)).await?;
+    }
     Ok(())
 }
 
