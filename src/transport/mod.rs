@@ -289,22 +289,18 @@ pub(crate) mod mock {
 
             let mut entries: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             for path in files.keys() {
-                if let Some(rest) = path.strip_prefix(&p) {
-                    if let Some(name) = rest.split('/').next() {
-                        if !name.is_empty() {
-                            entries.insert(name.to_string());
-                        }
+                if let Some(rest) = path.strip_prefix(&p)
+                    && let Some(name) = rest.split('/').next()
+                    && !name.is_empty() {
+                        entries.insert(name.to_string());
                     }
-                }
             }
             for dir in dirs.iter() {
-                if let Some(rest) = dir.strip_prefix(&p) {
-                    if let Some(name) = rest.split('/').next() {
-                        if !name.is_empty() {
-                            entries.insert(name.to_string());
-                        }
+                if let Some(rest) = dir.strip_prefix(&p)
+                    && let Some(name) = rest.split('/').next()
+                    && !name.is_empty() {
+                        entries.insert(name.to_string());
                     }
-                }
             }
 
             let mut out = Vec::new();
@@ -661,7 +657,7 @@ mod tests {
         let mut m = mock::MockTransport::new().with_file("/f", b"12345");
         let meta = m.metadata("/f").await.unwrap().unwrap();
         assert_eq!(meta.name, "f");
-        assert!(meta.is_dir() == false);
+        assert!(!meta.is_dir());
         assert_eq!(meta.size, 5);
     }
 

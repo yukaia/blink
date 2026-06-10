@@ -629,6 +629,18 @@ async fn pipelined_download(
             });
         }
     }
+
+    // The file shrank mid-transfer (a chunk read hit EOF before the size
+    // reported at open). Fail rather than rename a short file onto the
+    // final path as if the download had succeeded; the stale `.part` is
+    // detected and discarded on the next attempt.
+    if let Some(end) = size
+        && done < end {
+            return Err(BlinkError::transport(format!(
+                "{label}: remote file truncated during transfer \
+                 (expected {end} bytes, got {done})"
+            )));
+        }
     Ok(())
 }
 

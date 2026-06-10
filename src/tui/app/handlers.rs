@@ -91,8 +91,7 @@ impl App {
                 self.cycle_theme();
             }
             KeyCode::Char('q') | KeyCode::Esc => {
-                self.previous_screen = Screen::SessionSelect;
-                self.screen = Screen::ConfirmQuit;
+                self.request_quit(Screen::SessionSelect);
             }
             _ => {}
         }
@@ -401,10 +400,20 @@ impl App {
                     self.screen = Screen::ConfirmDisconnect;
                 }
             KeyCode::Char('q') | KeyCode::Esc => {
-                self.previous_screen = Screen::Main;
-                self.screen = Screen::ConfirmQuit;
+                self.request_quit(Screen::Main);
             }
             _ => {}
+        }
+    }
+
+    /// Quit via the confirmation modal, or immediately when the user has
+    /// disabled it with `confirm_quit = false` in config.ini.
+    fn request_quit(&mut self, from: Screen) {
+        if self.config.general.confirm_quit {
+            self.previous_screen = from;
+            self.screen = Screen::ConfirmQuit;
+        } else {
+            self.should_quit = true;
         }
     }
 

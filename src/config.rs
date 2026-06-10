@@ -241,14 +241,14 @@ mod tests {
     #[test]
     fn parse_bool_truthy_values() {
         for s in &["1", "true", "yes", "on", "TRUE", "Yes", " on "] {
-            assert_eq!(parse_bool(s).unwrap(), true, "expected true for {s:?}");
+            assert!(parse_bool(s).unwrap(), "expected true for {s:?}");
         }
     }
 
     #[test]
     fn parse_bool_falsy_values() {
         for s in &["0", "false", "no", "off", "FALSE", "No", " off "] {
-            assert_eq!(parse_bool(s).unwrap(), false, "expected false for {s:?}");
+            assert!(!parse_bool(s).unwrap(), "expected false for {s:?}");
         }
     }
 

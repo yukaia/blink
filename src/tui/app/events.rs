@@ -379,17 +379,13 @@ impl App {
         }
     }
 
-    pub(super) fn handle_transfer_event(&mut self, ev: TransferEvent) {
-        // Look up jobs by id from the manager's snapshot. The manager retains
-        // jobs across state changes, so this works for Started/Complete/Failed
-        // alike.
-        let snapshot = self
-            .transfer_manager
-            .as_ref()
-            .map(|m| m.snapshot())
-            .unwrap_or_default();
-        let lookup = |id: u64| snapshot.iter().find(|j| j.id == id).cloned();
+    /// O(1) lookup of a single job by id. The manager retains jobs across
+    /// state changes, so this works for Started/Complete/Failed alike.
+    fn job_lookup(&self, id: u64) -> Option<crate::transfer::TransferJob> {
+        self.transfer_manager.as_ref().and_then(|m| m.job(id))
+    }
 
+    pub(super) fn handle_transfer_event(&mut self, ev: TransferEvent) {
         match ev {
             TransferEvent::Queued(job) => {
                 self.push_log(LogLevel::Info, format!("queued: {}", job.remote_path));
@@ -407,7 +403,7 @@ impl App {
                             tracing::warn!(id, cp_idx, "checkpoint in_progress flush failed: {e}");
                         }
                     }
-                if let Some(j) = lookup(id) {
+                if let Some(j) = self.job_lookup(id) {
                     self.push_log(
                         LogLevel::Info,
                         format!("downloading: {}", j.remote_path),
@@ -443,7 +439,7 @@ impl App {
                             tracing::warn!(id, cp_idx, "checkpoint flush failed: {e}");
                         }
                     }
-                if let Some(j) = lookup(id) {
+                if let Some(j) = self.job_lookup(id) {
                     self.push_log(
                         LogLevel::Success,
                         format!(
@@ -488,7 +484,8 @@ impl App {
                         tracing::warn!(id, "checkpoint flush after failure failed: {e}");
                     }
 
-                let label = lookup(id)
+                let label = self
+                    .job_lookup(id)
                     .map(|j| j.remote_path)
                     .unwrap_or_else(|| format!("id={id}"));
                 self.push_log(LogLevel::Error, format!("failed: {label}: {error}"));

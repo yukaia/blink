@@ -119,14 +119,14 @@ impl App {
 
         let mut dirs = 0usize;
         let mut files = 0usize;
+        let mut dropped = 0usize;
         for (cp_idx, job) in plan.into_iter().enumerate() {
+            let is_mkdir = matches!(job, PlannedJob::Mkdir { .. });
             let job_id = match (job, batch_id) {
                 (PlannedJob::Mkdir { remote_path }, Some(b)) => {
-                    dirs += 1;
                     manager.enqueue_mkdir_batched(remote_path, b)
                 }
                 (PlannedJob::Mkdir { remote_path }, None) => {
-                    dirs += 1;
                     manager.enqueue_mkdir(remote_path)
                 }
                 (
@@ -135,43 +135,42 @@ impl App {
                         local_path,
                     },
                     Some(b),
-                ) => {
-                    files += 1;
-                    manager.enqueue_download_batched(remote_path, local_path, b)
-                }
+                ) => manager.enqueue_download_batched(remote_path, local_path, b),
                 (
                     PlannedJob::Download {
                         remote_path,
                         local_path,
                     },
                     None,
-                ) => {
-                    files += 1;
-                    manager.enqueue_download(remote_path, local_path)
-                }
+                ) => manager.enqueue_download(remote_path, local_path),
                 (
                     PlannedJob::Upload {
                         local_path,
                         remote_path,
                     },
                     Some(b),
-                ) => {
-                    files += 1;
-                    manager.enqueue_upload_batched(local_path, remote_path, b)
-                }
+                ) => manager.enqueue_upload_batched(local_path, remote_path, b),
                 (
                     PlannedJob::Upload {
                         local_path,
                         remote_path,
                     },
                     None,
-                ) => {
-                    files += 1;
-                    manager.enqueue_upload(local_path, remote_path)
-                }
+                ) => manager.enqueue_upload(local_path, remote_path),
             };
-            if let Some(id) = job_id {
-                self.checkpoint_job_map.insert(id, cp_idx);
+            match job_id {
+                Some(id) => {
+                    self.checkpoint_job_map.insert(id, cp_idx);
+                    if is_mkdir {
+                        dirs += 1;
+                    } else {
+                        files += 1;
+                    }
+                }
+                // Queue cap reached. The job stays `pending` in the
+                // checkpoint, so a later resume picks it up — but the user
+                // must be told the batch was only partially enqueued.
+                None => dropped += 1,
             }
         }
         let label = match kind {
@@ -183,6 +182,19 @@ impl App {
             LogLevel::Info,
             format!("queued {label}: {files} file(s) + {dirs} folder(s)"),
         );
+        if dropped > 0 {
+            self.push_log(
+                LogLevel::Warn,
+                format!(
+                    "transfer queue is full: {dropped} job(s) not enqueued — \
+                     resume ({}) after the queue drains to pick them up",
+                    match kind {
+                        Direction::Download => "r",
+                        _ => "R",
+                    }
+                ),
+            );
+        }
     }
 
     /// Dispatch a *resumed* plan: load the checkpoint for `kind`, skip jobs

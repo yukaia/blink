@@ -139,6 +139,14 @@ impl TransferManager {
         self.inner.lock().jobs.clone()
     }
 
+    /// Look up a single job by id. O(1) via the id → index map — event
+    /// handlers should prefer this over cloning the whole list with
+    /// [`Self::snapshot`].
+    pub fn job(&self, id: u64) -> Option<TransferJob> {
+        let inner = self.inner.lock();
+        inner.job_index.get(&id).map(|&idx| inner.jobs[idx].clone())
+    }
+
     pub fn pause(&self) {
         self.inner.lock().paused = true;
         let _ = self.events.send(TransferEvent::Paused);

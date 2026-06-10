@@ -677,7 +677,7 @@ mod tests {
     #[test]
     fn python_triple_string_single_line() {
         let (spans, state) = tokenize(Lang::Python, r#""""hello""""#, LineState::default());
-        assert!(!state.in_triple_string.is_some());
+        assert!(state.in_triple_string.is_none());
         assert!(spans.iter().any(|(k, _)| *k == TokenKind::String));
     }
 

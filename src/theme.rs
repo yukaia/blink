@@ -1,6 +1,6 @@
 //! Themes: a small palette of named colors used everywhere the TUI renders.
 //!
-//! Eight built-in themes ship with the binary. Users can add more by dropping
+//! Seven built-in themes ship with the binary. Users can add more by dropping
 //! `<name>.ini` into the themes dir (see [`paths::themes_dir`]):
 //!
 //! ```ini
