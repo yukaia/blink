@@ -428,7 +428,17 @@ impl SftpTransport {
                                     .await?
                             }
                             Err(pipe_err) => {
-                                let mut agent = AgentClient::connect_pageant().await;
+                                // russh 0.60 made connect_pageant fallible;
+                                // it previously returned the client directly.
+                                let mut agent = AgentClient::connect_pageant()
+                                    .await
+                                    .map_err(|e| {
+                                        BlinkError::auth(format!(
+                                            "ssh-agent: no agent found (OpenSSH \
+                                             pipe error: {pipe_err}; Pageant \
+                                             error: {e})"
+                                        ))
+                                    })?;
                                 try_agent_identities(&mut handle, username, &mut agent)
                                     .await
                                     .map_err(|e| {
