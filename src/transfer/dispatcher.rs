@@ -176,12 +176,29 @@ async fn run_loop(
         let tx_w = app_event_tx.clone();
         let pool_w = Arc::clone(&pool);
 
+        // The worker must not reach its completion path before its abort
+        // handle is registered. If it did, `deregister_active` would report
+        // "already removed" (which `run_one` reads as "cancel won the race")
+        // and return without ever marking the job Complete or Failed — the
+        // job would sit Active in the UI forever, and the late
+        // `register_active` below would leak a handle that nothing removes.
+        // Gate the body on a oneshot that fires only after registration.
+        let (start_tx, start_rx) = tokio::sync::oneshot::channel::<()>();
+
         let join = tokio::spawn(async move {
             // The guard decrements `active` on drop, even if `run_one` panics.
             let _g = guard;
+            // Err means the dispatcher dropped the sender without registering
+            // us; nothing would ever mark or cancel this job, so don't start.
+            if start_rx.await.is_err() {
+                return;
+            }
             run_one(manager_w, session_w, password_w, tx_w, pool_w, job).await;
         });
         manager.register_active(job_id, join.abort_handle());
+        // Registration is done — release the worker. A send error means the
+        // task was already aborted by `cancel`, which has marked it failed.
+        let _ = start_tx.send(());
     }
 
     // Close idle pooled connections on shutdown. Workers still in flight

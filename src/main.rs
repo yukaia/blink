@@ -112,21 +112,56 @@ fn init_tracing() {
     // If BLINK_LOG_FILE is set, write logs there; otherwise discard them so
     // they don't smear the TUI. Example: BLINK_LOG_FILE=/tmp/blink.log BLINK_LOG=debug blink
     if let Ok(log_path) = std::env::var("BLINK_LOG_FILE") {
-        if let Ok(file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&log_path)
+        let mut opts = OpenOptions::new();
+        opts.create(true).append(true);
+
+        // At debug level this file carries hostnames, usernames, and remote
+        // paths. Unlike everything else blink writes, it lives at a
+        // user-chosen path rather than inside the 0700 config dir, so it
+        // needs its own restrictive mode instead of inheriting the umask
+        // default (typically 0644).
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+
+        if let Ok(file) = opts.open(&log_path) {
+            // `mode` only applies when the file is created. A log file left
+            // over from an older blink (or created by another tool) keeps
+            // its original permissions, so say so rather than silently
+            // writing secrets into a world-readable file.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                if let Ok(meta) = file.metadata()
+                    && meta.mode() & 0o077 != 0
+                {
+                    eprintln!(
+                        "warning: {} is readable by other users (mode {:o}); \
+                         logs may contain hostnames and remote paths",
+                        sanitize_display(&log_path),
+                        meta.mode() & 0o7777,
+                    );
+                }
+            }
+
             let _ = fmt()
                 .with_env_filter(filter)
-                .with_writer(move || {
-                    file.try_clone().expect("log file clone")
+                .with_writer(move || match file.try_clone() {
+                    Ok(f) => Box::new(f) as Box<dyn std::io::Write>,
+                    // Out of file descriptors. Drop the line rather than
+                    // panicking from inside a logging call.
+                    Err(_) => Box::new(std::io::sink()),
                 })
                 .with_ansi(false)
                 .try_init();
             return;
         }
-        eprintln!("warning: could not open BLINK_LOG_FILE={log_path}, logs discarded");
+        eprintln!(
+            "warning: could not open BLINK_LOG_FILE={}, logs discarded",
+            sanitize_display(&log_path),
+        );
     }
 
     let _ = fmt()

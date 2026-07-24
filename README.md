@@ -220,6 +220,12 @@ where protocol is one of `sftp`, `scp`, `ftp`, or `ftps`. Both commands
 prompt for a password if the session uses password auth, or go straight to
 the Connection screen for key and agent auth.
 
+Omitting the port picks the protocol default: **22** for `sftp` / `scp`,
+**21** for `ftp` *and* `ftps`. FTPS defaults to 21 rather than 990 because
+blink speaks explicit FTPS (`AUTH TLS` on the standard FTP port); see
+[Honest caveats](#honest-caveats). Implicit-mode servers need `:990` spelled
+out, and blink cannot currently talk to them anyway.
+
 ## Configuration
 
 Files live in platform-appropriate locations:
@@ -605,11 +611,21 @@ RGBA buffer is already allocated.
   leave a stale `<remote>.part` behind; re-running the upload reuses
   (truncates) it.
 - Config directories are created with mode 0700 on Unix (not
-  world-readable).
+  world-readable). A `BLINK_LOG_FILE` is created with mode 0600, since at
+  debug level it records hostnames and remote paths; if the file already
+  exists with looser permissions blink warns rather than silently
+  tightening a path you chose.
 - `Config::save` round-trips unknown INI keys, so hand-edited or
   forward-compat options aren't silently dropped on a theme cycle.
 - Path-traversal and null-byte validation is applied when loading
   session and theme names from disk.
+- Server-supplied filenames are validated before being joined onto a local
+  path. Beyond the universal `/`, `\`, `..` and null-byte rejections,
+  Windows additionally rejects `:` (a drive prefix like `C:evil` would
+  otherwise *replace* the destination path per `PathBuf::push` semantics,
+  and `name:stream` opens an alternate data stream), trailing dots and
+  spaces (Windows strips them, aliasing two names to one file), and
+  reserved device names (`NUL`, `COM1`, …).
 
 ## Honest caveats
 
@@ -628,6 +644,14 @@ A few things worth knowing before you use this in anger:
   match. Hostname binding and handshake-signature verification stay on
   in both modes. There is no option to add a custom CA root without
   recompiling.
+- **RSA client keys carry a known timing-sidechannel risk.** The `rsa`
+  crate reached transitively through `russh` is affected by
+  [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071)
+  ("Marvin Attack") and has no fixed release. Exploiting it needs many
+  precisely-timed oracle queries against your private key, which a normal
+  interactive session does not provide — but if you want the risk gone,
+  use an Ed25519 key. The rationale is recorded in `.cargo/audit.toml`,
+  the ignore list used when running `cargo audit` against this tree.
 - **Passwords are held in memory** for the duration of the connected
   session, but the allocation is zeroised on drop. Each parallel
   transfer slot opens its own connection, so the dispatcher needs
@@ -694,7 +718,6 @@ and do not affect blink's MIT license except where noted.
 | [chrono](https://github.com/chronotope/chrono) | chronotope contributors | Date / time formatting |
 | [sha2](https://github.com/RustCrypto/hashes) | RustCrypto contributors | SHA-256 for known-hosts disambiguation and FTPS cert pins |
 | [zeroize](https://github.com/RustCrypto/utils/tree/master/zeroize) | RustCrypto contributors | Wipe in-memory passwords on drop |
-| [fs4](https://github.com/al8n/fs4-rs) | fs4 contributors | Cross-platform advisory file locks (known_hosts append) |
 
 ### Apache-2.0
 

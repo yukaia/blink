@@ -59,8 +59,13 @@ impl Protocol {
     pub fn default_port(&self) -> u16 {
         match self {
             Self::Sftp | Self::Scp => 22,
-            Self::Ftp => 21,
-            Self::Ftps => 990,
+            // FTPS defaults to 21, not the 990 you might expect: blink speaks
+            // *explicit* FTPS (RFC 4217 `AUTH TLS` on a plaintext control
+            // connection), which servers offer on the standard FTP port. Port
+            // 990 is implicit FTPS, where TLS starts before any FTP command —
+            // a mode blink does not implement, so defaulting to it made every
+            // portless `ftps://` session hang until the connect timeout.
+            Self::Ftp | Self::Ftps => 21,
         }
     }
 }
@@ -698,6 +703,30 @@ mod tests {
         let s = Session::from_url("ftp://files.example.com").unwrap();
         assert_eq!(s.port, 21);
         assert_eq!(s.protocol, Protocol::Ftp);
+    }
+
+    #[test]
+    fn from_url_ftps_defaults_to_explicit_port() {
+        // blink implements explicit FTPS (AUTH TLS), which lives on 21.
+        // Defaulting to the implicit-FTPS port 990 would hang every
+        // portless ftps:// session until the connect timeout.
+        let s = Session::from_url("ftps://files.example.com").unwrap();
+        assert_eq!(s.port, 21);
+        assert_eq!(s.protocol, Protocol::Ftps);
+    }
+
+    #[test]
+    fn ftps_default_port_is_not_implicit() {
+        assert_eq!(Protocol::Ftps.default_port(), 21);
+        assert_ne!(Protocol::Ftps.default_port(), 990);
+    }
+
+    #[test]
+    fn from_url_explicit_port_still_honoured() {
+        // A user with an implicit-mode server can still name 990 explicitly;
+        // the default just no longer picks it for them.
+        let s = Session::from_url("ftps://files.example.com:990").unwrap();
+        assert_eq!(s.port, 990);
     }
 
     #[test]

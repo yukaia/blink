@@ -1,11 +1,18 @@
 //! SFTP transport built on russh + russh-sftp.
 //!
 //! NOTE: russh and russh-sftp evolve their APIs across minor versions. The
-//! shape below targets `russh` 0.49.x and `russh-sftp` 2.x. If a `cargo build`
+//! shape below targets `russh` 0.60.x and `russh-sftp` 2.3.x. If a `cargo build`
 //! reports method-not-found errors here, check the exact constructor / method
 //! names against the version actually pulled in by `Cargo.lock`. The trait
 //! interface in `transport::Transport` is stable; only this file should need
 //! tweaking.
+//!
+//! Things that moved in the 0.49 → 0.60 jump, for whoever does the next one:
+//! `Handler` uses native `async fn` instead of `#[async_trait]`; the
+//! `authenticate_*` calls return `AuthResult` rather than `bool`;
+//! `authenticate_publickey_with` takes an explicit `hash_alg`; agent
+//! identities are `AgentIdentity` (key *or* certificate) rather than bare
+//! `PublicKey`; and `PrivateKeyWithHashAlg::new` is infallible.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -80,7 +87,8 @@ impl KnownHostsHandler {
     }
 }
 
-#[async_trait]
+// russh 0.60 declares `Handler` with native `async fn` (RPITIT) rather than
+// `#[async_trait]`, so this impl must not be wrapped in the macro.
 impl Handler for KnownHostsHandler {
     type Error = russh::Error;
 
@@ -189,6 +197,16 @@ impl Handler for KnownHostsHandler {
     }
 }
 
+/// Hash algorithm to request for a public-key authentication attempt.
+///
+/// RSA keys must ask for `rsa-sha2-512` explicitly: OpenSSH 8.8+ (Sept 2021)
+/// disables `ssh-rsa` (SHA-1) by default, so leaving this `None` silently
+/// fails against modern servers. Other key types have no hash to choose
+/// (Ed25519 in particular) and take `None`.
+fn rsa_hash_alg(algorithm: &ssh_key::Algorithm) -> Option<ssh_key::HashAlg> {
+    matches!(algorithm, ssh_key::Algorithm::Rsa { .. }).then_some(ssh_key::HashAlg::Sha512)
+}
+
 /// Attempt authentication against every identity in the agent.
 /// Returns `Ok(true)` on success, `Ok(false)` if no identity was accepted.
 /// Using a generic `S` avoids `Box<dyn AgentStream>` in the state machine,
@@ -218,12 +236,15 @@ where
     }
 
     for identity in identities {
+        // See the unix branch: identities may be keys or certificates.
+        let pubkey = identity.public_key().into_owned();
+        let hash_alg = rsa_hash_alg(&pubkey.algorithm());
         match handle
-            .authenticate_publickey_with(username, identity, agent)
+            .authenticate_publickey_with(username, pubkey, hash_alg, agent)
             .await
         {
-            Ok(true) => return Ok(true),
-            Ok(false) => {}
+            Ok(r) if r.success() => return Ok(true),
+            Ok(_) => {}
             Err(e) => {
                 tracing::debug!("ssh-agent identity rejected: {e}");
             }
@@ -316,6 +337,7 @@ impl SftpTransport {
                     .authenticate_password(username, pw)
                     .await
                     .map_err(|e| BlinkError::auth(e.to_string()))?
+                    .success()
             }
             AuthMethod::Key { path } => {
                 let passphrase = password.filter(|p| !p.is_empty());
@@ -335,22 +357,13 @@ impl SftpTransport {
                         )));
                     }
                 };
-                // RSA keys: request rsa-sha2-512 explicitly. OpenSSH 8.8+
-                // (Sept 2021) disables ssh-rsa (SHA-1) by default, so leaving
-                // `None` here would silently fail against modern servers.
-                // Non-RSA keys keep `None`, which lets russh pick the right
-                // hash for the key type (e.g. Ed25519 has no hash to choose).
-                let hash_alg = if matches!(kp.algorithm(), ssh_key::Algorithm::Rsa { .. }) {
-                    Some(ssh_key::HashAlg::Sha512)
-                } else {
-                    None
-                };
-                let kp = PrivateKeyWithHashAlg::new(Arc::new(kp), hash_alg)
-                    .map_err(|e| BlinkError::auth(format!("key algorithm: {e}")))?;
+                let hash_alg = rsa_hash_alg(&kp.algorithm());
+                let kp = PrivateKeyWithHashAlg::new(Arc::new(kp), hash_alg);
                 handle
                     .authenticate_publickey(username, kp)
                     .await
                     .map_err(|e| BlinkError::auth(e.to_string()))?
+                    .success()
             }
             AuthMethod::Agent => {
                 #[cfg(unix)]
@@ -374,15 +387,21 @@ impl SftpTransport {
                     let mut succeeded = false;
                     let mut last_err: Option<String> = None;
                     for identity in identities {
+                        // russh 0.60 models agent identities as plain keys OR
+                        // OpenSSH certificates; `public_key` normalises both.
+                        let pubkey = identity.public_key().into_owned();
+                        let hash_alg = rsa_hash_alg(&pubkey.algorithm());
                         let auth_result = handle
-                            .authenticate_publickey_with(username, identity, &mut agent)
+                            .authenticate_publickey_with(
+                                username, pubkey, hash_alg, &mut agent,
+                            )
                             .await;
                         match auth_result {
-                            Ok(true) => {
+                            Ok(r) if r.success() => {
                                 succeeded = true;
                                 break;
                             }
-                            Ok(false) => {}
+                            Ok(_) => {}
                             Err(e) => last_err = Some(e.to_string()),
                         }
                     }
@@ -510,7 +529,7 @@ impl SftpTransport {
                 if let Some(w) = limits.write_len {
                     write_chunk = write_chunk.min(w as usize);
                 }
-                raw.set_limits(Arc::new(limits));
+                raw.set_limits(limits);
             }
 
             self.transfer = Some(Transfer {
@@ -1205,7 +1224,6 @@ mod integration {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use async_trait::async_trait;
     use russh::server::{Auth, Msg, Session as ServerSession};
     use russh::{Channel, ChannelId};
     use russh_sftp::protocol::{
@@ -1232,7 +1250,7 @@ mod integration {
         store: Store,
     }
 
-    #[async_trait]
+    // Native `async fn` in trait as of russh 0.60 — see the client Handler.
     impl russh::server::Handler for SshServer {
         type Error = russh::Error;
 
@@ -1439,7 +1457,7 @@ mod integration {
         let config = Arc::new(russh::server::Config {
             keys: vec![
                 russh::keys::PrivateKey::random(
-                    &mut russh::keys::ssh_key::rand_core::OsRng,
+                    &mut rand::rng(),
                     russh::keys::Algorithm::Ed25519,
                 )
                 .unwrap(),
@@ -1582,7 +1600,7 @@ mod integration {
     /// server must see exactly one TCP connection.
     #[tokio::test]
     async fn dispatcher_reuses_pooled_connection_across_jobs() {
-        use crate::transfer::{Dispatcher, TransferEvent, TransferManager};
+        use crate::transfer::{Dispatcher, TransferEvent, TransferManager, TransferState};
         use crate::tui::event::AppEvent;
 
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
@@ -1673,6 +1691,18 @@ mod integration {
             1,
             "second job should reuse the pooled connection, not reconnect"
         );
+
+        // Every dispatched job must land in a terminal state. A job left
+        // Active after shutdown means its worker returned without marking it
+        // — the symptom of the abort-handle registration race.
+        for job in manager.snapshot() {
+            assert!(
+                matches!(job.state, TransferState::Complete),
+                "job {} left in non-terminal state {:?}",
+                job.id,
+                job.state
+            );
+        }
 
         for f in [&a_dst, &b_dst] {
             let _ = tokio::fs::remove_file(f).await;

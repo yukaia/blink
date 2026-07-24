@@ -1,6 +1,8 @@
 /target
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock IS committed: blink is a binary, not a library. The lockfile makes
+# releases reproducible, and makes `cargo audit` report on the versions people
+# actually build rather than a fresh resolution.
 .DS_Store
 .idea/
 .vscode/

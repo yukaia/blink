@@ -51,15 +51,67 @@ pub struct WalkResult {
 
 /// Validate a server-supplied file name before using it in a local `Path::join`.
 ///
-/// Returns `None` if the name would escape the intended directory via path
-/// separators, a `..` component, or a null byte. Callers must skip the entry.
+/// Returns `None` if the name would escape the intended directory, alias a
+/// different file, or resolve to a device. Callers must skip the entry.
+///
+/// Some rules only apply on Windows — a colon is a legal (if uncommon) Unix
+/// filename character, and rejecting it everywhere would break legitimate
+/// downloads of e.g. ISO-8601-timestamped files. See [`safe_local_name_for`]
+/// for the policy split.
 pub fn safe_local_name(name: &str) -> Option<&str> {
+    safe_local_name_for(name, cfg!(windows))
+}
+
+/// Windows device names that resolve to hardware rather than a file,
+/// regardless of the directory they appear in. Writing to `NUL` silently
+/// discards the download; `COM1` opens a serial port.
+const WINDOWS_RESERVED_STEMS: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// The body of [`safe_local_name`], with the platform policy passed in so both
+/// branches are compiled and testable on any host.
+fn safe_local_name_for(name: &str, windows_rules: bool) -> Option<&str> {
+    // --- Rules that apply everywhere ---
     if name.is_empty() || name == ".." || name == "." {
         return None;
     }
     if name.bytes().any(|b| matches!(b, b'\0' | b'/' | b'\\')) {
         return None;
     }
+
+    if !windows_rules {
+        return Some(name);
+    }
+
+    // --- Windows-only rules ---
+
+    // A colon is either a drive prefix or an alternate-data-stream separator.
+    // `PathBuf::push` documents that a component carrying a prefix but no root
+    // replaces the entire buffer, so `base.join("C:evil")` lands outside
+    // `base` altogether — a remote-controlled escape from the download tree.
+    if name.contains(':') {
+        return None;
+    }
+
+    // Windows strips trailing dots and spaces when resolving a path, so
+    // "secret. " and "secret" name the same file. A server could use that to
+    // overwrite a file the conflict check cleared under its other spelling.
+    if name.ends_with('.') || name.ends_with(' ') {
+        return None;
+    }
+
+    // Reserved device names match on the stem before the first dot, and are
+    // case-insensitive: `NUL`, `nul.txt` and `NUL.tar.gz` are all the device.
+    let stem = name.split('.').next().unwrap_or(name);
+    if WINDOWS_RESERVED_STEMS
+        .iter()
+        .any(|r| stem.eq_ignore_ascii_case(r))
+    {
+        return None;
+    }
+
     Some(name)
 }
 
@@ -337,6 +389,74 @@ mod tests {
         assert!(safe_local_name("a\\b").is_none());
         assert!(safe_local_name("a\0b").is_none());
         assert_eq!(safe_local_name("ok.txt"), Some("ok.txt"));
+    }
+
+    // -- Windows name rules ------------------------------------------------
+    //
+    // These exercise `safe_local_name_for(.., true)` directly so the Windows
+    // policy is covered when running the suite on any host, not only Windows.
+
+    #[test]
+    fn windows_rejects_drive_prefix() {
+        // `PathBuf::push` documents that a component with a prefix but no
+        // root REPLACES the whole buffer on Windows, so `base.join("C:evil")`
+        // escapes `base` entirely.
+        assert!(safe_local_name_for("C:evil.txt", true).is_none());
+        assert!(safe_local_name_for("c:", true).is_none());
+    }
+
+    #[test]
+    fn windows_rejects_alternate_data_stream() {
+        assert!(safe_local_name_for("report.txt:hidden", true).is_none());
+    }
+
+    #[test]
+    fn windows_rejects_trailing_dot_or_space() {
+        // Windows silently strips these, so "secret. " aliases "secret".
+        assert!(safe_local_name_for("secret.", true).is_none());
+        assert!(safe_local_name_for("secret ", true).is_none());
+        assert!(safe_local_name_for("secret. ", true).is_none());
+    }
+
+    #[test]
+    fn windows_rejects_reserved_device_names() {
+        for name in ["NUL", "nul", "CON", "aux", "COM1", "lpt9", "NUL.txt", "con.tar.gz"] {
+            assert!(
+                safe_local_name_for(name, true).is_none(),
+                "expected {name:?} to be rejected on Windows"
+            );
+        }
+    }
+
+    #[test]
+    fn windows_allows_names_merely_resembling_devices() {
+        for name in ["CONSOLE", "COM", "COM10", "NULL", "lpt", "nul_backup"] {
+            assert_eq!(
+                safe_local_name_for(name, true),
+                Some(name),
+                "expected {name:?} to be allowed on Windows"
+            );
+        }
+    }
+
+    #[test]
+    fn unix_still_allows_colons_and_device_names() {
+        // A colon is a legal, occasionally-used Unix filename character
+        // (timestamps in particular). The Windows rules must not leak over.
+        assert_eq!(
+            safe_local_name_for("2024-01-01T00:00:00.log", false),
+            Some("2024-01-01T00:00:00.log")
+        );
+        assert_eq!(safe_local_name_for("NUL", false), Some("NUL"));
+        assert_eq!(safe_local_name_for("trailing.", false), Some("trailing."));
+    }
+
+    #[test]
+    fn universal_rules_apply_under_windows_too() {
+        assert!(safe_local_name_for("..", true).is_none());
+        assert!(safe_local_name_for("a/b", true).is_none());
+        assert!(safe_local_name_for("a\0b", true).is_none());
+        assert_eq!(safe_local_name_for("ok.txt", true), Some("ok.txt"));
     }
 
     #[test]

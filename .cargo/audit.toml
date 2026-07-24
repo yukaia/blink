@@ -1,0 +1,31 @@
+# Configuration for `cargo audit`, which is run by hand:
+#
+#     cargo install cargo-audit --locked
+#     cargo audit
+#
+# Without this file that command exits non-zero on an advisory that has no
+# fixed release, which makes the whole signal easy to start ignoring. With it,
+# a non-zero exit means something NEW showed up.
+#
+# Everything listed here must carry a rationale. An ignore entry nobody can
+# justify should be a dependency bump instead.
+
+[advisories]
+ignore = [
+  # RUSTSEC-2023-0071 — "Marvin Attack" timing sidechannel in `rsa`.
+  #
+  # Reached transitively: blink -> russh -> internal-russh-forked-ssh-key -> rsa.
+  # There is no fixed release of `rsa` (the advisory itself says "No fixed
+  # upgrade is available"), and the only way to drop it entirely would be to
+  # drop RSA key support from the SSH client.
+  #
+  # Exposure: the attack recovers an RSA *private* key from timing variation in
+  # decryption/signing, and needs many precisely-timed oracle queries. blink
+  # performs RSA private-key operations only when the user authenticates with
+  # an RSA key, once per connection, against a server the user chose. That is
+  # not a practical oracle. Users who want this class of risk gone entirely can
+  # use an Ed25519 key, which blink prefers anyway.
+  #
+  # Revisit when `rsa` ships a fixed version.
+  "RUSTSEC-2023-0071",
+]

@@ -46,8 +46,6 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use fs4::fs_std::FileExt;
-
 use crate::error::{self, BlinkError, Result};
 use crate::paths;
 
@@ -225,8 +223,10 @@ pub fn append(host: &str, port: u16, key_type: &str, key_b64: &str) -> Result<()
 
     // Take an exclusive advisory lock to make the check-then-write sequence
     // atomic with respect to other blink processes. Blocks until acquired —
-    // acceptable here because the held region is small.
-    FileExt::lock_exclusive(&file)
+    // acceptable here because the held region is small. `File::lock` is std's
+    // (stable since Rust 1.89) and releases on drop, same flock semantics the
+    // fs4 crate provided before.
+    file.lock()
         .map_err(|e| BlinkError::config(format!("known_hosts lock: {e}")))?;
 
     let raw = read_bounded_from_handle(&mut file)?;
