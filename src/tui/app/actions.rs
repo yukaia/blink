@@ -22,6 +22,36 @@ use crate::tui::state::{EditSessionForm, OverwritePending, PendingDelete};
 
 use super::{App, LogLevel, Pane, Screen};
 
+/// Validate a name the user typed for a new or renamed remote entry,
+/// returning the reason it is unusable.
+///
+/// Shared by the rename and mkdir modals so the two can't drift. They had:
+/// `submit_mkdir` rejected `.` and `..`, `submit_rename` did not. A rename to
+/// `..` therefore reached [`transport::join_remote`], which rejects the `..`
+/// component by returning the base unchanged — so the app asked the server to
+/// rename the file onto its own parent directory and surfaced whatever opaque
+/// error came back, where the sibling modal gives a clear local one.
+///
+/// Control characters are refused too: the name goes onto the wire as a path
+/// component, and a listing renders it back through `error::sanitize`, so one
+/// containing an escape sequence or a bidi override would display as something
+/// other than what was actually created.
+fn remote_name_error(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("name cannot be empty");
+    }
+    if name.contains('/') || name.contains('\\') {
+        return Some("name cannot contain path separators");
+    }
+    if name == "." || name == ".." {
+        return Some("invalid name");
+    }
+    if name.chars().any(char::is_control) {
+        return Some("name cannot contain control characters");
+    }
+    None
+}
+
 impl App {
     // -------------------------------------------------------------------
     // Edit / delete saved sessions
@@ -214,12 +244,8 @@ impl App {
 
     pub(super) fn submit_rename(&mut self) {
         let new_name = self.rename_input.trim().to_string();
-        if new_name.is_empty() {
-            self.rename_error = Some("name cannot be empty".into());
-            return;
-        }
-        if new_name.contains('/') || new_name.contains('\\') {
-            self.rename_error = Some("name cannot contain path separators".into());
+        if let Some(reason) = remote_name_error(&new_name) {
+            self.rename_error = Some(reason.into());
             return;
         }
         if new_name == self.rename_original {
@@ -299,16 +325,8 @@ impl App {
 
     pub(super) fn submit_mkdir(&mut self) {
         let name = self.mkdir_input.trim().to_string();
-        if name.is_empty() {
-            self.mkdir_error = Some("name cannot be empty".into());
-            return;
-        }
-        if name.contains('/') || name.contains('\\') {
-            self.mkdir_error = Some("name cannot contain path separators".into());
-            return;
-        }
-        if name == "." || name == ".." {
-            self.mkdir_error = Some("invalid directory name".into());
+        if let Some(reason) = remote_name_error(&name) {
+            self.mkdir_error = Some(reason.into());
             return;
         }
         let path = transport::join_remote(&self.remote.path, &name);
@@ -450,5 +468,48 @@ impl App {
         self.save_session_input = default_name;
         self.save_session_error = None;
         self.screen = Screen::SaveSession;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remote_name_error;
+
+    #[test]
+    fn accepts_ordinary_names() {
+        for name in ["report.txt", "My Folder", "2024-01-01T00:00:00.log", "café"] {
+            assert_eq!(remote_name_error(name), None, "{name} should be allowed");
+        }
+    }
+
+    #[test]
+    fn rejects_dot_and_dotdot() {
+        // The gap this closes: `submit_rename` accepted these, so `..` reached
+        // join_remote, which drops the component and returns the base — the
+        // app then asked the server to rename a file onto its own parent.
+        assert!(remote_name_error(".").is_some());
+        assert!(remote_name_error("..").is_some());
+    }
+
+    #[test]
+    fn allows_names_that_merely_start_with_dots() {
+        assert_eq!(remote_name_error(".env"), None);
+        assert_eq!(remote_name_error("..config"), None);
+    }
+
+    #[test]
+    fn rejects_empty_and_separators() {
+        assert!(remote_name_error("").is_some());
+        assert!(remote_name_error("a/b").is_some());
+        assert!(remote_name_error("a\\b").is_some());
+    }
+
+    #[test]
+    fn rejects_control_characters() {
+        // These would go onto the wire verbatim but render back through
+        // `error::sanitize`, so the listing would disagree with reality.
+        assert!(remote_name_error("a\u{1b}[31mb").is_some());
+        assert!(remote_name_error("a\0b").is_some());
+        assert!(remote_name_error("a\nb").is_some());
     }
 }

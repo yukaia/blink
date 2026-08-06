@@ -91,16 +91,33 @@ impl App {
     /// first alphabetically, then user themes (deduplicated by name). The
     /// new theme is applied immediately and persisted to `config.ini` so
     /// it survives a restart.
+    ///
+    /// Both the position lookup and the persisted value use the theme's
+    /// *key* — the name `Theme::load` accepts, which is a built-in name or a
+    /// user theme's filename stem — rather than `Theme.name`, which is the
+    /// display label from the file's optional `[theme] name` field.
+    ///
+    /// Those are not the same string, and conflating them broke two things.
+    /// `list_all_names` yields keys, so a user theme whose display name
+    /// differed from its filename never matched and the cycle jumped back to
+    /// index 0 instead of advancing. Worse, the persisted value was the
+    /// display name: cycling onto `custom.ini` containing
+    /// `[theme] name = My Cool Theme` wrote `theme = My Cool Theme` into
+    /// config.ini, which resolves to no file and no built-in, so the next
+    /// launch fell back to dracula. `config.general.theme` is by definition
+    /// the key, so it serves as both.
     pub(super) fn cycle_theme(&mut self) {
         let names = Theme::list_all_names();
         if names.is_empty() {
             return;
         }
-        // Find current; if not in the list (shouldn't happen, but defend
-        // against it), start from -1 so the first cycle lands on index 0.
+        // Find current; if the configured value isn't a known key (a
+        // hand-edited config naming a theme that no longer exists, say),
+        // start from -1 so the first cycle lands on index 0 — and writes a
+        // valid key on the way, so the state self-heals.
         let current_idx = names
             .iter()
-            .position(|n| n == &self.theme.name)
+            .position(|n| n == &self.config.general.theme)
             .map(|i| i as isize)
             .unwrap_or(-1);
         let next_idx = ((current_idx + 1) as usize) % names.len();
@@ -108,7 +125,7 @@ impl App {
 
         match Theme::load(next_name) {
             Ok(theme) => {
-                self.config.general.theme = theme.name.clone();
+                self.config.general.theme = next_name.clone();
                 self.theme = theme;
                 self.push_log(
                     LogLevel::Info,

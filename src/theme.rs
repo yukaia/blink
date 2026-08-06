@@ -343,4 +343,57 @@ mod tests {
     fn parse_color_rejects_invalid_hex() {
         assert_eq!(parse_color("#gggggg"), None);
     }
+
+    // -- name vs. key ------------------------------------------------------
+    //
+    // A theme has two identifiers and they are not interchangeable: the *key*
+    // that `load` accepts (a built-in name or a user file's stem, which is
+    // what `list_all_names` yields), and `Theme.name`, the display label from
+    // the optional `[theme] name` field. `cycle_theme` persists the key;
+    // persisting the display name wrote a config value that resolved to
+    // nothing, so the next launch silently fell back to dracula.
+
+    #[test]
+    fn every_listed_builtin_is_loadable_by_its_key() {
+        // The invariant `cycle_theme` depends on: anything it can pick out of
+        // the name list must come back from `load`, because that value is
+        // what gets written to config.ini and re-loaded on the next launch.
+        for name in Theme::list_builtin_names() {
+            let theme = Theme::load(name)
+                .unwrap_or_else(|e| panic!("built-in {name} must load: {e}"));
+            assert_eq!(
+                &theme.name, name,
+                "a built-in's display name doubles as its key",
+            );
+        }
+    }
+
+    #[test]
+    fn user_theme_display_name_can_differ_from_its_key() {
+        // Demonstrates the divergence the fix accounts for: the loaded theme
+        // reports "My Cool Theme" while the only string that can load it
+        // again is the filename stem.
+        let dir = std::env::temp_dir()
+            .join(format!("blink-theme-key-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("custom.ini");
+        std::fs::write(
+            &path,
+            "[theme]\nname = My Cool Theme\n\n[colors]\n\
+             bg=#000000\nfg=#ffffff\ndim=#888888\ncursor_bg=#111111\n\
+             border_active=#ff00ff\nborder_inactive=#222222\naccent=#ff0000\n\
+             directory=#00ffff\nimage=#ffff00\nselected=#00ff00\n\
+             success=#00ff00\nwarning=#ffaa00\nerror=#ff0000\n",
+        )
+        .unwrap();
+
+        let theme = Theme::load_from(&path).expect("theme must parse");
+        assert_eq!(theme.name, "My Cool Theme", "display name comes from [theme]");
+        assert_ne!(
+            theme.name, "custom",
+            "display name is not the key — persisting it would not resolve",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -367,6 +367,13 @@ warning         = #ff9e64
 error           = #f7768e
 ```
 
+**The filename is the identifier, not the `[theme] name` field.** A theme is
+loaded by its *key* — a built-in name, or a user file's stem — which is what
+goes in `config.ini` and what `t` cycles through. `[theme] name` is only the
+label shown in the status bar, and it is optional; leave it out and the stem
+is used for both. The two are allowed to differ, so `custom.ini` can present
+itself as `My Cool Theme`, but `theme = custom` is what selects it.
+
 ## Hotkeys
 
 The full list lives in the in-app help overlay (`?`). Highlights:
