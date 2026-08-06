@@ -404,7 +404,34 @@ pub enum FileViewKind {
 }
 
 const TEXT_VIEW_LIMIT: u64 = 1_000_000; // 1 MB
-const IMAGE_VIEW_LIMIT: u64 = 10_000_000; // 10 MB
+
+/// Largest image accepted for preview, checked against the size the server
+/// reports in its directory listing.
+///
+/// The transports' `read_to_bytes` caps derive from this rather than
+/// restating it: that cap is the backstop for a server that under-reports a
+/// file's size in its listing, so if it were ever the *smaller* of the two,
+/// every image between the two values would silently truncate instead of
+/// being refused. Keeping one definition makes them impossible to drift.
+///
+/// Note this bounds bytes fetched, not decode memory — [`MAX_IMAGE_DIMENSION`]
+/// and [`MAX_IMAGE_ALLOC`] bound that independently, and the decoder rejects
+/// an oversized declaration from the header before allocating a pixel buffer.
+pub(crate) const IMAGE_VIEW_LIMIT: u64 = 25_000_000; // 25 MB
+
+/// Compile-time guard on the relationship described above.
+///
+/// Both transports currently *derive* their cap from this constant, so this
+/// holds trivially — the point is that it keeps holding if someone later
+/// writes a literal back into either one. A transport cap below the viewer's
+/// limit wouldn't fail loudly: images between the two values would come back
+/// truncated and fail to decode with a confusing error, instead of being
+/// cleanly refused before the fetch. Failing the build beats a test here,
+/// since there is no runtime state to observe.
+const _: () = {
+    assert!(crate::transport::sftp::MAX_PREVIEW_BYTES >= IMAGE_VIEW_LIMIT);
+    assert!(crate::transport::ftp_impl::MAX_PREVIEW_BYTES >= IMAGE_VIEW_LIMIT);
+};
 
 /// Decide what kind of viewer to open for `name` (with the given `size`).
 pub fn detect_view_kind(name: &str, size: u64) -> FileViewKind {
@@ -514,4 +541,54 @@ pub fn decode_cp437(bytes: &[u8]) -> String {
         .iter()
         .map(|&b| if b < 0x80 { b as char } else { MAP[(b - 0x80) as usize] })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_at_the_limit_is_viewable() {
+        assert_eq!(
+            detect_view_kind("photo.png", IMAGE_VIEW_LIMIT),
+            FileViewKind::Image,
+            "a file exactly at the cap must still open",
+        );
+    }
+
+    #[test]
+    fn image_over_the_limit_is_refused_with_its_size() {
+        let kind = detect_view_kind("photo.png", IMAGE_VIEW_LIMIT + 1);
+        match kind {
+            FileViewKind::Unsupported(reason) => {
+                assert!(reason.contains("too large"), "{reason}");
+                // The message quotes the actual size so the user can judge
+                // whether the cap or the file is the surprising part.
+                assert!(reason.contains("MiB"), "{reason}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_limit_is_unchanged_by_the_image_cap() {
+        // The two are independent; raising images must not quietly widen the
+        // text viewer, whose load path tokenises synchronously on the UI loop.
+        assert_eq!(
+            detect_view_kind("notes.txt", TEXT_VIEW_LIMIT),
+            FileViewKind::Text,
+        );
+        assert!(matches!(
+            detect_view_kind("notes.txt", TEXT_VIEW_LIMIT + 1),
+            FileViewKind::Unsupported(_),
+        ));
+    }
+
+    #[test]
+    fn unknown_extension_is_unsupported_regardless_of_size() {
+        assert!(matches!(
+            detect_view_kind("archive.tar.zst", 10),
+            FileViewKind::Unsupported(_),
+        ));
+    }
 }

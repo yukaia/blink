@@ -141,7 +141,9 @@ use crate::error::{self, BlinkError, Result};
 use crate::transport::error_map::map_ftp;
 use crate::transport::{EntryKind, ProgressUpdate, RemoteEntry};
 
-const MAX_PREVIEW_BYTES: u64 = 10_000_000;
+/// Cap on bytes read by `read_to_bytes`. See the equivalent in `sftp.rs`:
+/// derived from the viewer's image limit so the two cannot drift apart.
+pub(crate) const MAX_PREVIEW_BYTES: u64 = crate::preview::IMAGE_VIEW_LIMIT;
 
 /// Per-operation timeout on the FTP / FTPS control channel.
 ///

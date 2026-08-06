@@ -417,7 +417,10 @@ guessed by content sniffing.
 
 `.png`, `.jpg` / `.jpeg`, `.gif`, `.webp`
 
-Display caps at 10 MB to keep encode time bounded.
+Display caps at 25 MB. That bounds the fetch, not the decode: the decoder
+independently refuses anything over 4096 px per side or 128 MiB of
+allocation, checked from the image header before a pixel buffer is
+allocated, so a small file declaring huge dimensions is still rejected.
 
 ### Text
 
@@ -569,7 +572,7 @@ Applied to:
 - SSH key-type strings and host-key fingerprints
 - Error messages from transport layers
 - Text file content in the viewer (tabs preserved; no length cap beyond the
-  10 MB transport read limit) — the bidi filter matters as much here, since
+  25 MB transport read limit) — the bidi filter matters as much here, since
   viewing remote source is exactly the "trojan source" setting
 - Session and checkpoint names printed by the CLI subcommands
 
@@ -602,8 +605,8 @@ Applied to:
 
 | Resource | Limit |
 | -------- | ----- |
-| Text file preview read | 1 MB (at preview detection; 10 MB at transport) |
-| Image file preview read | 10 MB (at preview detection and transport) |
+| Text file preview read | 1 MB (at preview detection; 25 MB at transport) |
+| Image file preview read | 25 MB (at preview detection and transport) |
 | Image decoder pre-decode dimension cap | 4096 × 4096 px |
 | Image decoder max allocation | 128 MiB (enforced *before* full pixel-buffer alloc) |
 | Transfer job queue | 100,000 jobs |

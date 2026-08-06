@@ -36,8 +36,14 @@ use crate::session::{AuthMethod, Protocol, Session};
 use crate::transport::error_map::map_sftp;
 use crate::transport::{EntryKind, ProgressUpdate, RemoteEntry, Transport};
 
-/// Cap on bytes read by `read_to_bytes` — matches the image preview limit.
-const MAX_PREVIEW_BYTES: u64 = 10_000_000; // 10 MB
+/// Cap on bytes read by `read_to_bytes`.
+///
+/// Derived from the viewer's image limit rather than restating it, so raising
+/// one can't leave the other behind — this is the backstop for a server that
+/// under-reports a file's size in its listing, and if it were the smaller of
+/// the two, images between the two values would truncate instead of being
+/// refused.
+pub(crate) const MAX_PREVIEW_BYTES: u64 = crate::preview::IMAGE_VIEW_LIMIT;
 
 // ---------------------------------------------------------------------------
 // Host-key decision types (shared with the TUI layer via AppEvent)
