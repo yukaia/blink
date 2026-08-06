@@ -103,7 +103,7 @@ pub mod session_select {
 
         if app.sessions.is_empty() {
             lines.push(Line::from(Span::styled(
-                "  (no saved sessions — press [n] to create one)",
+                "  (no saved sessions — press [n] to connect, then save it)",
                 Style::default().fg(app.theme.dim),
             )));
         } else {
@@ -902,6 +902,86 @@ pub mod new_session {
 // ---------------------------------------------------------------------------
 // Save current session (overlay over Main)
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Offer to save an ad-hoc connection (overlay over Main)
+// ---------------------------------------------------------------------------
+
+pub mod offer_save_session {
+    use super::*;
+
+    pub fn render(f: &mut Frame, app: &App) {
+        let area = f.area();
+        let modal = super::centered_rect(56, 34, area);
+        f.render_widget(Clear, modal);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(app.theme.accent))
+            .title(Span::styled(
+                " save this session? ",
+                Style::default()
+                    .fg(app.theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(modal);
+        f.render_widget(block, modal);
+
+        let dim = Style::default().fg(app.theme.dim);
+        let fg = Style::default().fg(app.theme.fg);
+
+        let target = app
+            .current_session
+            .as_ref()
+            .map(|s| format!("{}@{}:{}", s.username, s.host, s.port))
+            .unwrap_or_else(|| "this connection".into());
+
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "connected — but this one isn't saved yet",
+                fg,
+            ))
+            .alignment(Alignment::Center),
+            Line::from(""),
+            Line::from(Span::styled(
+                crate::error::sanitize_display(&target).into_owned(),
+                fg.add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Center),
+            Line::from(""),
+            Line::from(Span::styled(
+                "saving keeps it in the selector for next time.",
+                dim,
+            ))
+            .alignment(Alignment::Center),
+            Line::from(Span::styled(
+                "you can always save later with ctrl+s.",
+                dim,
+            ))
+            .alignment(Alignment::Center),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    "[y]",
+                    Style::default()
+                        .fg(app.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" save      "),
+                Span::styled(
+                    "[n/esc]",
+                    Style::default()
+                        .fg(app.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" not now  "),
+            ])
+            .alignment(Alignment::Center),
+        ];
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+}
 
 pub mod save_session {
     use super::*;

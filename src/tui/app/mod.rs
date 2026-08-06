@@ -51,6 +51,14 @@ pub enum Screen {
     Search,
     /// Modal over Main: save current state as a session.
     SaveSession,
+    /// Modal over Main: a connection that isn't backed by a saved session
+    /// just came up — offer to persist it.
+    ///
+    /// `n` (and `blink connect`) deliberately connect ad-hoc, so nothing is
+    /// written to disk. That is easy to mistake for a failed save when the
+    /// selector you came from is titled "SAVED SESSIONS", so the offer is
+    /// made once, at the point the connection has proven it works.
+    OfferSaveSession,
     /// Modal over Main: rename a remote file or folder.
     Rename,
     /// Modal over Main: create a new remote directory.
@@ -142,6 +150,11 @@ pub struct App {
     // Pending connect — set when transitioning to PasswordPrompt or Connection,
     // cleared when the connect resolves or the user cancels.
     pub pending_session: Option<Session>,
+    /// Whether `pending_session` came from a URL rather than a file on disk,
+    /// i.e. connecting will not leave anything saved. Set alongside
+    /// `pending_session` at every site that populates it, and consumed by the
+    /// `Connected` handler to decide whether to offer persistence.
+    pending_session_unsaved: bool,
     /// Password as it is being typed.
     ///
     /// `Zeroizing` so the buffer is wiped on drop, and pre-sized via
@@ -270,6 +283,9 @@ pub struct App {
     /// selector. Set by `blink open` and `blink connect`; `None` in normal
     /// interactive mode.
     autoconnect: Option<Session>,
+    /// Whether [`Self::autoconnect`] was built from a URL (`blink connect`)
+    /// rather than loaded from disk (`blink open`).
+    autoconnect_unsaved: bool,
     /// Session files that failed to load during [`App::new`], drained into
     /// the log by [`App::run`] once there is somewhere to put them.
     startup_warnings: Vec<String>,
@@ -306,6 +322,7 @@ impl App {
             sessions,
             session_cursor: 0,
             pending_session: None,
+            pending_session_unsaved: false,
             password_input: credential_buffer(),
             passphrase_input: credential_buffer(),
             passphrase_error: None,
@@ -349,6 +366,7 @@ impl App {
             status_message: None,
             should_quit: false,
             autoconnect: None,
+            autoconnect_unsaved: false,
             startup_warnings,
         }
     }
@@ -374,9 +392,18 @@ impl App {
     /// Build an `App` that automatically connects to `session` on startup,
     /// skipping the session selector entirely. Used by `blink open` and
     /// `blink connect`.
-    pub fn with_session(config: Config, theme: Theme, session: Session) -> Self {
+    ///
+    /// `unsaved` marks a session built from a URL (`blink connect`), which
+    /// has no file behind it — the connect flow offers to persist those.
+    pub fn with_session(
+        config: Config,
+        theme: Theme,
+        session: Session,
+        unsaved: bool,
+    ) -> Self {
         let mut app = Self::new(config, theme);
         app.autoconnect = Some(session);
+        app.autoconnect_unsaved = unsaved;
         app
     }
 
@@ -412,6 +439,7 @@ impl App {
         // the event channel is wired, so `start_connect`'s tokio::spawn lands
         // in the right context.
         if let Some(session) = self.autoconnect.take() {
+            self.pending_session_unsaved = self.autoconnect_unsaved;
             match &session.auth {
                 AuthMethod::Password => {
                     self.pending_session = Some(session);
@@ -494,6 +522,10 @@ impl App {
             Screen::SaveSession => {
                 crate::tui::views::main::render(f, self);
                 crate::tui::views::save_session::render(f, self);
+            }
+            Screen::OfferSaveSession => {
+                crate::tui::views::main::render(f, self);
+                crate::tui::views::offer_save_session::render(f, self);
             }
             Screen::Rename => {
                 crate::tui::views::main::render(f, self);
@@ -622,6 +654,7 @@ impl App {
             Screen::Main => self.handle_main(key),
             Screen::Search => self.handle_search(key),
             Screen::SaveSession => self.handle_save_session(key),
+            Screen::OfferSaveSession => self.handle_offer_save_session(key),
             Screen::Rename => self.handle_rename(key),
             Screen::Mkdir => self.handle_mkdir(key),
             Screen::ConfirmDelete => self.handle_confirm_delete(key),
@@ -861,6 +894,109 @@ mod tests {
 
         assert_eq!(buf.capacity(), capacity_before, "buffer must not grow");
         assert_eq!(buf.as_ptr(), ptr_before, "buffer must not move");
+    }
+
+    // -- offer-to-save flow ------------------------------------------------
+    //
+    // `n` and `blink connect` build a session from a URL and persist nothing,
+    // which reads as "it connected but didn't save" when the selector you came
+    // from is titled SAVED SESSIONS. These cover the offer that closes that
+    // gap. The key handlers need no terminal — only `run` does — so the state
+    // machine can be driven directly.
+
+    fn app() -> App {
+        App::new(Config::default(), Theme::load("dracula").unwrap())
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn connecting_from_a_url_marks_the_session_unsaved() {
+        let mut a = app();
+        a.screen = Screen::NewSession;
+        a.new_session_input = "sftp://me@host.example.com".into();
+        a.handle_new_session(press(KeyCode::Enter));
+
+        assert!(
+            a.pending_session_unsaved,
+            "a URL-built session has no file behind it",
+        );
+        assert_eq!(a.screen, Screen::PasswordPrompt);
+    }
+
+    #[test]
+    fn connecting_to_a_saved_session_does_not_mark_it_unsaved() {
+        let mut a = app();
+        a.sessions = vec![Session::from_url("sftp://me@saved.example.com").unwrap()];
+        a.session_cursor = 0;
+        // Poison the flag first, so the test proves it is reset rather than
+        // merely observing the default.
+        a.pending_session_unsaved = true;
+
+        a.handle_session_select(press(KeyCode::Enter));
+
+        assert!(
+            !a.pending_session_unsaved,
+            "a session picked from the saved list is already on disk",
+        );
+    }
+
+    #[test]
+    fn declining_the_offer_returns_to_main() {
+        let mut a = app();
+        a.current_session = Some(Session::from_url("sftp://me@host").unwrap());
+        a.screen = Screen::OfferSaveSession;
+
+        a.handle_offer_save_session(press(KeyCode::Char('n')));
+
+        assert_eq!(a.screen, Screen::Main, "declining leaves the connection up");
+        assert!(
+            a.log.iter().any(|l| l.message.contains("ctrl+s")),
+            "declining must point at the way to save later",
+        );
+    }
+
+    #[test]
+    fn accepting_the_offer_opens_the_save_modal() {
+        let mut a = app();
+        a.current_session = Some(Session::from_url("sftp://me@host.example.com").unwrap());
+        a.screen = Screen::OfferSaveSession;
+
+        a.handle_offer_save_session(press(KeyCode::Char('y')));
+
+        assert_eq!(a.screen, Screen::SaveSession, "hands off to the save form");
+        assert!(
+            !a.save_session_input.is_empty(),
+            "the save form should arrive pre-filled with a name",
+        );
+    }
+
+    #[test]
+    fn the_offer_ignores_keys_it_does_not_list() {
+        // Matches every other confirm modal: unlisted keys do nothing rather
+        // than being guessed at as a default, so Enter can't dismiss the
+        // offer by accident.
+        let mut a = app();
+        a.current_session = Some(Session::from_url("sftp://me@host").unwrap());
+        a.screen = Screen::OfferSaveSession;
+
+        for code in [KeyCode::Enter, KeyCode::Char('x'), KeyCode::Tab] {
+            a.handle_offer_save_session(press(code));
+            assert_eq!(a.screen, Screen::OfferSaveSession, "{code:?} must not dismiss");
+        }
+    }
+
+    #[test]
+    fn the_offer_is_made_only_once_per_connect() {
+        // The Connected handler consumes the flag with `mem::take`, so a
+        // second connect that didn't set it can't inherit a stale offer.
+        let mut a = app();
+        a.pending_session_unsaved = true;
+        let first = std::mem::take(&mut a.pending_session_unsaved);
+        let second = std::mem::take(&mut a.pending_session_unsaved);
+        assert!(first && !second);
     }
 
     #[test]

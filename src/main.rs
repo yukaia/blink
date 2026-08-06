@@ -115,11 +115,13 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| {
                     crate::error::BlinkError::session_not_found(name.clone())
                 })?;
-            tui::run_with_session(config, theme, session).await
+            // Loaded from disk — already saved.
+            tui::run_with_session(config, theme, session, false).await
         }
         Some(Command::Connect { url }) => {
             let session = session::Session::from_url(&url)?;
-            tui::run_with_session(config, theme, session).await
+            // Built from a URL — nothing on disk behind it.
+            tui::run_with_session(config, theme, session, true).await
         }
         Some(Command::Checkpoints { clean, force }) => list_checkpoints(clean, force),
         Some(Command::KnownHosts { action }) => match action {

@@ -71,6 +71,11 @@ A cross-platform terminal SFTP / SCP / FTP / FTPS client with a three-pane TUI, 
   `parallel_downloads`, `accept_invalid_certs`, theme
 - Passwords are never persisted; prompted at connect time
 - Session URL parser (`sftp://user@host:port/path`) for ad-hoc connects
+- **`n` connects ad-hoc, it does not save.** Nothing is written to disk until
+  you say so — which keeps throwaway connects cheap, but is easy to mistake
+  for a failed save. Once the connection comes up blink offers to persist it;
+  decline and `ctrl+s` still saves at any point during the session (and
+  snapshots your current remote/local directories while it's at it).
 
 ### Theming
 

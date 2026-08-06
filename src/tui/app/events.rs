@@ -109,7 +109,16 @@ impl App {
                 self.dispatcher = Some(dispatcher);
                 let is_scp = session.protocol == crate::session::Protocol::Scp;
                 self.current_session = Some(session);
-                self.screen = Screen::Main;
+                // An ad-hoc connect leaves nothing on disk. Offer to fix that
+                // now that the connection has proven it works — waiting until
+                // the user goes looking for the session is how "it connected
+                // but didn't save" reads as a bug rather than a design.
+                let offer_save = std::mem::take(&mut self.pending_session_unsaved);
+                self.screen = if offer_save {
+                    Screen::OfferSaveSession
+                } else {
+                    Screen::Main
+                };
                 self.active_pane = Pane::Remote;
                 self.push_log(
                     LogLevel::Success,

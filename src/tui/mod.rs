@@ -90,13 +90,17 @@ pub async fn run(config: Config, theme: Theme) -> Result<()> {
 
 /// Run the TUI starting with an automatic connection to `session`, bypassing
 /// the session selector. Used by `blink open` and `blink connect`.
+///
+/// `unsaved` is true for `blink connect`, whose session comes from a URL and
+/// has no file behind it; the connect flow offers to persist those.
 pub async fn run_with_session(
     config: Config,
     theme: Theme,
     session: crate::session::Session,
+    unsaved: bool,
 ) -> Result<()> {
     let mut terminal = setup()?;
-    let result = App::with_session(config, theme, session)
+    let result = App::with_session(config, theme, session, unsaved)
         .run(&mut terminal)
         .await;
     let _ = restore(&mut terminal);

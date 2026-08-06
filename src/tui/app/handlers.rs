@@ -64,6 +64,8 @@ impl App {
                 let Some(s) = self.sessions.get(self.session_cursor).cloned() else {
                     return;
                 };
+                // Came from the saved-sessions list, so it is already on disk.
+                self.pending_session_unsaved = false;
                 match &s.auth {
                     AuthMethod::Password => {
                         self.pending_session = Some(s);
@@ -110,6 +112,9 @@ impl App {
                     Ok(session) => {
                         self.new_session_input.clear();
                         self.new_session_error = None;
+                        // Built from a URL — `from_url` persists nothing, so
+                        // the connect flow will offer to save it.
+                        self.pending_session_unsaved = true;
                         match &session.auth {
                             AuthMethod::Password => {
                                 self.pending_session = Some(session);
@@ -685,6 +690,30 @@ impl App {
             KeyCode::PageDown | KeyCode::Char(' ') => self.viewer_scroll(20),
             KeyCode::Home | KeyCode::Char('g') => self.viewer_scroll_to(0),
             KeyCode::End | KeyCode::Char('G') => self.viewer_scroll_to(usize::MAX),
+            _ => {}
+        }
+    }
+
+    /// The offer to persist an ad-hoc connection, shown once after it comes
+    /// up. `y` hands off to the existing save-session modal (which does the
+    /// naming, validation and write); anything else dismisses and leaves the
+    /// connection running unsaved — `ctrl+s` still works later.
+    pub(super) fn handle_offer_save_session(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.screen = Screen::Main;
+                self.open_save_session();
+            }
+            // Enter is deliberately not a dismiss key: the modal offers `y`
+            // and `n/esc`, and every other confirm in the app ignores keys it
+            // doesn't list rather than guessing at a default.
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.screen = Screen::Main;
+                self.push_log(
+                    LogLevel::Info,
+                    "not saved — press ctrl+s any time to save this session".into(),
+                );
+            }
             _ => {}
         }
     }
