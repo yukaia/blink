@@ -740,8 +740,8 @@ pub mod viewer {
                 );
                 f.render_widget(p, body);
             }
-            ViewerKind::Text { lines, tokens, scroll } => {
-                render_text(f, body, app, lines, tokens, *scroll);
+            ViewerKind::Text { tokens, scroll } => {
+                render_text(f, body, app, tokens, *scroll);
             }
             ViewerKind::Image { .. } => {
                 // Body is intentionally left blank — graphics escape codes are
@@ -763,10 +763,10 @@ pub mod viewer {
 
         // Hint strip at the bottom.
         let hint_text = match &viewer.kind {
-            ViewerKind::Text { lines, scroll, .. } => format!(
+            ViewerKind::Text { tokens, scroll } => format!(
                 "  line {}/{}    [↑↓] scroll  [pgup/pgdn] page  [g/G] top/bottom  [q/esc] close",
-                scroll.saturating_add(1).min(lines.len().max(1)),
-                lines.len(),
+                scroll.saturating_add(1).min(tokens.len().max(1)),
+                tokens.len(),
             ),
             _ => "  [q/esc] close".to_string(),
         };
@@ -781,20 +781,17 @@ pub mod viewer {
         f: &mut Frame,
         area: Rect,
         app: &App,
-        lines: &[String],
         tokens: &[Vec<(crate::highlight::TokenKind, String)>],
         scroll: usize,
     ) {
         let h = area.height as usize;
-        if h == 0 || lines.is_empty() {
+        if h == 0 || tokens.is_empty() {
             return;
         }
-        // `tokens` is built once at ViewLoaded time and must stay aligned
-        // with `lines`. Guard against a future refactor that drifts them.
-        debug_assert_eq!(lines.len(), tokens.len());
 
-        let start = scroll.min(lines.len().saturating_sub(1));
-        let end = (start + h).min(lines.len());
+        // One entry per line, so the token count is the line count.
+        let start = scroll.min(tokens.len().saturating_sub(1));
+        let end = (start + h).min(tokens.len());
         let lineno_width = end.to_string().len();
 
         let mut rendered = Vec::with_capacity(end - start);

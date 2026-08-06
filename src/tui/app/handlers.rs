@@ -12,6 +12,7 @@
 //! `self.push_log`, etc. without visibility changes.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use zeroize::Zeroize;
 
 use crate::session::{AuthMethod, Session};
 use crate::transfer::Direction;
@@ -66,7 +67,7 @@ impl App {
                 match &s.auth {
                     AuthMethod::Password => {
                         self.pending_session = Some(s);
-                        self.password_input.clear();
+                        self.password_input.zeroize();
                         self.screen = Screen::PasswordPrompt;
                     }
                     AuthMethod::Key { .. } | AuthMethod::Agent => {
@@ -112,7 +113,7 @@ impl App {
                         match &session.auth {
                             AuthMethod::Password => {
                                 self.pending_session = Some(session);
-                                self.password_input.clear();
+                                self.password_input.zeroize();
                                 self.screen = Screen::PasswordPrompt;
                             }
                             AuthMethod::Key { .. } | AuthMethod::Agent => {
@@ -188,7 +189,7 @@ impl App {
                                 LogLevel::Success,
                                 format!("session deleted: {}", s.name),
                             );
-                            self.sessions = Session::list_all().unwrap_or_default();
+                            self.reload_sessions();
                             // Clamp the cursor: the list just shrank.
                             if self.sessions.is_empty() {
                                 self.session_cursor = 0;
@@ -217,7 +218,7 @@ impl App {
     pub(super) fn handle_password_prompt(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                self.password_input.clear();
+                self.password_input.zeroize();
                 self.pending_session = None;
                 self.pending_password = None;
                 self.screen = Screen::SessionSelect;
@@ -227,7 +228,7 @@ impl App {
                     self.screen = Screen::SessionSelect;
                     return;
                 };
-                let password = zeroize::Zeroizing::new(std::mem::take(&mut self.password_input));
+                let password = zeroize::Zeroizing::new(std::mem::take(&mut *self.password_input));
                 self.pending_password = Some(password.clone());
                 self.start_connect(session, Some(password));
             }
@@ -241,7 +242,7 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 // Bail on the connect attempt entirely.
-                self.passphrase_input.clear();
+                self.passphrase_input.zeroize();
                 self.passphrase_error = None;
                 self.passphrase_attempted = false;
                 self.pending_session = None;
@@ -261,7 +262,7 @@ impl App {
                     self.screen = Screen::SessionSelect;
                     return;
                 };
-                let passphrase = zeroize::Zeroizing::new(std::mem::take(&mut self.passphrase_input));
+                let passphrase = zeroize::Zeroizing::new(std::mem::take(&mut *self.passphrase_input));
                 self.passphrase_attempted = true;
                 self.passphrase_error = None;
                 // Cache for the dispatcher: parallel transfers re-open the
@@ -640,7 +641,7 @@ impl App {
                         self.current_session = Some(to_save);
                         // Refresh the sessions list so it reflects the new
                         // entry next time the user opens the selector.
-                        self.sessions = Session::list_all().unwrap_or_default();
+                        self.reload_sessions();
                         self.save_session_error = None;
                         self.screen = Screen::Main;
                         self.push_log(

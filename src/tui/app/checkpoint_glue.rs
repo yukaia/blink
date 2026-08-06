@@ -56,15 +56,18 @@ impl App {
             return;
         };
 
-        // Only allocate a batch id when there's actually a batch — i.e.
-        // more than one file job (mkdirs alone don't count). Single-file
-        // plans get the no-batch path so the existing single-job cancel
-        // covers them; allocating a batch id would just be noise.
-        let file_count = plan
-            .iter()
-            .filter(|j| !matches!(j, PlannedJob::Mkdir { .. }))
-            .count();
-        let batch_id = if file_count > 1 || plan.len() > 1 {
+        // Allocate a batch id for any plan with more than one job, so `C`
+        // can cancel the whole thing as a unit — including the mkdir that
+        // precedes a single upload. A one-job plan gets the no-batch path
+        // because the single-job cancel (`c`) already covers it and a batch
+        // id would just be noise.
+        //
+        // (This used to read `file_count > 1 || plan.len() > 1` with a
+        // comment claiming mkdir-only plans were excluded. Since
+        // `plan.len() >= file_count`, the first clause could never decide
+        // anything and mkdir-only plans were batched regardless — the
+        // comment described an intent the code never had.)
+        let batch_id = if plan.len() > 1 {
             Some(manager.allocate_batch_id())
         } else {
             None

@@ -212,6 +212,7 @@ blink checkpoints --clean
 
 # Remove all checkpoint files unconditionally
 blink checkpoints --force
+# (both also delete the .part files left by the batches they remove)
 
 # Forget a stored SSH host key (see "known_hosts" below before running this)
 blink known-hosts remove host.example.com
@@ -620,12 +621,32 @@ RGBA buffer is already allocated.
   on disconnect / quit / connect failure). A long-running blink process
   doesn't leave the credential greppable in core dumps after the auth
   window has closed.
+- **This covers the prompt buffers too, not just the stored copy.** The
+  password and passphrase fields are `Zeroizing` from the first keystroke,
+  pre-sized so that typing never reallocates — a growing `String` copies the
+  partial secret into a new allocation and frees the old one *without*
+  clearing it, stranding fragments that no later wipe can reach. Abandoning
+  a prompt zeroizes the buffer rather than calling `clear()`, which would
+  only reset the length and leave the bytes in place.
 - Each parallel worker slot opens its own authenticated connection and
   receives the cached credentials; no shared state crosses task
   boundaries.
 
 ### Config and session file safety
 
+- **A session is validated before it is written.** `Session::save` refuses
+  anything `load_from` would reject — a relative `local_dir`, a relative
+  `key_path`, a field carrying a newline. Previously the edit-session form
+  applied no validation of its own, so typing a relative path into the Local
+  dir field saved successfully and produced a file the loader then skipped:
+  the session disappeared from the selector on the next launch, `.ini` still
+  on disk, with no way to reach it from the UI. Enforcing the invariant in
+  `save` means no form can reintroduce that.
+- **Session files that fail to load are reported, not silently dropped.**
+  `blink sessions` prints a `warning: skipped <file>: <reason>` line to
+  stderr, and the TUI logs one per unreadable file at startup and on every
+  reload. The old `tracing::warn` went to a sink unless `BLINK_LOG_FILE`
+  was set, so the only symptom was a session quietly going missing.
 - Session, config, and checkpoint files are written with the full
   atomic-and-durable pattern: tempfile → `sync_all` → rename →
   `sync_all` on the parent directory. Without the syncs, a power loss

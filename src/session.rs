@@ -105,6 +105,16 @@ impl AuthMethod {
     }
 }
 
+/// Result of enumerating the sessions directory: the sessions that loaded,
+/// plus a `"<file>: <reason>"` line for each one that didn't.
+#[derive(Debug, Clone)]
+pub struct SessionListing {
+    pub sessions: Vec<Session>,
+    /// Files present in the sessions dir that failed to load. Non-empty
+    /// means the user has a session on disk they cannot see in the UI.
+    pub skipped: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
     pub name: String,
@@ -195,8 +205,72 @@ impl Session {
         Ok(paths::sessions_dir()?.join(self.filename()))
     }
 
+    /// Check that this session satisfies every invariant [`Self::load_from`]
+    /// enforces, so a saved session can always be read back.
+    ///
+    /// `save` calls this before writing anything. Without it the writers and
+    /// the reader disagreed about what a valid session is: the edit-session
+    /// form applies no validation of its own, so typing a *relative* path
+    /// into the Local dir field wrote a file that `load_from` then rejected.
+    /// The save reported success, and on the next launch `list_all` skipped
+    /// the file — the session vanished from the selector with its `.ini`
+    /// still on disk and no way to reach it from the UI. Enforcing the
+    /// invariant here rather than in each form means a new writer cannot
+    /// reintroduce that.
+    ///
+    /// The rules are deliberately the loader's rules and no stricter, with
+    /// one addition: fields that would corrupt the INI itself (newlines,
+    /// nulls) are rejected everywhere. A value carrying a newline can never
+    /// survive a load anyway — the parser ends the value at the line break —
+    /// so nothing that currently round-trips is refused here.
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() {
+            return Err(BlinkError::config("session.name must not be empty"));
+        }
+        validate_network_field("name", &self.name)?;
+        validate_network_field("host", &self.host)?;
+        validate_network_field("username", &self.username)?;
+        validate_network_field("remote_dir", &self.remote_dir)?;
+
+        if let Some(local) = &self.local_dir {
+            let raw = local.to_string_lossy();
+            if !local.is_absolute() && !raw.starts_with("~/") && raw != "~" {
+                return Err(BlinkError::config(
+                    "session.local_dir must be an absolute path or start with ~/",
+                ));
+            }
+        }
+
+        if let AuthMethod::Key { path } = &self.auth
+            && !path.is_absolute()
+        {
+            return Err(BlinkError::config(
+                "auth.key_path must be an absolute path",
+            ));
+        }
+
+        if let Some(theme) = &self.theme {
+            config::validate_theme_name(theme)?;
+        }
+
+        if let Some(pin) = &self.cert_sha256
+            && (pin.len() != 64 || !pin.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(BlinkError::config(
+                "tls.cert_sha256 must be 64 lowercase hex characters",
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Serialize and write the session file atomically (write to `.tmp`, rename).
+    ///
+    /// Refuses to write a session that [`Self::validate`] rejects, so the
+    /// file on disk is always one `load_from` can read back.
     pub fn save(&self) -> Result<()> {
+        self.validate()?;
+
         let path = self.path()?;
         let tmp = path.with_extension("tmp");
 
@@ -431,25 +505,46 @@ impl Session {
         })
     }
 
-    /// List all saved sessions, sorted by name. Bad files are skipped with a
-    /// warning rather than aborting the listing.
+    /// List all saved sessions, sorted by name. Files that fail to load are
+    /// skipped rather than aborting the listing; use [`Self::list_all_detailed`]
+    /// when the caller can tell the user about them.
     pub fn list_all() -> Result<Vec<Self>> {
+        Ok(Self::list_all_detailed()?.sessions)
+    }
+
+    /// Like [`Self::list_all`], but also reports the files that were skipped.
+    ///
+    /// A skipped file is invisible to the user — the session simply isn't in
+    /// the selector — and the `tracing::warn` this used to emit goes nowhere
+    /// unless `BLINK_LOG_FILE` is set, because `init_tracing` sends logs to a
+    /// sink otherwise. Handing the reasons back lets the TUI and the CLI say
+    /// which file was dropped and why, instead of leaving the user to wonder
+    /// where their session went.
+    pub fn list_all_detailed() -> Result<SessionListing> {
         let dir = paths::sessions_dir()?;
-        let mut out = Vec::new();
+        let mut sessions = Vec::new();
+        let mut skipped = Vec::new();
         for entry in fs::read_dir(&dir)? {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("ini") {
                 continue;
             }
-            let load = Self::load_from(&path);
-            match load {
-                Ok(s) => out.push(s),
-                Err(e) => tracing::warn!(?path, "skipping bad session: {e}"),
+            match Self::load_from(&path) {
+                Ok(s) => sessions.push(s),
+                Err(e) => {
+                    tracing::warn!(?path, "skipping bad session: {e}");
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string());
+                    skipped.push(format!("{name}: {e}"));
+                }
             }
         }
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(out)
+        sessions.sort_by(|a, b| a.name.cmp(&b.name));
+        skipped.sort();
+        Ok(SessionListing { sessions, skipped })
     }
 
     pub fn delete(name: &str) -> Result<()> {
@@ -828,5 +923,148 @@ mod tests {
         let a = Session::name_to_filename("production");
         let b = Session::name_to_filename("production");
         assert_eq!(a, b);
+    }
+
+    // -- validate ----------------------------------------------------------
+    //
+    // `save` calls this, so anything rejected here can never reach disk and
+    // become a session that `load_from` refuses to read back.
+
+    fn valid() -> Session {
+        Session {
+            name: "prod".into(),
+            protocol: Protocol::Sftp,
+            host: "prod.example.com".into(),
+            port: 22,
+            username: "me".into(),
+            remote_dir: "/var/www".into(),
+            local_dir: None,
+            auth: AuthMethod::Password,
+            parallel_downloads: None,
+            theme: None,
+            accept_invalid_certs: false,
+            cert_sha256: None,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_a_plain_session() {
+        assert!(valid().validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_relative_local_dir() {
+        // The regression this exists for: the edit-session form applies no
+        // validation, so typing a relative path here used to save fine and
+        // then make the session unloadable — it silently vanished from the
+        // selector on the next launch.
+        for bad in ["downloads", "./dl", "../shared"] {
+            let mut s = valid();
+            s.local_dir = Some(PathBuf::from(bad));
+            let err = s.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("local_dir"),
+                "expected {bad:?} to be refused, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_absolute_and_tilde_local_dir() {
+        for ok in ["/home/me/dl", "~/dl", "~"] {
+            let mut s = valid();
+            s.local_dir = Some(PathBuf::from(ok));
+            assert!(s.validate().is_ok(), "{ok} should be accepted");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_relative_key_path() {
+        let mut s = valid();
+        s.auth = AuthMethod::Key { path: PathBuf::from("id_ed25519") };
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_name() {
+        let mut s = valid();
+        s.name = "   ".into();
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_ini_breaking_fields() {
+        // A newline ends the value when the INI is parsed back, so a field
+        // carrying one can never round-trip.
+        for mutate in [
+            (|s: &mut Session| s.host = "a\nb".into()) as fn(&mut Session),
+            |s: &mut Session| s.username = "a\nb".into(),
+            |s: &mut Session| s.remote_dir = "/a\nb".into(),
+            |s: &mut Session| s.name = "a\nb".into(),
+        ] {
+            let mut s = valid();
+            mutate(&mut s);
+            assert!(s.validate().is_err(), "newline field must be refused");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_bad_cert_pin() {
+        let mut s = valid();
+        s.cert_sha256 = Some("nothex".into());
+        assert!(s.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_traversing_theme_name() {
+        let mut s = valid();
+        s.theme = Some("../../etc/passwd".into());
+        assert!(s.validate().is_err());
+    }
+
+    /// Everything `validate` accepts must survive a round-trip through the
+    /// INI writer and `load_from`. This is the invariant the two sides were
+    /// disagreeing about; assert it directly rather than per-field.
+    #[test]
+    fn validated_sessions_round_trip_through_the_loader() {
+        let mut s = valid();
+        s.local_dir = Some(PathBuf::from("/home/me/dl"));
+        s.remote_dir = "/var/www/html".into();
+        s.parallel_downloads = Some(4);
+        s.theme = Some("tokyo-night".into());
+        s.validate().expect("fixture must be valid");
+
+        // Serialise exactly as `save` does, then read it back.
+        let mut ini = Ini::new();
+        ini.with_section(Some("session"))
+            .set("name", &s.name)
+            .set("protocol", s.protocol.as_str())
+            .set("host", &s.host)
+            .set("port", s.port.to_string())
+            .set("username", &s.username)
+            .set("remote_dir", &s.remote_dir)
+            .set("local_dir", s.local_dir.as_ref().unwrap().display().to_string());
+        ini.with_section(Some("auth")).set("method", "password");
+        ini.with_section(Some("transfer")).set("parallel_downloads", "4");
+        ini.with_section(Some("appearance")).set("theme", "tokyo-night");
+
+        let mut buf: Vec<u8> = Vec::new();
+        ini.write_to(&mut buf).unwrap();
+        let raw = String::from_utf8(buf).unwrap();
+
+        let dir = std::env::temp_dir()
+            .join(format!("blink-session-rt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rt.ini");
+        std::fs::write(&path, raw).unwrap();
+
+        let loaded = Session::load_from(&path).expect("validated session must load");
+        assert_eq!(loaded.name, s.name);
+        assert_eq!(loaded.host, s.host);
+        assert_eq!(loaded.remote_dir, s.remote_dir);
+        assert_eq!(loaded.local_dir, s.local_dir);
+        assert_eq!(loaded.parallel_downloads, Some(4));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

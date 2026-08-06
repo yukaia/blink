@@ -219,7 +219,8 @@ fn init_tracing() {
 }
 
 fn list_sessions() -> Result<()> {
-    for s in session::Session::list_all()? {
+    let listing = session::Session::list_all_detailed()?;
+    for s in &listing.sessions {
         println!(
             "{:<14}  {:<6}  {}@{}:{}",
             sanitize_display(&s.name),
@@ -228,6 +229,11 @@ fn list_sessions() -> Result<()> {
             sanitize_display(&s.host),
             s.port,
         );
+    }
+    // A session file that won't load is otherwise invisible: it just doesn't
+    // appear above. Say so, on stderr so the listing stays pipeable.
+    for skip in &listing.skipped {
+        eprintln!("warning: skipped {}", sanitize_display(skip));
     }
     Ok(())
 }

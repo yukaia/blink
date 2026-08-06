@@ -10,6 +10,7 @@ use std::time::Instant;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use tokio::sync::{mpsc, Mutex};
+use zeroize::Zeroize;
 
 use crate::checkpoint::Checkpoint;
 use crate::config::Config;
@@ -113,6 +114,20 @@ pub enum LogLevel {
 /// preview, …) can borrow it without contending with the UI loop.
 type SharedTransport = Arc<Mutex<Box<dyn Transport>>>;
 
+/// Capacity reserved for a credential typed into a prompt.
+///
+/// Comfortably longer than any realistic password or key passphrase, so the
+/// buffer never has to grow. Growth is the problem: `String::push`
+/// reallocating copies the partial secret into a new allocation and frees the
+/// old one without wiping it, so fragments outlive every later zeroize.
+const CREDENTIAL_CAPACITY: usize = 256;
+
+/// A zeroize-on-drop string buffer, pre-sized so typing into it never
+/// reallocates. See [`CREDENTIAL_CAPACITY`].
+fn credential_buffer() -> zeroize::Zeroizing<String> {
+    zeroize::Zeroizing::new(String::with_capacity(CREDENTIAL_CAPACITY))
+}
+
 pub struct App {
     pub config: Config,
     pub theme: Theme,
@@ -127,10 +142,20 @@ pub struct App {
     // Pending connect — set when transitioning to PasswordPrompt or Connection,
     // cleared when the connect resolves or the user cancels.
     pub pending_session: Option<Session>,
-    pub password_input: String,
+    /// Password as it is being typed.
+    ///
+    /// `Zeroizing` so the buffer is wiped on drop, and pre-sized via
+    /// [`credential_buffer`] so the per-keystroke `push` doesn't reallocate:
+    /// a realloc copies the partial password into a fresh allocation and
+    /// frees the old one *without* clearing it, leaving fragments on the
+    /// heap that no later wipe can reach. Abandon paths call `.zeroize()`
+    /// rather than `.clear()`, which would only reset the length.
+    pub password_input: zeroize::Zeroizing<String>,
 
     // SSH key passphrase prompt
-    pub passphrase_input: String,
+    /// Key passphrase as it is being typed. Same handling as
+    /// [`Self::password_input`].
+    pub passphrase_input: zeroize::Zeroizing<String>,
     pub passphrase_error: Option<String>,
     /// Whether the user has already submitted at least one passphrase for the
     /// current `pending_session`. If true on a re-entry to the prompt, the UI
@@ -245,6 +270,9 @@ pub struct App {
     /// selector. Set by `blink open` and `blink connect`; `None` in normal
     /// interactive mode.
     autoconnect: Option<Session>,
+    /// Session files that failed to load during [`App::new`], drained into
+    /// the log by [`App::run`] once there is somewhere to put them.
+    startup_warnings: Vec<String>,
 }
 
 mod actions;
@@ -258,7 +286,13 @@ mod viewer;
 
 impl App {
     pub fn new(config: Config, theme: Theme) -> Self {
-        let sessions = Session::list_all().unwrap_or_default();
+        // `new` predates the log, so stash any unreadable session files and
+        // let `run` report them once the log exists.
+        let listing = Session::list_all_detailed().ok();
+        let (sessions, startup_warnings) = match listing {
+            Some(l) => (l.sessions, l.skipped),
+            None => (Vec::new(), Vec::new()),
+        };
         let mut local = PaneState::empty();
         local.path = crate::paths::default_local_dir().display().to_string();
         let (tx, rx) = mpsc::unbounded_channel();
@@ -272,8 +306,8 @@ impl App {
             sessions,
             session_cursor: 0,
             pending_session: None,
-            password_input: String::new(),
-            passphrase_input: String::new(),
+            password_input: credential_buffer(),
+            passphrase_input: credential_buffer(),
             passphrase_error: None,
             passphrase_attempted: false,
             new_session_input: String::new(),
@@ -315,6 +349,25 @@ impl App {
             status_message: None,
             should_quit: false,
             autoconnect: None,
+            startup_warnings,
+        }
+    }
+
+    /// Re-read the sessions directory, reporting any file that wouldn't load.
+    ///
+    /// Every caller that mutates sessions on disk goes through here so an
+    /// unreadable file is never silently dropped from the selector.
+    fn reload_sessions(&mut self) {
+        match Session::list_all_detailed() {
+            Ok(listing) => {
+                self.sessions = listing.sessions;
+                for skip in listing.skipped {
+                    self.push_log(LogLevel::Warn, format!("unreadable session {skip}"));
+                }
+            }
+            Err(e) => {
+                self.push_log(LogLevel::Error, format!("could not list sessions: {e}"));
+            }
         }
     }
 
@@ -347,6 +400,12 @@ impl App {
             LogLevel::Info,
             format!("graphics protocol: {proto_label}"),
         );
+        // Session files that wouldn't parse. Reported here rather than left
+        // to `tracing`, which goes to a sink unless BLINK_LOG_FILE is set —
+        // so the session just disappeared from the selector with no clue why.
+        for skip in std::mem::take(&mut self.startup_warnings) {
+            self.push_log(LogLevel::Warn, format!("unreadable session {skip}"));
+        }
 
         // Autoconnect: `blink open` / `blink connect` pre-populate this
         // field. We trigger the connect here, after the runtime is live and
@@ -356,7 +415,7 @@ impl App {
             match &session.auth {
                 AuthMethod::Password => {
                     self.pending_session = Some(session);
-                    self.password_input.clear();
+                    self.password_input.zeroize();
                     self.screen = Screen::PasswordPrompt;
                 }
                 AuthMethod::Key { .. } | AuthMethod::Agent => {
@@ -627,7 +686,7 @@ impl App {
 
         // 4. Reset local pane focus and refresh the sessions list.
         self.active_pane = Pane::Local;
-        self.sessions = Session::list_all().unwrap_or_default();
+        self.reload_sessions();
         if self.session_cursor >= self.sessions.len().max(1) {
             self.session_cursor = self.sessions.len().saturating_sub(1);
         }
@@ -779,5 +838,43 @@ fn resolve_local_dir(raw: &std::path::Path) -> Option<std::path::PathBuf> {
         Some(expanded)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_buffer_does_not_reallocate_while_typing() {
+        // The whole point of pre-sizing: a realloc copies the partial secret
+        // into a fresh allocation and frees the old one without wiping it,
+        // leaving fragments no later zeroize can reach. Assert the buffer
+        // absorbs an unreasonably long credential without growing.
+        let mut buf = credential_buffer();
+        let capacity_before = buf.capacity();
+        let ptr_before = buf.as_ptr();
+
+        for _ in 0..CREDENTIAL_CAPACITY {
+            buf.push('x');
+        }
+
+        assert_eq!(buf.capacity(), capacity_before, "buffer must not grow");
+        assert_eq!(buf.as_ptr(), ptr_before, "buffer must not move");
+    }
+
+    #[test]
+    fn zeroize_keeps_the_capacity_for_the_next_attempt() {
+        // Abandon paths call `.zeroize()`, not `.clear()`. It must both empty
+        // the buffer and leave the pre-sized allocation in place, or a retry
+        // after a wrong password would start reallocating again.
+        let mut buf = credential_buffer();
+        buf.push_str("hunter2");
+        let capacity_before = buf.capacity();
+
+        buf.zeroize();
+
+        assert!(buf.is_empty(), "zeroize must empty the buffer");
+        assert_eq!(buf.capacity(), capacity_before, "capacity must survive");
     }
 }

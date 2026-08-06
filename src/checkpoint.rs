@@ -537,6 +537,44 @@ impl Checkpoint {
     }
 }
 
+/// Delete the `.part` files belonging to `cp`'s unfinished downloads.
+/// Returns how many were removed.
+///
+/// A download streams into `<dest>.part` and renames onto `<dest>` only on
+/// success, so an interrupted batch leaves partials scattered across the
+/// destination tree. The checkpoint is the only record of where they are —
+/// once it is gone, nothing can find them again and they sit there forever.
+///
+/// Only `Done` jobs are skipped: their `.part` was already renamed away, and
+/// a file at that path now would belong to some other transfer.
+///
+/// Deliberately confined to the `blink checkpoints` CLI path, which runs when
+/// no transfers are in flight. Doing the same sweep on an in-app batch cancel
+/// would race the worker still writing the file: on Unix the unlink succeeds,
+/// the worker keeps writing to the now-unlinked inode, and its final rename
+/// fails — turning a clean cancel into an error.
+fn remove_orphan_parts(cp: &Checkpoint) -> usize {
+    let mut removed = 0usize;
+    for job in &cp.jobs {
+        let CheckpointJob::Download { local_path, status, .. } = job else {
+            continue;
+        };
+        if *status == JobStatus::Done {
+            continue;
+        }
+        let part = crate::transport::part_path(local_path);
+        match std::fs::remove_file(&part) {
+            Ok(()) => removed += 1,
+            // Not there is the normal case — the job may never have started.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                eprintln!("warning: could not remove {}: {e}", part.display());
+            }
+        }
+    }
+    removed
+}
+
 /// Print checkpoint info. Pass `clean` to remove completed/orphaned files,
 /// `force` to remove every file unconditionally.
 pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
@@ -566,6 +604,7 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
 
     let mut removed = 0usize;
     let mut kept = 0usize;
+    let mut parts_removed = 0usize;
 
     for path in &entries {
         let cp = match Checkpoint::load_from(path) {
@@ -585,6 +624,11 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
         let should_remove = force || (clean && (pending == 0 || orphaned));
 
         if should_remove {
+            // Removing the checkpoint makes the batch unresumable, which
+            // strands the `.part` files its unfinished downloads left
+            // behind — nothing else records where they are. Sweep them
+            // while we still know.
+            parts_removed += remove_orphan_parts(&cp);
             match fs::remove_file(path) {
                 Ok(()) => {
                     let reason = if force {
@@ -626,6 +670,10 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
     if clean || force {
         println!();
         println!("{removed} removed, {kept} kept");
+        if parts_removed > 0 {
+            let plural = if parts_removed == 1 { "file" } else { "files" };
+            println!("{parts_removed} orphaned .part {plural} deleted");
+        }
     } else if kept > 0 {
         println!();
         println!("Use `blink checkpoints --clean` to remove completed and orphaned checkpoints.");

@@ -166,7 +166,7 @@ impl App {
                             ),
                         );
                     }
-                self.sessions = Session::list_all().unwrap_or_default();
+                self.reload_sessions();
                 // Keep the cursor pointed at the freshly-edited session if
                 // we can find it, otherwise clamp.
                 self.session_cursor = self

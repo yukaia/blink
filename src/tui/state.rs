@@ -153,14 +153,18 @@ pub struct Viewer {
 pub enum ViewerKind {
     /// Fetch in flight.
     Loading,
-    /// Decoded text with one-shot syntax tokenisation alongside.
+    /// Decoded text, stored purely as one-shot syntax tokenisation.
     ///
     /// `tokens` is computed once at load time; every subsequent frame just
     /// reads `tokens[start..end]` instead of re-tokenising the whole prefix
     /// (the viewer redraws on the 100 ms TUI tick, so an un-cached approach
     /// for a 10k-line file at the bottom was ~10k tokenize calls per frame).
+    ///
+    /// One entry per line, and the spans of a line concatenate back to that
+    /// line — so `tokens.len()` is the line count and no separate `Vec<String>`
+    /// of lines is kept. Holding both meant a file up to the 1 MB viewer limit
+    /// sat in memory twice, and the copy was read only for its `.len()`.
     Text {
-        lines: Vec<String>,
         tokens: Vec<Vec<(crate::highlight::TokenKind, String)>>,
         scroll: usize,
     },

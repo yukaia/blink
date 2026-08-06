@@ -14,6 +14,7 @@
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
+use zeroize::Zeroize;
 
 use crate::checkpoint::Checkpoint;
 use crate::preview::{self, FileViewKind};
@@ -55,7 +56,7 @@ impl App {
                 let remote_dir = session.remote_dir.clone();
                 let password = self.pending_password.clone();
                 // Successful connect — clear any leftover passphrase state.
-                self.passphrase_input.clear();
+                self.passphrase_input.zeroize();
                 self.passphrase_error = None;
                 self.passphrase_attempted = false;
 
@@ -129,8 +130,8 @@ impl App {
                 }
                 self.pending_session = None;
                 self.pending_password = None;
-                self.password_input.clear();
-                self.passphrase_input.clear();
+                self.password_input.zeroize();
+                self.passphrase_input.zeroize();
                 self.passphrase_error = None;
                 self.passphrase_attempted = false;
                 self.screen = Screen::SessionSelect;
@@ -143,7 +144,7 @@ impl App {
                     return;
                 }
                 let was_attempted = self.passphrase_attempted;
-                self.passphrase_input.clear();
+                self.passphrase_input.zeroize();
                 self.passphrase_error = if was_attempted {
                     Some("passphrase incorrect, try again".into())
                 } else {
@@ -293,11 +294,9 @@ impl App {
                                 let lines: Vec<String> =
                                     text.lines().map(crate::error::sanitize_line).collect();
                                 let tokens = super::viewer::tokenize_lines(&name, &lines);
-                                ViewerKind::Text {
-                                    lines,
-                                    tokens,
-                                    scroll: 0,
-                                }
+                                // `lines` is dropped here: the tokens carry
+                                // the same text, one Vec per line.
+                                ViewerKind::Text { tokens, scroll: 0 }
                             }
                             FileViewKind::Image => {
                                 // Only enter Image state if a graphics backend
