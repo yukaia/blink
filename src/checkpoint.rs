@@ -596,7 +596,7 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
                     };
                     println!(
                         "removed  {:<20}  {:<8}  {}/{} done  ({})",
-                        cp.session,
+                        crate::error::sanitize_display(&cp.session),
                         cp.kind.as_str(),
                         done,
                         total,
@@ -612,7 +612,7 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
             let flag = if orphaned { " [orphaned]" } else { "" };
             println!(
                 "{:<20}  {:<8}  {}/{} done  ({} remaining){}",
-                cp.session,
+                crate::error::sanitize_display(&cp.session),
                 cp.kind.as_str(),
                 done,
                 total,

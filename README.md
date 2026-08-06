@@ -212,6 +212,10 @@ blink checkpoints --clean
 
 # Remove all checkpoint files unconditionally
 blink checkpoints --force
+
+# Forget a stored SSH host key (see "known_hosts" below before running this)
+blink known-hosts remove host.example.com
+blink known-hosts remove host.example.com --port 2222
 ```
 
 `blink open` exits with an error if the session name is not found.
@@ -268,9 +272,25 @@ with the server's SHA-256 fingerprint and three choices:
 
 If a host's key changes after being saved, blink hard-rejects the
 connection and shows a warning screen that only `Enter` / `Esc` / `q`
-dismisses (so a held key can't blow past the warning). To reconnect after
-a legitimate key rotation, remove the old entry from the known-hosts file
-manually and reconnect.
+dismisses (so a held key can't blow past the warning). The screen prints
+the exact command that clears the stored entry:
+
+```sh
+blink known-hosts remove host.example.com            # port 22
+blink known-hosts remove host.example.com --port 2222
+```
+
+That command is deliberately *not* a key on the warning screen. A key
+mismatch is what a legitimate key rotation and a man-in-the-middle look
+like alike, so forgetting the old fingerprint should take a conscious step
+outside the TUI — the same reason OpenSSH points you at `ssh-keygen -R`
+instead of offering to do it for you. Confirm the new fingerprint through
+some channel other than the connection that just failed before you run it.
+
+Removal takes every algorithm stored for that host and port (a host with
+both an `ssh-ed25519` and an `ssh-rsa` entry is fully forgotten), leaves
+other hosts and comments untouched, and reports how many entries went
+away — `0` almost always means the host was stored under a different port.
 
 Concurrent appends from two blink processes accepting the same new host
 are serialised through an exclusive advisory file lock, so two parallel
@@ -519,15 +539,31 @@ terminal. The following properties are enforced in the current codebase.
 
 ### Terminal injection prevention
 
-All server-controlled strings pass through a sanitizer that replaces control
-characters (U+0000–U+001F and U+007F–U+009F, covering ESC and all ANSI
-sequence starters) with spaces before being stored or rendered:
+All server-controlled strings pass through a sanitizer before being stored or
+rendered. Two classes of character are replaced with spaces:
+
+- **Control characters** (U+0000–U+001F and U+007F–U+009F) — covers ESC and
+  every ANSI sequence starter.
+- **Bidirectional and zero-width formatters** (U+061C, U+200B–U+200C,
+  U+200E–U+200F, U+202A–U+202E, U+2066–U+2069, U+FEFF). These are Unicode
+  category **Cf**, so a `is_control()` check alone misses them. A
+  RIGHT-TO-LEFT OVERRIDE lets a server name a file that *renders* as
+  `report.png` while the bytes end in `.exe`; zero-width characters let two
+  different names render identically. Replacing rather than deleting is
+  deliberate — it makes the difference visible instead of collapsing two
+  distinct names onto one rendering. U+200D ZERO WIDTH JOINER is
+  intentionally kept: it can't spoof an extension, and stripping it would
+  break emoji sequences in legitimate filenames.
+
+Applied to:
 
 - Remote directory-entry names (`list()` in every transport)
 - SSH key-type strings and host-key fingerprints
 - Error messages from transport layers
 - Text file content in the viewer (tabs preserved; no length cap beyond the
-  10 MB transport read limit)
+  10 MB transport read limit) — the bidi filter matters as much here, since
+  viewing remote source is exactly the "trojan source" setting
+- Session and checkpoint names printed by the CLI subcommands
 
 ### Path safety
 
@@ -542,6 +578,10 @@ sequence starters) with spaces before being stored or rendered:
   user's destination tree, and an A→B→A symlink cycle can't loop the
   walker. Single-file `View` of a symlink still works — that's an
   explicit per-file action.
+- **Directories count against the recursive-walk budget.** A remote
+  download walk emits jobs only for files, so a server serving a deep or
+  very wide tree of *empty* directories would otherwise expand the walk
+  (and create local directories) without ever tripping the job cap.
 - **SFTP recursive delete unlinks symlinks rather than following them.**
   Some SFTP servers report symlink-to-directory entries with both
   `is_dir` and `is_symlink` set; a recursive `delete_dir(true)` that
@@ -559,7 +599,7 @@ sequence starters) with spaces before being stored or rendered:
 | Image decoder pre-decode dimension cap | 4096 × 4096 px |
 | Image decoder max allocation | 128 MiB (enforced *before* full pixel-buffer alloc) |
 | Transfer job queue | 100,000 jobs |
-| Recursive walk plan | 100,000 jobs (bails before materialising the whole tree) |
+| Recursive walk plan | 100,000 entries — planned jobs *plus* directories visited and queued (bails before materialising the whole tree) |
 | Error string length | 512 characters |
 | Session / config / theme files | 64 KiB each |
 | Checkpoint files | 10 MiB |

@@ -246,17 +246,66 @@ pub fn append(host: &str, port: u16, key_type: &str, key_b64: &str) -> Result<()
     Ok(())
 }
 
-/// Remove all lines for `host` (any port form) from the known-hosts file.
-#[allow(dead_code)]
-pub fn remove_host(host: &str, port: u16) -> Result<()> {
+/// Remove every entry for `(host, port)` from the known-hosts file.
+///
+/// Returns how many lines were removed, so the caller can tell "forgot the
+/// key" apart from "nothing matched" — the latter usually means the user
+/// named a different host form than the one that was stored (a bare host
+/// when the entry is `[host]:port`, or vice versa).
+///
+/// Matching accepts the same forms as [`check`]: the canonical bare host for
+/// port 22, the bracketed `[host]:port`, and the legacy `host:port`.
+pub fn remove_host(host: &str, port: u16) -> Result<usize> {
     let path = known_hosts_path()?;
 
     let raw = match read_bounded(&path) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(BlinkError::from(e)),
     };
 
+    let (filtered, removed) = filter_out_host(&raw, host, port);
+
+    // Nothing to do — don't rewrite the file (and don't risk clobbering a
+    // concurrent append) just to produce identical content.
+    if removed == 0 {
+        return Ok(0);
+    }
+
+    // Atomic + durable write, same pattern as every other file blink owns:
+    // tempfile → sync_all → rename → fsync the parent directory. Without the
+    // syncs a power loss can leave a zero-byte known_hosts, which would
+    // silently downgrade every stored host to "unknown".
+    //
+    // Note this does NOT take the advisory lock `append` uses: that lock
+    // lives on the original inode, and renaming a replacement over it can't
+    // be serialised against it that way. A concurrent accept-and-save racing
+    // this removal can therefore be lost — the consequence is one re-prompt
+    // on the next connect, not a wrong trust decision.
+    let tmp = path.with_extension("tmp");
+    {
+        use std::io::Write as _;
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(filtered.as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &path)?;
+    paths::sync_parent_dir(&path)?;
+    Ok(removed)
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Drop every entry matching `(host, port)` from `raw`, returning the
+/// rewritten contents and how many lines went away.
+///
+/// Comments and blank lines are preserved, and lines whose host field names a
+/// different host or a different port are left alone — removing a key must
+/// not disturb neighbouring entries.
+fn filter_out_host(raw: &str, host: &str, port: u16) -> (String, usize) {
+    let mut removed = 0usize;
     let filtered: String = raw
         .lines()
         .filter(|line| {
@@ -265,22 +314,16 @@ pub fn remove_host(host: &str, port: u16) -> Result<()> {
                 return true; // keep comments and blanks
             }
             let host_field = t.split(' ').next().unwrap_or("");
-            !host_matches(host_field, host, port)
+            let matched = host_matches(host_field, host, port);
+            if matched {
+                removed += 1;
+            }
+            !matched
         })
         .map(|l| format!("{l}\n"))
         .collect();
-
-    // Write atomically: temp file + rename so a crash mid-write never
-    // corrupts the file.
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, &filtered)?;
-    fs::rename(&tmp, &path)?;
-    Ok(())
+    (filtered, removed)
 }
-
-// ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
 
 /// Open `path` and read at most `MAX_KNOWN_HOSTS_BYTES` into a `String`.
 fn read_bounded(path: &Path) -> std::io::Result<String> {
@@ -479,5 +522,90 @@ mod tests {
     fn append_rejects_carriage_return_in_key() {
         let r = super::append("host", 22, "ssh-ed25519", "KEY\rwith-cr");
         assert!(r.is_err());
+    }
+
+    // -- remove_host ------------------------------------------------------
+    //
+    // `remove_host` itself resolves the real user's known_hosts path, so the
+    // filtering logic is tested through `filter_out_host` — the same split
+    // `check` / `check_in_str` already uses.
+
+    #[test]
+    fn remove_drops_the_canonical_entry() {
+        let raw = format!("prod.example.com ssh-ed25519 {ED_KEY}\n");
+        let (out, n) = filter_out_host(&raw, "prod.example.com", 22);
+        assert_eq!(n, 1);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn remove_drops_the_bracketed_and_legacy_forms() {
+        for stored in ["[prod.example.com]:2222", "prod.example.com:2222"] {
+            let raw = format!("{stored} ssh-ed25519 {ED_KEY}\n");
+            let (out, n) = filter_out_host(&raw, "prod.example.com", 2222);
+            assert_eq!(n, 1, "{stored} should have matched");
+            assert_eq!(out, "");
+        }
+    }
+
+    #[test]
+    fn remove_takes_every_algorithm_for_the_host() {
+        // A host with both an ed25519 and an rsa entry must be fully
+        // forgotten, or the next connect still trips on the leftover.
+        let raw = format!(
+            "prod.example.com ssh-ed25519 {ED_KEY}\n\
+             prod.example.com ssh-rsa {RSA_KEY}\n"
+        );
+        let (out, n) = filter_out_host(&raw, "prod.example.com", 22);
+        assert_eq!(n, 2);
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn remove_leaves_other_hosts_untouched() {
+        let raw = format!(
+            "# blink known hosts\n\
+             \n\
+             other.example.com ssh-ed25519 {ED_KEY_2}\n\
+             prod.example.com ssh-ed25519 {ED_KEY}\n"
+        );
+        let (out, n) = filter_out_host(&raw, "prod.example.com", 22);
+        assert_eq!(n, 1);
+        assert!(out.contains("other.example.com"), "neighbour was dropped: {out:?}");
+        assert!(out.contains("# blink known hosts"), "comment was dropped: {out:?}");
+        assert!(!out.contains("prod.example.com"));
+    }
+
+    #[test]
+    fn remove_respects_the_port() {
+        // A port-22 entry must not be removed by a request for port 2222.
+        let raw = format!("prod.example.com ssh-ed25519 {ED_KEY}\n");
+        let (out, n) = filter_out_host(&raw, "prod.example.com", 2222);
+        assert_eq!(n, 0, "wrong port must not match");
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn remove_reports_zero_when_nothing_matches() {
+        let raw = format!("prod.example.com ssh-ed25519 {ED_KEY}\n");
+        let (_, n) = filter_out_host(&raw, "absent.example.com", 22);
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn removed_host_is_unknown_again() {
+        // The end-to-end property the command exists for: after removal the
+        // host reads as Unknown (re-prompt), not Changed (hard reject).
+        let raw = format!("prod.example.com ssh-ed25519 {ED_KEY}\n");
+        assert!(matches!(
+            check_in_str(&raw, "prod.example.com", 22, "ssh-ed25519", ED_KEY_2),
+            KeyStatus::Changed { .. }
+        ));
+
+        let (after, _) = filter_out_host(&raw, "prod.example.com", 22);
+        assert_eq!(
+            check_in_str(&after, "prod.example.com", 22, "ssh-ed25519", ED_KEY_2),
+            KeyStatus::Unknown,
+        );
     }
 }

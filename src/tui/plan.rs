@@ -135,19 +135,30 @@ pub async fn walk_remote(
 ) -> Result<WalkResult> {
     let mut out: Vec<PlannedJob> = Vec::new();
     let mut symlinks_skipped: usize = 0;
+    let mut dirs_visited: usize = 0;
 
     // Iterative DFS. Stack holds (remote_path_to_visit, local_path_dest).
     let mut stack: Vec<(String, PathBuf)> =
         vec![(remote_root.to_string(), local_root.to_path_buf())];
 
     while let Some((remote_dir, local_dir)) = stack.pop() {
+        dirs_visited += 1;
+
         // Guard against pathological remote trees (or a `proc`-like FS) that
         // would otherwise OOM the walker before the dispatcher's pending-job
         // cap ever fires. Stop early with a real error so the user gets a
         // useful message instead of a process killed by the OOM killer.
-        if out.len() > MAX_QUEUED_JOBS {
+        //
+        // Directories have to count towards the budget, not just the jobs
+        // they yield. Unlike `walk_local`, this walk emits no Mkdir job per
+        // directory — only Downloads — so a remote serving a deep or wide
+        // tree of *empty* directories left `out` at zero while `stack` and
+        // the local mkdirs grew without limit, and the cap never fired.
+        // Counting visits plus the queued stack matches the budget
+        // `walk_local` gets implicitly from its per-directory Mkdir.
+        if out.len() + dirs_visited + stack.len() > MAX_QUEUED_JOBS {
             return Err(BlinkError::transport(format!(
-                "recursive walk exceeded {MAX_QUEUED_JOBS} jobs — \
+                "recursive walk exceeded {MAX_QUEUED_JOBS} entries — \
                  narrow the source or run separate transfers",
             )));
         }
@@ -379,6 +390,115 @@ pub fn drop_conflicting(plan: Vec<PlannedJob>, conflicts: &[usize]) -> Vec<Plann
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- Walk budget -------------------------------------------------------
+
+    /// Transport stub that reports every directory as containing `fan_out`
+    /// subdirectories and no files. `walk_remote` only ever calls `list`, so
+    /// nothing else needs a real implementation.
+    struct EmptyDirTree {
+        fan_out: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for EmptyDirTree {
+        async fn list(&mut self, _remote_path: &str) -> Result<Vec<transport::RemoteEntry>> {
+            Ok((0..self.fan_out)
+                .map(|i| transport::RemoteEntry {
+                    name: format!("d{i}"),
+                    kind: EntryKind::Directory,
+                    size: 0,
+                    modified: None,
+                    mode: None,
+                })
+                .collect())
+        }
+
+        fn protocol(&self) -> crate::session::Protocol {
+            crate::session::Protocol::Sftp
+        }
+        async fn download(
+            &mut self,
+            _: &str,
+            _: &Path,
+            _: Option<tokio::sync::mpsc::UnboundedSender<transport::ProgressUpdate>>,
+        ) -> Result<()> {
+            unreachable!("walk_remote does not transfer")
+        }
+        async fn upload(
+            &mut self,
+            _: &Path,
+            _: &str,
+            _: Option<tokio::sync::mpsc::UnboundedSender<transport::ProgressUpdate>>,
+        ) -> Result<()> {
+            unreachable!("walk_remote does not transfer")
+        }
+        async fn rename(&mut self, _: &str, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn delete_file(&mut self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn delete_dir(&mut self, _: &str, _: bool) -> Result<()> {
+            unreachable!()
+        }
+        async fn mkdir(&mut self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn metadata(&mut self, _: &str) -> Result<Option<transport::RemoteEntry>> {
+            unreachable!()
+        }
+        async fn read_to_bytes(&mut self, _: &str) -> Result<bytes::Bytes> {
+            unreachable!()
+        }
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Unique scratch directory, removed by the caller.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("blink-plan-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[tokio::test]
+    async fn walk_remote_counts_directories_towards_the_cap() {
+        // The regression: `walk_remote` emits Downloads only, never a Mkdir,
+        // so a tree of empty directories left `out` at zero and the cap never
+        // fired no matter how much the walk expanded. A fan-out wider than
+        // the budget must now be refused.
+        let root = scratch("wide");
+        let mut t = EmptyDirTree {
+            fan_out: MAX_QUEUED_JOBS + 1,
+        };
+
+        let err = walk_remote(&mut t, "/", &root)
+            .await
+            .expect_err("a tree this wide must not be planned");
+        assert!(
+            err.to_string().contains("exceeded"),
+            "expected the walk budget error, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn walk_remote_still_accepts_a_small_empty_tree() {
+        // The guard must not fire on ordinary input — an empty directory
+        // tree is legitimate, it just plans no transfers.
+        let root = scratch("small");
+        let mut t = EmptyDirTree { fan_out: 0 };
+
+        let result = walk_remote(&mut t, "/", &root).await.expect("must succeed");
+        assert!(result.plan.is_empty(), "no files means no jobs");
+        assert_eq!(result.symlinks_skipped, 0);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn safe_local_name_rejects_traversal_and_separators() {

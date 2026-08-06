@@ -356,6 +356,8 @@ impl App {
             }
             AppEvent::HostKeyChanged {
                 host,
+                lookup_host,
+                lookup_port,
                 stored_key_type,
                 presented_key_type,
                 fingerprint,
@@ -369,6 +371,8 @@ impl App {
                 );
                 self.host_key_changed_info = Some(HostKeyChangedInfo {
                     host,
+                    lookup_host,
+                    lookup_port,
                     stored_key_type,
                     presented_key_type,
                     fingerprint,

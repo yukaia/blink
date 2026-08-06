@@ -240,7 +240,12 @@ impl Drop for PendingHostKey {
 /// State for the host-key-changed error modal.
 #[derive(Debug, Clone)]
 pub struct HostKeyChangedInfo {
+    /// Display form (bare host for port 22, `[host]:port` otherwise).
     pub host: String,
+    /// Raw host and port, for the `blink known-hosts remove` command the
+    /// modal prints as the recovery path.
+    pub lookup_host: String,
+    pub lookup_port: u16,
     pub stored_key_type: String,
     pub presented_key_type: String,
     pub fingerprint: String,

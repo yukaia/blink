@@ -126,6 +126,8 @@ impl Handler for KnownHostsHandler {
                 // error message rather than a generic connect failure.
                 let event = crate::tui::event::AppEvent::HostKeyChanged {
                     host: display_host,
+                    lookup_host: self.host.clone(),
+                    lookup_port: self.port,
                     stored_key_type,
                     presented_key_type: key_type,
                     fingerprint,

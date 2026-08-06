@@ -65,6 +65,29 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Inspect or edit the stored SSH host keys.
+    KnownHosts {
+        #[command(subcommand)]
+        action: KnownHostsAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum KnownHostsAction {
+    /// Forget the stored key for a host, so the next connect asks you to
+    /// verify the new one.
+    ///
+    /// Run this only when you know the server's key was legitimately
+    /// replaced (a rebuild, a migration). If blink reported a mismatch you
+    /// were not expecting, confirm the new fingerprint out of band first —
+    /// a mismatch is also what a man-in-the-middle looks like.
+    Remove {
+        /// Hostname exactly as you connect to it.
+        host: String,
+        /// Port the entry was stored under.
+        #[arg(long, default_value_t = 22)]
+        port: u16,
+    },
 }
 
 #[tokio::main]
@@ -99,7 +122,32 @@ async fn main() -> Result<()> {
             tui::run_with_session(config, theme, session).await
         }
         Some(Command::Checkpoints { clean, force }) => list_checkpoints(clean, force),
+        Some(Command::KnownHosts { action }) => match action {
+            KnownHostsAction::Remove { host, port } => remove_known_host(&host, port),
+        },
     }
+}
+
+/// Forget the stored host key(s) for `host` on `port`.
+fn remove_known_host(host: &str, port: u16) -> Result<()> {
+    let removed = known_hosts::remove_host(host, port)?;
+    let shown = sanitize_display(host);
+    if removed == 0 {
+        // Almost always a host-form mismatch rather than a real absence, so
+        // say what was searched for instead of just "not found".
+        println!("no stored key for {shown} port {port} — nothing removed");
+        println!(
+            "entries are stored per host AND port; check `{}` if the host looks right",
+            known_hosts::known_hosts_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "the known_hosts file".to_string()),
+        );
+        return Ok(());
+    }
+    let plural = if removed == 1 { "entry" } else { "entries" };
+    println!("removed {removed} {plural} for {shown} port {port}");
+    println!("the next connect will ask you to verify the server's key");
+    Ok(())
 }
 
 fn init_tracing() {

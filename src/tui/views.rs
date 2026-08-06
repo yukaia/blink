@@ -2000,9 +2000,19 @@ pub mod host_key_changed {
             None => return,
         };
 
-        let known_hosts_path = crate::known_hosts::known_hosts_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "~/.config/blink/known_hosts".to_string());
+        // Exact, copy-pasteable recovery command. Deliberately something the
+        // user has to leave blink to run: this modal is the MITM warning, and
+        // a key that forgets the stored fingerprint from inside it would turn
+        // the warning into a dismiss button. Same posture as OpenSSH pointing
+        // at `ssh-keygen -R` rather than offering to do it for you.
+        let remove_cmd = if info.lookup_port == 22 {
+            format!("blink known-hosts remove {}", info.lookup_host)
+        } else {
+            format!(
+                "blink known-hosts remove {} --port {}",
+                info.lookup_host, info.lookup_port
+            )
+        };
 
         let lines = vec![
             Line::from(""),
@@ -2053,21 +2063,21 @@ pub mod host_key_changed {
             Line::from(""),
             Line::from(
                 Span::styled(
-                    "If the server key was legitimately replaced, remove the old",
+                    "Only if you know the key was legitimately replaced, and",
                     Style::default().fg(app.theme.dim),
                 )
             ).alignment(Alignment::Center),
             Line::from(
                 Span::styled(
-                    "entry from your known-hosts file and reconnect.",
+                    "have confirmed the new fingerprint out of band, run:",
                     Style::default().fg(app.theme.dim),
                 )
             ).alignment(Alignment::Center),
             Line::from(""),
             Line::from(
                 Span::styled(
-                    known_hosts_path,
-                    Style::default().fg(app.theme.dim).add_modifier(Modifier::ITALIC),
+                    remove_cmd,
+                    Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
                 )
             ).alignment(Alignment::Center),
             Line::from(""),

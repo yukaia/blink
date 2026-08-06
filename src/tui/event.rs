@@ -132,7 +132,14 @@ pub enum AppEvent {
     /// The App should surface this as a clear error before returning to the
     /// session selector.
     HostKeyChanged {
+        /// Display form of the host (bare for the default SSH port,
+        /// `[host]:port` otherwise) — used for the modal label.
         host: String,
+        /// Raw hostname and port as connected. Carried separately from
+        /// `host` because the recovery command the modal prints
+        /// (`blink known-hosts remove`) takes them unformatted.
+        lookup_host: String,
+        lookup_port: u16,
         stored_key_type: String,
         presented_key_type: String,
         fingerprint: String,
