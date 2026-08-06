@@ -3,6 +3,7 @@
 use std::io::{self, Stdout};
 use std::time::Duration;
 
+use crossterm::cursor::Show;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -29,9 +30,37 @@ pub type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 /// Convenience tick interval for the event loop.
 pub const TICK_INTERVAL: Duration = Duration::from_millis(100);
 
+/// Restore the terminal from inside a panic, then delegate to the hook that
+/// was installed before us.
+///
+/// [`restore`] only runs on the normal return path — a panic anywhere in the
+/// run loop (a render bug, an `unwrap` that turns out to be reachable)
+/// unwinds straight past it, and `Terminal`'s `Drop` undoes neither raw mode
+/// nor the alternate screen. The user would be left at a shell with no echo
+/// and no line editing, with the panic message painted onto the alternate
+/// screen they can no longer see.
+///
+/// Idempotent: installing twice would nest the hooks, and both `run` and
+/// `run_with_session` call [`setup`].
+fn install_panic_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Best effort — we're already panicking, so a failure here has
+            // nowhere useful to go. Order mirrors `restore`.
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture, Show);
+            previous(info);
+        }));
+    });
+}
+
 /// Set up the alternate screen, raw mode, and mouse capture. The matching
 /// teardown lives in [`restore`] and MUST run on every exit path.
 pub fn setup() -> Result<TuiTerminal> {
+    // Before raw mode, so the hook is in place for anything that follows.
+    install_panic_hook();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;

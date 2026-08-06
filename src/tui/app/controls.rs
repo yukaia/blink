@@ -58,21 +58,7 @@ impl App {
 
         // Count siblings in the batch, including pending ones (which the
         // active-only list above doesn't include).
-        let snapshot = manager.snapshot();
-        let active = snapshot
-            .iter()
-            .filter(|j| {
-                j.batch_id == Some(batch_id)
-                    && matches!(j.state, crate::transfer::TransferState::Active)
-            })
-            .count();
-        let pending = snapshot
-            .iter()
-            .filter(|j| {
-                j.batch_id == Some(batch_id)
-                    && matches!(j.state, crate::transfer::TransferState::Pending)
-            })
-            .count();
+        let (active, pending) = manager.batch_counts(batch_id);
         if active == 0 && pending == 0 {
             return;
         }
@@ -154,15 +140,14 @@ impl App {
 
     /// Snapshot of currently-running jobs, for the transfer strip and the
     /// cancel helpers above.
+    ///
+    /// Delegates to [`crate::transfer::TransferManager::active_jobs`], which
+    /// filters while it holds the lock. Doing the filter here instead meant
+    /// cloning every job the manager had ever tracked on every frame.
     pub fn active_jobs(&self) -> Vec<TransferJob> {
         self.transfer_manager
             .as_ref()
-            .map(|m| {
-                m.snapshot()
-                    .into_iter()
-                    .filter(|j| j.state == crate::transfer::TransferState::Active)
-                    .collect()
-            })
+            .map(|m| m.active_jobs())
             .unwrap_or_default()
     }
 }

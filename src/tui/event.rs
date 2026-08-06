@@ -147,6 +147,10 @@ pub struct EventStream {
     crossterm: CrosstermEventStream,
     tick: Interval,
     app: mpsc::UnboundedReceiver<AppEvent>,
+    /// Set by [`drain_progress`] when collapsing a burst of progress events
+    /// turns up something that isn't progress. Returned ahead of the channel
+    /// on the next call so nothing is reordered or dropped.
+    deferred: Option<AppEvent>,
 }
 
 impl EventStream {
@@ -155,10 +159,15 @@ impl EventStream {
             crossterm: CrosstermEventStream::new(),
             tick: interval(tick_rate),
             app,
+            deferred: None,
         }
     }
 
     pub async fn next(&mut self) -> Result<Event> {
+        // Anything held back by the last coalesce pass goes first.
+        if let Some(ev) = self.deferred.take() {
+            return Ok(Event::App(ev));
+        }
         loop {
             tokio::select! {
                 // Bias the arms so keystrokes and app events drain before
@@ -184,9 +193,92 @@ impl EventStream {
                         None => return Ok(Event::Tick),
                     }
                 }
-                Some(ev) = self.app.recv() => return Ok(Event::App(ev)),
+                Some(ev) = self.app.recv() => {
+                    if matches!(ev, AppEvent::Transfer(TransferEvent::Progress)) {
+                        self.deferred = drain_progress(&mut self.app);
+                    }
+                    return Ok(Event::App(ev));
+                }
                 _ = self.tick.tick() => return Ok(Event::Tick),
             }
         }
+    }
+}
+
+/// Drop every immediately-available [`TransferEvent::Progress`] from `app`,
+/// returning the first non-progress event found (which must be handed back to
+/// the caller, not discarded) or `None` if the channel drained.
+///
+/// Every app event wakes the run loop into a full `terminal.draw()`, and the
+/// transports emit one progress update per chunk per worker — so a large
+/// transfer produces redraw requests far faster than the terminal can absorb
+/// them and the backlog only grows. Progress carries no payload (byte counts
+/// live in `TransferManager`, and the App's handler for it is a no-op), so N
+/// queued back-to-back mean exactly what one means: redraw. Draining them
+/// makes the redraw rate self-limiting — whatever piled up during the last
+/// frame becomes one frame — while still repainting immediately instead of
+/// waiting for the next tick.
+fn drain_progress(app: &mut mpsc::UnboundedReceiver<AppEvent>) -> Option<AppEvent> {
+    while let Ok(ev) = app.try_recv() {
+        if matches!(ev, AppEvent::Transfer(TransferEvent::Progress)) {
+            continue;
+        }
+        return Some(ev);
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn progress() -> AppEvent {
+        AppEvent::Transfer(TransferEvent::Progress)
+    }
+
+    #[test]
+    fn drains_a_pure_progress_burst() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        for _ in 0..64 {
+            tx.send(progress()).unwrap();
+        }
+        assert!(drain_progress(&mut rx).is_none(), "nothing to defer");
+        assert!(rx.try_recv().is_err(), "burst must be fully consumed");
+    }
+
+    #[test]
+    fn stops_at_the_first_non_progress_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(progress()).unwrap();
+        tx.send(progress()).unwrap();
+        tx.send(AppEvent::ConnectFailed("boom".into())).unwrap();
+        tx.send(progress()).unwrap();
+
+        // The non-progress event is handed back rather than swallowed...
+        match drain_progress(&mut rx) {
+            Some(AppEvent::ConnectFailed(msg)) => assert_eq!(msg, "boom"),
+            _ => panic!("expected the ConnectFailed event to be deferred"),
+        }
+        // ...and draining stops there, leaving what followed it in order.
+        assert!(
+            matches!(rx.try_recv(), Ok(AppEvent::Transfer(TransferEvent::Progress))),
+            "events queued after the deferred one must survive",
+        );
+    }
+
+    #[test]
+    fn returns_a_leading_non_progress_event_untouched() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tx.send(AppEvent::ConnectKeyNeedsPassphrase).unwrap();
+        assert!(
+            matches!(drain_progress(&mut rx), Some(AppEvent::ConnectKeyNeedsPassphrase)),
+            "a non-progress head must not be dropped",
+        );
+    }
+
+    #[test]
+    fn empty_channel_defers_nothing() {
+        let (_tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
+        assert!(drain_progress(&mut rx).is_none());
     }
 }

@@ -411,9 +411,13 @@ impl App {
                 }
             }
             TransferEvent::Progress => {
-                // Progress is tracked inside TransferManager; no per-tick log
-                // spam. A later pass can render an active-transfers strip in
-                // the header from `manager.snapshot()`.
+                // Deliberately empty. Byte counts live in TransferManager and
+                // the transfers pane reads them from `active_jobs()` as it
+                // renders; the only job this event has is waking the run loop
+                // for that redraw. Bursts are collapsed upstream by
+                // `event::drain_progress`, so keep this a no-op —
+                // anything added here would run once per drained burst, not
+                // once per update.
             }
             TransferEvent::Complete(id) => {
                 // Update in-memory state and either debounce-save (still more

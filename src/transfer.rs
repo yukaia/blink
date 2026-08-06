@@ -134,7 +134,14 @@ impl TransferManager {
         self.inner.lock().parallelism = n;
     }
 
-    /// Snapshot of every tracked job (for rendering).
+    /// Snapshot of every job the manager has ever tracked, terminal states
+    /// included.
+    ///
+    /// Clones the full history, which grows for the lifetime of the session.
+    /// Render paths must NOT use this — see [`Self::active_jobs`], which is
+    /// bounded by the concurrency limit. Currently only the dispatcher tests
+    /// need the whole list (to assert every job reached a terminal state).
+    #[allow(dead_code)]
     pub fn snapshot(&self) -> Vec<TransferJob> {
         self.inner.lock().jobs.clone()
     }
@@ -314,6 +321,43 @@ impl TransferManager {
             .collect()
     }
 
+    /// Snapshot of only the jobs currently running.
+    ///
+    /// The render path asks for this every frame. `jobs` retains every job
+    /// the manager has ever seen — indices have to stay stable for
+    /// `job_index` — so going through [`Self::snapshot`] and filtering
+    /// afterwards clones the whole history to keep at most `parallelism`
+    /// entries. After a batch of [`MAX_QUEUED_JOBS`] that is 100k structs
+    /// (two heap `String`s apiece) copied per frame, at a frame rate the
+    /// transfers themselves are driving. Filtering under the lock bounds
+    /// the clone by [`crate::config::MAX_PARALLEL`] instead.
+    pub fn active_jobs(&self) -> Vec<TransferJob> {
+        self.inner
+            .lock()
+            .jobs
+            .iter()
+            .filter(|j| j.state == TransferState::Active)
+            .cloned()
+            .collect()
+    }
+
+    /// Count the Active and Pending jobs belonging to `batch_id`, as
+    /// `(active, pending)`. Scans without cloning — this runs on the
+    /// batch-cancel keypress, not per frame.
+    pub fn batch_counts(&self, batch_id: u64) -> (usize, usize) {
+        let inner = self.inner.lock();
+        let mut active = 0;
+        let mut pending = 0;
+        for j in inner.jobs.iter().filter(|j| j.batch_id == Some(batch_id)) {
+            match j.state {
+                TransferState::Active => active += 1,
+                TransferState::Pending => pending += 1,
+                _ => {}
+            }
+        }
+        (active, pending)
+    }
+
     /// Atomically claim the first pending job for a worker: marks it `Active`,
     /// emits a `Started` event, and returns a clone. Returns `None` when the
     /// queue holds nothing pending.
@@ -458,4 +502,90 @@ pub fn format_eta(bytes_remaining: u64, bytes_per_sec: u64) -> String {
     let m = total_secs / 60;
     let s = total_secs % 60;
     format!("{m}:{s:02}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manager() -> TransferManager {
+        // The event receiver is dropped; every `send` then fails silently,
+        // which is exactly what the production code already tolerates.
+        TransferManager::new(4).0
+    }
+
+    #[test]
+    fn active_jobs_returns_only_running_ones() {
+        let m = manager();
+        let queued = m.enqueue_download("/a".into(), "/tmp/a".into()).unwrap();
+        m.enqueue_download("/b".into(), "/tmp/b".into()).unwrap();
+        let done = m.enqueue_download("/c".into(), "/tmp/c".into()).unwrap();
+
+        m.mark(queued, TransferState::Active);
+        m.mark(done, TransferState::Complete);
+
+        let active = m.active_jobs();
+        assert_eq!(active.len(), 1, "pending and complete must be excluded");
+        assert_eq!(active[0].id, queued);
+    }
+
+    #[test]
+    fn active_jobs_is_empty_when_nothing_runs() {
+        let m = manager();
+        m.enqueue_download("/a".into(), "/tmp/a".into()).unwrap();
+        assert!(m.active_jobs().is_empty(), "a pending job is not active");
+    }
+
+    #[test]
+    fn active_jobs_does_not_grow_with_finished_history() {
+        // The whole point of filtering under the lock: a long tail of
+        // completed jobs must not inflate what the render path clones.
+        let m = manager();
+        for i in 0..500 {
+            let id = m
+                .enqueue_download(format!("/f{i}"), format!("/tmp/f{i}").into())
+                .unwrap();
+            m.mark(id, TransferState::Complete);
+        }
+        let running = m.enqueue_download("/live".into(), "/tmp/live".into()).unwrap();
+        m.mark(running, TransferState::Active);
+
+        assert_eq!(m.active_jobs().len(), 1);
+        assert_eq!(m.snapshot().len(), 501, "history itself is still retained");
+    }
+
+    #[test]
+    fn batch_counts_splits_active_and_pending() {
+        let m = manager();
+        let batch = m.allocate_batch_id();
+        let a = m.enqueue_download_batched("/a".into(), "/tmp/a".into(), batch).unwrap();
+        let b = m.enqueue_download_batched("/b".into(), "/tmp/b".into(), batch).unwrap();
+        m.enqueue_download_batched("/c".into(), "/tmp/c".into(), batch).unwrap();
+
+        m.mark(a, TransferState::Active);
+        m.mark(b, TransferState::Complete);
+
+        // a is Active, b is Complete (counted in neither), c is Pending.
+        assert_eq!(m.batch_counts(batch), (1, 1));
+    }
+
+    #[test]
+    fn batch_counts_ignores_other_batches_and_loose_jobs() {
+        let m = manager();
+        let mine = m.allocate_batch_id();
+        let theirs = m.allocate_batch_id();
+        m.enqueue_download_batched("/a".into(), "/tmp/a".into(), mine).unwrap();
+        m.enqueue_download_batched("/b".into(), "/tmp/b".into(), theirs).unwrap();
+        m.enqueue_download("/loose".into(), "/tmp/loose".into()).unwrap();
+
+        assert_eq!(m.batch_counts(mine), (0, 1));
+        assert_eq!(m.batch_counts(theirs), (0, 1));
+    }
+
+    #[test]
+    fn batch_counts_unknown_batch_is_zero() {
+        let m = manager();
+        m.enqueue_download("/a".into(), "/tmp/a".into()).unwrap();
+        assert_eq!(m.batch_counts(9999), (0, 0));
+    }
 }
