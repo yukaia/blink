@@ -341,6 +341,28 @@ impl TransferManager {
             .collect()
     }
 
+    /// Count every job that would be abandoned if the session ended now, as
+    /// `(active, pending)`.
+    ///
+    /// Both endings drop queued work as well as running work — quit breaks the
+    /// run loop and shuts the dispatcher down, disconnect additionally drops
+    /// the manager — so a confirmation that counts only the running jobs
+    /// understates what the user is about to lose. Scans without cloning
+    /// because the confirmation modals ask on every frame they are open.
+    pub fn queue_counts(&self) -> (usize, usize) {
+        let inner = self.inner.lock();
+        let mut active = 0;
+        let mut pending = 0;
+        for j in &inner.jobs {
+            match j.state {
+                TransferState::Active => active += 1,
+                TransferState::Pending => pending += 1,
+                _ => {}
+            }
+        }
+        (active, pending)
+    }
+
     /// Count the Active and Pending jobs belonging to `batch_id`, as
     /// `(active, pending)`. Scans without cloning — this runs on the
     /// batch-cancel keypress, not per frame.
@@ -580,6 +602,43 @@ mod tests {
 
         assert_eq!(m.batch_counts(mine), (0, 1));
         assert_eq!(m.batch_counts(theirs), (0, 1));
+    }
+
+    #[test]
+    fn queue_counts_splits_active_from_pending() {
+        let m = manager();
+        let a = m.enqueue_download("/a".into(), "/tmp/a".into()).unwrap();
+        let b = m.enqueue_download("/b".into(), "/tmp/b".into()).unwrap();
+        m.enqueue_download("/c".into(), "/tmp/c".into()).unwrap();
+        m.mark(a, TransferState::Active);
+        m.mark(b, TransferState::Complete);
+
+        // a Active, b Complete (counted in neither), c Pending.
+        assert_eq!(m.queue_counts(), (1, 1));
+    }
+
+    #[test]
+    fn queue_counts_sees_queued_work_with_nothing_running() {
+        // The case the confirmations used to miss entirely: a large batch sat
+        // queued behind the concurrency limit still gets thrown away on quit.
+        let m = manager();
+        for i in 0..50 {
+            m.enqueue_download(format!("/f{i}"), format!("/tmp/f{i}").into())
+                .unwrap();
+        }
+        assert_eq!(m.queue_counts(), (0, 50));
+    }
+
+    #[test]
+    fn queue_counts_ignores_finished_history() {
+        let m = manager();
+        for i in 0..20 {
+            let id = m
+                .enqueue_download(format!("/f{i}"), format!("/tmp/f{i}").into())
+                .unwrap();
+            m.mark(id, TransferState::Complete);
+        }
+        assert_eq!(m.queue_counts(), (0, 0), "nothing left to cancel");
     }
 
     #[test]

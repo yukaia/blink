@@ -380,6 +380,76 @@ pub mod help {
 // Quit confirmation
 // ---------------------------------------------------------------------------
 
+/// One line describing what ending the session right now would throw away,
+/// or `None` when there is nothing in flight.
+///
+/// Shared by the quit and disconnect confirmations so they can't disagree
+/// about the same situation. Both count queued jobs alongside running ones:
+/// each ending shuts the dispatcher down, so pending work is discarded too,
+/// and a warning that mentioned only the running jobs understated it.
+fn cancellation_warning(active: usize, pending: usize) -> Option<String> {
+    let total = active + pending;
+    if total == 0 {
+        return None;
+    }
+    let plural = if total == 1 { "" } else { "s" };
+    Some(match (active, pending) {
+        (0, p) => format!("{p} queued transfer{plural} will be discarded."),
+        (a, 0) => format!("{a} in-flight transfer{plural} will be cancelled."),
+        (a, p) => {
+            format!("{a} in-flight and {p} queued transfer{plural} will be cancelled.")
+        }
+    })
+}
+
+#[cfg(test)]
+mod cancellation_warning_tests {
+    use super::cancellation_warning;
+
+    #[test]
+    fn silent_when_nothing_is_in_flight() {
+        // The bug this addresses: the quit modal warned about transfers being
+        // cancelled even when none existed — including when quitting straight
+        // from the session selector, with no connection at all.
+        assert_eq!(cancellation_warning(0, 0), None);
+    }
+
+    #[test]
+    fn counts_queued_work_not_just_running_work() {
+        // A batch sitting behind the concurrency limit is discarded too, so
+        // reporting only the running jobs understated the loss.
+        let msg = cancellation_warning(0, 40).expect("40 queued is worth saying");
+        assert!(msg.contains("40"), "{msg}");
+        assert!(msg.contains("queued"), "{msg}");
+    }
+
+    #[test]
+    fn reports_both_when_both_exist() {
+        let msg = cancellation_warning(2, 40).unwrap();
+        assert!(msg.contains('2') && msg.contains("40"), "{msg}");
+        assert!(msg.contains("in-flight") && msg.contains("queued"), "{msg}");
+    }
+
+    #[test]
+    fn singular_for_exactly_one() {
+        assert_eq!(
+            cancellation_warning(1, 0).unwrap(),
+            "1 in-flight transfer will be cancelled.",
+        );
+        assert_eq!(
+            cancellation_warning(0, 1).unwrap(),
+            "1 queued transfer will be discarded.",
+        );
+    }
+
+    #[test]
+    fn plural_for_more_than_one_across_both_buckets() {
+        // One of each is two transfers total, so it must read "transfers".
+        assert!(cancellation_warning(1, 1).unwrap().contains("transfers"));
+        assert!(cancellation_warning(3, 0).unwrap().contains("transfers"));
+    }
+}
+
 pub mod confirm_quit {
     use super::*;
 
@@ -400,11 +470,24 @@ pub mod confirm_quit {
         let inner = block.inner(modal);
         f.render_widget(block, modal);
 
-        let lines = vec![
-            Line::from(""),
-            Line::from("  any in-flight transfers will be cancelled.")
+        // Quit is reachable from the session selector too, where there is no
+        // connection at all — so the warning is conditional. It used to be
+        // unconditional, telling users their transfers would be cancelled
+        // when nothing was running.
+        let (active, pending) = app.queue_counts();
+
+        let mut lines = vec![Line::from("")];
+        if let Some(warning) = super::cancellation_warning(active, pending) {
+            lines.push(
+                Line::from(Span::styled(
+                    warning,
+                    Style::default().fg(app.theme.error),
+                ))
                 .alignment(Alignment::Center),
-            Line::from(""),
+            );
+            lines.push(Line::from(""));
+        }
+        lines.push(
             Line::from(vec![
                 Span::raw("   "),
                 Span::styled(
@@ -423,7 +506,7 @@ pub mod confirm_quit {
                 Span::raw(" no  "),
             ])
             .alignment(Alignment::Center),
-        ];
+        );
         f.render_widget(Paragraph::new(lines), inner);
     }
 }
@@ -1903,9 +1986,7 @@ pub mod confirm_disconnect {
 
         let dim = Style::default().fg(app.theme.dim);
         let fg = Style::default().fg(app.theme.fg);
-        let active = app
-            .active_jobs()
-            .len();
+        let (active, pending) = app.queue_counts();
         let target = app
             .current_session
             .as_ref()
@@ -1929,13 +2010,10 @@ pub mod confirm_disconnect {
                 .alignment(Alignment::Center),
             Line::from(""),
         ];
-        if active > 0 {
-            let plural = if active == 1 { "" } else { "s" };
+        if let Some(warning) = super::cancellation_warning(active, pending) {
             lines.push(
                 Line::from(Span::styled(
-                    format!(
-                        "{active} in-flight transfer{plural} will be cancelled."
-                    ),
+                    warning,
                     Style::default().fg(app.theme.error),
                 ))
                 .alignment(Alignment::Center),

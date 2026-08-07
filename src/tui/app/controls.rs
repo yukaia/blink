@@ -167,4 +167,13 @@ impl App {
             .map(|m| m.active_jobs())
             .unwrap_or_default()
     }
+
+    /// `(active, pending)` job counts, or `(0, 0)` when not connected —
+    /// which is the case whenever quit is reached from the session selector.
+    pub fn queue_counts(&self) -> (usize, usize) {
+        self.transfer_manager
+            .as_ref()
+            .map(|m| m.queue_counts())
+            .unwrap_or((0, 0))
+    }
 }
