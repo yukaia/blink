@@ -249,6 +249,21 @@ impl Session {
             ));
         }
 
+        // Out of range here would reach `TransferManager::new` as the
+        // session's concurrency cap. The manager clamps defensively, but a
+        // value blink writes itself should already be in range. Slightly
+        // stricter than the loader, which corrects rather than rejects —
+        // safe in that direction, because a corrected value always lands
+        // inside the range this accepts.
+        if let Some(n) = self.parallel_downloads
+            && !(1..=config::MAX_PARALLEL).contains(&n)
+        {
+            return Err(BlinkError::config(format!(
+                "transfer.parallel_downloads must be between 1 and {}",
+                config::MAX_PARALLEL
+            )));
+        }
+
         if let Some(theme) = &self.theme {
             config::validate_theme_name(theme)?;
         }
@@ -443,10 +458,28 @@ impl Session {
             None => AuthMethod::Password,
         };
 
+        // Clamp rather than reject: an out-of-range value here is a tuning
+        // knob, and refusing the file would make the whole session vanish
+        // from the selector. Zero in particular used to reach the dispatcher
+        // verbatim, where the `active >= parallelism` gate turned it into a
+        // permanent stall. Mirrors how `Config::load_from` treats the global
+        // setting of the same name.
         let parallel_downloads = ini
             .section(Some("transfer"))
             .and_then(|s| s.get("parallel_downloads"))
-            .and_then(|v| v.parse().ok());
+            .and_then(|v| v.trim().parse::<u8>().ok())
+            .map(|n| {
+                let clamped = n.clamp(1, config::MAX_PARALLEL);
+                if clamped != n {
+                    tracing::warn!(
+                        path = %path.display(),
+                        requested = n,
+                        used = clamped,
+                        "session: parallel_downloads is out of range; clamped",
+                    );
+                }
+                clamped
+            });
 
         let theme = match ini
             .section(Some("appearance"))
@@ -1005,6 +1038,104 @@ mod tests {
             let mut s = valid();
             mutate(&mut s);
             assert!(s.validate().is_err(), "newline field must be refused");
+        }
+    }
+
+    // -- parallel_downloads bounds -----------------------------------------
+    //
+    // `parallel_downloads = 0` in a session file used to reach
+    // `TransferManager::new` verbatim and livelock the dispatcher. The
+    // manager now clamps, but the session layer should not be producing
+    // out-of-range values in the first place: `validate` refuses to write
+    // one, and `load_from` corrects one already on disk rather than making
+    // the whole session unloadable over a tuning knob.
+
+    #[test]
+    fn validate_rejects_out_of_range_parallel_downloads() {
+        for bad in [0, MAX_PARALLEL_FOR_TEST + 1] {
+            let mut s = valid();
+            s.parallel_downloads = Some(bad);
+            let err = s.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("parallel_downloads"),
+                "expected {bad} to be refused, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_accepts_in_range_parallel_downloads() {
+        for ok in [1, 2, MAX_PARALLEL_FOR_TEST] {
+            let mut s = valid();
+            s.parallel_downloads = Some(ok);
+            assert!(s.validate().is_ok(), "{ok} should be accepted");
+        }
+    }
+
+    const MAX_PARALLEL_FOR_TEST: u8 = crate::config::MAX_PARALLEL;
+
+    /// Write `body` as a session file and load it back.
+    fn load_written(tag: &str, body: &str) -> Result<Session> {
+        let dir = std::env::temp_dir()
+            .join(format!("blink-session-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.ini");
+        std::fs::write(&path, body).unwrap();
+        let loaded = Session::load_from(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        loaded
+    }
+
+    const MINIMAL: &str = "[session]\nname = t\nprotocol = sftp\nhost = h\nusername = u\n";
+
+    #[test]
+    fn load_clamps_zero_parallel_downloads_to_one() {
+        // Zero is the value that livelocked the dispatcher. The session must
+        // still load — losing a saved session over this would be worse than
+        // the setting being quietly corrected — but it must not load as zero.
+        let s = load_written(
+            "pd-zero",
+            &format!("{MINIMAL}\n[transfer]\nparallel_downloads = 0\n"),
+        )
+        .expect("session must still load");
+        assert_eq!(s.parallel_downloads, Some(1));
+    }
+
+    #[test]
+    fn load_clamps_parallel_downloads_above_the_maximum() {
+        let s = load_written(
+            "pd-huge",
+            &format!("{MINIMAL}\n[transfer]\nparallel_downloads = 200\n"),
+        )
+        .expect("session must still load");
+        assert_eq!(s.parallel_downloads, Some(MAX_PARALLEL_FOR_TEST));
+    }
+
+    #[test]
+    fn load_keeps_in_range_parallel_downloads() {
+        let s = load_written(
+            "pd-ok",
+            &format!("{MINIMAL}\n[transfer]\nparallel_downloads = 4\n"),
+        )
+        .expect("session must load");
+        assert_eq!(s.parallel_downloads, Some(4));
+    }
+
+    /// Whatever `load_from` produces must satisfy `validate`, or a session
+    /// read from disk could not be written back.
+    #[test]
+    fn loaded_parallel_downloads_always_validates() {
+        for raw in ["0", "1", "4", "10", "200"] {
+            let s = load_written(
+                &format!("pd-rt-{raw}"),
+                &format!("{MINIMAL}\n[transfer]\nparallel_downloads = {raw}\n"),
+            )
+            .expect("session must load");
+            assert!(
+                s.validate().is_ok(),
+                "loaded parallel_downloads={raw:?} -> {:?} must validate",
+                s.parallel_downloads,
+            );
         }
     }
 

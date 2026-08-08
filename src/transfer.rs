@@ -105,7 +105,18 @@ struct Inner {
 }
 
 impl TransferManager {
+    /// Build a manager with a concurrency cap of `parallelism`.
+    ///
+    /// The value is clamped to `1..=MAX_PARALLEL` here rather than at the
+    /// call sites. The dispatcher's gate is `active >= parallelism()`, so a
+    /// zero means `0 >= 0` on every loop iteration: nothing is ever
+    /// dispatched and every job sits Pending forever with no error and no
+    /// log line. That value is reachable from a hand-edited session file,
+    /// which parses the field without a range check — and any future caller
+    /// could reintroduce it. Clamping at the single constructor makes the
+    /// livelock unrepresentable instead of relying on each caller to check.
     pub fn new(parallelism: u8) -> (Self, mpsc::UnboundedReceiver<TransferEvent>) {
+        let parallelism = parallelism.clamp(1, crate::config::MAX_PARALLEL);
         let (tx, rx) = mpsc::unbounded_channel();
         let inner = Arc::new(Mutex::new(Inner {
             next_id: 1,
@@ -534,6 +545,36 @@ mod tests {
         // The event receiver is dropped; every `send` then fails silently,
         // which is exactly what the production code already tolerates.
         TransferManager::new(4).0
+    }
+
+    // -- parallelism bounds ------------------------------------------------
+    //
+    // The dispatcher gates on `active >= manager.parallelism()`. A zero here
+    // makes that `0 >= 0` on every iteration, so nothing is ever dispatched
+    // and every transfer sits Pending forever with no error. The constructor
+    // is the single point every caller goes through, so it — not the callers
+    // — is where the range has to be enforced.
+
+    #[test]
+    fn new_clamps_zero_parallelism_to_one() {
+        let (m, _rx) = TransferManager::new(0);
+        assert_eq!(
+            m.parallelism(),
+            1,
+            "zero would livelock the dispatcher rather than run serially",
+        );
+    }
+
+    #[test]
+    fn new_clamps_parallelism_to_the_documented_maximum() {
+        let (m, _rx) = TransferManager::new(200);
+        assert_eq!(m.parallelism(), crate::config::MAX_PARALLEL);
+    }
+
+    #[test]
+    fn new_leaves_in_range_parallelism_alone() {
+        let (m, _rx) = TransferManager::new(4);
+        assert_eq!(m.parallelism(), 4);
     }
 
     #[test]
