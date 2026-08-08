@@ -337,14 +337,27 @@ impl Checkpoint {
     /// writes instead of 100k — same correctness (any lost mark just causes
     /// the affected job to be re-run on resume), small fraction of the I/O.
     pub fn flush_if_due(&mut self) -> Result<()> {
-        if !self.dirty {
-            return Ok(());
+        if write_due(
+            self.dirty,
+            self.last_save,
+            Instant::now(),
+            CHECKPOINT_FLUSH_INTERVAL,
+        ) {
+            self.flush()
+        } else {
+            Ok(())
         }
-        let due = match self.last_save {
-            None => true,
-            Some(t) => t.elapsed() >= CHECKPOINT_FLUSH_INTERVAL,
-        };
-        if due { self.flush() } else { Ok(()) }
+    }
+
+    /// Whether this checkpoint has changes that have not reached disk.
+    ///
+    /// Test-only: it exists so the debounce contract can be asserted — a
+    /// coalesced mark leaves the checkpoint dirty, a written one does not.
+    /// Nothing in the running app needs to ask, so it isn't shipped; if a
+    /// use appears (an "unsaved" indicator, say), drop the `cfg`.
+    #[cfg(test)]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     /// Mark a job as `in_progress` in memory.
@@ -580,6 +593,31 @@ impl Checkpoint {
     }
 }
 
+/// Whether a checkpoint write is owed right now.
+///
+/// Split out from [`Checkpoint::flush_if_due`] so the policy can be tested
+/// without touching a disk or a clock. It is load-bearing for throughput
+/// rather than correctness: a batch can be 100k jobs, and writing on every
+/// state change would cost an fsync apiece, while a *lost* change only means
+/// that job re-runs on resume.
+///
+/// The first write is always owed — nothing has been persisted yet, and the
+/// plan has to reach disk before any transfer starts.
+fn write_due(
+    dirty: bool,
+    last_save: Option<Instant>,
+    now: Instant,
+    interval: Duration,
+) -> bool {
+    if !dirty {
+        return false;
+    }
+    match last_save {
+        None => true,
+        Some(t) => now.duration_since(t) >= interval,
+    }
+}
+
 /// Delete the `.part` files belonging to `cp`'s unfinished downloads.
 /// Returns how many were removed.
 ///
@@ -727,6 +765,85 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod debounce_tests {
+    use super::*;
+
+    // -- the debounce policy ------------------------------------------------
+    //
+    // Per-job state changes are coalesced: a batch can be 100k jobs, and an
+    // fsync apiece would dominate the transfer it is supposed to be
+    // recording. The cost of coalescing is bounded — a lost mark only means
+    // that job re-runs on resume — so the policy is safe to keep loose, but
+    // it is load-bearing for throughput and nothing else enforces it.
+
+    #[test]
+    fn a_clean_checkpoint_is_never_written() {
+        let now = Instant::now();
+        assert!(!write_due(false, None, now, CHECKPOINT_FLUSH_INTERVAL));
+        assert!(!write_due(
+            false,
+            Some(now - Duration::from_secs(10)),
+            now,
+            CHECKPOINT_FLUSH_INTERVAL,
+        ));
+    }
+
+    #[test]
+    fn the_first_write_is_always_due() {
+        // Nothing has been persisted yet, so there is no interval to wait
+        // out — the plan needs to reach disk before any transfer starts.
+        let now = Instant::now();
+        assert!(write_due(true, None, now, CHECKPOINT_FLUSH_INTERVAL));
+    }
+
+    #[test]
+    fn a_change_inside_the_interval_is_held_back() {
+        let now = Instant::now();
+        let just_wrote = now - Duration::from_millis(10);
+        assert!(!write_due(true, Some(just_wrote), now, CHECKPOINT_FLUSH_INTERVAL));
+    }
+
+    #[test]
+    fn a_change_after_the_interval_is_written() {
+        let now = Instant::now();
+        let stale = now - (CHECKPOINT_FLUSH_INTERVAL + Duration::from_millis(1));
+        assert!(write_due(true, Some(stale), now, CHECKPOINT_FLUSH_INTERVAL));
+    }
+
+    #[test]
+    fn the_interval_boundary_counts_as_due() {
+        let now = Instant::now();
+        let exactly = now - CHECKPOINT_FLUSH_INTERVAL;
+        assert!(write_due(true, Some(exactly), now, CHECKPOINT_FLUSH_INTERVAL));
+    }
+
+    /// The property the policy exists for, stated as a rate: a burst of
+    /// marks arriving far faster than the interval must collapse into a
+    /// handful of writes rather than one apiece.
+    #[test]
+    fn a_burst_of_marks_collapses_into_few_writes() {
+        let start = Instant::now();
+        let mut last_save = Some(start);
+        let mut writes = 0usize;
+
+        // 10k marks spread over one second of simulated time.
+        for i in 0..10_000u32 {
+            let now = start + Duration::from_micros(u64::from(i) * 100);
+            if write_due(true, last_save, now, CHECKPOINT_FLUSH_INTERVAL) {
+                writes += 1;
+                last_save = Some(now);
+            }
+        }
+
+        assert!(
+            writes <= 8,
+            "one second of marks should cost a handful of writes, not {writes}",
+        );
+        assert!(writes >= 3, "but it must still make progress: {writes}");
+    }
 }
 
 #[cfg(test)]

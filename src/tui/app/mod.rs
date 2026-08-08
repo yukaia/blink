@@ -1327,6 +1327,68 @@ mod tests {
         clean_checkpoints(&a);
     }
 
+    // -- the completion path must not fsync per job ------------------------
+    //
+    // `settle_checkpoint` decides whether a state change reaches disk now or
+    // is coalesced. An earlier draft of the per-batch work flushed
+    // unconditionally, which put an fsync on every completed job — a batch
+    // can be 100k of them. The suite was green with that in place; nothing
+    // described the contract until these.
+
+    #[tokio::test]
+    async fn completing_a_job_coalesces_its_mark_instead_of_writing() {
+        let mut a = checkpoint_app("debounce");
+        a.dispatch_plan(
+            vec![download(0), download(1), download(2)],
+            Direction::Download,
+        );
+        // `dispatch_plan` persists the plan up front, so the checkpoint
+        // starts clean and inside the debounce interval.
+        let ids: Vec<u64> = a.checkpoint_job_map.keys().copied().collect();
+        assert!(
+            !a.active_checkpoints[&CheckpointKind::Download].is_dirty(),
+            "the initial plan write is unconditional",
+        );
+
+        a.handle_transfer_event(TransferEvent::Complete(ids[0]));
+
+        // Two jobs still pending, so this took the flush branch rather than
+        // the drop-the-checkpoint branch. The mark must be held, not written.
+        // (The interval is 250ms; these are two function calls.)
+        assert!(
+            a.active_checkpoints[&CheckpointKind::Download].is_dirty(),
+            "a completed job forced a write instead of coalescing",
+        );
+
+        clean_checkpoints(&a);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_batch_writes_immediately() {
+        // The other side of the contract: a cancel is exactly the state the
+        // user would lose by quitting straight afterwards, so it is forced
+        // rather than coalesced.
+        let mut a = checkpoint_app("force");
+        a.dispatch_plan(
+            vec![download(0), download(1), download(2)],
+            Direction::Download,
+        );
+        let ids: Vec<u64> = a.checkpoint_job_map.keys().copied().collect();
+
+        // Dirty the checkpoint, then cancel one job of the batch.
+        a.handle_transfer_event(TransferEvent::Complete(ids[0]));
+        assert!(a.active_checkpoints[&CheckpointKind::Download].is_dirty());
+
+        a.cancel_batch_in_checkpoint(&ids[1..2]);
+
+        assert!(
+            !a.active_checkpoints[&CheckpointKind::Download].is_dirty(),
+            "a cancel must reach disk rather than waiting out the interval",
+        );
+
+        clean_checkpoints(&a);
+    }
+
     #[tokio::test]
     async fn upload_and_download_batches_keep_separate_checkpoints() {
         // A single slot meant an upload batch displaced a running download
