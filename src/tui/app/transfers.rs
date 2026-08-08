@@ -63,14 +63,13 @@ impl App {
         // unfold via walk_local. Either way the plan goes through the same
         // conflict-check + dispatch flow.
         let local_base = PathBuf::from(&self.local.path);
+        // A name that can't be joined onto the remote path is skipped rather
+        // than silently retargeted at the destination directory itself.
         let roots: Vec<(PathBuf, String, bool)> = entries
             .iter()
-            .map(|(name, is_dir)| {
-                (
-                    local_base.join(name),
-                    transport::join_remote(&self.remote.path, name),
-                    *is_dir,
-                )
+            .filter_map(|(name, is_dir)| {
+                let remote = transport::join_remote(&self.remote.path, name)?;
+                Some((local_base.join(name), remote, *is_dir))
             })
             .collect();
 
@@ -95,12 +94,14 @@ impl App {
             // single Upload job; directories unfold into mkdirs + uploads.
             let mut plan: Vec<PlannedJob> = Vec::new();
             let mut symlinks_skipped: usize = 0;
+            let mut unencodable_skipped: usize = 0;
             for (local, remote, is_dir) in roots {
                 let chunk = if is_dir {
                     let walk = walk_local(&local, &remote).await;
                     match walk {
                         Ok(r) => {
                             symlinks_skipped += r.symlinks_skipped;
+                            unencodable_skipped += r.unencodable_skipped;
                             r.plan
                         }
                         Err(e) => {
@@ -139,6 +140,7 @@ impl App {
                 plan,
                 conflict_indices,
                 symlinks_skipped,
+                unencodable_skipped,
                 kind: Direction::Upload,
             });
         });
@@ -172,11 +174,8 @@ impl App {
             .iter()
             .filter_map(|(name, is_dir)| {
                 let safe = safe_local_name(name)?;
-                Some((
-                    transport::join_remote(&self.remote.path, name),
-                    local_base.join(safe),
-                    *is_dir,
-                ))
+                let remote = transport::join_remote(&self.remote.path, name)?;
+                Some((remote, local_base.join(safe), *is_dir))
             })
             .collect();
 
@@ -239,6 +238,9 @@ impl App {
                 plan,
                 conflict_indices,
                 symlinks_skipped,
+                // Remote-side walks build local paths through
+                // `safe_local_name`, not through UTF-8 decoding.
+                unencodable_skipped: 0,
                 kind: Direction::Download,
             });
         });

@@ -44,6 +44,10 @@ pub enum PlannedJob {
 pub struct WalkResult {
     pub plan: Vec<PlannedJob>,
     pub symlinks_skipped: usize,
+    /// Local entries whose names are not valid UTF-8 and so cannot be sent
+    /// as a remote path. Counted rather than silently dropped — see
+    /// [`walk_local`].
+    pub unencodable_skipped: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +212,14 @@ pub async fn walk_remote(
                 );
                 continue;
             };
-            let remote_child = transport::join_remote(&remote_dir, &entry.raw_name);
+            let Some(remote_child) = transport::join_remote(&remote_dir, &entry.raw_name)
+            else {
+                tracing::warn!(
+                    "skipping remote entry whose name cannot be joined: {:?}",
+                    entry.display_name
+                );
+                continue;
+            };
             let local_child = local_dir.join(safe_name);
             match entry.kind {
                 EntryKind::Directory => {
@@ -246,6 +257,7 @@ pub async fn walk_remote(
     Ok(WalkResult {
         plan: out,
         symlinks_skipped,
+        unencodable_skipped: 0,
     })
 }
 
@@ -255,6 +267,7 @@ pub async fn walk_remote(
 pub async fn walk_local(local_root: &Path, remote_root: &str) -> Result<WalkResult> {
     let mut out: Vec<PlannedJob> = Vec::new();
     let mut symlinks_skipped: usize = 0;
+    let mut unencodable_skipped: usize = 0;
 
     // Iterative DFS. Stack holds (local_path_to_visit, remote_path_dest).
     let mut stack: Vec<(PathBuf, String)> =
@@ -300,9 +313,22 @@ pub async fn walk_local(local_root: &Path, remote_root: &str) -> Result<WalkResu
                 );
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
+            // `to_string_lossy` would replace the undecodable bytes with
+            // U+FFFD and upload the file under a name that is not its own —
+            // and that no one can map back. The local path stays exact, so
+            // the mismatch is silent. Skip and count instead.
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                unencodable_skipped += 1;
+                tracing::warn!(
+                    local = %entry.path().display(),
+                    "skipping local entry whose name is not valid UTF-8",
+                );
+                continue;
+            };
             let local_child = entry.path();
-            let remote_child = transport::join_remote(&remote_dir, &name);
+            let Some(remote_child) = transport::join_remote(&remote_dir, &name) else {
+                continue;
+            };
 
             if file_type.is_dir() {
                 subdirs.push((local_child, remote_child));
@@ -321,6 +347,7 @@ pub async fn walk_local(local_root: &Path, remote_root: &str) -> Result<WalkResu
     Ok(WalkResult {
         plan: out,
         symlinks_skipped,
+        unencodable_skipped,
     })
 }
 
@@ -378,10 +405,14 @@ pub async fn find_upload_conflicts(
         };
         let listing = match result {
             Ok(l) => l,
-            // "Directory doesn't exist yet" — no conflicts there. Other
-            // errors also short-circuit to "no conflicts" because the
-            // upload itself will surface the real issue with a clear path.
-            Err(_) => continue,
+            // "Directory doesn't exist yet" genuinely has no conflicts —
+            // that is the normal case when uploading into a new tree.
+            Err(BlinkError::NotFound(_)) => continue,
+            // Anything else means we do not know what is in there. Reporting
+            // "no conflicts" skipped the overwrite prompt entirely, so a
+            // directory we merely lacked permission to *list* was silently
+            // written over. Surface it and let the user decide.
+            Err(e) => return Err(e),
         };
         for (i, name) in entries {
             // Compare against the server's own bytes: the upload will address
@@ -900,6 +931,130 @@ mod tests {
         assert!(safe_local_name_for("a/b", true).is_none());
         assert!(safe_local_name_for("a\0b", true).is_none());
         assert_eq!(safe_local_name_for("ok.txt", true), Some("ok.txt"));
+    }
+
+    // -- F-13: a listing that fails is not "no conflicts" -------------------
+
+    /// Transport stub whose listing always fails with the given error.
+    struct FailingList {
+        err: fn() -> BlinkError,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for FailingList {
+        async fn list(&mut self, _: &str) -> Result<Vec<transport::RemoteEntry>> {
+            Err((self.err)())
+        }
+        fn protocol(&self) -> crate::session::Protocol {
+            crate::session::Protocol::Sftp
+        }
+        async fn download(
+            &mut self,
+            _: &str,
+            _: &Path,
+            _: Option<tokio::sync::mpsc::UnboundedSender<transport::ProgressUpdate>>,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        async fn upload(
+            &mut self,
+            _: &Path,
+            _: &str,
+            _: Option<tokio::sync::mpsc::UnboundedSender<transport::ProgressUpdate>>,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        async fn rename(&mut self, _: &str, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn delete_file(&mut self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn delete_dir(&mut self, _: &str, _: bool) -> Result<()> {
+            unreachable!()
+        }
+        async fn mkdir(&mut self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn metadata(&mut self, _: &str) -> Result<Option<transport::RemoteEntry>> {
+            unreachable!()
+        }
+        async fn read_to_bytes(&mut self, _: &str) -> Result<bytes::Bytes> {
+            unreachable!()
+        }
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn upload_plan() -> Vec<PlannedJob> {
+        vec![PlannedJob::Upload {
+            local_path: PathBuf::from("/l/a.txt"),
+            remote_path: "/r/a.txt".into(),
+        }]
+    }
+
+    #[tokio::test]
+    async fn a_missing_destination_directory_has_no_conflicts() {
+        // The legitimate case: uploading into a tree that doesn't exist yet.
+        let t = shared(FailingList {
+            err: || BlinkError::not_found("/r"),
+        });
+        let conflicts = find_upload_conflicts(&t, &upload_plan())
+            .await
+            .expect("a missing directory is not an error");
+        assert!(conflicts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_listing_refused_by_the_server_fails_the_probe() {
+        // Swallowing this returned "no conflicts", so the overwrite prompt
+        // never appeared and the upload clobbered whatever was there.
+        let t = shared(FailingList {
+            err: || BlinkError::permission("/r"),
+        });
+        let err = find_upload_conflicts(&t, &upload_plan())
+            .await
+            .expect_err("a refused listing must not read as `no conflicts`");
+        assert!(matches!(err, BlinkError::Permission(_)), "{err:?}");
+    }
+
+    // -- F-14: local names that cannot be sent verbatim ---------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn walk_local_skips_names_that_are_not_valid_utf8() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = scratch("nonutf8");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("good.txt"), b"x").unwrap();
+        let bad = std::ffi::OsStr::from_bytes(b"bad\xff.txt");
+        std::fs::write(root.join(bad), b"x").unwrap();
+
+        let result = walk_local(&root, "/dest").await.expect("walk");
+
+        let uploads: Vec<&String> = result
+            .plan
+            .iter()
+            .filter_map(|j| match j {
+                PlannedJob::Upload { remote_path, .. } => Some(remote_path),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(uploads.len(), 1, "only the encodable name is planned");
+        assert!(uploads[0].ends_with("good.txt"));
+        assert!(
+            !uploads[0].contains('\u{FFFD}'),
+            "a lossy name must never reach the wire: {}",
+            uploads[0],
+        );
+        assert_eq!(
+            result.unencodable_skipped, 1,
+            "the skip has to be reported, not silent",
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

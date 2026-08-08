@@ -261,8 +261,19 @@ impl App {
                 plan,
                 conflict_indices,
                 symlinks_skipped,
+                unencodable_skipped,
                 kind,
             } => {
+                if unencodable_skipped > 0 {
+                    let noun = if unencodable_skipped == 1 { "file" } else { "files" };
+                    self.push_log(
+                        LogLevel::Warn,
+                        format!(
+                            "skipped {unencodable_skipped} {noun} whose name is not \
+                             valid UTF-8 and has no faithful remote form"
+                        ),
+                    );
+                }
                 if symlinks_skipped > 0 {
                     let noun = if symlinks_skipped == 1 { "symlink" } else { "symlinks" };
                     self.push_log(

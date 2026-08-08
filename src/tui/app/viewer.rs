@@ -102,7 +102,17 @@ impl App {
                     self.screen = self.previous_screen.clone();
                     return;
                 };
-                let remote_path = transport::join_remote(&self.remote.path, &raw_name);
+                let Some(remote_path) =
+                    transport::join_remote(&self.remote.path, &raw_name)
+                else {
+                    self.viewer = None;
+                    self.screen = self.previous_screen.clone();
+                    self.push_log(
+                        LogLevel::Warn,
+                        format!("cannot view `{name}`: unusable name"),
+                    );
+                    return;
+                };
                 tokio::spawn(async move {
                     let mut transport = t.lock().await;
                     let event = match transport.read_to_bytes(&remote_path).await {

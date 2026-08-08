@@ -381,22 +381,31 @@ pub async fn open(
 /// `name` must be a single path component (a filename from a directory
 /// listing). Leading slashes are stripped to prevent a server-controlled name
 /// like `"/etc/shadow"` from producing an absolute remote path via the `//`
-/// resolution most servers apply. Names containing a `..` component are
-/// rejected (returning `base` unchanged) to prevent upward traversal.
-pub(crate) fn join_remote(base: &str, name: &str) -> String {
+/// resolution most servers apply.
+///
+/// Returns `None` when `name` cannot be joined safely, and the caller must
+/// skip the entry. It used to return `base` unchanged in that case, which
+/// callers could not tell apart from a successful join — so they acted on it.
+/// The recursive delete was the sharp edge: for an entry named `..` it called
+/// `remove_file` on the directory being walked rather than skipping the
+/// entry.
+pub(crate) fn join_remote(base: &str, name: &str) -> Option<String> {
     let name = name.trim_start_matches('/');
+    if name.is_empty() {
+        return None;
+    }
     // Reject `.` and `..` components: `..` traverses upward; `.` is a no-op
     // but would produce paths like `/foo/./bar` that some servers don't
     // normalise, and a server-controlled `.` in a name is almost always
     // malicious.
     if name.split('/').any(|c| c == ".." || c == ".") {
-        return base.to_string();
+        return None;
     }
-    if base.ends_with('/') {
+    Some(if base.ends_with('/') {
         format!("{base}{name}")
     } else {
         format!("{base}/{name}")
-    }
+    })
 }
 
 /// Compute the parent of a remote path.
@@ -780,42 +789,47 @@ mod tests {
     // join_remote
     #[test]
     fn join_appends_name() {
-        assert_eq!(join_remote("/home/user", "file.txt"), "/home/user/file.txt");
+        assert_eq!(join_remote("/home/user", "file.txt").as_deref(), Some("/home/user/file.txt"));
     }
 
     #[test]
     fn join_trailing_slash_base() {
-        assert_eq!(join_remote("/home/user/", "file.txt"), "/home/user/file.txt");
+        assert_eq!(join_remote("/home/user/", "file.txt").as_deref(), Some("/home/user/file.txt"));
     }
 
     #[test]
     fn join_strips_leading_slash_from_name() {
-        assert_eq!(join_remote("/srv", "/etc/shadow"), "/srv/etc/shadow");
+        assert_eq!(join_remote("/srv", "/etc/shadow").as_deref(), Some("/srv/etc/shadow"));
     }
+
+    // Returning the base unchanged made "rejected" indistinguishable from a
+    // real join, so callers acted on it: the recursive delete walked its
+    // entries and called `remove_file(parent_dir)` for a hostile name
+    // instead of skipping it. `None` forces every caller to decide.
 
     #[test]
     fn join_rejects_dotdot_traversal() {
-        assert_eq!(join_remote("/srv/data", "../secret"), "/srv/data");
+        assert_eq!(join_remote("/srv/data", "../secret"), None);
     }
 
     #[test]
     fn join_rejects_embedded_dotdot() {
-        assert_eq!(join_remote("/srv/data", "a/../b"), "/srv/data");
+        assert_eq!(join_remote("/srv/data", "a/../b"), None);
     }
 
     #[test]
     fn join_rejects_single_dot() {
-        assert_eq!(join_remote("/srv/data", "."), "/srv/data");
+        assert_eq!(join_remote("/srv/data", "."), None);
     }
 
     #[test]
     fn join_rejects_embedded_single_dot() {
-        assert_eq!(join_remote("/srv/data", "a/./b"), "/srv/data");
+        assert_eq!(join_remote("/srv/data", "a/./b"), None);
     }
 
     #[test]
     fn join_root_base() {
-        assert_eq!(join_remote("/", "etc"), "/etc");
+        assert_eq!(join_remote("/", "etc").as_deref(), Some("/etc"));
     }
 
     // parent_remote

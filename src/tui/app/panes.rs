@@ -116,7 +116,16 @@ impl App {
         let new_path = if entry.is_parent() {
             transport::parent_remote(&self.remote.path)
         } else {
-            transport::join_remote(&self.remote.path, &entry.raw_name)
+            match transport::join_remote(&self.remote.path, &entry.raw_name) {
+                Some(p) => p,
+                None => {
+                    self.push_log(
+                        LogLevel::Warn,
+                        format!("cannot open `{}`: unusable name", entry.display_name),
+                    );
+                    return;
+                }
+            }
         };
         self.refresh_remote_pane(new_path);
     }

@@ -407,7 +407,15 @@ pub async fn ftp_delete_dir<T: TokioTlsStream + Send>(
                     if name == "." || name == ".." {
                         continue;
                     }
-                    let child = crate::transport::join_remote(&path, name);
+                    // See the SFTP path: an unjoinable name is skipped, not
+                    // folded onto the directory being walked.
+                    let Some(child) = crate::transport::join_remote(&path, name) else {
+                        tracing::warn!(
+                            dir = %path,
+                            "skipping unusable entry name in recursive delete",
+                        );
+                        continue;
+                    };
                     if parsed.is_directory() {
                         subdirs.push(Op::Visit(child));
                     } else {

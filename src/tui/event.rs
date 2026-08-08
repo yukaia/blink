@@ -95,6 +95,9 @@ pub enum AppEvent {
         plan: Vec<crate::tui::plan::PlannedJob>,
         conflict_indices: Vec<usize>,
         symlinks_skipped: usize,
+        /// Local entries skipped because their names are not valid UTF-8 and
+        /// so have no faithful remote form.
+        unencodable_skipped: usize,
         kind: Direction,
     },
 

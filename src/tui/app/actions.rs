@@ -265,8 +265,17 @@ impl App {
             return;
         }
 
-        let from = transport::join_remote(&self.remote.path, &self.rename_source);
-        let to = transport::join_remote(&self.remote.path, &new_name);
+        // `remote_name_error` already rejected `.`/`..` and separators for
+        // the typed name, and the source came from a listing entry we
+        // navigated to — but join is the authority on what is joinable, so
+        // ask it rather than assuming the two agree.
+        let (Some(from), Some(to)) = (
+            transport::join_remote(&self.remote.path, &self.rename_source),
+            transport::join_remote(&self.remote.path, &new_name),
+        ) else {
+            self.rename_error = Some("that name cannot be used here".into());
+            return;
+        };
 
         // Collision check against the cached pane listing. If the user navigated
         // here recently the cache is fresh enough; in the rare case it's stale,
@@ -346,7 +355,10 @@ impl App {
             self.mkdir_error = Some(reason.into());
             return;
         }
-        let path = transport::join_remote(&self.remote.path, &name);
+        let Some(path) = transport::join_remote(&self.remote.path, &name) else {
+            self.mkdir_error = Some("that name cannot be used here".into());
+            return;
+        };
         self.mkdir_input.clear();
         self.mkdir_error = None;
         self.screen = Screen::Main;
@@ -394,7 +406,14 @@ impl App {
         // Delete addresses the real name; the modal shows the readable one.
         // Conflating them is how a confirmation for one file ends up
         // unlinking another whose name merely renders the same.
-        let remote_path = transport::join_remote(&self.remote.path, &entry.raw_name);
+        let Some(remote_path) = transport::join_remote(&self.remote.path, &entry.raw_name)
+        else {
+            self.push_log(
+                LogLevel::Warn,
+                format!("cannot delete `{}`: unusable name", entry.display_name),
+            );
+            return;
+        };
         self.pending_delete = Some(PendingDelete {
             name: entry.display_name,
             is_dir: entry.is_dir,

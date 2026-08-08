@@ -586,6 +586,23 @@ impl SftpTransport {
 /// A reply shorter than `len` that isn't itself short — or an `Eof` status —
 /// marks end-of-file, so the returned `Vec` may be shorter than `len` only at
 /// the end of the file.
+/// Bytes of a read reply that may be accepted, given how many are still
+/// wanted.
+///
+/// A server must never return more than was asked for. If it does, its idea
+/// of the request and ours disagree, and since `pipelined_download` writes
+/// chunks in order, accepting the surplus shifts every later chunk and
+/// corrupts the file. Refuse instead of guessing which end is wrong.
+fn reply_within_request(reply_len: usize, requested: u32, label: &str) -> Result<u32> {
+    if reply_len as u64 > u64::from(requested) {
+        return Err(BlinkError::transport(format!(
+            "{label}: server returned more data than requested \
+             ({reply_len} bytes for a {requested}-byte read)"
+        )));
+    }
+    Ok(reply_len as u32)
+}
+
 async fn read_full(
     raw: &RawSftpSession,
     handle: &str,
@@ -599,13 +616,13 @@ async fn read_full(
     while remaining > 0 {
         match raw.read(handle, pos, remaining).await {
             Ok(data) => {
-                if data.data.is_empty() {
+                let n = reply_within_request(data.data.len(), remaining, label)?;
+                if n == 0 {
                     break;
                 }
-                let n = data.data.len();
                 buf.extend_from_slice(&data.data);
-                pos += n as u64;
-                remaining = remaining.saturating_sub(n as u32);
+                pos += u64::from(n);
+                remaining -= n;
             }
             Err(SftpError::Status(s)) if s.status_code == StatusCode::Eof => break,
             Err(e) => return Err(map_sftp("read", label, e)),
@@ -1071,7 +1088,17 @@ impl Transport for SftpTransport {
                         if name == "." || name == ".." {
                             continue;
                         }
-                        let child = super::join_remote(&path, &name);
+                        // A name that can't be joined (`..`, `.`) is a
+                        // hostile or broken listing entry. Skip it; joining
+                        // used to fall back to `path` itself, so this
+                        // unlinked the directory being walked.
+                        let Some(child) = super::join_remote(&path, &name) else {
+                            tracing::warn!(
+                                dir = %path,
+                                "skipping unusable entry name in recursive delete",
+                            );
+                            continue;
+                        };
                         let attrs = e.metadata();
                         // is_symlink() before is_dir(): some SFTP servers
                         // report symlink-to-directory entries with both
@@ -1187,7 +1214,32 @@ impl Transport for SftpTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::{chunk_offsets, read_local_full};
+    use super::{chunk_offsets, read_local_full, reply_within_request};
+
+    // -- over-long read replies --------------------------------------------
+    //
+    // `read_full` appended whatever came back and decremented with
+    // `saturating_sub`, so a reply longer than the request overran its chunk.
+    // `pipelined_download` writes chunks in order, so that shifts every later
+    // chunk — a corrupt file from a server we simply believed.
+
+    #[test]
+    fn a_reply_within_the_request_is_accepted() {
+        assert_eq!(reply_within_request(100, 250, "/f").unwrap(), 100);
+        assert_eq!(reply_within_request(250, 250, "/f").unwrap(), 250);
+    }
+
+    #[test]
+    fn an_over_long_reply_is_refused() {
+        let err = reply_within_request(300, 250, "/f").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("more data than requested"), "{msg}");
+    }
+
+    #[test]
+    fn an_empty_reply_is_accepted_as_eof() {
+        assert_eq!(reply_within_request(0, 250, "/f").unwrap(), 0);
+    }
 
     #[test]
     fn chunk_offsets_splits_evenly() {
