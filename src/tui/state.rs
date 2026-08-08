@@ -33,7 +33,6 @@ pub struct PaneEntry {
     pub display_name: String,
     pub is_dir: bool,
     pub size: u64,
-    pub selected: bool,
     pub previewable_image: bool,
 }
 
@@ -47,7 +46,6 @@ impl PaneEntry {
             display_name,
             is_dir,
             size,
-            selected: false,
             previewable_image,
         }
     }
@@ -79,6 +77,18 @@ pub struct PaneState {
     /// Full unfiltered list, stashed while a filter is active so we can
     /// restore on clear (and re-apply on refresh).
     all_entries: Option<Vec<PaneEntry>>,
+    /// Raw names of the selected entries.
+    ///
+    /// Deliberately *not* a flag on [`PaneEntry`]. Filtering stashes a clone
+    /// of the rows in `all_entries` and rebuilds `entries` from it, so a flag
+    /// living on a row is discarded the moment the filter changes or clears —
+    /// which silently threw away every selection made while a filter was
+    /// active. Keying by name survives every rebuild of the row list.
+    ///
+    /// A name is unique within a directory on every protocol blink speaks, so
+    /// it identifies a row unambiguously. Cleared by [`Self::set_entries`],
+    /// i.e. whenever a new listing arrives.
+    selected: std::collections::HashSet<String>,
 }
 
 impl PaneState {
@@ -89,6 +99,7 @@ impl PaneState {
             cursor: 0,
             filter: None,
             all_entries: None,
+            selected: std::collections::HashSet::new(),
         }
     }
 
@@ -109,9 +120,47 @@ impl PaneState {
     }
 
     pub fn toggle_selected(&mut self) {
-        if let Some(e) = self.entries.get_mut(self.cursor) {
-            e.selected = !e.selected;
+        let Some(e) = self.entries.get(self.cursor) else {
+            return;
+        };
+        // `..` is a navigation affordance, not a file — see `selection`.
+        if e.is_parent() {
+            return;
         }
+        if !self.selected.remove(&e.raw_name) {
+            self.selected.insert(e.raw_name.clone());
+        }
+    }
+
+    /// Whether `entry` is selected. Used by the renderer.
+    pub fn is_selected(&self, entry: &PaneEntry) -> bool {
+        self.selected.contains(&entry.raw_name)
+    }
+
+    /// How many entries are selected, including any currently hidden by the
+    /// filter — the footer should report what a transfer would act on, not
+    /// what happens to be on screen.
+    pub fn selected_count(&self) -> usize {
+        self.selected.len()
+    }
+
+    /// Total size of the selected entries, filter-hidden ones included.
+    pub fn selected_size(&self) -> u64 {
+        self.all_rows()
+            .iter()
+            .filter(|e| self.is_selected(e))
+            .map(|e| e.size)
+            .sum()
+    }
+
+    /// Drop every selection.
+    pub fn clear_selection(&mut self) {
+        self.selected.clear();
+    }
+
+    /// Every row in this directory, filter or no filter.
+    fn all_rows(&self) -> &[PaneEntry] {
+        self.all_entries.as_deref().unwrap_or(&self.entries)
     }
 
     /// The entries a transfer should act on, as `(raw_name, is_dir)`.
@@ -127,9 +176,9 @@ impl PaneState {
     /// which entries they consider.
     pub fn selection(&self) -> Vec<(String, bool)> {
         let selected: Vec<(String, bool)> = self
-            .entries
+            .all_rows()
             .iter()
-            .filter(|e| e.selected && !e.is_parent())
+            .filter(|e| self.is_selected(e) && !e.is_parent())
             .map(|e| (e.raw_name.clone(), e.is_dir))
             .collect();
         if !selected.is_empty() {
@@ -145,6 +194,10 @@ impl PaneState {
     /// re-applied against the new list, so refresh-while-filtered keeps the
     /// view narrow. Cursor is clamped to the new range.
     pub fn set_entries(&mut self, entries: Vec<PaneEntry>) {
+        // A new listing means new rows; carrying selections across a refresh
+        // or a navigation would be surprising. Filtering deliberately does
+        // *not* come through here.
+        self.selected.clear();
         if let Some(query) = self.filter.clone() {
             let lower = query.to_ascii_lowercase();
             let filtered: Vec<PaneEntry> = entries
@@ -227,7 +280,9 @@ mod pane_tests {
     fn selection_prefers_explicitly_selected_entries() {
         let mut p = pane(vec![PaneEntry::parent(), file("a.txt"), file("b.txt")]);
         p.cursor = 1;
-        p.entries[2].selected = true;
+        p.cursor = 2;
+        p.toggle_selected();
+        p.cursor = 1;
         assert_eq!(p.selection(), vec![("b.txt".to_string(), false)]);
     }
 
@@ -238,8 +293,10 @@ mod pane_tests {
         // directory — the cursor path guarded against it, the selection
         // path did not.
         let mut p = pane(vec![PaneEntry::parent(), file("a.txt")]);
-        p.entries[0].selected = true;
-        p.entries[1].selected = true;
+        p.cursor = 0;
+        p.toggle_selected(); // the parent row — must be refused
+        p.cursor = 1;
+        p.toggle_selected();
         assert_eq!(
             p.selection(),
             vec![("a.txt".to_string(), false)],
@@ -269,6 +326,114 @@ mod pane_tests {
     fn selection_is_empty_for_an_empty_pane() {
         let p = PaneState::empty();
         assert!(p.selection().is_empty());
+    }
+
+    // -- selection vs. filtering -------------------------------------------
+    //
+    // Selection used to live as a flag on the entry rows, and `set_filter`
+    // stashes a *clone* of those rows. Toggling touched the filtered copies,
+    // and `clear_filter` restored the stale clone — so every selection made
+    // while a filter was active was silently discarded. Leaving search with
+    // Esc is exactly that path: the user selects ten files, presses Esc,
+    // ctrl+d, and gets the one under the cursor.
+
+    #[test]
+    fn selections_made_while_filtered_survive_clearing_the_filter() {
+        let mut p = pane(vec![
+            PaneEntry::parent(),
+            file("alpha.txt"),
+            file("alpha2.txt"),
+            file("beta.txt"),
+        ]);
+        p.set_filter("alpha".into());
+        assert_eq!(p.entries.len(), 3, "parent plus the two alphas");
+
+        p.cursor = 1;
+        p.toggle_selected();
+        p.cursor = 2;
+        p.toggle_selected();
+
+        p.clear_filter();
+
+        let mut names: Vec<String> = p.selection().into_iter().map(|(n, _)| n).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["alpha.txt".to_string(), "alpha2.txt".to_string()],
+            "selections must outlive the filter that was active when they were made",
+        );
+    }
+
+    #[test]
+    fn selections_survive_narrowing_the_filter() {
+        let mut p = pane(vec![file("alpha.txt"), file("alpha2.txt")]);
+        p.set_filter("alpha".into());
+        p.cursor = 0;
+        p.toggle_selected();
+        p.cursor = 1;
+        p.toggle_selected();
+
+        // Narrow so only one of them is visible.
+        p.set_filter("alpha2".into());
+        assert_eq!(p.entries.len(), 1);
+
+        assert_eq!(
+            p.selection().len(),
+            2,
+            "a selection hidden by the filter is still selected",
+        );
+        assert_eq!(p.selected_count(), 2, "and the footer must say so");
+    }
+
+    #[test]
+    fn refreshing_the_pane_clears_the_selection() {
+        // Unchanged behaviour: a new listing means new rows, and carrying
+        // selections across a refresh or a navigation would be surprising.
+        let mut p = pane(vec![file("a.txt")]);
+        p.cursor = 0;
+        p.toggle_selected();
+        assert_eq!(p.selected_count(), 1);
+
+        p.set_entries(vec![file("a.txt"), file("b.txt")]);
+        assert_eq!(p.selected_count(), 0, "a fresh listing starts unselected");
+    }
+
+    #[test]
+    fn toggling_twice_deselects() {
+        let mut p = pane(vec![file("a.txt")]);
+        p.cursor = 0;
+        p.toggle_selected();
+        p.toggle_selected();
+        assert_eq!(p.selected_count(), 0);
+        assert!(p.selection().len() == 1, "falls back to the cursor entry");
+    }
+
+    #[test]
+    fn the_parent_row_cannot_be_selected() {
+        let mut p = pane(vec![PaneEntry::parent(), file("a.txt")]);
+        p.cursor = 0;
+        p.toggle_selected();
+        assert_eq!(p.selected_count(), 0, "`..` is not a file");
+    }
+
+    #[test]
+    fn is_selected_tracks_the_toggle() {
+        let mut p = pane(vec![file("a.txt"), file("b.txt")]);
+        p.cursor = 0;
+        p.toggle_selected();
+        assert!(p.is_selected(&p.entries[0]));
+        assert!(!p.is_selected(&p.entries[1]));
+    }
+
+    #[test]
+    fn clear_selection_empties_it() {
+        let mut p = pane(vec![file("a.txt"), file("b.txt")]);
+        p.cursor = 0;
+        p.toggle_selected();
+        p.cursor = 1;
+        p.toggle_selected();
+        p.clear_selection();
+        assert_eq!(p.selected_count(), 0);
     }
 }
 

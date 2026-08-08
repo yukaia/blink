@@ -1272,6 +1272,66 @@ mod tests {
         assert_eq!(a.rename_source, "notes.md");
     }
 
+    // -- credential buffers survive a submit -------------------------------
+    //
+    // `credential_buffer` pre-sizes so a per-keystroke `push` never
+    // reallocates: a realloc copies the partial secret into a fresh
+    // allocation and frees the old one unwiped, leaving fragments no later
+    // zeroize can reach. Submitting with `mem::take` handed that allocation
+    // away and left `String::default()` — capacity zero — behind, so the
+    // protection covered the first attempt and nothing after it. A retry
+    // after a wrong password is exactly when it matters.
+
+    #[tokio::test]
+    async fn submitting_a_password_leaves_the_buffer_pre_sized() {
+        let mut a = app();
+        a.pending_session = Some(Session::from_url("sftp://me@host").unwrap());
+        a.password_input.push_str("hunter2");
+        let capacity_before = a.password_input.capacity();
+
+        a.handle_password_prompt(press(KeyCode::Enter));
+
+        assert!(a.password_input.is_empty(), "buffer must be emptied");
+        assert_eq!(
+            a.password_input.capacity(),
+            capacity_before,
+            "the pre-sized allocation must survive for the retry",
+        );
+    }
+
+    #[tokio::test]
+    async fn submitting_a_passphrase_leaves_the_buffer_pre_sized() {
+        let mut a = app();
+        a.pending_session = Some(Session::from_url("sftp://me@host").unwrap());
+        a.passphrase_input.push_str("correct horse");
+        let capacity_before = a.passphrase_input.capacity();
+
+        a.handle_key_passphrase_prompt(press(KeyCode::Enter));
+
+        assert!(a.passphrase_input.is_empty());
+        assert_eq!(a.passphrase_input.capacity(), capacity_before);
+    }
+
+    #[tokio::test]
+    async fn retyping_a_password_after_a_failed_attempt_does_not_reallocate() {
+        // The end-to-end property: submit, get rejected, type again. The
+        // second attempt must not grow the buffer, or it leaves the same
+        // heap fragments the pre-sizing exists to prevent.
+        let mut a = app();
+        a.pending_session = Some(Session::from_url("sftp://me@host").unwrap());
+        a.password_input.push_str("wrong");
+        a.handle_password_prompt(press(KeyCode::Enter));
+
+        let capacity_before = a.password_input.capacity();
+        let ptr_before = a.password_input.as_ptr();
+        for _ in 0..CREDENTIAL_CAPACITY {
+            a.password_input.push('x');
+        }
+
+        assert_eq!(a.password_input.capacity(), capacity_before, "buffer grew");
+        assert_eq!(a.password_input.as_ptr(), ptr_before, "buffer moved");
+    }
+
     #[test]
     fn zeroize_keeps_the_capacity_for_the_next_attempt() {
         // Abandon paths call `.zeroize()`, not `.clear()`. It must both empty

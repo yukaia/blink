@@ -89,12 +89,13 @@ pub mod file_pane {
             } else {
                 ("  ", Style::default().fg(app.theme.fg))
             };
-            let row_style = if e.selected {
+            let is_selected = state.is_selected(e);
+            let row_style = if is_selected {
                 Style::default().fg(app.theme.selected)
             } else {
                 base_style
             };
-            let sel_marker = if e.selected { "☑ " } else { "" };
+            let sel_marker = if is_selected { "☑ " } else { "" };
 
             let mut row = vec![
                 Span::raw(" "),
@@ -131,13 +132,10 @@ pub mod file_pane {
         f.render_widget(Paragraph::new(lines), list_area);
 
         // Footer
-        let selected_count = state.entries.iter().filter(|e| e.selected).count();
-        let selected_size: u64 = state
-            .entries
-            .iter()
-            .filter(|e| e.selected)
-            .map(|e| e.size)
-            .sum();
+        // Counts the whole selection, including entries the active filter is
+        // hiding — the footer should report what a transfer would act on.
+        let selected_count = state.selected_count();
+        let selected_size: u64 = state.selected_size();
         let footer_text = if selected_count == 0 {
             format!(" {} items", state.entries.len())
         } else {

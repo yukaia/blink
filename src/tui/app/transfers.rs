@@ -56,9 +56,7 @@ impl App {
 
         // Clear selection upfront — the walk task is async, and we'd rather
         // not surprise the user later if they select more items meanwhile.
-        for e in &mut self.local.entries {
-            e.selected = false;
-        }
+        self.local.clear_selection();
 
         // Build the upload roots: each selected entry becomes a (local, remote)
         // pair. Files become "trivial walks" of a single Upload job; directories
@@ -165,9 +163,7 @@ impl App {
         }
 
         // Clear selection upfront — see start_selected_uploads for rationale.
-        for e in &mut self.remote.entries {
-            e.selected = false;
-        }
+        self.remote.clear_selection();
 
         let local_base = PathBuf::from(&self.local.path);
         // `safe_local_name` is what makes a server-supplied name safe to join
