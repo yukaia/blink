@@ -1052,11 +1052,22 @@ mod tests {
     fn declining_the_offer_returns_to_main() {
         let mut a = app();
         a.current_session = Some(Session::from_url("sftp://me@host").unwrap());
+        // A real queue, not an empty one: `handle_offer_save_session` must
+        // pop this entry, or the next `show_next_offer` sees it again and
+        // the modal never lets go — a real-shaped queue is what makes that
+        // regression visible; an empty one lets `pop_front` be a no-op.
+        a.pending_offers =
+            std::collections::VecDeque::from(vec![PostConnectOffer::SaveSession]);
         a.screen = Screen::OfferSaveSession;
 
         a.handle_offer_save_session(press(KeyCode::Char('n')));
 
         assert_eq!(a.screen, Screen::Main, "declining leaves the connection up");
+        assert!(
+            a.pending_offers.is_empty(),
+            "declining must consume its own queue entry, or show_next_offer \
+             re-shows this same offer forever",
+        );
         assert!(
             a.log.iter().any(|l| l.message.contains("ctrl+s")),
             "declining must point at the way to save later",
@@ -1067,11 +1078,17 @@ mod tests {
     fn accepting_the_offer_opens_the_save_modal() {
         let mut a = app();
         a.current_session = Some(Session::from_url("sftp://me@host.example.com").unwrap());
+        a.pending_offers =
+            std::collections::VecDeque::from(vec![PostConnectOffer::SaveSession]);
         a.screen = Screen::OfferSaveSession;
 
         a.handle_offer_save_session(press(KeyCode::Char('y')));
 
         assert_eq!(a.screen, Screen::SaveSession, "hands off to the save form");
+        assert!(
+            a.pending_offers.is_empty(),
+            "accepting must consume its own queue entry too",
+        );
         assert!(
             !a.save_session_input.is_empty(),
             "the save form should arrive pre-filled with a name",
@@ -1085,12 +1102,54 @@ mod tests {
         // offer by accident.
         let mut a = app();
         a.current_session = Some(Session::from_url("sftp://me@host").unwrap());
+        a.pending_offers =
+            std::collections::VecDeque::from(vec![PostConnectOffer::SaveSession]);
         a.screen = Screen::OfferSaveSession;
 
         for code in [KeyCode::Enter, KeyCode::Char('x'), KeyCode::Tab] {
             a.handle_offer_save_session(press(code));
             assert_eq!(a.screen, Screen::OfferSaveSession, "{code:?} must not dismiss");
         }
+        assert_eq!(
+            a.pending_offers.len(),
+            1,
+            "an ignored key must not pop the queue either",
+        );
+    }
+
+    #[test]
+    fn answering_the_save_offer_through_the_queue_drains_it_from_a_checkpoint_offer() {
+        // The queue-discipline property that matters: answering one offer
+        // through its handler must hand off to the *next* queued offer, not
+        // just to Main. A missing `pop_front()` in either arm of
+        // `handle_offer_save_session` would strand the user re-showing the
+        // save offer forever, or would leave a checkpoint offer stuck behind
+        // an already-answered save offer.
+        let mut a = app();
+        a.current_session = Some(Session::from_url("sftp://me@host").unwrap());
+        a.pending_offers = std::collections::VecDeque::from(vec![
+            offer(CheckpointKind::Download),
+            PostConnectOffer::SaveSession,
+        ]);
+        a.show_next_offer();
+        assert_eq!(a.screen, Screen::OfferResumeCheckpoint);
+
+        // Defer the checkpoint offer — the esc arm doesn't touch disk, so
+        // this is safe without a real checkpoint file backing it.
+        a.handle_offer_resume_checkpoint(press(KeyCode::Esc));
+        assert_eq!(
+            a.screen,
+            Screen::OfferSaveSession,
+            "answering the first offer must advance to the next queued one",
+        );
+
+        a.handle_offer_save_session(press(KeyCode::Char('n')));
+
+        assert_eq!(a.screen, Screen::Main, "the queue is now empty");
+        assert!(
+            a.pending_offers.is_empty(),
+            "both offers must have been popped",
+        );
     }
 
     #[test]
