@@ -843,7 +843,18 @@ what blink checkpoints --clean already does."
 
 ---
 
-## Task 6: Post-connect offer queue
+## Task 6: The resume offer — queue, handler, and panel
+
+`Screen` is matched exhaustively with no catch-all arm in `draw`, so the
+moment `Screen::OfferResumeCheckpoint` exists, `draw` and `handle_key` must
+both handle it or the crate does not compile. The variant, the handler that
+answers it, and the view that renders it are therefore one atomic change —
+this is the smallest unit that ends green.
+
+It runs in three parts. Parts A and B do not build on their own; the test
+gate and the commit are at the end of Part C.
+
+### Part A — the queue
 
 **Files:**
 - Modify: `src/tui/state.rs` (`PostConnectOffer`)
@@ -928,14 +939,6 @@ pub enum PostConnectOffer {
 
 In `src/tui/app/mod.rs`:
 
-Add the screen variant next to `OfferSaveSession`:
-
-```rust
-    /// Modal over Main: a previous batch to this session left work
-    /// unfinished — offer to resume it.
-    OfferResumeCheckpoint,
-```
-
 Add the field to `App` next to `pending_session_unsaved`:
 
 ```rust
@@ -968,7 +971,7 @@ Add the method to the `impl App` block, next to `push_log`:
     }
 ```
 
-Do **not** add the `draw` or `handle_key` arms in this task. The renderer lands in Task 8 and the handler in Task 7; adding either arm early leaves the crate uncompilable. `Screen::OfferResumeCheckpoint` is unreachable until Task 7 wires `handle_key`, which is fine — `show_next_offer` can name it, nothing routes to it yet, and the match arms stay exhaustive because both `draw` and `handle_key` already have catch-all-free matches that the compiler will demand you complete in Tasks 7 and 8.
+Add `Screen::OfferResumeCheckpoint` in Part C, together with its `draw` and `handle_key` arms — `draw` matches `Screen` with no catch-all, so the variant and both arms have to arrive in the same edit.
 
 In `src/tui/app/events.rs`, replace the `Connected` handler's screen decision:
 
@@ -1000,26 +1003,11 @@ and replace the existing:
 
 with `self.show_next_offer();` — placed after `self.current_session = Some(session);` so `session.name` is read before the move. Import `PostConnectOffer` in `events.rs`.
 
-- [ ] **Step 4: Run tests**
+Part A does not compile on its own — `show_next_offer` names
+`Screen::OfferResumeCheckpoint`, which Part C introduces along with its match
+arms. Continue straight to Part B.
 
-Run: `cargo test --quiet && cargo clippy --all-targets -- -D warnings`
-Expected: all pass. The existing `the_offer_is_made_only_once_per_connect` test still passes — `mem::take` is unchanged.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/tui/state.rs src/tui/app/mod.rs src/tui/app/events.rs
-git commit -m "feat(tui): queue the questions asked after a connection comes up
-
-One VecDeque owns post-connect sequencing rather than each handler
-deciding what follows it. Checkpoints are offered before the save-session
-offer because they are keyed by session name and accepting the save can
-rename the session."
-```
-
----
-
-## Task 7: Answer the resume offer
+### Part B — answering it
 
 **Files:**
 - Modify: `src/tui/app/handlers.rs` (`handle_offer_resume_checkpoint`, `handle_offer_save_session`)
@@ -1231,29 +1219,10 @@ Add the `handle_key` arm in `src/tui/app/mod.rs`, next to `Screen::OfferSaveSess
             Screen::OfferResumeCheckpoint => self.handle_offer_resume_checkpoint(key),
 ```
 
-- [ ] **Step 4: Run tests**
+Part B still does not compile — `Screen::OfferResumeCheckpoint` and its match
+arms arrive in Part C. Continue.
 
-Run: `cargo test --quiet && cargo clippy --all-targets -- -D warnings`
-Expected: all pass, clippy silent.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/tui/app/handlers.rs src/tui/app/mod.rs
-git commit -m "feat(tui): answer the resume offer
-
-r resumes through the existing resume_walk, d discards the checkpoint and
-sweeps its orphaned partials, esc defers. Deferring is non-destructive by
-design — the checkpoint is offered again next connect, and the log says
-how to reach it in the meantime.
-
-handle_offer_save_session now pops the queue and advances rather than
-hardcoding Main, so the two offers compose."
-```
-
----
-
-## Task 8: The panel
+### Part C — the panel, and the arms that make it reachable
 
 **Files:**
 - Modify: `src/tui/views.rs` (new `offer_resume_checkpoint` module)
@@ -1457,7 +1426,17 @@ Delete the copy in `bottom_pane` and update its two call sites (`render_transfer
     }
 ```
 
-Now add the `draw` arm in `src/tui/app/mod.rs`, next to `Screen::OfferSaveSession`:
+Now add the `Screen` variant and both match arms in `src/tui/app/mod.rs` — this is the edit that makes the crate compile again.
+
+Next to `OfferSaveSession` in the `Screen` enum:
+
+```rust
+    /// Modal over Main: a previous batch to this session left work
+    /// unfinished — offer to resume it.
+    OfferResumeCheckpoint,
+```
+
+In `draw`, next to the `Screen::OfferSaveSession` arm:
 
 ```rust
             Screen::OfferResumeCheckpoint => {
@@ -1466,26 +1445,49 @@ Now add the `draw` arm in `src/tui/app/mod.rs`, next to `Screen::OfferSaveSessio
             }
 ```
 
-- [ ] **Step 4: Run tests and build**
+In `handle_key`, next to the `Screen::OfferSaveSession` arm:
+
+```rust
+            Screen::OfferResumeCheckpoint => self.handle_offer_resume_checkpoint(key),
+```
+
+- [ ] **Step 4: Run the whole task's tests**
+
+This is the first point since Part A at which the crate compiles.
 
 Run: `cargo test --quiet && cargo clippy --all-targets -- -D warnings && cargo build --release`
 Expected: all pass, clippy silent, release builds.
 
+If any of the queue or handler tests compiled straight to green, re-break the
+implementation to confirm they catch it: make `show_next_offer` always return
+`Screen::Main` and check the queue test fails; restore it.
+
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/tui/views.rs src/tui/app/mod.rs
-git commit -m "feat(tui): panel offering to resume an interrupted batch
+git add src/tui/state.rs src/tui/app/mod.rs src/tui/app/handlers.rs src/tui/app/events.rs src/tui/views.rs src/tui/widgets.rs
+git commit -m "feat(tui): offer to resume an interrupted batch on connect
 
-Shows direction, how much is left, how old the checkpoint is, and up to
-three of the outstanding paths — the paths are what make a batch
-recognisable weeks later. Age is deliberately coarse: the question being
-answered is whether the batch is still relevant."
+A VecDeque owns post-connect sequencing rather than each handler deciding
+what follows it; checkpoints are offered before the save-session offer,
+because they are keyed by session name and accepting the save can rename
+the session.
+
+r resumes through the existing resume_walk, d discards the checkpoint and
+sweeps its orphaned partials, esc defers — non-destructive by design, so
+the offer returns next connect and the log says how to reach it meanwhile.
+
+The panel shows direction, how much is left, how old the checkpoint is,
+and up to three outstanding paths — the paths are what make a batch
+recognisable weeks later.
+
+Screen is matched exhaustively with no catch-all, so the variant, its two
+match arms, the handler, and the view had to land together."
 ```
 
 ---
 
-## Task 9: Documentation
+## Task 7: Documentation
 
 **Files:**
 - Modify: `README.md`
