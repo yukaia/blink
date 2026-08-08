@@ -88,19 +88,7 @@ impl Config {
     }
 
     pub fn load_from(path: &Path) -> Result<Self> {
-        // Enforce a size limit before reading. Use the take() pattern (open
-        // then read) rather than metadata() + read_to_string() to avoid a
-        // TOCTOU race where the file grows between the two syscalls.
-        use std::io::Read as _;
-        let file = fs::File::open(path)?;
-        let mut raw = String::new();
-        file.take(MAX_CONFIG_BYTES + 1)
-            .read_to_string(&mut raw)?;
-        if raw.len() as u64 > MAX_CONFIG_BYTES {
-            return Err(BlinkError::config(format!(
-                "config file is too large (limit is {MAX_CONFIG_BYTES} bytes)"
-            )));
-        }
+        let raw = read_capped(path, MAX_CONFIG_BYTES)?;
         let ini = Ini::load_from_str(&raw)
             .map_err(|e| BlinkError::config(format!("{}: {e}", path.display())))?;
         let mut cfg = Self::default();
@@ -159,9 +147,13 @@ impl Config {
         let tmp = path.with_extension("tmp");
 
         // Start from the file on disk so unknown sections / keys round-trip.
-        // If the file doesn't exist or won't parse, fall back to a fresh
-        // INI — we still produce a syntactically valid config.
-        let mut ini = match fs::read_to_string(&path) {
+        // If the file doesn't exist, won't parse, or is larger than we are
+        // willing to read, fall back to a fresh INI — we still produce a
+        // syntactically valid config. The cap is the same one `load_from`
+        // applies: reading unbounded here meant a file the loader would
+        // refuse could still be pulled entirely into memory by a theme
+        // cycle.
+        let mut ini = match read_capped(&path, MAX_CONFIG_BYTES) {
             Ok(raw) => Ini::load_from_str(&raw).unwrap_or_else(|_| Ini::new()),
             Err(_) => Ini::new(),
         };
@@ -195,6 +187,25 @@ impl Config {
         paths::sync_parent_dir(&path)?;
         Ok(())
     }
+}
+
+/// Read `path`, refusing anything larger than `max` bytes.
+///
+/// Uses the take() pattern (open then read) rather than metadata() +
+/// read_to_string() so the file cannot grow between the two syscalls. I/O
+/// errors pass through unchanged, so callers can still tell `NotFound`
+/// (first run) from a real failure.
+fn read_capped(path: &Path, max: u64) -> Result<String> {
+    use std::io::Read as _;
+    let file = fs::File::open(path)?;
+    let mut raw = String::new();
+    file.take(max + 1).read_to_string(&mut raw)?;
+    if raw.len() as u64 > max {
+        return Err(BlinkError::config(format!(
+            "config file is too large (limit is {max} bytes)"
+        )));
+    }
+    Ok(raw)
 }
 
 /// Validate a theme name from the config file.
@@ -236,6 +247,54 @@ fn parse_bool(s: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- bounded reads -----------------------------------------------------
+    //
+    // `load_from` capped the file it parsed; `save` read the same file back
+    // with an unbounded `read_to_string` to preserve unknown keys. Same file,
+    // two different ideas of how big it may be.
+
+    fn tmp(tag: &str, bytes: usize) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("blink-cfg-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.ini");
+        std::fs::write(&path, "x".repeat(bytes)).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_file_within_the_cap_reads_back() {
+        let path = tmp("small", 16);
+        let raw = read_capped(&path, MAX_CONFIG_BYTES).expect("must read");
+        assert_eq!(raw.len(), 16);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_file_at_the_cap_reads_back() {
+        let path = tmp("exact", MAX_CONFIG_BYTES as usize);
+        assert!(read_capped(&path, MAX_CONFIG_BYTES).is_ok());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_file_over_the_cap_is_refused() {
+        let path = tmp("big", MAX_CONFIG_BYTES as usize + 1);
+        let err = read_capped(&path, MAX_CONFIG_BYTES).unwrap_err();
+        assert!(err.to_string().contains("too large"), "{err}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_missing_file_reports_not_found() {
+        let err = read_capped(std::path::Path::new("/nonexistent/blink.ini"), 64)
+            .unwrap_err();
+        assert!(
+            matches!(err, BlinkError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound),
+            "callers distinguish first-run from a real failure: {err:?}",
+        );
+    }
 
     // parse_bool
     #[test]

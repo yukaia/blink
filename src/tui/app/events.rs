@@ -42,9 +42,22 @@ impl App {
                 if let Some(new_pin) = connected.new_cert_pin {
                     session.cert_sha256 = Some(new_pin);
                     if let Err(e) = session.save() {
+                        // The pin is the whole of the trust decision for a
+                        // session with chain validation disabled: without it
+                        // on disk, the *next* connect trusts the first
+                        // certificate it is shown all over again. A warning
+                        // buried in the log undersells that — this connection
+                        // is fine, but the protection the user thinks they
+                        // have does not exist yet.
                         self.push_log(
-                            LogLevel::Warn,
-                            format!("could not save FTPS cert pin: {e}"),
+                            LogLevel::Error,
+                            format!(
+                                "could not save the FTPS certificate pin for `{}`: {e} — \
+                                 this connection is verified, but the next one will \
+                                 trust whatever certificate it is offered. Fix the \
+                                 session file's permissions and reconnect.",
+                                session.name
+                            ),
                         );
                     } else {
                         self.push_log(
