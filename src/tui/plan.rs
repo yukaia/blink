@@ -15,7 +15,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{BlinkError, Result};
 use crate::transfer::MAX_QUEUED_JOBS;
-use crate::transport::{self, EntryKind, Transport};
+use crate::transport::{self, EntryKind};
+use crate::tui::app::SharedTransport;
 
 // ---------------------------------------------------------------------------
 // PlannedJob and WalkResult
@@ -128,8 +129,14 @@ fn safe_local_name_for(name: &str, windows_rules: bool) -> Option<&str> {
 ///
 /// Transport-level errors propagate; partial trees are NOT fixed up here —
 /// the caller surfaces a `WalkFailed` log line and the user can retry.
+/// The transport is taken as the shared handle rather than a borrowed
+/// `&mut dyn Transport`, and locked once per directory. Holding it across the
+/// whole walk blocked every other user of the connection — including the pane
+/// listing the UI issues on F5 or a navigation — until the walk finished,
+/// which on a large tree is minutes. Every listing addresses an absolute
+/// path, so interleaving another operation between two directories is safe.
 pub async fn walk_remote(
-    transport: &mut dyn Transport,
+    transport: &SharedTransport,
     remote_root: &str,
     local_root: &Path,
 ) -> Result<WalkResult> {
@@ -173,7 +180,12 @@ pub async fn walk_remote(
             )));
         }
 
-        let entries = transport.list(&remote_dir).await?;
+        // Scoped: the guard is dropped before the entries are processed and
+        // before the next iteration, so other work gets a turn.
+        let entries = {
+            let mut t = transport.lock().await;
+            t.list(&remote_dir).await?
+        };
 
         // Pre-collect subdirs so we can push them in reverse for a stable
         // depth-first ordering (leftmost child popped next).
@@ -339,7 +351,7 @@ pub async fn find_download_conflicts(plan: &[PlannedJob]) -> Vec<usize> {
 /// If a destination directory doesn't exist yet, it has no conflicts by
 /// definition. We swallow the listing error in that case.
 pub async fn find_upload_conflicts(
-    transport: &mut dyn Transport,
+    transport: &SharedTransport,
     plan: &[PlannedJob],
 ) -> Result<Vec<usize>> {
     use std::collections::HashMap;
@@ -359,7 +371,12 @@ pub async fn find_upload_conflicts(
 
     let mut conflicts = Vec::new();
     for (dir, entries) in by_dir {
-        let listing = match transport.list(&dir).await {
+        // Per-directory lock, same reasoning as `walk_remote`.
+        let result = {
+            let mut t = transport.lock().await;
+            t.list(&dir).await
+        };
+        let listing = match result {
             Ok(l) => l,
             // "Directory doesn't exist yet" — no conflicts there. Other
             // errors also short-circuit to "no conflicts" because the
@@ -402,6 +419,7 @@ pub fn drop_conflicting(plan: Vec<PlannedJob>, conflicts: &[usize]) -> Vec<Plann
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::Transport;
 
     // -- Walk budget -------------------------------------------------------
 
@@ -470,12 +488,149 @@ mod tests {
         }
     }
 
+    /// Wrap a stub transport in the shared handle the walk now takes.
+    fn shared<T: Transport + 'static>(t: T) -> SharedTransport {
+        std::sync::Arc::new(tokio::sync::Mutex::new(Box::new(t) as Box<dyn Transport>))
+    }
+
     /// Unique scratch directory, removed by the caller.
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir()
             .join(format!("blink-plan-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
+    }
+
+    // -- the walk must not monopolise the connection -----------------------
+
+    /// Transport stub whose listings block until the test lets each one
+    /// through, except for `/quick` which returns immediately. Lets a test
+    /// hold a walk mid-flight and ask whether anything else can still use
+    /// the connection.
+    struct GatedTree {
+        /// Sends one gate per gated `list` call; the test releases them.
+        gates: tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>,
+        fan_out: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for GatedTree {
+        async fn list(&mut self, remote_path: &str) -> Result<Vec<transport::RemoteEntry>> {
+            if remote_path != "/quick" {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let _ = self.gates.send(tx);
+                let _ = rx.await;
+            }
+            // Only the root fans out; children are leaves, so the walk makes
+            // exactly `fan_out + 1` gated listings.
+            let n = if remote_path == "/gated" { self.fan_out } else { 0 };
+            Ok((0..n)
+                .map(|i| {
+                    transport::RemoteEntry::new(
+                        format!("d{i}"),
+                        EntryKind::Directory,
+                        0,
+                        None,
+                        None,
+                    )
+                })
+                .collect())
+        }
+
+        fn protocol(&self) -> crate::session::Protocol {
+            crate::session::Protocol::Sftp
+        }
+        async fn download(
+            &mut self,
+            _: &str,
+            _: &Path,
+            _: Option<tokio::sync::mpsc::UnboundedSender<transport::ProgressUpdate>>,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        async fn upload(
+            &mut self,
+            _: &Path,
+            _: &str,
+            _: Option<tokio::sync::mpsc::UnboundedSender<transport::ProgressUpdate>>,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        async fn rename(&mut self, _: &str, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn delete_file(&mut self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn delete_dir(&mut self, _: &str, _: bool) -> Result<()> {
+            unreachable!()
+        }
+        async fn mkdir(&mut self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn metadata(&mut self, _: &str) -> Result<Option<transport::RemoteEntry>> {
+            unreachable!()
+        }
+        async fn read_to_bytes(&mut self, _: &str) -> Result<bytes::Bytes> {
+            unreachable!()
+        }
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The walk must release the connection between directories.
+    ///
+    /// It used to hold the transport lock for the whole tree, so a listing
+    /// requested from the UI — F5, or navigating — waited for the entire
+    /// walk to finish. On a large remote that is minutes of a pane that has
+    /// already been blanked.
+    ///
+    /// Deterministic rather than timing-based: exactly one gated listing is
+    /// released, so the walk is parked inside its *second* one. If the lock
+    /// were held across the walk, the pane listing could never complete —
+    /// the walk is not going to finish.
+    #[tokio::test]
+    async fn a_walk_releases_the_connection_between_directories() {
+        let root = scratch("gated");
+        let (gate_tx, mut gate_rx) = tokio::sync::mpsc::unbounded_channel();
+        let shared: SharedTransport = std::sync::Arc::new(tokio::sync::Mutex::new(Box::new(
+            GatedTree {
+                gates: gate_tx,
+                fan_out: 3,
+            },
+        )
+            as Box<dyn Transport>));
+
+        let walk_handle = {
+            let shared = shared.clone();
+            let root = root.clone();
+            tokio::spawn(async move { walk_remote(&shared, "/gated", &root).await.map(|_| ()) })
+        };
+
+        // Wait until the walk is inside its first listing, then let just that
+        // one through. The walk then parks on the next one.
+        let first = gate_rx.recv().await.expect("walk should start listing");
+        let _ = first.send(());
+
+        // A pane refresh, issued while the walk is still in flight.
+        let listed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut t = shared.lock().await;
+            t.list("/quick").await
+        })
+        .await;
+
+        assert!(
+            listed.is_ok(),
+            "a pane listing must not wait for the whole walk to finish",
+        );
+
+        // Let the walk drain so the task doesn't outlive the test.
+        while let Ok(gate) = gate_rx.try_recv() {
+            let _ = gate.send(());
+        }
+        walk_handle.abort();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[tokio::test]
@@ -485,11 +640,11 @@ mod tests {
         // fired no matter how much the walk expanded. A fan-out wider than
         // the budget must now be refused.
         let root = scratch("wide");
-        let mut t = EmptyDirTree {
+        let t = EmptyDirTree {
             fan_out: MAX_QUEUED_JOBS + 1,
         };
 
-        let err = walk_remote(&mut t, "/", &root)
+        let err = walk_remote(&shared(t), "/", &root)
             .await
             .expect_err("a tree this wide must not be planned");
         assert!(
@@ -505,9 +660,9 @@ mod tests {
         // The guard must not fire on ordinary input — an empty directory
         // tree is legitimate, it just plans no transfers.
         let root = scratch("small");
-        let mut t = EmptyDirTree { fan_out: 0 };
+        let t = EmptyDirTree { fan_out: 0 };
 
-        let result = walk_remote(&mut t, "/", &root).await.expect("must succeed");
+        let result = walk_remote(&shared(t), "/", &root).await.expect("must succeed");
         assert!(result.plan.is_empty(), "no files means no jobs");
         assert_eq!(result.symlinks_skipped, 0);
 
@@ -593,11 +748,11 @@ mod tests {
         // "/srv/re port.txt" asks for a file that does not exist.
         let root = scratch("rawname");
         let raw = "re\u{202E}port.txt";
-        let mut t = FileList {
+        let t = FileList {
             names: vec![raw.to_string()],
         };
 
-        let result = walk_remote(&mut t, "/srv", &root).await.expect("walk");
+        let result = walk_remote(&shared(t), "/srv", &root).await.expect("walk");
 
         match result.plan.as_slice() {
             [PlannedJob::Download { remote_path, .. }] => assert_eq!(
@@ -618,11 +773,11 @@ mod tests {
         let root = scratch("collide");
         let decoy = "invoice\u{200B}.pdf";
         let real = "invoice .pdf";
-        let mut t = FileList {
+        let t = FileList {
             names: vec![decoy.to_string(), real.to_string()],
         };
 
-        let result = walk_remote(&mut t, "/srv", &root).await.expect("walk");
+        let result = walk_remote(&shared(t), "/srv", &root).await.expect("walk");
 
         let mut remotes: Vec<&str> = result
             .plan

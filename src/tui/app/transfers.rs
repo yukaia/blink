@@ -123,9 +123,8 @@ impl App {
             // Phase 2: collect every destination directory mentioned by the
             // plan (the parent of each Upload job), then list each one once
             // and check for conflicts in O(dirs) round-trips.
-            let mut transport = t.lock().await;
             let conflict_indices =
-                match find_upload_conflicts(&mut **transport, &plan).await {
+                match find_upload_conflicts(&t, &plan).await {
                     Ok(c) => c,
                     Err(e) => {
                         let _ = tx.send(AppEvent::WalkFailed {
@@ -205,10 +204,9 @@ impl App {
             let mut plan: Vec<PlannedJob> = Vec::new();
             let mut symlinks_skipped: usize = 0;
             {
-                let mut transport = t.lock().await;
                 for (remote, local, is_dir) in roots {
                     let chunk = if is_dir {
-                        let walk = walk_remote(&mut **transport, &remote, &local).await;
+                        let walk = walk_remote(&t, &remote, &local).await;
                         match walk {
                             Ok(r) => {
                                 symlinks_skipped += r.symlinks_skipped;

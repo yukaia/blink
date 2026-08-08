@@ -130,11 +130,17 @@ impl App {
         // Reflect the new path immediately so the UI shows where we're going,
         // and so the stale-guard in handle_app_event can compare against it.
         self.remote.path = path.clone();
-        self.remote.entries.clear();
         if path_changed {
-            // Navigation: drop into the new dir at the top.
+            // Navigation: the old directory's rows don't belong to the new
+            // path, and acting on one would address the wrong file. Drop them
+            // and start at the top.
+            self.remote.entries.clear();
             self.remote.cursor = 0;
         }
+        // An in-place refresh deliberately keeps the current rows until the
+        // new listing arrives. Clearing first blanked the pane for however
+        // long the listing took — and behind a recursive walk that had the
+        // connection, that was the length of the whole walk.
         let tx = self.app_event_tx.clone();
 
         tokio::spawn(async move {

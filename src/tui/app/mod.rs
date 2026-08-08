@@ -120,7 +120,10 @@ pub enum LogLevel {
 
 /// Shared transport: behind a `tokio::Mutex` so background tasks (list, rename,
 /// preview, …) can borrow it without contending with the UI loop.
-type SharedTransport = Arc<Mutex<Box<dyn Transport>>>;
+///
+/// Long-running work must take this per operation rather than holding it for
+/// its whole duration — see [`crate::tui::plan::walk_remote`].
+pub(crate) type SharedTransport = Arc<Mutex<Box<dyn Transport>>>;
 
 /// Capacity reserved for a credential typed into a prompt.
 ///
@@ -1146,6 +1149,49 @@ mod tests {
             Screen::Main,
             "the return screen must survive a second prompt",
         );
+    }
+
+    // -- pane refresh ------------------------------------------------------
+
+    #[tokio::test]
+    async fn refreshing_the_remote_pane_keeps_showing_the_current_listing() {
+        // Refreshing in place used to blank the pane and only repopulate when
+        // the listing came back — which, behind a recursive walk holding the
+        // connection, could be minutes.
+        let mut a = app();
+        a.transport = Some(Arc::new(Mutex::new(
+            Box::new(crate::transport::mock::MockTransport::new()) as Box<dyn Transport>,
+        )));
+        a.remote.path = "/srv".into();
+        a.remote.set_entries(vec![PaneEntry::new("a.txt".into(), false, 1)]);
+
+        a.refresh_remote_pane("/srv".to_string());
+
+        assert_eq!(
+            a.remote.entries.len(),
+            1,
+            "an in-place refresh must not blank the pane while it waits",
+        );
+    }
+
+    #[tokio::test]
+    async fn navigating_the_remote_pane_drops_the_previous_listing() {
+        // Navigation is different: the old directory's rows do not belong to
+        // the new path, and acting on them would address the wrong files.
+        let mut a = app();
+        a.transport = Some(Arc::new(Mutex::new(
+            Box::new(crate::transport::mock::MockTransport::new()) as Box<dyn Transport>,
+        )));
+        a.remote.path = "/srv".into();
+        a.remote.set_entries(vec![PaneEntry::new("a.txt".into(), false, 1)]);
+
+        a.refresh_remote_pane("/srv/sub".to_string());
+
+        assert!(
+            a.remote.entries.is_empty(),
+            "stale rows must not survive a navigation",
+        );
+        assert_eq!(a.remote.cursor, 0);
     }
 
     // -- changed host key --------------------------------------------------
