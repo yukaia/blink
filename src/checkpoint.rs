@@ -65,7 +65,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -593,6 +593,96 @@ impl Checkpoint {
     }
 }
 
+/// A display-only summary of a checkpoint that still has work to do.
+///
+/// Everything here is for rendering. `sample_paths` is sanitized at
+/// construction because the panel draws it directly rather than going
+/// through `push_log`, which is where sanitization otherwise happens
+/// centrally — and remote paths carry the server's own bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointOffer {
+    pub kind: CheckpointKind,
+    pub session: String,
+    /// Jobs still to run: pending plus in-progress.
+    pub remaining: usize,
+    /// `remaining + done`. Cancelled jobs are excluded — that is work the
+    /// user already abandoned, and counting it would overstate the total.
+    pub total: usize,
+    /// How long ago the checkpoint file was last written, if it could be
+    /// stat'ed.
+    pub age: Option<Duration>,
+    /// Up to three outstanding paths, taken from the source side.
+    pub sample_paths: Vec<String>,
+}
+
+/// The path a job reads *from* — what the user selected, and so what they
+/// will recognise in the panel.
+fn source_path(job: &CheckpointJob) -> String {
+    match job {
+        CheckpointJob::Download { remote_path, .. } => remote_path.clone(),
+        CheckpointJob::Upload { local_path, .. } => local_path.display().to_string(),
+        CheckpointJob::Mkdir { remote_path, .. } => remote_path.clone(),
+    }
+}
+
+/// How long ago `path` was modified.
+fn age_of(path: &Path) -> Option<Duration> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    SystemTime::now().duration_since(modified).ok()
+}
+
+impl Checkpoint {
+    /// Summarise this checkpoint for the resume panel.
+    pub fn to_offer(&self, age: Option<Duration>) -> CheckpointOffer {
+        let remaining = self.pending_count();
+        let done = self.done_count();
+        let sample_paths = self
+            .jobs
+            .iter()
+            .filter(|j| j.needs_resume())
+            .take(3)
+            .map(|j| crate::error::sanitize(source_path(j)))
+            .collect();
+        CheckpointOffer {
+            kind: self.kind,
+            session: self.session.clone(),
+            remaining,
+            total: remaining + done,
+            age,
+            sample_paths,
+        }
+    }
+}
+
+/// Summaries of every checkpoint for `session` that still has work left.
+///
+/// A file that is absent, empty of outstanding work, or unreadable yields
+/// no offer: connecting must never fail because of a checkpoint.
+// Not called by this task's callers; the resume-offer panel (a later task
+// in this plan) is the real consumer.
+#[allow(dead_code)]
+pub fn offers_for(session: &str) -> Vec<CheckpointOffer> {
+    let mut out = Vec::new();
+    for kind in [CheckpointKind::Download, CheckpointKind::Upload] {
+        let Ok(path) = Checkpoint::path_for(session, kind) else {
+            continue;
+        };
+        let cp = match Checkpoint::load_from(&path) {
+            Ok(Some(cp)) => cp,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(?path, "skipping unreadable checkpoint: {e}");
+                continue;
+            }
+        };
+        if cp.pending_count() == 0 {
+            continue;
+        }
+        out.push(cp.to_offer(age_of(&path)));
+    }
+    out
+}
+
 /// Whether a checkpoint write is owed right now.
 ///
 /// Split out from [`Checkpoint::flush_if_due`] so the policy can be tested
@@ -992,6 +1082,182 @@ mod sweep_tests {
         assert!(outcome.failures.is_empty(), "the job simply never started");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod offer_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn dl(n: usize, status: JobStatus) -> CheckpointJob {
+        CheckpointJob::Download {
+            remote_path: format!("/srv/file{n}.bin"),
+            local_path: PathBuf::from(format!("/l/file{n}.bin")),
+            status,
+        }
+    }
+
+    #[test]
+    fn the_offer_counts_only_outstanding_and_completed_work() {
+        // `total` is remaining + done. A cancelled job is work the user
+        // already abandoned; counting it would overstate what is left.
+        let cp = Checkpoint::new(
+            "s",
+            CheckpointKind::Download,
+            vec![
+                dl(0, JobStatus::Done),
+                dl(1, JobStatus::Pending),
+                dl(2, JobStatus::InProgress),
+                dl(3, JobStatus::Cancelled),
+            ],
+        );
+
+        let offer = cp.to_offer(None);
+
+        assert_eq!(offer.remaining, 2, "pending + in_progress");
+        assert_eq!(offer.total, 3, "remaining + done, cancelled excluded");
+        assert_eq!(offer.kind, CheckpointKind::Download);
+    }
+
+    #[test]
+    fn the_offer_samples_at_most_three_outstanding_paths() {
+        let jobs: Vec<CheckpointJob> = (0..10).map(|n| dl(n, JobStatus::Pending)).collect();
+        let cp = Checkpoint::new("s", CheckpointKind::Download, jobs);
+
+        let offer = cp.to_offer(None);
+
+        assert_eq!(offer.sample_paths.len(), 3);
+        assert_eq!(offer.sample_paths[0], "/srv/file0.bin");
+    }
+
+    #[test]
+    fn the_offer_skips_finished_jobs_when_sampling() {
+        let cp = Checkpoint::new(
+            "s",
+            CheckpointKind::Download,
+            vec![dl(0, JobStatus::Done), dl(1, JobStatus::Pending)],
+        );
+
+        let offer = cp.to_offer(None);
+
+        assert_eq!(
+            offer.sample_paths,
+            vec!["/srv/file1.bin".to_string()],
+            "the panel should show what is left, not what is finished",
+        );
+    }
+
+    #[test]
+    fn an_upload_offer_samples_the_local_source() {
+        // For an upload the user picked local files; that is what they will
+        // recognise, not the remote destination.
+        let cp = Checkpoint::new(
+            "s",
+            CheckpointKind::Upload,
+            vec![CheckpointJob::Upload {
+                local_path: PathBuf::from("/home/me/photos/a.cr2"),
+                remote_path: "/srv/backup/a.cr2".into(),
+                status: JobStatus::Pending,
+            }],
+        );
+
+        let offer = cp.to_offer(None);
+
+        assert_eq!(offer.sample_paths, vec!["/home/me/photos/a.cr2".to_string()]);
+    }
+
+    #[test]
+    fn sample_paths_are_sanitized() {
+        // The panel renders these directly rather than through push_log, so
+        // a server-supplied name must not carry escapes into the terminal.
+        let cp = Checkpoint::new(
+            "s",
+            CheckpointKind::Download,
+            vec![CheckpointJob::Download {
+                remote_path: "/srv/re\u{202E}port.bin".into(),
+                local_path: PathBuf::from("/l/x"),
+                status: JobStatus::Pending,
+            }],
+        );
+
+        let offer = cp.to_offer(None);
+
+        assert!(
+            !offer.sample_paths[0].contains('\u{202E}'),
+            "bidi override reached the panel: {:?}",
+            offer.sample_paths[0],
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_checkpoints_has_no_offers() {
+        let name = format!("blink-test-none-{}", std::process::id());
+        assert!(offers_for(&name).is_empty());
+    }
+
+    #[test]
+    fn a_pending_checkpoint_on_disk_produces_one_offer() {
+        let name = format!("blink-test-offer-{}", std::process::id());
+        let _cleanup = test_support::CheckpointCleanup::new(&name);
+        let mut cp = Checkpoint::new(
+            &name,
+            CheckpointKind::Download,
+            vec![dl(0, JobStatus::Done), dl(1, JobStatus::Pending)],
+        );
+        cp.flush().expect("write the checkpoint");
+
+        let offers = offers_for(&name);
+
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].remaining, 1);
+        assert_eq!(offers[0].total, 2);
+        assert!(offers[0].age.is_some(), "age comes from the file mtime");
+    }
+
+    #[test]
+    fn a_finished_checkpoint_produces_no_offer() {
+        let name = format!("blink-test-done-{}", std::process::id());
+        let _cleanup = test_support::CheckpointCleanup::new(&name);
+        let mut cp = Checkpoint::new(
+            &name,
+            CheckpointKind::Download,
+            vec![dl(0, JobStatus::Done)],
+        );
+        cp.flush().expect("write the checkpoint");
+
+        assert!(
+            offers_for(&name).is_empty(),
+            "nothing left to resume means nothing to offer",
+        );
+    }
+
+    #[test]
+    fn both_directions_each_produce_an_offer() {
+        let name = format!("blink-test-both-{}", std::process::id());
+        let _cleanup = test_support::CheckpointCleanup::new(&name);
+        for kind in [CheckpointKind::Download, CheckpointKind::Upload] {
+            let mut cp = Checkpoint::new(&name, kind, vec![dl(0, JobStatus::Pending)]);
+            cp.flush().expect("write the checkpoint");
+        }
+
+        let offers = offers_for(&name);
+
+        assert_eq!(offers.len(), 2);
+        assert!(offers.iter().any(|o| o.kind == CheckpointKind::Download));
+        assert!(offers.iter().any(|o| o.kind == CheckpointKind::Upload));
+    }
+
+    #[test]
+    fn an_unreadable_checkpoint_is_skipped_rather_than_propagated() {
+        // Connecting must never fail because a checkpoint won't parse.
+        let name = format!("blink-test-corrupt-{}", std::process::id());
+        let path = Checkpoint::path_for(&name, CheckpointKind::Download).unwrap();
+        std::fs::write(&path, b"{ not json").unwrap();
+
+        assert!(offers_for(&name).is_empty());
+
+        let _ = std::fs::remove_file(&path);
     }
 }
 
