@@ -233,7 +233,16 @@ impl App {
                     self.screen = Screen::SessionSelect;
                     return;
                 };
-                let password = zeroize::Zeroizing::new(std::mem::take(&mut *self.password_input));
+                // Copy out and wipe in place, rather than `mem::take`.
+                // Taking hands the pre-sized allocation to the connect task
+                // and leaves `String::default()` — capacity zero — in the
+                // field, so a retry after a wrong password reallocates on
+                // every keystroke, scattering fragments of the partial
+                // secret across the heap that no later zeroize can reach.
+                // `zeroize` clears the bytes and keeps the capacity.
+                let password =
+                    zeroize::Zeroizing::new(self.password_input.as_str().to_owned());
+                self.password_input.zeroize();
                 self.pending_password = Some(password.clone());
                 self.start_connect(session, Some(password));
             }
@@ -267,7 +276,10 @@ impl App {
                     self.screen = Screen::SessionSelect;
                     return;
                 };
-                let passphrase = zeroize::Zeroizing::new(std::mem::take(&mut *self.passphrase_input));
+                // See the password prompt: copy out, wipe in place.
+                let passphrase =
+                    zeroize::Zeroizing::new(self.passphrase_input.as_str().to_owned());
+                self.passphrase_input.zeroize();
                 self.passphrase_attempted = true;
                 self.passphrase_error = None;
                 // Cache for the dispatcher: parallel transfers re-open the
