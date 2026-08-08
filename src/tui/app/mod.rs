@@ -762,6 +762,13 @@ impl App {
             .unwrap_or_else(|| "session".to_string());
 
         // 3. Clear connection-scoped state.
+        // Checkpoint bookkeeping is scoped to the connection that created
+        // it. The next connection gets a fresh TransferManager whose job
+        // ids restart at 1, so a surviving map would alias new jobs onto
+        // old checkpoint entries — and a surviving checkpoint would make
+        // `resume_walk` refuse a resume the user was just offered.
+        self.active_checkpoints.clear();
+        self.checkpoint_job_map.clear();
         self.transfer_manager = None;
         self.current_session = None;
         self.pending_password = None;
@@ -1317,6 +1324,25 @@ mod tests {
         idx.sort_unstable();
         idx.dedup();
         assert_eq!(idx.len(), 3, "checkpoint indices must be distinct");
+    }
+
+    #[tokio::test]
+    async fn disconnecting_clears_checkpoint_state() {
+        // A new connection gets a fresh TransferManager whose job ids restart
+        // at 1. Leaving the old id map in place lets a new job's id collide
+        // with a stale entry and mark the wrong checkpoint entry done.
+        let (mut a, _cleanup) = checkpoint_app("disconnect");
+        a.dispatch_plan(vec![download(0), download(1)], Direction::Download);
+        assert!(!a.active_checkpoints.is_empty(), "fixture must set up state");
+        assert!(!a.checkpoint_job_map.is_empty());
+
+        a.disconnect();
+
+        assert!(
+            a.active_checkpoints.is_empty(),
+            "a checkpoint from the previous connection must not survive it",
+        );
+        assert!(a.checkpoint_job_map.is_empty(), "stale job ids must not survive");
     }
 
     // -- the completion path must not fsync per job ------------------------
