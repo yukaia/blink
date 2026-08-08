@@ -1258,22 +1258,16 @@ mod tests {
     // `.part` files unfindable, since the checkpoint is the only record of
     // where they are.
 
-    /// An app whose checkpoints go under a name no real session will use.
-    fn checkpoint_app(tag: &str) -> App {
+    /// An app whose checkpoints go under a name no real session will use,
+    /// plus a guard that removes them however the test ends.
+    fn checkpoint_app(tag: &str) -> (App, crate::checkpoint::test_support::CheckpointCleanup) {
         let mut a = app();
         let name = format!("blink-test-{tag}-{}", std::process::id());
         let mut s = Session::from_url("sftp://me@host").unwrap();
-        s.name = name;
+        s.name = name.clone();
         a.current_session = Some(s);
         a.transfer_manager = Some(TransferManager::new(1).0);
-        a
-    }
-
-    fn clean_checkpoints(a: &App) {
-        if let Some(s) = a.current_session.as_ref() {
-            let _ = crate::checkpoint::Checkpoint::remove(&s.name, CheckpointKind::Download);
-            let _ = crate::checkpoint::Checkpoint::remove(&s.name, CheckpointKind::Upload);
-        }
+        (a, crate::checkpoint::test_support::CheckpointCleanup::new(name))
     }
 
     fn download(n: u32) -> crate::tui::plan::PlannedJob {
@@ -1292,7 +1286,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_batch_joins_the_first_instead_of_replacing_it() {
-        let mut a = checkpoint_app("merge");
+        let (mut a, _cleanup) = checkpoint_app("merge");
 
         a.dispatch_plan(vec![download(0), download(1)], Direction::Download);
         let first_ids: Vec<u64> = a.checkpoint_job_map.keys().copied().collect();
@@ -1323,8 +1317,6 @@ mod tests {
         idx.sort_unstable();
         idx.dedup();
         assert_eq!(idx.len(), 3, "checkpoint indices must be distinct");
-
-        clean_checkpoints(&a);
     }
 
     // -- the completion path must not fsync per job ------------------------
@@ -1337,7 +1329,7 @@ mod tests {
 
     #[tokio::test]
     async fn completing_a_job_coalesces_its_mark_instead_of_writing() {
-        let mut a = checkpoint_app("debounce");
+        let (mut a, _cleanup) = checkpoint_app("debounce");
         a.dispatch_plan(
             vec![download(0), download(1), download(2)],
             Direction::Download,
@@ -1359,8 +1351,6 @@ mod tests {
             a.active_checkpoints[&CheckpointKind::Download].is_dirty(),
             "a completed job forced a write instead of coalescing",
         );
-
-        clean_checkpoints(&a);
     }
 
     #[tokio::test]
@@ -1368,7 +1358,7 @@ mod tests {
         // The other side of the contract: a cancel is exactly the state the
         // user would lose by quitting straight afterwards, so it is forced
         // rather than coalesced.
-        let mut a = checkpoint_app("force");
+        let (mut a, _cleanup) = checkpoint_app("force");
         a.dispatch_plan(
             vec![download(0), download(1), download(2)],
             Direction::Download,
@@ -1385,15 +1375,13 @@ mod tests {
             !a.active_checkpoints[&CheckpointKind::Download].is_dirty(),
             "a cancel must reach disk rather than waiting out the interval",
         );
-
-        clean_checkpoints(&a);
     }
 
     #[tokio::test]
     async fn upload_and_download_batches_keep_separate_checkpoints() {
         // A single slot meant an upload batch displaced a running download
         // batch, across directions as well as within one.
-        let mut a = checkpoint_app("kinds");
+        let (mut a, _cleanup) = checkpoint_app("kinds");
 
         a.dispatch_plan(vec![download(0), download(1)], Direction::Download);
         a.dispatch_plan(vec![upload(0), upload(1)], Direction::Upload);
@@ -1404,13 +1392,11 @@ mod tests {
             "each direction tracks its own batch",
         );
         assert_eq!(a.checkpoint_job_map.len(), 4);
-
-        clean_checkpoints(&a);
     }
 
     #[tokio::test]
     async fn cancelling_one_batch_leaves_the_other_direction_alone() {
-        let mut a = checkpoint_app("cancel");
+        let (mut a, _cleanup) = checkpoint_app("cancel");
 
         a.dispatch_plan(vec![download(0), download(1)], Direction::Download);
         let dl_ids: Vec<u64> = a.checkpoint_job_map.keys().copied().collect();
@@ -1426,8 +1412,6 @@ mod tests {
             !a.active_checkpoints.contains_key(&CheckpointKind::Download),
             "the cancelled download batch has nothing left to resume",
         );
-
-        clean_checkpoints(&a);
     }
 
     // -- pane refresh ------------------------------------------------------

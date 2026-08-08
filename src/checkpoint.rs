@@ -265,7 +265,7 @@ impl Checkpoint {
     /// other's checkpoint. Append the first eight hex chars of
     /// `sha256(session)` to disambiguate; the suffix derives from the raw
     /// session name (no sanitisation), so it's stable per logical name.
-    fn path_for(session: &str, kind: CheckpointKind) -> Result<PathBuf> {
+    pub(crate) fn path_for(session: &str, kind: CheckpointKind) -> Result<PathBuf> {
         use sha2::{Digest, Sha256};
         let safe_name: String = session
             .chars()
@@ -843,6 +843,76 @@ mod debounce_tests {
             "one second of marks should cost a handful of writes, not {writes}",
         );
         assert!(writes >= 3, "but it must still make progress: {writes}");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::{Checkpoint, CheckpointKind};
+
+    /// Removes a test session's checkpoints when it drops.
+    ///
+    /// Tests resolve through the user's real checkpoint directory — there is
+    /// no injection point on `paths::checkpoints_dir` — so cleanup on the
+    /// last line of a test leaves a file behind whenever that test panics,
+    /// which is precisely when it matters.
+    pub struct CheckpointCleanup(String);
+
+    impl CheckpointCleanup {
+        pub fn new(session: impl Into<String>) -> Self {
+            Self(session.into())
+        }
+
+        // Not read by this task's callers; a later task in this plan needs it
+        // to look up the session a resume prompt is offering.
+        #[allow(dead_code)]
+        pub fn session(&self) -> &str {
+            &self.0
+        }
+    }
+
+    impl Drop for CheckpointCleanup {
+        fn drop(&mut self) {
+            for kind in [CheckpointKind::Download, CheckpointKind::Upload] {
+                let _ = Checkpoint::remove(&self.0, kind);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::test_support::CheckpointCleanup;
+    use super::*;
+
+    #[test]
+    fn the_guard_removes_the_checkpoint_when_it_drops() {
+        let name = format!("blink-test-guard-{}", std::process::id());
+        let path = Checkpoint::path_for(&name, CheckpointKind::Download).unwrap();
+        {
+            let _guard = CheckpointCleanup::new(&name);
+            let mut cp = Checkpoint::new(&name, CheckpointKind::Download, Vec::new());
+            cp.flush().expect("write the checkpoint");
+            assert!(path.exists(), "fixture must have written something");
+        }
+        assert!(!path.exists(), "the guard must clean up on drop");
+    }
+
+    #[test]
+    fn the_guard_cleans_up_even_when_a_test_panics() {
+        let name = format!("blink-test-panic-{}", std::process::id());
+        let path = Checkpoint::path_for(&name, CheckpointKind::Download).unwrap();
+
+        let name_inner = name.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _guard = CheckpointCleanup::new(&name_inner);
+            let mut cp = Checkpoint::new(&name_inner, CheckpointKind::Download, Vec::new());
+            cp.flush().expect("write the checkpoint");
+            panic!("as a failing test would");
+        });
+
+        assert!(result.is_err(), "the closure must have panicked");
+        assert!(!path.exists(), "unwinding must still run the guard");
     }
 }
 
