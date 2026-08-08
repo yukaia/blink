@@ -1066,6 +1066,149 @@ pub mod offer_save_session {
     }
 }
 
+pub mod offer_resume_checkpoint {
+    use super::*;
+    use crate::tui::state::PostConnectOffer;
+
+    /// Coarse, human-readable age. Precision past the unit is noise here —
+    /// the question the user is answering is "is this batch still relevant".
+    fn human_age(d: std::time::Duration) -> String {
+        let secs = d.as_secs();
+        let (n, unit) = if secs < 60 {
+            return "just now".to_string();
+        } else if secs < 3600 {
+            (secs / 60, "minute")
+        } else if secs < 86_400 {
+            (secs / 3600, "hour")
+        } else {
+            (secs / 86_400, "day")
+        };
+        let plural = if n == 1 { "" } else { "s" };
+        format!("{n} {unit}{plural} ago")
+    }
+
+    pub fn render(f: &mut Frame, app: &App) {
+        let Some(PostConnectOffer::ResumeCheckpoint(offer)) = app.pending_offers_front() else {
+            return;
+        };
+
+        let area = f.area();
+        let modal = super::centered_rect(60, 42, area);
+        f.render_widget(Clear, modal);
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(app.theme.accent))
+            .title(Span::styled(
+                " resume interrupted transfer? ",
+                Style::default()
+                    .fg(app.theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        let inner = block.inner(modal);
+        f.render_widget(block, modal);
+
+        let dim = Style::default().fg(app.theme.dim);
+        let fg = Style::default().fg(app.theme.fg);
+        let width = inner.width.saturating_sub(4) as usize;
+
+        let mut lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("an interrupted {} batch was found", offer.kind.as_str()),
+                fg,
+            ))
+            .alignment(Alignment::Center),
+            Line::from(""),
+        ];
+
+        let counts = format!("{} of {} items remaining", offer.remaining, offer.total);
+        let headline = match &offer.age {
+            Some(age) => format!("{counts} · {}", human_age(*age)),
+            None => counts,
+        };
+        lines.push(
+            Line::from(Span::styled(headline, fg.add_modifier(Modifier::BOLD)))
+                .alignment(Alignment::Center),
+        );
+        lines.push(Line::from(""));
+
+        // Already sanitized in `CheckpointOffer`; only width remains.
+        for path in &offer.sample_paths {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(crate::tui::widgets::truncate_middle(path, width), dim),
+            ]));
+        }
+        if offer.remaining > offer.sample_paths.len() {
+            let more = offer.remaining - offer.sample_paths.len();
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("… and {more} more"), dim),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(
+            Line::from(vec![
+                Span::styled(
+                    "[r]",
+                    Style::default()
+                        .fg(app.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" resume   ", dim),
+                Span::styled(
+                    "[d]",
+                    Style::default()
+                        .fg(app.theme.warning)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" discard   ", dim),
+                Span::styled(
+                    "[esc]",
+                    Style::default()
+                        .fg(app.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(" later", dim),
+            ])
+            .alignment(Alignment::Center),
+        );
+
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    #[cfg(test)]
+    mod age_tests {
+        use super::human_age;
+        use std::time::Duration;
+
+        #[test]
+        fn recent_ages_read_as_minutes() {
+            assert_eq!(human_age(Duration::from_secs(90)), "1 minute ago");
+            assert_eq!(human_age(Duration::from_secs(600)), "10 minutes ago");
+        }
+
+        #[test]
+        fn hours_and_days_round_down() {
+            assert_eq!(human_age(Duration::from_secs(3 * 3600 + 59 * 60)), "3 hours ago");
+            assert_eq!(human_age(Duration::from_secs(50 * 3600)), "2 days ago");
+        }
+
+        #[test]
+        fn the_first_minute_reads_as_just_now() {
+            assert_eq!(human_age(Duration::from_secs(5)), "just now");
+        }
+
+        #[test]
+        fn singular_and_plural_are_both_handled() {
+            assert_eq!(human_age(Duration::from_secs(3600)), "1 hour ago");
+            assert_eq!(human_age(Duration::from_secs(24 * 3600)), "1 day ago");
+        }
+    }
+}
+
 pub mod save_session {
     use super::*;
 

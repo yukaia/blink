@@ -8,6 +8,28 @@ use ratatui::Frame;
 
 use crate::tui::app::{App, Pane};
 
+/// Truncate `s` to `max` chars by replacing the middle with `…`, so both
+/// the head and the tail of a long path stay readable.
+pub(crate) fn truncate_middle(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    if max == 1 {
+        return "…".into();
+    }
+    let keep = max - 1;
+    let head = keep / 2;
+    let tail = keep - head;
+    let chars: Vec<char> = s.chars().collect();
+    let head_part: String = chars[..head].iter().collect();
+    let tail_part: String = chars[n - tail..].iter().collect();
+    format!("{head_part}…{tail_part}")
+}
+
 // ---------------------------------------------------------------------------
 // File pane (used for both Local and Remote)
 // ---------------------------------------------------------------------------
@@ -284,7 +306,7 @@ pub mod bottom_pane {
         let avail_for_name = width.saturating_sub(prefix_w + right_w);
 
         let display_name = crate::tui::app::name_for_job(job);
-        let name_str = truncate_middle(&display_name, avail_for_name);
+        let name_str = super::truncate_middle(&display_name, avail_for_name);
         let name_pad = avail_for_name.saturating_sub(name_str.chars().count());
 
         let percent_color = if paused {
@@ -332,27 +354,6 @@ pub mod bottom_pane {
         } else {
             line
         }
-    }
-
-    /// Truncate `s` to `max` chars by replacing the middle with `…`.
-    fn truncate_middle(s: &str, max: usize) -> String {
-        if max == 0 {
-            return String::new();
-        }
-        let n = s.chars().count();
-        if n <= max {
-            return s.to_string();
-        }
-        if max == 1 {
-            return "…".into();
-        }
-        let keep = max - 1;
-        let head = keep / 2;
-        let tail = keep - head;
-        let chars: Vec<char> = s.chars().collect();
-        let head_part: String = chars[..head].iter().collect();
-        let tail_part: String = chars[n - tail..].iter().collect();
-        format!("{head_part}…{tail_part}")
     }
 
     // ----- Log page -------------------------------------------------------

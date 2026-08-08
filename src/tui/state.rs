@@ -680,6 +680,23 @@ impl EditSessionForm {
 }
 
 // ---------------------------------------------------------------------------
+// Post-connect offers
+// ---------------------------------------------------------------------------
+
+/// Something to ask the user immediately after a connection comes up.
+///
+/// Held in a queue so one place owns "what happens after connect" — the
+/// order matters, and splitting it across the handlers that answer each
+/// offer is how that ordering drifts.
+#[derive(Debug, Clone)]
+pub enum PostConnectOffer {
+    /// A previous batch left work unfinished. Carries its summary.
+    ResumeCheckpoint(crate::checkpoint::CheckpointOffer),
+    /// The connection isn't backed by a saved session.
+    SaveSession,
+}
+
+// ---------------------------------------------------------------------------
 // Overwrite confirmations
 // ---------------------------------------------------------------------------
 

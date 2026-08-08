@@ -20,7 +20,9 @@ use zeroize::Zeroize;
 use crate::preview::{self, FileViewKind};
 use crate::transfer::{format_bytes, Direction, Dispatcher, TransferEvent, TransferManager};
 use crate::tui::event::AppEvent;
-use crate::tui::state::{HostKeyChangedInfo, OverwritePending, PendingHostKey, ViewerKind};
+use crate::tui::state::{
+    HostKeyChangedInfo, OverwritePending, PendingHostKey, PostConnectOffer, ViewerKind,
+};
 
 use super::checkpoint_glue::CheckpointFlush;
 
@@ -131,17 +133,24 @@ impl App {
                 self.transfer_manager = Some(manager);
                 self.dispatcher = Some(dispatcher);
                 let is_scp = session.protocol == crate::session::Protocol::Scp;
-                self.current_session = Some(session);
+                // Ask about unfinished work before asking about saving the
+                // session: checkpoints are keyed by session *name*, and
+                // accepting the save offer can rename it.
+                let mut offers: std::collections::VecDeque<PostConnectOffer> =
+                    crate::checkpoint::offers_for(&session.name)
+                        .into_iter()
+                        .map(PostConnectOffer::ResumeCheckpoint)
+                        .collect();
                 // An ad-hoc connect leaves nothing on disk. Offer to fix that
                 // now that the connection has proven it works — waiting until
                 // the user goes looking for the session is how "it connected
                 // but didn't save" reads as a bug rather than a design.
-                let offer_save = std::mem::take(&mut self.pending_session_unsaved);
-                self.screen = if offer_save {
-                    Screen::OfferSaveSession
-                } else {
-                    Screen::Main
-                };
+                if std::mem::take(&mut self.pending_session_unsaved) {
+                    offers.push_back(PostConnectOffer::SaveSession);
+                }
+                self.pending_offers = offers;
+                self.current_session = Some(session);
+                self.show_next_offer();
                 self.active_pane = Pane::Remote;
                 self.push_log(
                     LogLevel::Success,

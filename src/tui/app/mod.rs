@@ -23,7 +23,7 @@ use crate::transport::{self, RemoteEntry, Transport};
 use crate::tui::event::{AppEvent, Event, EventStream};
 use crate::tui::state::{
     EditSessionForm, HostKeyChangedInfo, OverwritePending, PaneEntry, PaneState, PendingCancel,
-    PendingDelete, PendingHostKey, Viewer,
+    PendingDelete, PendingHostKey, PostConnectOffer, Viewer,
 };
 use crate::tui::{TuiTerminal, TICK_INTERVAL};
 
@@ -59,6 +59,9 @@ pub enum Screen {
     /// selector you came from is titled "SAVED SESSIONS", so the offer is
     /// made once, at the point the connection has proven it works.
     OfferSaveSession,
+    /// Modal over Main: a previous batch to this session left work
+    /// unfinished — offer to resume it.
+    OfferResumeCheckpoint,
     /// Modal over Main: rename a remote file or folder.
     Rename,
     /// Modal over Main: create a new remote directory.
@@ -158,6 +161,9 @@ pub struct App {
     /// `pending_session` at every site that populates it, and consumed by the
     /// `Connected` handler to decide whether to offer persistence.
     pending_session_unsaved: bool,
+    /// Questions to ask once the connection is up, in order. Checkpoints
+    /// first, then the save offer — see `show_next_offer`.
+    pending_offers: std::collections::VecDeque<PostConnectOffer>,
     /// Password as it is being typed.
     ///
     /// `Zeroizing` so the buffer is wiped on drop, and pre-sized via
@@ -345,6 +351,7 @@ impl App {
             session_cursor: 0,
             pending_session: None,
             pending_session_unsaved: false,
+            pending_offers: std::collections::VecDeque::new(),
             password_input: credential_buffer(),
             passphrase_input: credential_buffer(),
             passphrase_error: None,
@@ -551,6 +558,10 @@ impl App {
                 crate::tui::views::main::render(f, self);
                 crate::tui::views::offer_save_session::render(f, self);
             }
+            Screen::OfferResumeCheckpoint => {
+                crate::tui::views::main::render(f, self);
+                crate::tui::views::offer_resume_checkpoint::render(f, self);
+            }
             Screen::Rename => {
                 crate::tui::views::main::render(f, self);
                 crate::tui::views::rename::render(f, self);
@@ -710,6 +721,7 @@ impl App {
             Screen::Search => self.handle_search(key),
             Screen::SaveSession => self.handle_save_session(key),
             Screen::OfferSaveSession => self.handle_offer_save_session(key),
+            Screen::OfferResumeCheckpoint => self.handle_offer_resume_checkpoint(key),
             Screen::Rename => self.handle_rename(key),
             Screen::Mkdir => self.handle_mkdir(key),
             Screen::ConfirmDelete => self.handle_confirm_delete(key),
@@ -872,6 +884,23 @@ impl App {
         while self.log.len() > 500 {
             self.log.pop_front();
         }
+    }
+
+    /// Show the next post-connect offer, or fall through to the main view.
+    ///
+    /// The offer stays at the front of the queue while it is displayed and
+    /// is popped by whichever handler answers it.
+    pub(super) fn show_next_offer(&mut self) {
+        self.screen = match self.pending_offers.front() {
+            Some(PostConnectOffer::ResumeCheckpoint(_)) => Screen::OfferResumeCheckpoint,
+            Some(PostConnectOffer::SaveSession) => Screen::OfferSaveSession,
+            None => Screen::Main,
+        };
+    }
+
+    /// The offer currently being shown, if any. Used by its renderer.
+    pub(crate) fn pending_offers_front(&self) -> Option<&PostConnectOffer> {
+        self.pending_offers.front()
     }
 }
 
@@ -1288,6 +1317,131 @@ mod tests {
         crate::tui::plan::PlannedJob::Upload {
             local_path: std::path::PathBuf::from(format!("/l/{n}")),
             remote_path: format!("/r/{n}"),
+        }
+    }
+
+    // -- the post-connect offer queue ---------------------------------------
+    //
+    // Checkpoints and the save-session offer both want to ask the user
+    // something right after a connection comes up. A `VecDeque` owns that
+    // sequencing in one place rather than each handler deciding what
+    // follows it.
+
+    fn offer(kind: CheckpointKind) -> PostConnectOffer {
+        PostConnectOffer::ResumeCheckpoint(crate::checkpoint::CheckpointOffer {
+            kind,
+            session: "s".into(),
+            remaining: 1,
+            total: 2,
+            age: None,
+            sample_paths: vec!["/srv/a.bin".into()],
+        })
+    }
+
+    #[test]
+    fn the_offer_queue_walks_to_each_screen_in_turn() {
+        let mut a = app();
+        a.pending_offers = std::collections::VecDeque::from(vec![
+            offer(CheckpointKind::Download),
+            PostConnectOffer::SaveSession,
+        ]);
+
+        a.show_next_offer();
+        assert_eq!(a.screen, Screen::OfferResumeCheckpoint);
+
+        a.pending_offers.pop_front();
+        a.show_next_offer();
+        assert_eq!(a.screen, Screen::OfferSaveSession);
+
+        a.pending_offers.pop_front();
+        a.show_next_offer();
+        assert_eq!(a.screen, Screen::Main, "an empty queue lands on the main view");
+    }
+
+    #[test]
+    fn an_empty_offer_queue_goes_straight_to_main() {
+        let mut a = app();
+        a.show_next_offer();
+        assert_eq!(a.screen, Screen::Main);
+    }
+
+    // -- answering the resume-checkpoint offer ------------------------------
+
+    /// An app with one download checkpoint on disk and its offer queued,
+    /// plus the cleanup guard the caller must hold for the test's lifetime.
+    fn app_with_queued_offer(
+        tag: &str,
+    ) -> (App, crate::checkpoint::test_support::CheckpointCleanup) {
+        let (mut a, cleanup) = checkpoint_app(tag);
+        let name = a.current_session.as_ref().unwrap().name.clone();
+        let mut cp = crate::checkpoint::Checkpoint::new(
+            &name,
+            CheckpointKind::Download,
+            vec![crate::checkpoint::CheckpointJob::Download {
+                remote_path: "/srv/a.bin".into(),
+                local_path: std::path::PathBuf::from("/tmp/blink-test-a.bin"),
+                status: crate::checkpoint::JobStatus::Pending,
+            }],
+        );
+        cp.flush().expect("write the checkpoint");
+        a.pending_offers = std::collections::VecDeque::from(vec![
+            PostConnectOffer::ResumeCheckpoint(cp.to_offer(None)),
+        ]);
+        a.show_next_offer();
+        (a, cleanup)
+    }
+
+    #[tokio::test]
+    async fn resuming_from_the_offer_queues_the_outstanding_work() {
+        let (mut a, _cleanup) = app_with_queued_offer("resume");
+
+        a.handle_offer_resume_checkpoint(press(KeyCode::Char('r')));
+
+        let queued = a.transfer_manager.as_ref().unwrap().queue_counts();
+        assert!(queued.1 > 0 || queued.0 > 0, "the outstanding job must be queued");
+        assert_eq!(a.screen, Screen::Main, "the queue is empty, so we land on Main");
+    }
+
+    #[tokio::test]
+    async fn discarding_from_the_offer_removes_the_checkpoint() {
+        let (mut a, _cleanup) = app_with_queued_offer("discard");
+        let name = a.current_session.as_ref().unwrap().name.clone();
+
+        a.handle_offer_resume_checkpoint(press(KeyCode::Char('d')));
+
+        assert!(
+            crate::checkpoint::offers_for(&name).is_empty(),
+            "the checkpoint must be gone",
+        );
+        assert_eq!(a.screen, Screen::Main);
+    }
+
+    #[tokio::test]
+    async fn deferring_the_offer_leaves_the_checkpoint_on_disk() {
+        let (mut a, _cleanup) = app_with_queued_offer("later");
+        let name = a.current_session.as_ref().unwrap().name.clone();
+
+        a.handle_offer_resume_checkpoint(press(KeyCode::Esc));
+
+        assert_eq!(
+            crate::checkpoint::offers_for(&name).len(),
+            1,
+            "later means later, not never",
+        );
+        assert_eq!(a.screen, Screen::Main);
+    }
+
+    #[tokio::test]
+    async fn the_resume_offer_ignores_keys_it_does_not_list() {
+        let (mut a, _cleanup) = app_with_queued_offer("stray");
+
+        for code in [KeyCode::Enter, KeyCode::Char('y'), KeyCode::Tab] {
+            a.handle_offer_resume_checkpoint(press(code));
+            assert_eq!(
+                a.screen,
+                Screen::OfferResumeCheckpoint,
+                "{code:?} must not dismiss the offer",
+            );
         }
     }
 

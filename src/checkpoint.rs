@@ -658,9 +658,6 @@ impl Checkpoint {
 ///
 /// A file that is absent, empty of outstanding work, or unreadable yields
 /// no offer: connecting must never fail because of a checkpoint.
-// Not called by this task's callers; the resume-offer panel (a later task
-// in this plan) is the real consumer.
-#[allow(dead_code)]
 pub fn offers_for(session: &str) -> Vec<CheckpointOffer> {
     let mut out = Vec::new();
     for kind in [CheckpointKind::Download, CheckpointKind::Upload] {
@@ -691,9 +688,6 @@ pub fn offers_for(session: &str) -> Vec<CheckpointOffer> {
 /// so only partials of transfers that never finished are removed.
 ///
 /// Idempotent: a checkpoint that is already gone reports nothing removed.
-// Not called by this task's callers; the resume-offer panel (a later task
-// in this plan) is the real consumer.
-#[allow(dead_code)]
 pub fn discard(session: &str, kind: CheckpointKind) -> Result<DiscardOutcome> {
     let outcome = match Checkpoint::load(session, kind) {
         Ok(Some(cp)) => remove_orphan_parts(&cp),

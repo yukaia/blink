@@ -14,10 +14,11 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use zeroize::Zeroize;
 
+use crate::checkpoint::CheckpointKind;
 use crate::session::{AuthMethod, Session};
 use crate::transfer::Direction;
 use crate::transport;
-use crate::tui::state::{EditField, PendingCancel, ViewerKind};
+use crate::tui::state::{EditField, PendingCancel, PostConnectOffer, ViewerKind};
 
 use super::{App, LogLevel, Pane, Screen};
 
@@ -724,6 +725,7 @@ impl App {
     pub(super) fn handle_offer_save_session(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.pending_offers.pop_front();
                 self.screen = Screen::Main;
                 self.open_save_session();
             }
@@ -731,11 +733,87 @@ impl App {
             // and `n/esc`, and every other confirm in the app ignores keys it
             // doesn't list rather than guessing at a default.
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.screen = Screen::Main;
+                self.pending_offers.pop_front();
+                self.show_next_offer();
                 self.push_log(
                     LogLevel::Info,
                     "not saved — press ctrl+s any time to save this session".into(),
                 );
+            }
+            _ => {}
+        }
+    }
+
+    /// The offer to resume an interrupted batch, shown once per checkpoint
+    /// after a connection comes up.
+    ///
+    /// `later` is deliberately non-destructive: the checkpoint stays on disk
+    /// and is offered again next connect. `discard` is the way out, and it
+    /// sweeps the batch's orphaned partials because the checkpoint is the
+    /// only record of where they are.
+    pub(super) fn handle_offer_resume_checkpoint(&mut self, key: KeyEvent) {
+        let Some(PostConnectOffer::ResumeCheckpoint(offer)) =
+            self.pending_offers.front().cloned()
+        else {
+            // Nothing queued — shouldn't happen, but don't strand the user.
+            self.show_next_offer();
+            return;
+        };
+
+        let direction = match offer.kind {
+            CheckpointKind::Download => Direction::Download,
+            CheckpointKind::Upload => Direction::Upload,
+        };
+
+        match key.code {
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.pending_offers.pop_front();
+                self.resume_walk(direction);
+                self.show_next_offer();
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                self.pending_offers.pop_front();
+                match crate::checkpoint::discard(&offer.session, offer.kind) {
+                    Ok(outcome) => {
+                        let parts = outcome.parts_removed;
+                        self.push_log(
+                            LogLevel::Info,
+                            if parts > 0 {
+                                format!(
+                                    "discarded the {} checkpoint and {parts} partial download(s)",
+                                    offer.kind.as_str()
+                                )
+                            } else {
+                                format!("discarded the {} checkpoint", offer.kind.as_str())
+                            },
+                        );
+                        for failure in outcome.failures {
+                            self.push_log(LogLevel::Warn, failure);
+                        }
+                    }
+                    Err(e) => {
+                        self.push_log(
+                            LogLevel::Error,
+                            format!("could not discard the checkpoint: {e}"),
+                        );
+                    }
+                }
+                self.show_next_offer();
+            }
+            KeyCode::Esc | KeyCode::Char('l') | KeyCode::Char('L') => {
+                self.pending_offers.pop_front();
+                self.push_log(
+                    LogLevel::Info,
+                    format!(
+                        "{} checkpoint kept — press {} in the transfers pane to resume it",
+                        offer.kind.as_str(),
+                        match offer.kind {
+                            CheckpointKind::Download => "r",
+                            CheckpointKind::Upload => "R",
+                        }
+                    ),
+                );
+                self.show_next_offer();
             }
             _ => {}
         }
