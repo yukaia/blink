@@ -28,6 +28,19 @@ use crate::tui::plan::PlannedJob;
 
 use super::{App, LogLevel};
 
+/// Whether [`App::settle_checkpoint`] should write immediately or let the
+/// debounce decide.
+///
+/// Per-job transitions must stay debounced: a batch can be 100k jobs, and an
+/// fsync apiece would dominate the transfer. Terminal moments — a cancel —
+/// force the write, because the state that would be lost is the state the
+/// user just asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum CheckpointFlush {
+    Debounced,
+    Force,
+}
+
 impl App {
     /// Tear down the active checkpoint: remove the in-memory state and
     /// delete the file on disk.
@@ -36,15 +49,58 @@ impl App {
     /// confirmed) or when a transfer fails in a way that makes the batch
     /// unresumable. Soft-failures (e.g. the file was already removed) are
     /// logged at `warn` and do not abort other work.
-    pub(super) fn discard_active_checkpoint(&mut self) {
-        if let Some(cp) = self.active_checkpoint.take() {
-            self.checkpoint_job_map.clear();
-            if let Err(e) = Checkpoint::remove(&cp.session, cp.kind) {
+    pub(super) fn cancel_batch_in_checkpoint(&mut self, job_ids: &[u64]) {
+        // Mark just this batch's entries, then drop the checkpoint only if
+        // nothing resumable is left. Removing the whole file — which is what
+        // this used to do — would throw away a *different* batch that is
+        // still running and still tracked in the same file.
+        let mut touched: Vec<CheckpointKind> = Vec::new();
+        for id in job_ids {
+            let Some((kind, idx)) = self.checkpoint_job_map.remove(id) else {
+                continue;
+            };
+            if let Some(cp) = self.active_checkpoints.get_mut(&kind) {
+                cp.mark_cancelled(idx);
+                if !touched.contains(&kind) {
+                    touched.push(kind);
+                }
+            }
+        }
+        for kind in touched {
+            // Force: the user is likely to quit or resume right after
+            // cancelling, and a lost cancel means the abandoned jobs come
+            // back on the next `r` / `R`.
+            self.settle_checkpoint(kind, CheckpointFlush::Force);
+        }
+    }
+
+    /// Flush a checkpoint, or drop it when it has no work left.
+    ///
+    /// "No work left" covers both the batch finishing and the batch being
+    /// cancelled: either way a later `r` / `R` has nothing to re-queue, and
+    /// leaving the file behind invites resuming something already settled.
+    pub(super) fn settle_checkpoint(&mut self, kind: CheckpointKind, flush: CheckpointFlush) {
+        let Some(cp) = self.active_checkpoints.get_mut(&kind) else {
+            return;
+        };
+        if cp.pending_count() == 0 {
+            let session = cp.session.clone();
+            self.active_checkpoints.remove(&kind);
+            self.checkpoint_job_map.retain(|_, (k, _)| *k != kind);
+            if let Err(e) = Checkpoint::remove(&session, kind) {
                 self.push_log(
                     LogLevel::Warn,
                     format!("could not remove checkpoint file: {e}"),
                 );
             }
+            return;
+        }
+        let written = match flush {
+            CheckpointFlush::Debounced => cp.flush_if_due(),
+            CheckpointFlush::Force => cp.flush(),
+        };
+        if let Err(e) = written {
+            self.push_log(LogLevel::Warn, format!("checkpoint save failed: {e}"));
         }
     }
 
@@ -106,18 +162,31 @@ impl App {
             })
             .collect();
 
-        let mut checkpoint = Checkpoint::new(&session_name, ck_kind, ck_jobs);
-        // First save is critical — it persists the entire plan before any I/O
-        // starts. Use flush() (unconditional) rather than flush_if_due()
-        // because there's no "previous save" to debounce against.
-        if let Err(e) = checkpoint.flush() {
+        // Append to the checkpoint already tracking this direction, if there
+        // is one. Overwriting it — which is what a fresh `Checkpoint::new`
+        // did — destroyed the plan of a batch that was still running, taking
+        // its resumability with it and stranding the `.part` files of its
+        // unfinished downloads, since the checkpoint is the only record of
+        // where those are.
+        let base = match self.active_checkpoints.get_mut(&ck_kind) {
+            Some(existing) => existing.append(ck_jobs),
+            None => {
+                self.active_checkpoints
+                    .insert(ck_kind, Checkpoint::new(&session_name, ck_kind, ck_jobs));
+                0
+            }
+        };
+        // Persist the whole plan before any I/O starts, so a kill during the
+        // first transfer still leaves something to resume. Unconditional
+        // rather than debounced: there is nothing to coalesce yet.
+        if let Some(cp) = self.active_checkpoints.get_mut(&ck_kind)
+            && let Err(e) = cp.flush()
+        {
             self.push_log(
                 LogLevel::Warn,
                 format!("checkpoint save failed (resume unavailable): {e}"),
             );
         }
-        self.active_checkpoint = Some(checkpoint);
-        self.checkpoint_job_map.clear();
         // ---------------------------------------------------------------
 
         let mut dirs = 0usize;
@@ -163,7 +232,7 @@ impl App {
             };
             match job_id {
                 Some(id) => {
-                    self.checkpoint_job_map.insert(id, cp_idx);
+                    self.checkpoint_job_map.insert(id, (ck_kind, base + cp_idx));
                     if is_mkdir {
                         dirs += 1;
                     } else {
@@ -216,6 +285,22 @@ impl App {
             .as_ref()
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "default".to_string());
+
+        // Refuse while a batch of this direction is still tracked: the file
+        // on disk *is* that batch's state, so re-queuing from it would
+        // duplicate jobs that are already in flight.
+        if let Some(active) = self.active_checkpoints.get(&ck_kind)
+            && active.pending_count() > 0
+        {
+            self.push_log(
+                LogLevel::Warn,
+                format!(
+                    "a {} batch is still in flight — let it finish or cancel it first",
+                    ck_kind.as_str()
+                ),
+            );
+            return;
+        }
 
         let checkpoint = match Checkpoint::load(&session_name, ck_kind) {
             Ok(Some(cp)) => cp,

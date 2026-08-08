@@ -12,7 +12,7 @@ use ratatui::Frame;
 use tokio::sync::{mpsc, Mutex};
 use zeroize::Zeroize;
 
-use crate::checkpoint::Checkpoint;
+use crate::checkpoint::{Checkpoint, CheckpointKind};
 use crate::config::Config;
 use crate::error::Result;
 use crate::preview;
@@ -272,11 +272,18 @@ pub struct App {
     /// `None` when no batch is in flight. Written to disk before the first
     /// job is enqueued; updated as jobs complete; removed when the batch
     /// finishes cleanly. Survives app crashes so the batch can be resumed.
-    active_checkpoint: Option<Checkpoint>,
-    /// Maps dispatcher job-id → index into `active_checkpoint.jobs` so the
-    /// transfer-event handler can look up which checkpoint entry to mark done
-    /// without a linear scan of the full plan.
-    checkpoint_job_map: std::collections::HashMap<u64, usize>,
+    /// The checkpoint being tracked for each direction, at most one per
+    /// direction.
+    ///
+    /// Keyed by kind rather than held as a single slot: a download batch and
+    /// an upload batch can be in flight at once, and a single slot meant the
+    /// second one to start silently displaced the first — which stopped being
+    /// updated and became unresumable while still running.
+    active_checkpoints: std::collections::HashMap<CheckpointKind, Checkpoint>,
+    /// Maps dispatcher job-id → the checkpoint entry it corresponds to, as
+    /// `(kind, index)`, so the transfer-event handler can mark the right
+    /// entry without a linear scan of the plan.
+    checkpoint_job_map: std::collections::HashMap<u64, (CheckpointKind, usize)>,
 
     // Viewer
     pub viewer: Option<Viewer>,
@@ -375,7 +382,7 @@ impl App {
             dispatcher: None,
             pending_host_key: None,
             host_key_changed_info: None,
-            active_checkpoint: None,
+            active_checkpoints: std::collections::HashMap::new(),
             checkpoint_job_map: std::collections::HashMap::new(),
             viewer: None,
             image_needs_redraw: false,
@@ -959,6 +966,8 @@ mod tests {
     // gap. The key handlers need no terminal — only `run` does — so the state
     // machine can be driven directly.
 
+    use crate::transfer::Direction;
+
     fn app() -> App {
         App::new(Config::default(), Theme::load("dracula").unwrap())
     }
@@ -1149,6 +1158,124 @@ mod tests {
             Screen::Main,
             "the return screen must survive a second prompt",
         );
+    }
+
+    // -- checkpoints across concurrent batches ------------------------------
+    //
+    // Storage is one checkpoint per (session, direction). Queuing a second
+    // batch used to write a fresh one over the top, so a batch that was still
+    // running lost its plan — unresumable, and its unfinished downloads'
+    // `.part` files unfindable, since the checkpoint is the only record of
+    // where they are.
+
+    /// An app whose checkpoints go under a name no real session will use.
+    fn checkpoint_app(tag: &str) -> App {
+        let mut a = app();
+        let name = format!("blink-test-{tag}-{}", std::process::id());
+        let mut s = Session::from_url("sftp://me@host").unwrap();
+        s.name = name;
+        a.current_session = Some(s);
+        a.transfer_manager = Some(TransferManager::new(1).0);
+        a
+    }
+
+    fn clean_checkpoints(a: &App) {
+        if let Some(s) = a.current_session.as_ref() {
+            let _ = crate::checkpoint::Checkpoint::remove(&s.name, CheckpointKind::Download);
+            let _ = crate::checkpoint::Checkpoint::remove(&s.name, CheckpointKind::Upload);
+        }
+    }
+
+    fn download(n: u32) -> crate::tui::plan::PlannedJob {
+        crate::tui::plan::PlannedJob::Download {
+            remote_path: format!("/r/{n}"),
+            local_path: std::path::PathBuf::from(format!("/l/{n}")),
+        }
+    }
+
+    fn upload(n: u32) -> crate::tui::plan::PlannedJob {
+        crate::tui::plan::PlannedJob::Upload {
+            local_path: std::path::PathBuf::from(format!("/l/{n}")),
+            remote_path: format!("/r/{n}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_second_batch_joins_the_first_instead_of_replacing_it() {
+        let mut a = checkpoint_app("merge");
+
+        a.dispatch_plan(vec![download(0), download(1)], Direction::Download);
+        let first_ids: Vec<u64> = a.checkpoint_job_map.keys().copied().collect();
+        assert_eq!(first_ids.len(), 2, "first batch tracked");
+
+        a.dispatch_plan(vec![download(2)], Direction::Download);
+
+        let cp = a
+            .active_checkpoints
+            .get(&CheckpointKind::Download)
+            .expect("a download checkpoint must still be tracked");
+        assert_eq!(cp.jobs.len(), 3, "both batches live in one checkpoint");
+        assert_eq!(
+            a.checkpoint_job_map.len(),
+            3,
+            "the first batch's jobs must still be mapped",
+        );
+        for id in first_ids {
+            assert!(
+                a.checkpoint_job_map.contains_key(&id),
+                "job {id} from the first batch lost its checkpoint entry",
+            );
+        }
+
+        // Every job maps to a distinct entry — an off-by-one in the append
+        // offset would alias two jobs onto one.
+        let mut idx: Vec<usize> = a.checkpoint_job_map.values().map(|(_, i)| *i).collect();
+        idx.sort_unstable();
+        idx.dedup();
+        assert_eq!(idx.len(), 3, "checkpoint indices must be distinct");
+
+        clean_checkpoints(&a);
+    }
+
+    #[tokio::test]
+    async fn upload_and_download_batches_keep_separate_checkpoints() {
+        // A single slot meant an upload batch displaced a running download
+        // batch, across directions as well as within one.
+        let mut a = checkpoint_app("kinds");
+
+        a.dispatch_plan(vec![download(0), download(1)], Direction::Download);
+        a.dispatch_plan(vec![upload(0), upload(1)], Direction::Upload);
+
+        assert_eq!(
+            a.active_checkpoints.len(),
+            2,
+            "each direction tracks its own batch",
+        );
+        assert_eq!(a.checkpoint_job_map.len(), 4);
+
+        clean_checkpoints(&a);
+    }
+
+    #[tokio::test]
+    async fn cancelling_one_batch_leaves_the_other_direction_alone() {
+        let mut a = checkpoint_app("cancel");
+
+        a.dispatch_plan(vec![download(0), download(1)], Direction::Download);
+        let dl_ids: Vec<u64> = a.checkpoint_job_map.keys().copied().collect();
+        a.dispatch_plan(vec![upload(0)], Direction::Upload);
+
+        a.cancel_batch_in_checkpoint(&dl_ids);
+
+        assert!(
+            a.active_checkpoints.contains_key(&CheckpointKind::Upload),
+            "the upload batch must survive a download cancel",
+        );
+        assert!(
+            !a.active_checkpoints.contains_key(&CheckpointKind::Download),
+            "the cancelled download batch has nothing left to resume",
+        );
+
+        clean_checkpoints(&a);
     }
 
     // -- pane refresh ------------------------------------------------------

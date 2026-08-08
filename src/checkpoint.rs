@@ -87,7 +87,9 @@ const CHECKPOINT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 /// Version history:
 ///   1 — initial format, boolean `done` field per job
 ///   2 — three-state `status` field: pending / in_progress / done
-const FORMAT_VERSION: u32 = 2;
+///   3 — adds the `cancelled` status. Purely additive: a version-2
+///       document is a valid version-3 document and loads unchanged.
+const FORMAT_VERSION: u32 = 3;
 
 /// Maximum checkpoint file size accepted on load (10 MiB).
 const MAX_CHECKPOINT_BYTES: u64 = 10 * 1024 * 1024;
@@ -100,7 +102,7 @@ const MAX_CHECKPOINT_JOBS: usize = 1_000_000;
 // ---------------------------------------------------------------------------
 
 /// Which direction a checkpointed walk is going.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckpointKind {
     Upload,
@@ -135,6 +137,10 @@ pub enum JobStatus {
     InProgress,
     /// The job completed successfully. Resume skips these.
     Done,
+    /// The user cancelled the batch this job belonged to. Resume skips
+    /// these, but they are not `Done` — nothing was transferred, and a
+    /// checkpoint holding only cancelled jobs has nothing left to do.
+    Cancelled,
 }
 
 
@@ -194,6 +200,10 @@ impl CheckpointJob {
 
     pub fn mark_done(&mut self) {
         self.set_status(JobStatus::Done);
+    }
+
+    pub fn mark_cancelled(&mut self) {
+        self.set_status(JobStatus::Cancelled);
     }
 
     /// Returns the remote path for log messages.
@@ -356,6 +366,39 @@ impl Checkpoint {
                     job_index,
                     total = self.jobs.len(),
                     "mark_in_progress: job index out of bounds — checkpoint not updated",
+                );
+            }
+        }
+    }
+
+    /// Append `jobs` to this checkpoint, returning the index the first one
+    /// landed at.
+    ///
+    /// Storage is one checkpoint per (session, direction), so a second batch
+    /// of the same direction used to overwrite the first — while the first
+    /// was still running, leaving it unresumable and its `.part` files
+    /// unfindable. Appending keeps both in one file; the caller offsets its
+    /// job-id map by the returned base.
+    pub fn append(&mut self, jobs: Vec<CheckpointJob>) -> usize {
+        let base = self.jobs.len();
+        self.jobs.extend(jobs);
+        self.dirty = true;
+        base
+    }
+
+    /// Mark a job as cancelled in memory. See [`Self::mark_in_progress`].
+    pub fn mark_cancelled(&mut self, job_index: usize) {
+        match self.jobs.get_mut(job_index) {
+            Some(j) => {
+                j.mark_cancelled();
+                self.dirty = true;
+            }
+            None => {
+                tracing::warn!(
+                    session = %self.session,
+                    job_index,
+                    total = self.jobs.len(),
+                    "mark_cancelled: job index out of bounds — checkpoint not updated",
                 );
             }
         }
@@ -684,6 +727,103 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn dl(n: usize) -> CheckpointJob {
+        CheckpointJob::Download {
+            remote_path: format!("/r/{n}"),
+            local_path: PathBuf::from(format!("/l/{n}")),
+            status: JobStatus::Pending,
+        }
+    }
+
+    // -- appending a second batch ------------------------------------------
+    //
+    // One checkpoint per (session, direction) is the storage model, so a
+    // second batch of the same direction used to overwrite the first — while
+    // the first was still running. Appending keeps both resumable.
+
+    #[test]
+    fn append_returns_the_base_index_of_the_added_jobs() {
+        let mut cp = Checkpoint::new("s", CheckpointKind::Download, vec![dl(0), dl(1)]);
+        let base = cp.append(vec![dl(2), dl(3)]);
+        assert_eq!(base, 2, "the caller maps job ids from this offset");
+        assert_eq!(cp.jobs.len(), 4);
+    }
+
+    #[test]
+    fn append_preserves_the_progress_of_the_existing_jobs() {
+        let mut cp = Checkpoint::new("s", CheckpointKind::Download, vec![dl(0), dl(1)]);
+        cp.mark_done(0);
+        cp.mark_in_progress(1);
+
+        cp.append(vec![dl(2)]);
+
+        assert_eq!(cp.jobs[0].status(), JobStatus::Done);
+        assert_eq!(cp.jobs[1].status(), JobStatus::InProgress);
+        assert_eq!(cp.jobs[2].status(), JobStatus::Pending);
+    }
+
+    #[test]
+    fn append_into_an_empty_checkpoint_starts_at_zero() {
+        let mut cp = Checkpoint::new("s", CheckpointKind::Upload, Vec::new());
+        assert_eq!(cp.append(vec![dl(0)]), 0);
+    }
+
+    // -- cancelled jobs ----------------------------------------------------
+
+    #[test]
+    fn a_cancelled_job_is_neither_resumed_nor_counted_done() {
+        // Cancelling one batch must not re-queue it on the next resume, and
+        // must not make the checkpoint look finished either.
+        let mut cp = Checkpoint::new("s", CheckpointKind::Download, vec![dl(0), dl(1)]);
+        cp.mark_cancelled(0);
+
+        assert!(!cp.jobs[0].needs_resume(), "a cancelled job must not resume");
+        assert!(!cp.jobs[0].is_done(), "and must not count as completed");
+        assert_eq!(cp.pending_count(), 1, "only the untouched job remains");
+        assert_eq!(cp.done_count(), 0);
+    }
+
+    #[test]
+    fn cancelling_every_job_leaves_nothing_to_resume() {
+        let mut cp = Checkpoint::new("s", CheckpointKind::Download, vec![dl(0), dl(1)]);
+        cp.mark_cancelled(0);
+        cp.mark_cancelled(1);
+        assert_eq!(cp.pending_count(), 0);
+    }
+
+    #[test]
+    fn a_version_2_document_still_loads() {
+        // v3 only adds a status value, so v2 files are valid v3 documents and
+        // must keep loading — a checkpoint written by the previous release is
+        // exactly what someone resumes after upgrading.
+        let dir = std::env::temp_dir()
+            .join(format!("blink-cp-v2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("v2.json");
+        std::fs::write(
+            &path,
+            r#"{"version":2,"session":"s","kind":"download","jobs":[
+                 {"type":"download","remote_path":"/r/0","local_path":"/l/0","status":"done"},
+                 {"type":"download","remote_path":"/r/1","local_path":"/l/1","status":"pending"}
+               ]}"#,
+        )
+        .unwrap();
+
+        let cp = Checkpoint::load_from(&path)
+            .expect("a v2 checkpoint must still load")
+            .expect("file exists");
+        assert_eq!(cp.done_count(), 1);
+        assert_eq!(cp.pending_count(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

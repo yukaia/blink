@@ -374,6 +374,21 @@ impl TransferManager {
         (active, pending)
     }
 
+    /// Every job id belonging to `batch_id`, whatever its state.
+    ///
+    /// Used by the cancel path to find the checkpoint entries that belong to
+    /// the batch being abandoned, so they can be marked without disturbing a
+    /// batch running the other way.
+    pub fn job_ids_in_batch(&self, batch_id: u64) -> Vec<u64> {
+        self.inner
+            .lock()
+            .jobs
+            .iter()
+            .filter(|j| j.batch_id == Some(batch_id))
+            .map(|j| j.id)
+            .collect()
+    }
+
     /// Count the Active and Pending jobs belonging to `batch_id`, as
     /// `(active, pending)`. Scans without cloning — this runs on the
     /// batch-cancel keypress, not per frame.

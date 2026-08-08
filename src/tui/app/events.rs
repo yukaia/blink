@@ -16,11 +16,13 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use zeroize::Zeroize;
 
-use crate::checkpoint::Checkpoint;
+
 use crate::preview::{self, FileViewKind};
 use crate::transfer::{format_bytes, Direction, Dispatcher, TransferEvent, TransferManager};
 use crate::tui::event::AppEvent;
 use crate::tui::state::{HostKeyChangedInfo, OverwritePending, PendingHostKey, ViewerKind};
+
+use super::checkpoint_glue::CheckpointFlush;
 
 use super::{App, LogLevel, Pane, Screen};
 
@@ -424,8 +426,8 @@ impl App {
                 // job is re-queued on resume (its file-on-disk state still
                 // says `pending`) — which is the same safe outcome as a
                 // crash mid-transfer, just at a different moment.
-                if let Some(cp_idx) = self.checkpoint_job_map.get(&id).copied()
-                    && let Some(cp) = self.active_checkpoint.as_mut() {
+                if let Some((kind, cp_idx)) = self.checkpoint_job_map.get(&id).copied()
+                    && let Some(cp) = self.active_checkpoints.get_mut(&kind) {
                         cp.mark_in_progress(cp_idx);
                         if let Err(e) = cp.flush_if_due() {
                             tracing::warn!(id, cp_idx, "checkpoint in_progress flush failed: {e}");
@@ -450,27 +452,18 @@ impl App {
             TransferEvent::Complete(id) => {
                 // Update in-memory state and either debounce-save (still more
                 // work pending) or delete the file (every job is done).
-                if let Some(cp_idx) = self.checkpoint_job_map.get(&id).copied()
-                    && let Some(cp) = self.active_checkpoint.as_mut() {
+                if let Some((kind, cp_idx)) = self.checkpoint_job_map.get(&id).copied() {
+                    if let Some(cp) = self.active_checkpoints.get_mut(&kind) {
                         cp.mark_done(cp_idx);
-                        // When every job is done, drop the checkpoint file
-                        // entirely so a subsequent `r` press doesn't try to
-                        // resume a completed batch. Skip the debounced write
-                        // — there's no point flushing right before deleting.
-                        if cp.pending_count() == 0 {
-                            let session = cp.session.clone();
-                            let kind = cp.kind;
-                            self.active_checkpoint = None;
-                            self.checkpoint_job_map.clear();
-                            if let Err(e) = Checkpoint::remove(&session, kind) {
-                                tracing::warn!("could not remove completed checkpoint: {e}");
-                            }
-                        } else if let Err(e) = cp.flush_if_due() {
-                            // Non-fatal: a missed mark just causes that job
-                            // to be re-run on resume, never silently skipped.
-                            tracing::warn!(id, cp_idx, "checkpoint flush failed: {e}");
-                        }
                     }
+                    // Writes the mark (debounced — one fsync per completed
+                    // job would dominate a large batch; a missed mark only
+                    // means that job re-runs on resume), and drops the
+                    // checkpoint once this direction has nothing left to do
+                    // so a later `r` doesn't resume a finished batch. A batch
+                    // running the other way keeps its own checkpoint.
+                    self.settle_checkpoint(kind, CheckpointFlush::Debounced);
+                }
                 if let Some(j) = self.job_lookup(id) {
                     self.push_log(
                         LogLevel::Success,
@@ -498,7 +491,7 @@ impl App {
                 //
                 // We do NOT mark the job `done` in the file — a failed job
                 // should be re-queued on resume, not silently skipped.
-                self.checkpoint_job_map.remove(&id);
+                let failed_entry = self.checkpoint_job_map.remove(&id);
 
                 // Failed jobs are left as `in_progress` in the checkpoint
                 // file (the `Started` write already flipped them from
@@ -511,10 +504,12 @@ impl App {
                 // hits disk: the user is likely to react to the failure by
                 // killing or quitting blink, and we don't want them losing
                 // a debounce-window of completed-job state.
-                if let Some(cp) = self.active_checkpoint.as_mut()
-                    && let Err(e) = cp.flush() {
-                        tracing::warn!(id, "checkpoint flush after failure failed: {e}");
-                    }
+                if let Some((kind, _)) = failed_entry
+                    && let Some(cp) = self.active_checkpoints.get_mut(&kind)
+                    && let Err(e) = cp.flush()
+                {
+                    tracing::warn!(id, "checkpoint flush after failure failed: {e}");
+                }
 
                 let label = self
                     .job_lookup(id)

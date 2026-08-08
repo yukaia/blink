@@ -455,6 +455,9 @@ impl App {
                                 self.checkpoint_job_map.remove(&id);
                             }
                             PendingCancel::Batch { batch_id, .. } => {
+                                // Collect before cancelling: the ids are what
+                                // tie the batch to its checkpoint entries.
+                                let batch_ids = manager.job_ids_in_batch(batch_id);
                                 let (active_n, pending_n) =
                                     manager.cancel_batch(batch_id);
                                 self.push_log(
@@ -464,11 +467,13 @@ impl App {
                                         active_n, pending_n
                                     ),
                                 );
-                                // The whole batch is being abandoned. Drop the
-                                // checkpoint so stale files don't accumulate
-                                // and a mistaken `r` / `R` doesn't re-queue a
-                                // batch the user explicitly threw away.
-                                self.discard_active_checkpoint();
+                                // Mark just this batch's checkpoint entries
+                                // cancelled, so a mistaken `r` / `R` doesn't
+                                // re-queue work the user threw away — while
+                                // leaving any batch running the other way
+                                // (which shares the same checkpoint storage)
+                                // intact and still resumable.
+                                self.cancel_batch_in_checkpoint(&batch_ids);
                             }
                         }
                     }
