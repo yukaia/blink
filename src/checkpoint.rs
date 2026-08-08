@@ -634,8 +634,19 @@ fn write_due(
 /// would race the worker still writing the file: on Unix the unlink succeeds,
 /// the worker keeps writing to the now-unlinked inode, and its final rename
 /// fails — turning a clean cancel into an error.
-fn remove_orphan_parts(cp: &Checkpoint) -> usize {
-    let mut removed = 0usize;
+/// What a checkpoint teardown removed, and what it could not.
+///
+/// Returned rather than printed: the CLI writes failures to stderr, but the
+/// TUI has to route them through its log — writing to stderr under a
+/// full-screen terminal UI smears the display.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DiscardOutcome {
+    pub parts_removed: usize,
+    pub failures: Vec<String>,
+}
+
+fn remove_orphan_parts(cp: &Checkpoint) -> DiscardOutcome {
+    let mut outcome = DiscardOutcome::default();
     for job in &cp.jobs {
         let CheckpointJob::Download { local_path, status, .. } = job else {
             continue;
@@ -645,18 +656,18 @@ fn remove_orphan_parts(cp: &Checkpoint) -> usize {
         }
         let part = crate::transport::part_path(local_path);
         match std::fs::remove_file(&part) {
-            Ok(()) => removed += 1,
+            Ok(()) => outcome.parts_removed += 1,
             // Not there is the normal case — the job may never have started.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                eprintln!("warning: could not remove {}: {e}", part.display());
-            }
+            Err(e) => outcome
+                .failures
+                .push(format!("could not remove {}: {e}", part.display())),
         }
         // The provenance sidecar describes the partial we just deleted;
         // leaving it behind would strand a file nothing refers to.
         let _ = std::fs::remove_file(crate::transport::part_meta_path(local_path));
     }
-    removed
+    outcome
 }
 
 /// Print checkpoint info. Pass `clean` to remove completed/orphaned files,
@@ -712,7 +723,11 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
             // strands the `.part` files its unfinished downloads left
             // behind — nothing else records where they are. Sweep them
             // while we still know.
-            parts_removed += remove_orphan_parts(&cp);
+            let swept = remove_orphan_parts(&cp);
+            parts_removed += swept.parts_removed;
+            for failure in swept.failures {
+                eprintln!("warning: {failure}");
+            }
             match fs::remove_file(path) {
                 Ok(()) => {
                     let reason = if force {
@@ -913,6 +928,70 @@ mod cleanup_tests {
 
         assert!(result.is_err(), "the closure must have panicked");
         assert!(!path.exists(), "unwinding must still run the guard");
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A scratch directory holding real `.part` files for the sweep to find.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("blink-sweep-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn job(dir: &Path, name: &str, status: JobStatus) -> CheckpointJob {
+        CheckpointJob::Download {
+            remote_path: format!("/r/{name}"),
+            local_path: dir.join(name),
+            status,
+        }
+    }
+
+    #[test]
+    fn the_sweep_reports_what_it_removed() {
+        let dir = scratch("reports");
+        let unfinished = job(&dir, "a.bin", JobStatus::Pending);
+        let finished = job(&dir, "b.bin", JobStatus::Done);
+        // Both have a partial on disk; only the unfinished one is orphaned.
+        for j in [&unfinished, &finished] {
+            let CheckpointJob::Download { local_path, .. } = j else { unreachable!() };
+            std::fs::write(crate::transport::part_path(local_path), b"x").unwrap();
+        }
+        let cp = Checkpoint::new("s", CheckpointKind::Download, vec![unfinished, finished]);
+
+        let outcome = remove_orphan_parts(&cp);
+
+        assert_eq!(outcome.parts_removed, 1, "only the unfinished job's partial");
+        assert!(outcome.failures.is_empty());
+        assert!(
+            std::fs::metadata(crate::transport::part_path(&dir.join("b.bin"))).is_ok(),
+            "a completed job's partial belongs to some other transfer",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_partial_is_not_a_failure() {
+        let dir = scratch("missing");
+        let cp = Checkpoint::new(
+            "s",
+            CheckpointKind::Download,
+            vec![job(&dir, "never-started.bin", JobStatus::Pending)],
+        );
+
+        let outcome = remove_orphan_parts(&cp);
+
+        assert_eq!(outcome.parts_removed, 0);
+        assert!(outcome.failures.is_empty(), "the job simply never started");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
