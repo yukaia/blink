@@ -683,6 +683,32 @@ pub fn offers_for(session: &str) -> Vec<CheckpointOffer> {
     out
 }
 
+/// Remove a checkpoint and the partial downloads it is the only record of.
+///
+/// The checkpoint names where every unfinished download left its `.part`
+/// file; delete it without sweeping and those files are stranded with
+/// nothing left to reference them. `remove_orphan_parts` skips `Done` jobs,
+/// so only partials of transfers that never finished are removed.
+///
+/// Idempotent: a checkpoint that is already gone reports nothing removed.
+// Not called by this task's callers; the resume-offer panel (a later task
+// in this plan) is the real consumer.
+#[allow(dead_code)]
+pub fn discard(session: &str, kind: CheckpointKind) -> Result<DiscardOutcome> {
+    let outcome = match Checkpoint::load(session, kind) {
+        Ok(Some(cp)) => remove_orphan_parts(&cp),
+        // Absent, or unreadable — either way there is nothing to sweep, but
+        // the file (if any) should still go.
+        Ok(None) => DiscardOutcome::default(),
+        Err(e) => {
+            tracing::warn!(session, "discarding an unreadable checkpoint: {e}");
+            DiscardOutcome::default()
+        }
+    };
+    Checkpoint::remove(session, kind)?;
+    Ok(outcome)
+}
+
 /// Whether a checkpoint write is owed right now.
 ///
 /// Split out from [`Checkpoint::flush_if_due`] so the policy can be tested
@@ -1082,6 +1108,38 @@ mod sweep_tests {
         assert!(outcome.failures.is_empty(), "the job simply never started");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discarding_removes_the_file_and_its_partials() {
+        let dir = scratch("discard");
+        let name = format!("blink-test-discard-{}", std::process::id());
+        let _cleanup = super::test_support::CheckpointCleanup::new(&name);
+        let unfinished = job(&dir, "a.bin", JobStatus::Pending);
+        let CheckpointJob::Download { local_path, .. } = &unfinished else { unreachable!() };
+        std::fs::write(crate::transport::part_path(local_path), b"x").unwrap();
+
+        let mut cp = Checkpoint::new(&name, CheckpointKind::Download, vec![unfinished]);
+        cp.flush().expect("write the checkpoint");
+        let path = Checkpoint::path_for(&name, CheckpointKind::Download).unwrap();
+
+        let outcome = discard(&name, CheckpointKind::Download).expect("discard");
+
+        assert_eq!(outcome.parts_removed, 1);
+        assert!(!path.exists(), "the checkpoint file must be gone");
+        assert!(
+            std::fs::metadata(crate::transport::part_path(&dir.join("a.bin"))).is_err(),
+            "its orphaned partial must be gone too — nothing else records where it is",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discarding_a_checkpoint_that_is_already_gone_is_fine() {
+        let name = format!("blink-test-absent-{}", std::process::id());
+        let outcome = discard(&name, CheckpointKind::Download).expect("must not error");
+        assert_eq!(outcome, DiscardOutcome::default());
     }
 }
 
