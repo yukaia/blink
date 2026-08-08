@@ -434,10 +434,17 @@ impl App {
                         }
                     }
                 if let Some(j) = self.job_lookup(id) {
-                    self.push_log(
-                        LogLevel::Info,
-                        format!("downloading: {}", j.remote_path),
-                    );
+                    // Say what the job actually is: every started job used to
+                    // announce itself as a download, including uploads and
+                    // the mkdirs a recursive upload plans.
+                    let msg = match j.direction {
+                        Direction::Download => format!("downloading: {}", j.remote_path),
+                        Direction::Upload => format!("uploading: {}", j.remote_path),
+                        Direction::CreateDir => {
+                            format!("creating directory: {}", j.remote_path)
+                        }
+                    };
+                    self.push_log(LogLevel::Info, msg);
                 }
             }
             TransferEvent::Progress => {
@@ -465,14 +472,18 @@ impl App {
                     self.settle_checkpoint(kind, CheckpointFlush::Debounced);
                 }
                 if let Some(j) = self.job_lookup(id) {
-                    self.push_log(
-                        LogLevel::Success,
+                    // A directory creation has no byte count; "(0 B)" next to
+                    // it reads as a transfer that moved nothing.
+                    let msg = if j.direction == Direction::CreateDir {
+                        format!("created: {}", j.remote_path)
+                    } else {
                         format!(
                             "complete: {} ({})",
                             j.remote_path,
                             format_bytes(j.bytes_total)
-                        ),
-                    );
+                        )
+                    };
+                    self.push_log(LogLevel::Success, msg);
                     // Uploads land new files on the remote side; refresh the
                     // pane so the user sees them. Skip for downloads — the
                     // local pane doesn't auto-refresh on its own either, and

@@ -283,7 +283,7 @@ pub mod bottom_pane {
             percent_str.chars().count() + 1 + BAR_WIDTH + 1 + speed_str.chars().count() + 1;
         let avail_for_name = width.saturating_sub(prefix_w + right_w);
 
-        let display_name = display_name_for(job);
+        let display_name = crate::tui::app::name_for_job(job);
         let name_str = truncate_middle(&display_name, avail_for_name);
         let name_pad = avail_for_name.saturating_sub(name_str.chars().count());
 
@@ -332,25 +332,6 @@ pub mod bottom_pane {
         } else {
             line
         }
-    }
-
-    fn display_name_for(job: &crate::transfer::TransferJob) -> String {
-        let from_remote = job
-            .remote_path
-            .rsplit('/')
-            .find(|s| !s.is_empty())
-            .unwrap_or(&job.remote_path);
-        let raw = if !from_remote.is_empty() {
-            from_remote.to_string()
-        } else {
-            job.local_path
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| job.remote_path.clone())
-        };
-        // A job's `remote_path` is built from the name the server sent, so
-        // this string is server-controlled and goes straight to the terminal.
-        crate::error::sanitize(raw)
     }
 
     /// Truncate `s` to `max` chars by replacing the middle with `…`.
@@ -402,7 +383,7 @@ pub mod bottom_pane {
 
     #[cfg(test)]
     mod tests {
-        use super::display_name_for;
+        use crate::tui::app::name_for_job as display_name_for;
         use crate::transfer::{Direction, TransferJob, TransferState};
 
         fn job(remote: &str) -> TransferJob {

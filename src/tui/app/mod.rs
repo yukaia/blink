@@ -892,7 +892,12 @@ fn build_remote_pane_entries(remote_entries: &[RemoteEntry], path: &str) -> Vec<
 
 /// Pull a short display name from a TransferJob — the basename of its remote
 /// path, falling back to the local file name if the remote is empty.
-fn name_for_job(job: &TransferJob) -> String {
+///
+/// Shared with the transfers pane renderer, which had a byte-identical copy
+/// of this. Both needed the same sanitize fix when remote paths started
+/// carrying the server's own bytes; had only one been found, half the UI
+/// would still be rendering escape sequences from a listing.
+pub(crate) fn name_for_job(job: &TransferJob) -> String {
     let from_remote = job
         .remote_path
         .rsplit('/')
@@ -966,7 +971,7 @@ mod tests {
     // gap. The key handlers need no terminal — only `run` does — so the state
     // machine can be driven directly.
 
-    use crate::transfer::Direction;
+    use crate::transfer::{Direction, TransferEvent};
 
     fn app() -> App {
         App::new(Config::default(), Theme::load("dracula").unwrap())
@@ -1158,6 +1163,91 @@ mod tests {
             Screen::Main,
             "the return screen must survive a second prompt",
         );
+    }
+
+    // -- transfer log lines ------------------------------------------------
+    //
+    // Every started job announced itself as "downloading:", whatever it was.
+
+    fn app_with_manager() -> App {
+        let mut a = app();
+        a.transfer_manager = Some(TransferManager::new(1).0);
+        a
+    }
+
+    fn last_log(a: &App) -> String {
+        a.log.back().map(|l| l.message.clone()).unwrap_or_default()
+    }
+
+    #[test]
+    fn a_started_download_says_downloading() {
+        let mut a = app_with_manager();
+        let id = a
+            .transfer_manager
+            .as_ref()
+            .unwrap()
+            .enqueue_download("/r/f.bin".into(), "/l/f.bin".into())
+            .unwrap();
+        a.handle_transfer_event(TransferEvent::Started(id));
+        assert!(last_log(&a).starts_with("downloading: "), "{}", last_log(&a));
+    }
+
+    #[test]
+    fn a_started_upload_does_not_say_downloading() {
+        let mut a = app_with_manager();
+        let id = a
+            .transfer_manager
+            .as_ref()
+            .unwrap()
+            .enqueue_upload("/l/f.bin".into(), "/r/f.bin".into())
+            .unwrap();
+        a.handle_transfer_event(TransferEvent::Started(id));
+        let msg = last_log(&a);
+        assert!(msg.starts_with("uploading: "), "{msg}");
+    }
+
+    #[test]
+    fn a_started_mkdir_says_what_it_is() {
+        let mut a = app_with_manager();
+        let id = a
+            .transfer_manager
+            .as_ref()
+            .unwrap()
+            .enqueue_mkdir("/r/newdir".into())
+            .unwrap();
+        a.handle_transfer_event(TransferEvent::Started(id));
+        let msg = last_log(&a);
+        assert!(
+            !msg.contains("downloading") && !msg.contains("uploading"),
+            "a directory creation is neither: {msg}"
+        );
+        assert!(msg.contains("newdir"), "{msg}");
+    }
+
+    #[test]
+    fn a_completed_mkdir_does_not_report_a_byte_count() {
+        // "complete: /r/newdir (0 B)" reads as a failed transfer.
+        let mut a = app_with_manager();
+        let id = a
+            .transfer_manager
+            .as_ref()
+            .unwrap()
+            .enqueue_mkdir("/r/newdir".into())
+            .unwrap();
+        a.handle_transfer_event(TransferEvent::Complete(id));
+        let msg = last_log(&a);
+        assert!(!msg.contains(" B)"), "no size for a directory: {msg}");
+    }
+
+    #[test]
+    fn a_completed_download_still_reports_its_size() {
+        let mut a = app_with_manager();
+        let m = a.transfer_manager.as_ref().unwrap().clone();
+        let id = m.enqueue_download("/r/f.bin".into(), "/l/f.bin".into()).unwrap();
+        m.update_progress(id, 2048, 2048, 0);
+        a.handle_transfer_event(TransferEvent::Complete(id));
+        let msg = last_log(&a);
+        assert!(msg.contains("2 KiB"), "{msg}");
     }
 
     // -- checkpoints across concurrent batches ------------------------------
