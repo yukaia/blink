@@ -1913,13 +1913,13 @@ pub mod search {
                 .local
                 .entries
                 .iter()
-                .filter(|e| e.name != "..")
+                .filter(|e| !e.is_parent())
                 .count(),
             Pane::Remote => app
                 .remote
                 .entries
                 .iter()
-                .filter(|e| e.name != "..")
+                .filter(|e| !e.is_parent())
                 .count(),
             _ => visible_count,
         };

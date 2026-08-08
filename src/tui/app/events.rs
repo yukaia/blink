@@ -91,7 +91,15 @@ impl App {
                     .unwrap_or(self.config.general.parallel_downloads);
                 let (manager, mut events_rx) = TransferManager::new(parallelism);
                 let dispatcher =
-                    Dispatcher::spawn(manager.clone(), session.clone(), password, self.app_event_tx.clone());
+                    Dispatcher::spawn(
+                        manager.clone(),
+                        session.clone(),
+                        password,
+                        self.app_event_tx.clone(),
+                        // Same store the initial connect used, so a
+                        // "trust once" is not re-asked per worker.
+                        self.pending_trust.clone(),
+                    );
 
                 // Forwarder: drain the dispatcher's event stream into the App
                 // event channel as `AppEvent::Transfer(...)`.
@@ -359,7 +367,15 @@ impl App {
                     fingerprint,
                     decision_tx: Some(decision_tx),
                 });
-                self.previous_screen = self.screen.clone();
+                // Don't let a second prompt make this modal its own return
+                // target — that strands the user on it. (The shared
+                // `SessionTrust` means concurrent prompts are now rare, but
+                // the state machine shouldn't depend on that.) The dropped
+                // `PendingHostKey` above answers its own oneshot with
+                // `Reject`, so the connection it belonged to still unwinds.
+                if self.screen != Screen::ConfirmHostKey {
+                    self.previous_screen = self.screen.clone();
+                }
                 self.screen = Screen::ConfirmHostKey;
             }
             AppEvent::HostKeyChanged {

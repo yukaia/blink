@@ -51,8 +51,9 @@ impl ScpTransport {
         session: &Session,
         password: Option<&str>,
         app_event_tx: tokio::sync::mpsc::UnboundedSender<crate::tui::event::AppEvent>,
+        trust: crate::known_hosts::SessionTrust,
     ) -> Result<Self> {
-        let inner = SftpTransport::connect(session, password, app_event_tx).await?;
+        let inner = SftpTransport::connect(session, password, app_event_tx, trust).await?;
         Ok(Self { inner })
     }
 }

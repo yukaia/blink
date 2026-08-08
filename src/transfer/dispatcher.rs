@@ -60,14 +60,18 @@ impl Dispatcher {
     /// down. Reused for both password auth and as the SSH key passphrase.
     ///
     /// `app_event_tx` is forwarded to each worker's transport connection so
-    /// the SFTP host-key handler can send events to the TUI. In practice the
-    /// host key is already in known_hosts after the initial connect, so the
-    /// channel is rarely used from here — but it must be valid.
+    /// the SFTP host-key handler can send events to the TUI.
+    ///
+    /// `trust` must be the same store the initial connect used. A key the
+    /// user accepted with "trust once" is deliberately not written to
+    /// known_hosts, so without the shared store every worker connection
+    /// would find it unknown and raise its own prompt mid-transfer.
     pub fn spawn(
         manager: TransferManager,
         session: Session,
         password: Option<zeroize::Zeroizing<String>>,
         app_event_tx: mpsc::UnboundedSender<crate::tui::event::AppEvent>,
+        trust: crate::known_hosts::SessionTrust,
     ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let password = password.map(Arc::new);
@@ -77,6 +81,7 @@ impl Dispatcher {
             password,
             Arc::clone(&shutdown),
             app_event_tx,
+            trust,
         ));
         Self { shutdown, join }
     }
@@ -144,6 +149,7 @@ async fn run_loop(
     password: Option<Arc<zeroize::Zeroizing<String>>>,
     shutdown: Arc<AtomicBool>,
     app_event_tx: mpsc::UnboundedSender<crate::tui::event::AppEvent>,
+    trust: crate::known_hosts::SessionTrust,
 ) {
     let active = Arc::new(AtomicU8::new(0));
     let pool = Arc::new(Pool::new());
@@ -175,6 +181,7 @@ async fn run_loop(
         let password_w = password.clone();
         let tx_w = app_event_tx.clone();
         let pool_w = Arc::clone(&pool);
+        let trust_w = trust.clone();
 
         // The worker must not reach its completion path before its abort
         // handle is registered. If it did, `deregister_active` would report
@@ -193,7 +200,7 @@ async fn run_loop(
             if start_rx.await.is_err() {
                 return;
             }
-            run_one(manager_w, session_w, password_w, tx_w, pool_w, job).await;
+            run_one(manager_w, session_w, password_w, tx_w, pool_w, trust_w, job).await;
         });
         manager.register_active(job_id, join.abort_handle());
         // Registration is done — release the worker. A send error means the
@@ -219,12 +226,13 @@ async fn connect(
     session: &Session,
     password: Option<&str>,
     app_event_tx: &mpsc::UnboundedSender<crate::tui::event::AppEvent>,
+    trust: &crate::known_hosts::SessionTrust,
 ) -> crate::error::Result<Box<dyn Transport>> {
     // A stalling server (connects but never completes the handshake) would
     // otherwise pin this worker slot for the lifetime of the TCP session.
     let connected = tokio::time::timeout(
         CONNECT_TIMEOUT,
-        transport::open(session, password, app_event_tx.clone()),
+        transport::open(session, password, app_event_tx.clone(), trust.clone()),
     )
     .await
     .map_err(|_| BlinkError::connect("connection timed out"))??;
@@ -255,12 +263,14 @@ async fn run_job(
 
 /// Run a single transfer to completion (or failure), reusing a pooled
 /// connection when one is available.
+#[allow(clippy::too_many_arguments)]
 async fn run_one(
     manager: TransferManager,
     session: Session,
     password: Option<Arc<zeroize::Zeroizing<String>>>,
     app_event_tx: mpsc::UnboundedSender<crate::tui::event::AppEvent>,
     pool: Arc<Pool>,
+    trust: crate::known_hosts::SessionTrust,
     job: TransferJob,
 ) {
     let id = job.id;
@@ -300,7 +310,7 @@ async fn run_one(
         let reused = pooled.is_some();
         let mut transport = match pooled {
             Some(t) => t,
-            None => connect(&session, pw, &app_event_tx).await?,
+            None => connect(&session, pw, &app_event_tx, &trust).await?,
         };
 
         let mut outcome = run_job(transport.as_mut(), &job, &prog_tx).await;
@@ -311,7 +321,7 @@ async fn run_one(
         // partially written download picks up from its `.part` offset.
         if reused && matches!(outcome, Err(BlinkError::Disconnected(_))) {
             drop(transport); // dead; Drop tears down the socket
-            transport = connect(&session, pw, &app_event_tx).await?;
+            transport = connect(&session, pw, &app_event_tx, &trust).await?;
             outcome = run_job(transport.as_mut(), &job, &prog_tx).await;
         }
 

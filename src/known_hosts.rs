@@ -78,6 +78,65 @@ pub enum KeyStatus {
 }
 
 // ---------------------------------------------------------------------------
+// Per-session trust ("accept once")
+// ---------------------------------------------------------------------------
+
+/// Host keys the user accepted for the lifetime of one connected session,
+/// without persisting them to the known-hosts file.
+///
+/// "Trust once" has to mean once per *session*, not once per TCP connection.
+/// A connected session opens many: the interactive one, plus one per
+/// parallel-transfer worker in the dispatcher's pool. Each runs its own
+/// [`check`] against the known-hosts file, finds nothing (that is what
+/// accept-once means), and would ask again — mid-transfer, once per worker.
+///
+/// Cloning shares the underlying set, so a decision made on any connection is
+/// immediately visible to the rest. Dropping the last clone — which happens on
+/// disconnect — forgets the decision, which is the scope the prompt promised.
+#[derive(Clone, Default)]
+pub struct SessionTrust {
+    accepted: std::sync::Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl SessionTrust {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Host is case-folded to match [`check`]'s lookup semantics; the key
+    /// blob and algorithm are compared verbatim.
+    fn entry(host: &str, port: u16, key_type: &str, key_b64: &str) -> String {
+        format!(
+            "{}\u{0}{port}\u{0}{key_type}\u{0}{key_b64}",
+            host.to_ascii_lowercase()
+        )
+    }
+
+    /// Record that the user accepted this key for the current session.
+    pub fn trust(&self, host: &str, port: u16, key_type: &str, key_b64: &str) {
+        self.accepted
+            .lock()
+            .insert(Self::entry(host, port, key_type, key_b64));
+    }
+
+    /// Whether this exact key was already accepted for the current session.
+    pub fn is_trusted(&self, host: &str, port: u16, key_type: &str, key_b64: &str) -> bool {
+        self.accepted
+            .lock()
+            .contains(&Self::entry(host, port, key_type, key_b64))
+    }
+}
+
+impl std::fmt::Debug for SessionTrust {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never print the accepted keys themselves.
+        f.debug_struct("SessionTrust")
+            .field("accepted", &self.accepted.lock().len())
+            .finish()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // File path
 // ---------------------------------------------------------------------------
 
@@ -358,6 +417,65 @@ fn read_bounded_from_handle(file: &mut std::fs::File) -> Result<String> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod trust_tests {
+    use super::SessionTrust;
+
+    const KEY: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIGoodkey";
+
+    #[test]
+    fn an_untrusted_key_is_not_trusted() {
+        let t = SessionTrust::new();
+        assert!(!t.is_trusted("h", 22, "ssh-ed25519", KEY));
+    }
+
+    #[test]
+    fn a_trusted_key_is_recognised_again() {
+        // The whole point: "trust once" has to mean once per session, not
+        // once per TCP connection. Each parallel-transfer worker opens its
+        // own connection, and without this every one of them re-prompted.
+        let t = SessionTrust::new();
+        t.trust("h", 22, "ssh-ed25519", KEY);
+        assert!(t.is_trusted("h", 22, "ssh-ed25519", KEY));
+    }
+
+    #[test]
+    fn trust_is_scoped_to_the_exact_key() {
+        let t = SessionTrust::new();
+        t.trust("h", 22, "ssh-ed25519", KEY);
+        assert!(!t.is_trusted("h", 22, "ssh-ed25519", "OTHERKEY"), "different key");
+        assert!(!t.is_trusted("h", 22, "ssh-rsa", KEY), "different algorithm");
+        assert!(!t.is_trusted("h", 2222, "ssh-ed25519", KEY), "different port");
+        assert!(!t.is_trusted("other", 22, "ssh-ed25519", KEY), "different host");
+    }
+
+    #[test]
+    fn clones_share_one_set() {
+        // Workers get clones; a decision made on one must be visible to all.
+        let t = SessionTrust::new();
+        let worker = t.clone();
+        t.trust("h", 22, "ssh-ed25519", KEY);
+        assert!(worker.is_trusted("h", 22, "ssh-ed25519", KEY));
+    }
+
+    #[test]
+    fn separate_stores_do_not_share_trust() {
+        // A new connected session starts from scratch — an accept-once from
+        // a previous session must not carry over.
+        let a = SessionTrust::new();
+        let b = SessionTrust::new();
+        a.trust("h", 22, "ssh-ed25519", KEY);
+        assert!(!b.is_trusted("h", 22, "ssh-ed25519", KEY));
+    }
+
+    #[test]
+    fn host_matching_is_case_insensitive() {
+        let t = SessionTrust::new();
+        t.trust("Host.Example.COM", 22, "ssh-ed25519", KEY);
+        assert!(t.is_trusted("host.example.com", 22, "ssh-ed25519", KEY));
+    }
+}
 
 #[cfg(test)]
 mod tests {

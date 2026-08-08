@@ -498,25 +498,31 @@ impl App {
                 && let Some(tx) = phk.decision_tx.take() {
                     let _ = tx.send(decision);
                 }
-            // Return to the Connection screen while we wait for the connect
-            // task to proceed (or fail). The task is still blocked on the
-            // oneshot; it will resume now that we've sent the decision.
-            self.screen = match decision {
-                HostKeyDecision::Reject => {
-                    self.pending_session = None;
-                    Screen::SessionSelect
-                }
-                _ => Screen::Connection,
-            };
+            // Return to whatever the prompt interrupted, whichever way the
+            // user answered.
+            //
+            // This prompt is not only raised by the initial connect: every
+            // connection a session opens runs the same check, so a transfer
+            // worker can raise it while the user is connected and working.
+            // Jumping to the session selector on reject left them there with
+            // a live transport and a running dispatcher behind it, and
+            // jumping to the "connecting…" modal on accept showed a connect
+            // that had already finished.
+            //
+            // During the initial connect the interrupted screen *is*
+            // `Connection`, so a reject lands back there and the connect task
+            // — now unblocked with `Reject` — fails and drives the usual
+            // `ConnectFailed` path, which says why. That is strictly better
+            // than silently returning to the selector: the user gets a log
+            // line either way.
+            self.screen = self.previous_screen.clone();
         }
     }
 
     pub(super) fn handle_rename(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
-                self.rename_input.clear();
-                self.rename_original.clear();
-                self.rename_error = None;
+                self.clear_rename_form();
                 self.screen = Screen::Main;
             }
             KeyCode::Enter => self.submit_rename(),

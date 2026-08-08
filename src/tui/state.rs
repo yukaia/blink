@@ -19,13 +19,49 @@ use crate::tui::plan::PlannedJob;
 // Pane state (file lists)
 // ---------------------------------------------------------------------------
 
+/// One row in a file pane.
+///
+/// Carries the same two-name split as [`crate::transport::RemoteEntry`], and
+/// for the same reason: the string that is safe to render is lossy, so it
+/// cannot be the string blink uses to open, download, rename, or delete the
+/// file. Build with [`PaneEntry::new`] so the two can never drift.
 #[derive(Debug, Clone)]
 pub struct PaneEntry {
-    pub name: String,
+    /// The name as the source reported it. Use for every path.
+    pub raw_name: String,
+    /// Sanitized for terminal rendering. Never use to address anything.
+    pub display_name: String,
     pub is_dir: bool,
     pub size: u64,
     pub selected: bool,
     pub previewable_image: bool,
+}
+
+impl PaneEntry {
+    pub fn new(raw_name: String, is_dir: bool, size: u64) -> Self {
+        let display_name = crate::error::sanitize(raw_name.clone());
+        let previewable_image =
+            !is_dir && crate::preview::is_previewable_image(&raw_name);
+        Self {
+            raw_name,
+            display_name,
+            is_dir,
+            size,
+            selected: false,
+            previewable_image,
+        }
+    }
+
+    /// The synthetic `..` row every pane shows below the root.
+    pub fn parent() -> Self {
+        Self::new("..".to_string(), true, 0)
+    }
+
+    /// Whether this is the synthetic parent row, which no transfer or
+    /// delete should ever act on.
+    pub fn is_parent(&self) -> bool {
+        self.raw_name == ".."
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -36,7 +72,8 @@ pub struct PaneState {
     pub entries: Vec<PaneEntry>,
     pub cursor: usize,
     /// Active substring filter, if any. Case-insensitive match against
-    /// `entry.name`. The `..` parent entry is always retained so the user can
+    /// `entry.display_name` — the user filters on what they can read. The
+    /// `..` parent entry is always retained so the user can
     /// navigate out of a filtered view.
     pub filter: Option<String>,
     /// Full unfiltered list, stashed while a filter is active so we can
@@ -77,6 +114,33 @@ impl PaneState {
         }
     }
 
+    /// The entries a transfer should act on, as `(raw_name, is_dir)`.
+    ///
+    /// Explicitly selected entries win; with nothing selected, the cursor
+    /// entry stands in. The `..` row is excluded from both — it is a
+    /// navigation affordance, not a file, and treating it as a transfer root
+    /// resolves to the *parent* directory. The cursor path always guarded
+    /// against that; the selection path did not, so selecting `..` and
+    /// pressing ctrl+u walked and uploaded the whole parent tree.
+    ///
+    /// Shared by the upload and download paths so the two cannot drift on
+    /// which entries they consider.
+    pub fn selection(&self) -> Vec<(String, bool)> {
+        let selected: Vec<(String, bool)> = self
+            .entries
+            .iter()
+            .filter(|e| e.selected && !e.is_parent())
+            .map(|e| (e.raw_name.clone(), e.is_dir))
+            .collect();
+        if !selected.is_empty() {
+            return selected;
+        }
+        match self.entries.get(self.cursor) {
+            Some(e) if !e.is_parent() => vec![(e.raw_name.clone(), e.is_dir)],
+            _ => Vec::new(),
+        }
+    }
+
     /// Replace the underlying entry list. If a filter is active it gets
     /// re-applied against the new list, so refresh-while-filtered keeps the
     /// view narrow. Cursor is clamped to the new range.
@@ -86,7 +150,7 @@ impl PaneState {
             let filtered: Vec<PaneEntry> = entries
                 .iter()
                 .filter(|e| {
-                    e.name == ".." || e.name.to_ascii_lowercase().contains(&lower)
+                    e.is_parent() || e.display_name.to_ascii_lowercase().contains(&lower)
                 })
                 .cloned()
                 .collect();
@@ -113,7 +177,7 @@ impl PaneState {
         self.entries = all
             .iter()
             .filter(|e| {
-                e.name == ".." || e.name.to_ascii_lowercase().contains(&lower)
+                e.is_parent() || e.display_name.to_ascii_lowercase().contains(&lower)
             })
             .cloned()
             .collect();
@@ -135,6 +199,76 @@ impl PaneState {
         } else if self.cursor >= self.entries.len() {
             self.cursor = self.entries.len() - 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod pane_tests {
+    use super::*;
+
+    fn file(name: &str) -> PaneEntry {
+        PaneEntry::new(name.to_string(), false, 1)
+    }
+
+    fn pane(entries: Vec<PaneEntry>) -> PaneState {
+        let mut p = PaneState::empty();
+        p.set_entries(entries);
+        p
+    }
+
+    #[test]
+    fn selection_falls_back_to_the_cursor_entry() {
+        let mut p = pane(vec![PaneEntry::parent(), file("a.txt"), file("b.txt")]);
+        p.cursor = 2;
+        assert_eq!(p.selection(), vec![("b.txt".to_string(), false)]);
+    }
+
+    #[test]
+    fn selection_prefers_explicitly_selected_entries() {
+        let mut p = pane(vec![PaneEntry::parent(), file("a.txt"), file("b.txt")]);
+        p.cursor = 1;
+        p.entries[2].selected = true;
+        assert_eq!(p.selection(), vec![("b.txt".to_string(), false)]);
+    }
+
+    #[test]
+    fn selection_never_includes_the_parent_row() {
+        // `..` is a navigation affordance, not a file. Selecting it and
+        // pressing ctrl+u used to walk and upload the entire parent
+        // directory — the cursor path guarded against it, the selection
+        // path did not.
+        let mut p = pane(vec![PaneEntry::parent(), file("a.txt")]);
+        p.entries[0].selected = true;
+        p.entries[1].selected = true;
+        assert_eq!(
+            p.selection(),
+            vec![("a.txt".to_string(), false)],
+            "the parent row must never become a transfer root",
+        );
+    }
+
+    #[test]
+    fn selection_on_the_parent_row_alone_is_empty() {
+        let mut p = pane(vec![PaneEntry::parent(), file("a.txt")]);
+        p.cursor = 0;
+        assert!(p.selection().is_empty(), "nothing to transfer");
+    }
+
+    #[test]
+    fn selection_uses_raw_names() {
+        let mut p = pane(vec![file("re\u{202E}port.txt")]);
+        p.cursor = 0;
+        assert_eq!(
+            p.selection(),
+            vec![("re\u{202E}port.txt".to_string(), false)],
+            "transfers address the real name, not the rendered one",
+        );
+    }
+
+    #[test]
+    fn selection_is_empty_for_an_empty_pane() {
+        let p = PaneState::empty();
+        assert!(p.selection().is_empty());
     }
 }
 

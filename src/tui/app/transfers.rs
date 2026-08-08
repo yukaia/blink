@@ -43,20 +43,11 @@ impl App {
             return;
         }
 
-        let any_selected = self.local.entries.iter().any(|e| e.selected);
-        let entries: Vec<(String, bool)> = if any_selected {
-            self.local
-                .entries
-                .iter()
-                .filter(|e| e.selected)
-                .map(|e| (e.name.clone(), e.is_dir))
-                .collect()
-        } else {
-            match self.local.entries.get(self.local.cursor) {
-                Some(e) if e.name != ".." => vec![(e.name.clone(), e.is_dir)],
-                _ => Vec::new(),
-            }
-        };
+        // Raw names throughout: these become both the local path read from
+        // and the remote path written to. `selection` also keeps the `..`
+        // row out, so a stray space on it can't turn into an upload of the
+        // parent directory.
+        let entries = self.local.selection();
 
         if entries.is_empty() {
             self.push_log(LogLevel::Warn, "no items to upload".into());
@@ -164,24 +155,9 @@ impl App {
             return;
         }
 
-        // Collect (name, is_dir) pairs from the active selection or the
-        // cursor entry.
-        let selections: Vec<(String, bool)> = {
-            let any_selected = self.remote.entries.iter().any(|e| e.selected);
-            if any_selected {
-                self.remote
-                    .entries
-                    .iter()
-                    .filter(|e| e.selected)
-                    .map(|e| (e.name.clone(), e.is_dir))
-                    .collect()
-            } else {
-                match self.remote.entries.get(self.remote.cursor) {
-                    Some(e) if e.name != ".." => vec![(e.name.clone(), e.is_dir)],
-                    _ => Vec::new(),
-                }
-            }
-        };
+        // (raw_name, is_dir) pairs from the active selection, or the cursor
+        // entry when nothing is selected.
+        let selections = self.remote.selection();
 
         if selections.is_empty() {
             self.push_log(LogLevel::Warn, "no items to download".into());
@@ -194,6 +170,9 @@ impl App {
         }
 
         let local_base = PathBuf::from(&self.local.path);
+        // `safe_local_name` is what makes a server-supplied name safe to join
+        // onto a local path; it must see the real name, not a sanitized one,
+        // or two distinct remote files can land on the same local path.
         let roots: Vec<(String, PathBuf, bool)> = selections
             .iter()
             .filter_map(|(name, is_dir)| {
@@ -282,8 +261,7 @@ impl App {
         self.screen = Screen::Main;
         match op {
             OverwritePending::Rename { from, to, .. } => {
-                self.rename_input.clear();
-                self.rename_original.clear();
+                self.clear_rename_form();
                 self.start_rename(from, to);
             }
             OverwritePending::DownloadPlan {

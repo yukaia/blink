@@ -100,7 +100,7 @@ pub mod file_pane {
                 Span::raw(" "),
                 Span::raw(icon),
                 Span::styled(sel_marker.to_string(), row_style),
-                Span::styled(e.name.clone(), row_style),
+                Span::styled(e.display_name.clone(), row_style),
             ];
 
             // Right-align the size column.
@@ -342,13 +342,17 @@ pub mod bottom_pane {
             .rsplit('/')
             .find(|s| !s.is_empty())
             .unwrap_or(&job.remote_path);
-        if !from_remote.is_empty() {
-            return from_remote.to_string();
-        }
-        job.local_path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| job.remote_path.clone())
+        let raw = if !from_remote.is_empty() {
+            from_remote.to_string()
+        } else {
+            job.local_path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| job.remote_path.clone())
+        };
+        // A job's `remote_path` is built from the name the server sent, so
+        // this string is server-controlled and goes straight to the terminal.
+        crate::error::sanitize(raw)
     }
 
     /// Truncate `s` to `max` chars by replacing the middle with `…`.
@@ -396,6 +400,46 @@ pub mod bottom_pane {
             ]));
         }
         f.render_widget(Paragraph::new(lines), area);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::display_name_for;
+        use crate::transfer::{Direction, TransferJob, TransferState};
+
+        fn job(remote: &str) -> TransferJob {
+            TransferJob {
+                id: 1,
+                direction: Direction::Download,
+                remote_path: remote.to_string(),
+                local_path: std::path::PathBuf::from("/tmp/x"),
+                bytes_total: 0,
+                bytes_done: 0,
+                bytes_per_sec: 0,
+                state: TransferState::Pending,
+                batch_id: None,
+            }
+        }
+
+        #[test]
+        fn transfer_row_name_is_sanitized() {
+            // Remote paths carry the server's own bytes now, and this row is
+            // rendered straight into the terminal.
+            let name = display_name_for(&job("/srv/re\u{202E}port.txt"));
+            assert!(!name.contains('\u{202E}'), "bidi override reached the pane: {name:?}");
+            assert_eq!(name, "re port.txt");
+        }
+
+        #[test]
+        fn transfer_row_name_strips_escape_sequences() {
+            let name = display_name_for(&job("/srv/a\u{1b}[31mb.txt"));
+            assert!(!name.contains('\u{1b}'), "ESC reached the pane: {name:?}");
+        }
+
+        #[test]
+        fn ordinary_transfer_row_name_is_the_basename() {
+            assert_eq!(display_name_for(&job("/srv/data/report.pdf")), "report.pdf");
+        }
     }
 }
 

@@ -31,7 +31,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{self, BlinkError, Result};
-use crate::known_hosts::{self, KeyStatus};
+use crate::known_hosts::{self, KeyStatus, SessionTrust};
 use crate::session::{AuthMethod, Protocol, Session};
 use crate::transport::error_map::map_sftp;
 use crate::transport::{EntryKind, ProgressUpdate, RemoteEntry, Transport};
@@ -79,6 +79,10 @@ struct KnownHostsHandler {
     port: u16,
     /// Sends unknown-key info to the TUI so a confirmation modal can appear.
     event_tx: Option<mpsc::UnboundedSender<crate::tui::event::AppEvent>>,
+    /// Keys the user accepted for this session without saving them. Shared
+    /// with every other connection the session opens, so an accept-once is
+    /// answered once rather than per worker. See [`SessionTrust`].
+    trust: SessionTrust,
 }
 
 impl KnownHostsHandler {
@@ -156,6 +160,13 @@ impl Handler for KnownHostsHandler {
             Ok(KeyStatus::Unknown) => {}
         }
 
+        // Not in the file, but the user may already have accepted it for this
+        // session. Every worker connection lands here, and re-asking would
+        // pop a modal mid-transfer for each one.
+        if self.trust.is_trusted(&self.host, self.port, &key_type, &key_b64) {
+            return Ok(true);
+        }
+
         // Unknown key: send the details to the TUI and await the user's call.
         let (decision_tx, decision_rx) = oneshot::channel();
 
@@ -199,7 +210,13 @@ impl Handler for KnownHostsHandler {
                 }
                 Ok(true)
             }
-            HostKeyDecision::AcceptOnce => Ok(true),
+            HostKeyDecision::AcceptOnce => {
+                // Scope the decision to this session so the connections that
+                // follow — one per transfer worker — don't ask again.
+                self.trust
+                    .trust(&self.host, self.port, &key_type, &key_b64);
+                Ok(true)
+            }
             HostKeyDecision::Reject => Ok(false),
         }
     }
@@ -316,6 +333,7 @@ impl SftpTransport {
         session: &Session,
         password: Option<&str>,
         app_event_tx: mpsc::UnboundedSender<crate::tui::event::AppEvent>,
+        trust: SessionTrust,
     ) -> Result<Self> {
         let config = Arc::new(client::Config {
             keepalive_interval: Some(KEEPALIVE_INTERVAL),
@@ -329,6 +347,7 @@ impl SftpTransport {
             host: session.host.clone(),
             port: session.port,
             event_tx: Some(app_event_tx),
+            trust,
         };
 
         let mut handle = client::connect(config, addr.clone(), handler)
@@ -825,8 +844,12 @@ impl Transport for SftpTransport {
 
         let mut out = Vec::new();
         for e in entries {
-            let name = error::sanitize(e.file_name());
-            if name == "." || name == ".." {
+            // Keep the server's own bytes: `RemoteEntry::new` derives the
+            // sanitized form for rendering, and every path blink builds from
+            // this entry uses the raw name. Sanitizing here instead would
+            // name a file that does not exist.
+            let raw_name = e.file_name();
+            if raw_name == "." || raw_name == ".." {
                 continue;
             }
             let attrs = e.metadata();
@@ -839,15 +862,15 @@ impl Transport for SftpTransport {
             } else {
                 EntryKind::Other
             };
-            out.push(RemoteEntry {
-                name,
+            out.push(RemoteEntry::new(
+                raw_name,
                 kind,
-                size: attrs.size.unwrap_or(0),
-                modified: attrs
+                attrs.size.unwrap_or(0),
+                attrs
                     .mtime
                     .and_then(|t| chrono::DateTime::from_timestamp(t as i64, 0)),
-                mode: attrs.permissions,
-            });
+                attrs.permissions,
+            ));
         }
         Ok(out)
     }
@@ -863,14 +886,6 @@ impl Transport for SftpTransport {
         // until the download is fully complete and fsynced, and isolates
         // partial bytes from a previous attempt under a recognisable suffix.
         let part = super::part_path(local_path);
-
-        // Resume support: if a partial `.part` exists, skip the bytes it
-        // already holds so interrupted transfers pick up where they left off.
-        let existing = tokio::fs::metadata(&part)
-            .await
-            .ok()
-            .map(|m| m.len())
-            .unwrap_or(0);
 
         let xfer = self.transfer_session().await?;
         let raw = Arc::clone(&xfer.raw);
@@ -890,26 +905,12 @@ impl Transport for SftpTransport {
 
         let total = reported_size.unwrap_or(0);
 
-        // If the server reports the file size and the partial file is already
-        // larger, the file must have been replaced — restart from zero so we
-        // don't append garbage.  If the server does not report a size (None),
-        // we have no basis for comparison and trust the existing offset; not
-        // resetting avoids silently restarting every resumed FTP-style transfer.
-        let offset = match reported_size {
-            Some(server_size) if existing > server_size => {
-                tracing::warn!(
-                    remote = %remote_path,
-                    local_bytes = existing,
-                    server_bytes = server_size,
-                    "partial file is larger than server file — restarting download",
-                );
-                // Drop the stale `.part` so the OpenOptions below truncate
-                // from a clean state.
-                let _ = tokio::fs::remove_file(&part).await;
-                0
-            }
-            _ => existing,
-        };
+        // Resume only a partial we can positively identify as this file —
+        // see `transport::decide_resume`. Anything unproven (a partial of a
+        // different remote file that shares this local name, one from an
+        // older blink, or one whose file has since been replaced) is
+        // discarded here so the create below starts from a clean state.
+        let offset = super::resume_offset(local_path, remote_path, reported_size).await;
 
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -922,6 +923,10 @@ impl Transport for SftpTransport {
         } else {
             tokio::fs::File::create(&part).await?
         };
+        // Record what these bytes are before writing any, so an interrupt at
+        // any point leaves an identifiable partial rather than an anonymous
+        // one that the next attempt has to throw away.
+        super::write_part_meta(local_path, remote_path, reported_size).await;
 
         let result = pipelined_download(
             &raw,
@@ -947,6 +952,9 @@ impl Transport for SftpTransport {
         local.sync_all().await?;
         drop(local);
         tokio::fs::rename(&part, local_path).await?;
+        // The partial is gone; its provenance record has nothing left to
+        // describe.
+        super::clear_part_meta(local_path).await;
         Ok(())
     }
 
@@ -1138,20 +1146,20 @@ impl Transport for SftpTransport {
         } else {
             EntryKind::Other
         };
-        let name = remote_path
+        let raw_name = remote_path
             .rsplit('/')
             .find(|s| !s.is_empty())
             .unwrap_or(remote_path)
             .to_string();
-        Ok(Some(RemoteEntry {
-            name,
+        Ok(Some(RemoteEntry::new(
+            raw_name,
             kind,
-            size: attrs.size.unwrap_or(0),
-            modified: attrs
+            attrs.size.unwrap_or(0),
+            attrs
                 .mtime
                 .and_then(|t| chrono::DateTime::from_timestamp(t as i64, 0)),
-            mode: attrs.permissions,
-        }))
+            attrs.permissions,
+        )))
     }
 
     async fn read_to_bytes(&mut self, remote_path: &str) -> Result<Bytes> {
@@ -1503,6 +1511,72 @@ mod integration {
         (port, connects)
     }
 
+    /// "Trust once" must cover every connection the session opens, not just
+    /// the first. Each dispatcher worker opens its own; before the shared
+    /// trust store, every one of them raised a fresh host-key prompt
+    /// mid-transfer — and that prompt takes over the whole UI.
+    #[tokio::test]
+    async fn accept_once_covers_later_connections_of_the_same_session() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let (port, _c) = start_server(store).await;
+        let session = test_session(port);
+        let trust = crate::known_hosts::SessionTrust::new();
+
+        // First connection: unknown key, user picks "trust once".
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let mut first = Box::pin(SftpTransport::connect(
+            &session,
+            Some("pw"),
+            ev_tx,
+            trust.clone(),
+        ));
+        let mut prompts = 0usize;
+        let mut first = loop {
+            tokio::select! {
+                res = &mut first => break res.expect("first connect"),
+                Some(ev) = ev_rx.recv() => {
+                    if let AppEvent::HostKeyUnknown { decision_tx, .. } = ev {
+                        prompts += 1;
+                        let _ = decision_tx.send(HostKeyDecision::AcceptOnce);
+                    }
+                }
+            }
+        };
+        assert_eq!(prompts, 1, "the first connection must ask");
+
+        // Second connection, same session, same trust store — as a worker
+        // would. It must not ask again.
+        let (ev_tx2, mut ev_rx2) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let mut second = SftpTransport::connect(&session, Some("pw"), ev_tx2, trust)
+            .await
+            .expect("second connect should succeed without a prompt");
+
+        assert!(
+            ev_rx2.try_recv().is_err(),
+            "a session-trusted key must not raise a second prompt",
+        );
+
+        let _ = first.close().await;
+        let _ = second.close().await;
+    }
+
+    fn test_session(port: u16) -> Session {
+        Session {
+            name: "it".to_string(),
+            protocol: Protocol::Sftp,
+            host: "127.0.0.1".to_string(),
+            port,
+            username: "tester".to_string(),
+            remote_dir: "/".to_string(),
+            local_dir: None,
+            auth: AuthMethod::Password,
+            parallel_downloads: None,
+            theme: None,
+            accept_invalid_certs: false,
+            cert_sha256: None,
+        }
+    }
+
     async fn connect(port: u16) -> SftpTransport {
         let session = Session {
             name: "it".to_string(),
@@ -1519,7 +1593,12 @@ mod integration {
             cert_sha256: None,
         };
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-        let mut fut = Box::pin(SftpTransport::connect(&session, Some("pw"), ev_tx));
+        let mut fut = Box::pin(SftpTransport::connect(
+            &session,
+            Some("pw"),
+            ev_tx,
+            crate::known_hosts::SessionTrust::new(),
+        ));
         loop {
             tokio::select! {
                 res = &mut fut => return res.expect("connect should succeed"),
@@ -1612,6 +1691,96 @@ mod integration {
         let _ = transport.close().await;
     }
 
+    /// A `.part` left behind by a download of a *different* remote file must
+    /// never be resumed into the current one. Before the provenance check,
+    /// this appended B's tail to A's head and renamed the result into place
+    /// as a completed download of B.
+    #[tokio::test]
+    async fn a_partial_from_another_file_is_not_resumed_into_this_one() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let a_bytes = pseudo_random(40_000);
+        let b_bytes = pseudo_random(52_000)
+            .into_iter()
+            .map(|b| b ^ 0xA5) // make B unmistakably different from A
+            .collect::<Vec<u8>>();
+        store.lock().await.insert("/a.bin".to_string(), a_bytes.clone());
+        store.lock().await.insert("/b.bin".to_string(), b_bytes.clone());
+
+        let (port, _c) = start_server(store).await;
+        let mut transport = connect(port).await;
+
+        let dst = std::env::temp_dir().join(format!("blink-prov-{port}.bin"));
+        let part = crate::transport::part_path(&dst);
+        let meta = crate::transport::part_meta_path(&dst);
+        for f in [&dst, &part, &meta] {
+            let _ = tokio::fs::remove_file(f).await;
+        }
+
+        // Simulate an interrupted download of /a.bin: a partial plus the
+        // sidecar naming where those bytes came from.
+        tokio::fs::write(&part, &a_bytes[..10_000]).await.unwrap();
+        crate::transport::write_part_meta(&dst, "/a.bin", Some(a_bytes.len() as u64)).await;
+
+        // Now download a different remote file to the same local name.
+        transport
+            .download("/b.bin", &dst, None)
+            .await
+            .expect("download should succeed");
+
+        let got = tokio::fs::read(&dst).await.unwrap();
+        assert_eq!(
+            got.len(),
+            b_bytes.len(),
+            "the stale partial must not have been prepended",
+        );
+        assert!(got == b_bytes, "downloaded bytes must be exactly /b.bin");
+        assert!(
+            !tokio::fs::try_exists(&meta).await.unwrap_or(false),
+            "the sidecar must be cleared once the download lands",
+        );
+
+        for f in [&dst, &part, &meta] {
+            let _ = tokio::fs::remove_file(f).await;
+        }
+        let _ = transport.close().await;
+    }
+
+    /// The other half: a partial that *is* this file must still be resumed,
+    /// or the provenance check would have turned resume off entirely.
+    #[tokio::test]
+    async fn a_partial_of_this_file_is_resumed_and_completes_correctly() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let bytes = pseudo_random(40_000);
+        store.lock().await.insert("/c.bin".to_string(), bytes.clone());
+
+        let (port, _c) = start_server(store).await;
+        let mut transport = connect(port).await;
+
+        let dst = std::env::temp_dir().join(format!("blink-prov-ok-{port}.bin"));
+        let part = crate::transport::part_path(&dst);
+        let meta = crate::transport::part_meta_path(&dst);
+        for f in [&dst, &part, &meta] {
+            let _ = tokio::fs::remove_file(f).await;
+        }
+
+        tokio::fs::write(&part, &bytes[..15_000]).await.unwrap();
+        crate::transport::write_part_meta(&dst, "/c.bin", Some(bytes.len() as u64)).await;
+
+        transport
+            .download("/c.bin", &dst, None)
+            .await
+            .expect("download should succeed");
+
+        let got = tokio::fs::read(&dst).await.unwrap();
+        assert_eq!(got.len(), bytes.len(), "resumed file has the wrong length");
+        assert!(got == bytes, "resumed bytes must match the source");
+
+        for f in [&dst, &part, &meta] {
+            let _ = tokio::fs::remove_file(f).await;
+        }
+        let _ = transport.close().await;
+    }
+
     /// The dispatcher's connection pool must reuse one connection across
     /// sequential jobs instead of opening a fresh SSH session per job.
     /// Two downloads at parallelism 1 run strictly back-to-back, so the
@@ -1671,6 +1840,7 @@ mod integration {
             session,
             Some(zeroize::Zeroizing::new("pw".to_string())),
             ev_tx,
+            crate::known_hosts::SessionTrust::new(),
         );
 
         // Drive both event streams: answer host-key prompts (the ephemeral

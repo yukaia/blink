@@ -214,8 +214,14 @@ pub struct App {
     pub pending_cancel: Option<PendingCancel>,
 
     // Rename form
+    /// The new name as the user is typing it. Rendered in the modal, so it
+    /// must never be seeded with unsanitized server bytes.
     pub rename_input: String,
+    /// The current name, sanitized — this is the "from:" line in the modal.
     pub rename_original: String,
+    /// The current name exactly as the server reported it. Never rendered;
+    /// this is what the rename addresses on the wire.
+    pub rename_source: String,
     pub rename_error: Option<String>,
 
     // Mkdir form
@@ -242,6 +248,12 @@ pub struct App {
     /// long-lived blink process doesn't keep the credential live on the
     /// heap after the auth window closes.
     pending_password: Option<zeroize::Zeroizing<String>>,
+    /// Host keys accepted with "trust once" for the connection being opened
+    /// (or the one currently up). Created per connect attempt and handed to
+    /// the dispatcher so every worker connection shares the decision instead
+    /// of re-prompting. Dropped on disconnect, which is the scope the prompt
+    /// promises the user.
+    pending_trust: crate::known_hosts::SessionTrust,
     pub transfer_manager: Option<TransferManager>,
     dispatcher: Option<Dispatcher>,
 
@@ -346,6 +358,7 @@ impl App {
             pending_cancel: None,
             rename_input: String::new(),
             rename_original: String::new(),
+            rename_source: String::new(),
             rename_error: None,
             mkdir_input: String::new(),
             mkdir_error: None,
@@ -354,6 +367,7 @@ impl App {
             app_event_tx: tx,
             app_event_rx: Some(rx),
             pending_password: None,
+            pending_trust: crate::known_hosts::SessionTrust::new(),
             transfer_manager: None,
             dispatcher: None,
             pending_host_key: None,
@@ -556,7 +570,15 @@ impl App {
                 crate::tui::views::confirm_disconnect::render(f, self);
             }
             Screen::ConfirmHostKey => {
-                crate::tui::views::session_select::render(f, self);
+                // A transfer worker can raise this prompt while a session is
+                // up. Drawing the selector behind it then reads as though the
+                // connection had been dropped; draw whatever the prompt
+                // actually interrupted.
+                if self.transport.is_some() {
+                    crate::tui::views::main::render(f, self);
+                } else {
+                    crate::tui::views::session_select::render(f, self);
+                }
                 crate::tui::views::confirm_host_key::render(f, self);
             }
             Screen::HostKeyChanged => {
@@ -710,6 +732,9 @@ impl App {
         self.transfer_manager = None;
         self.current_session = None;
         self.pending_password = None;
+        // Forget any "trust once" acceptance — it was scoped to the
+        // connection we just tore down.
+        self.pending_trust = crate::known_hosts::SessionTrust::new();
         self.pending_cancel = None;
         self.pending_overwrite = None;
         self.pending_delete = None;
@@ -755,6 +780,10 @@ impl App {
         // send HostKeyUnknown / HostKeyChanged events back to the TUI.
         let tx = self.app_event_tx.clone();
         let tx_for_transport = self.app_event_tx.clone();
+        // A fresh store per attempt: an accept-once from a previous session
+        // must not silently carry into a new one.
+        self.pending_trust = crate::known_hosts::SessionTrust::new();
+        let trust = self.pending_trust.clone();
         tokio::spawn(async move {
             // Borrow as &str just for the duration of the connect; the
             // Zeroizing<String> is moved into this task and zeroes on drop
@@ -762,7 +791,7 @@ impl App {
             let pw_borrow = password.as_ref().map(|p| p.as_str());
             let result = match tokio::time::timeout(
                 CONNECT_TIMEOUT,
-                transport::open(&session, pw_borrow, tx_for_transport),
+                transport::open(&session, pw_borrow, tx_for_transport, trust),
             )
             .await
             {
@@ -784,11 +813,19 @@ impl App {
     // Logging
     // -------------------------------------------------------------------
 
+    /// Append a line to the log pane.
+    ///
+    /// The message is sanitized here, at the one funnel every log line goes
+    /// through, rather than at each of the ~20 call sites. Most of them
+    /// interpolate a remote path or filename, and those now carry the
+    /// server's own bytes verbatim (see [`crate::transport::RemoteEntry`]) —
+    /// so without this a listing could inject escape sequences into the log
+    /// pane. Sanitizing centrally means a new call site cannot forget.
     pub fn push_log(&mut self, level: LogLevel, message: String) {
         self.log.push_back(LogLine {
             time: chrono::Local::now(),
             level,
-            message,
+            message: crate::error::sanitize(message),
         });
         // VecDeque pop_front is O(1); the old Vec drain(0..n) shifted every
         // remaining element down by N on every overflow.
@@ -803,29 +840,18 @@ impl App {
 fn build_remote_pane_entries(remote_entries: &[RemoteEntry], path: &str) -> Vec<PaneEntry> {
     let mut entries: Vec<PaneEntry> = remote_entries
         .iter()
-        .map(|e| PaneEntry {
-            name: e.name.clone(),
-            is_dir: e.is_dir(),
-            size: e.size,
-            selected: false,
-            previewable_image: !e.is_dir() && crate::preview::is_previewable_image(&e.name),
-        })
+        .map(|e| PaneEntry::new(e.raw_name.clone(), e.is_dir(), e.size))
         .collect();
+    // Sort on what the user reads, so the pane is ordered the way it looks.
     entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
         (true, false) => std::cmp::Ordering::Less,
         (false, true) => std::cmp::Ordering::Greater,
-        _ => a.name.cmp(&b.name),
+        _ => a.display_name.cmp(&b.display_name),
     });
 
     let mut out = Vec::with_capacity(entries.len() + 1);
     if path != "/" {
-        out.push(PaneEntry {
-            name: "..".into(),
-            is_dir: true,
-            size: 0,
-            selected: false,
-            previewable_image: false,
-        });
+        out.push(PaneEntry::parent());
     }
     out.extend(entries);
     out
@@ -839,13 +865,16 @@ fn name_for_job(job: &TransferJob) -> String {
         .rsplit('/')
         .find(|s| !s.is_empty())
         .unwrap_or(&job.remote_path);
-    if !from_remote.is_empty() {
-        return from_remote.to_string();
-    }
-    job.local_path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| job.remote_path.clone())
+    let raw = if !from_remote.is_empty() {
+        from_remote.to_string()
+    } else {
+        job.local_path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| job.remote_path.clone())
+    };
+    // Server-controlled, and this ends up rendered in the cancel modal.
+    crate::error::sanitize(raw)
 }
 
 /// Resolve a session's `local_dir` override into a usable filesystem path.
@@ -997,6 +1026,149 @@ mod tests {
         let first = std::mem::take(&mut a.pending_session_unsaved);
         let second = std::mem::take(&mut a.pending_session_unsaved);
         assert!(first && !second);
+    }
+
+    // -- host-key modal ----------------------------------------------------
+    //
+    // A worker connection can raise this prompt while the user is connected
+    // and working. It used to answer by jumping to the session selector
+    // (reject) or the "connecting…" modal (accept) — both wrong for a
+    // session that is already up, and the reject path dropped the user into
+    // the selector with a live transport and a running dispatcher behind it.
+    // The modal must return to whatever it interrupted.
+
+    fn pending_host_key() -> PendingHostKey {
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        PendingHostKey {
+            host: "h".into(),
+            key_type: "ssh-ed25519".into(),
+            fingerprint: "SHA256:abc".into(),
+            decision_tx: Some(tx),
+        }
+    }
+
+    #[test]
+    fn rejecting_a_host_key_returns_to_the_screen_it_interrupted() {
+        let mut a = app();
+        a.previous_screen = Screen::Main;
+        a.screen = Screen::ConfirmHostKey;
+        a.pending_host_key = Some(pending_host_key());
+
+        a.handle_confirm_host_key(press(KeyCode::Char('n')));
+
+        assert_eq!(
+            a.screen,
+            Screen::Main,
+            "rejecting a worker's prompt must not abandon the live session",
+        );
+    }
+
+    #[test]
+    fn accepting_a_host_key_returns_to_the_screen_it_interrupted() {
+        let mut a = app();
+        a.previous_screen = Screen::Main;
+        a.screen = Screen::ConfirmHostKey;
+        a.pending_host_key = Some(pending_host_key());
+
+        a.handle_confirm_host_key(press(KeyCode::Char('t')));
+
+        assert_eq!(
+            a.screen,
+            Screen::Main,
+            "accepting mid-session must not show the connecting modal",
+        );
+    }
+
+    #[test]
+    fn rejecting_during_the_initial_connect_leaves_the_connect_to_report_it() {
+        // During the first connect the prompt interrupts the Connection
+        // screen. Returning there lets the connect task fail and drive the
+        // usual ConnectFailed path, which logs why — rather than silently
+        // dropping the user in the selector.
+        let mut a = app();
+        a.previous_screen = Screen::Connection;
+        a.screen = Screen::ConfirmHostKey;
+        a.pending_session = Some(Session::from_url("sftp://me@host").unwrap());
+        a.pending_host_key = Some(pending_host_key());
+
+        a.handle_confirm_host_key(press(KeyCode::Char('n')));
+
+        assert_eq!(a.screen, Screen::Connection);
+        assert!(
+            a.pending_session.is_some(),
+            "ConnectFailed needs the pending session to report the failure",
+        );
+    }
+
+    #[test]
+    fn a_second_host_key_prompt_keeps_the_original_return_screen() {
+        // Two prompts arriving back to back must not make ConfirmHostKey its
+        // own return target — that would strand the user on the modal.
+        let mut a = app();
+        a.screen = Screen::Main;
+
+        for _ in 0..2 {
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            a.handle_app_event(AppEvent::HostKeyUnknown {
+                host: "h".into(),
+                key_type: "ssh-ed25519".into(),
+                fingerprint: "SHA256:abc".into(),
+                decision_tx: tx,
+            });
+        }
+
+        assert_eq!(a.screen, Screen::ConfirmHostKey);
+        assert_eq!(
+            a.previous_screen,
+            Screen::Main,
+            "the return screen must survive a second prompt",
+        );
+    }
+
+    // -- rename form -------------------------------------------------------
+
+    fn connected_app_with_remote(entries: Vec<PaneEntry>) -> App {
+        let mut a = app();
+        a.remote.path = "/srv".into();
+        a.remote.set_entries(entries);
+        a.remote.cursor = 0;
+        a.transport = Some(Arc::new(Mutex::new(
+            Box::new(crate::transport::mock::MockTransport::new()) as Box<dyn Transport>,
+        )));
+        a
+    }
+
+    #[test]
+    fn the_rename_form_shows_a_readable_name_but_renames_the_real_one() {
+        // The form's contents are rendered straight into the modal, so they
+        // must be the sanitized name. The rename itself still has to address
+        // the file the server actually listed.
+        let raw = "re\u{202E}port.txt";
+        let mut a = connected_app_with_remote(vec![PaneEntry::new(raw.into(), false, 1)]);
+
+        a.open_rename();
+
+        assert_eq!(
+            a.rename_original, "re port.txt",
+            "the modal must not render the server's control characters",
+        );
+        assert!(
+            !a.rename_input.contains('\u{202E}'),
+            "the editable field is rendered too: {:?}",
+            a.rename_input,
+        );
+        assert_eq!(
+            a.rename_source, raw,
+            "the rename source must be the name on the wire",
+        );
+    }
+
+    #[test]
+    fn an_ordinary_rename_prefills_the_current_name() {
+        let mut a = connected_app_with_remote(vec![PaneEntry::new("notes.md".into(), false, 1)]);
+        a.open_rename();
+        assert_eq!(a.rename_input, "notes.md");
+        assert_eq!(a.rename_source, "notes.md");
     }
 
     #[test]

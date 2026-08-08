@@ -571,6 +571,9 @@ fn remove_orphan_parts(cp: &Checkpoint) -> usize {
                 eprintln!("warning: could not remove {}: {e}", part.display());
             }
         }
+        // The provenance sidecar describes the partial we just deleted;
+        // leaving it behind would strand a file nothing refers to.
+        let _ = std::fs::remove_file(crate::transport::part_meta_path(local_path));
     }
     removed
 }

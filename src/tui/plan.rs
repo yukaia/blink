@@ -180,14 +180,23 @@ pub async fn walk_remote(
         let mut subdirs: Vec<(String, PathBuf)> = Vec::new();
 
         for entry in entries {
-            if entry.name == "." || entry.name == ".." {
+            if entry.raw_name == "." || entry.raw_name == ".." {
                 continue;
             }
-            let Some(safe_name) = safe_local_name(&entry.name) else {
-                tracing::warn!("skipping remote entry with unsafe name: {:?}", entry.name);
+            // Both the remote path and the local destination derive from the
+            // server's own bytes. Using the sanitized form for either would
+            // fetch the wrong file, or collapse two distinct entries onto one
+            // local path and silently clobber one with the other.
+            // `safe_local_name` is what makes the raw name safe to join —
+            // it rejects separators, traversal, and the Windows hazards.
+            let Some(safe_name) = safe_local_name(&entry.raw_name) else {
+                tracing::warn!(
+                    "skipping remote entry with unsafe name: {:?}",
+                    entry.display_name
+                );
                 continue;
             };
-            let remote_child = transport::join_remote(&remote_dir, &entry.name);
+            let remote_child = transport::join_remote(&remote_dir, &entry.raw_name);
             let local_child = local_dir.join(safe_name);
             match entry.kind {
                 EntryKind::Directory => {
@@ -358,7 +367,10 @@ pub async fn find_upload_conflicts(
             Err(_) => continue,
         };
         for (i, name) in entries {
-            if listing.iter().any(|e| e.name == name) {
+            // Compare against the server's own bytes: the upload will address
+            // `name` verbatim, so the sanitized form could both miss a real
+            // collision and invent one that isn't there.
+            if listing.iter().any(|e| e.raw_name == name) {
                 conflicts.push(i);
             }
         }
@@ -404,12 +416,14 @@ mod tests {
     impl Transport for EmptyDirTree {
         async fn list(&mut self, _remote_path: &str) -> Result<Vec<transport::RemoteEntry>> {
             Ok((0..self.fan_out)
-                .map(|i| transport::RemoteEntry {
-                    name: format!("d{i}"),
-                    kind: EntryKind::Directory,
-                    size: 0,
-                    modified: None,
-                    mode: None,
+                .map(|i| {
+                    transport::RemoteEntry::new(
+                        format!("d{i}"),
+                        EntryKind::Directory,
+                        0,
+                        None,
+                        None,
+                    )
                 })
                 .collect())
         }
@@ -498,6 +512,160 @@ mod tests {
         assert_eq!(result.symlinks_skipped, 0);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // -- raw vs. display names ---------------------------------------------
+    //
+    // `list()` sanitizes names for terminal rendering: control and bidi
+    // characters become spaces, and the string is truncated. That is correct
+    // for what the user *sees* and wrong for what blink *addresses* — the
+    // sanitized form names a different file, or no file at all. These pin the
+    // rule that everything path-building reads the server's own bytes.
+
+    /// Transport stub whose root directory holds exactly the given files.
+    struct FileList {
+        names: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for FileList {
+        async fn list(&mut self, _remote_path: &str) -> Result<Vec<transport::RemoteEntry>> {
+            Ok(self
+                .names
+                .iter()
+                .map(|n| {
+                    transport::RemoteEntry::new(
+                        n.clone(),
+                        EntryKind::File,
+                        3,
+                        None,
+                        None,
+                    )
+                })
+                .collect())
+        }
+
+        fn protocol(&self) -> crate::session::Protocol {
+            crate::session::Protocol::Sftp
+        }
+        async fn download(
+            &mut self,
+            _: &str,
+            _: &Path,
+            _: Option<tokio::sync::mpsc::UnboundedSender<transport::ProgressUpdate>>,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        async fn upload(
+            &mut self,
+            _: &Path,
+            _: &str,
+            _: Option<tokio::sync::mpsc::UnboundedSender<transport::ProgressUpdate>>,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        async fn rename(&mut self, _: &str, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn delete_file(&mut self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn delete_dir(&mut self, _: &str, _: bool) -> Result<()> {
+            unreachable!()
+        }
+        async fn mkdir(&mut self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn metadata(&mut self, _: &str) -> Result<Option<transport::RemoteEntry>> {
+            unreachable!()
+        }
+        async fn read_to_bytes(&mut self, _: &str) -> Result<bytes::Bytes> {
+            unreachable!()
+        }
+        async fn close(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn walk_remote_addresses_files_by_the_name_the_server_sent() {
+        // A right-to-left override in the name sanitizes to a space. Fetching
+        // "/srv/re port.txt" asks for a file that does not exist.
+        let root = scratch("rawname");
+        let raw = "re\u{202E}port.txt";
+        let mut t = FileList {
+            names: vec![raw.to_string()],
+        };
+
+        let result = walk_remote(&mut t, "/srv", &root).await.expect("walk");
+
+        match result.plan.as_slice() {
+            [PlannedJob::Download { remote_path, .. }] => assert_eq!(
+                remote_path,
+                &format!("/srv/{raw}"),
+                "the remote path must carry the server's own bytes",
+            ),
+            other => panic!("expected one Download, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn walk_remote_keeps_names_that_sanitize_alike_distinct() {
+        // Both names render identically once sanitized. If the plan is built
+        // from the rendered form, one job addresses the other's file — and
+        // both land on one local path.
+        let root = scratch("collide");
+        let decoy = "invoice\u{200B}.pdf";
+        let real = "invoice .pdf";
+        let mut t = FileList {
+            names: vec![decoy.to_string(), real.to_string()],
+        };
+
+        let result = walk_remote(&mut t, "/srv", &root).await.expect("walk");
+
+        let mut remotes: Vec<&str> = result
+            .plan
+            .iter()
+            .map(|j| match j {
+                PlannedJob::Download { remote_path, .. } => remote_path.as_str(),
+                other => panic!("expected Downloads, got {other:?}"),
+            })
+            .collect();
+        remotes.sort_unstable();
+        assert_eq!(remotes.len(), 2);
+        assert_ne!(
+            remotes[0], remotes[1],
+            "two distinct server names must stay two distinct remote paths",
+        );
+
+        let mut locals: Vec<PathBuf> = result
+            .plan
+            .iter()
+            .map(|j| match j {
+                PlannedJob::Download { local_path, .. } => local_path.clone(),
+                other => panic!("expected Downloads, got {other:?}"),
+            })
+            .collect();
+        locals.sort();
+        assert_ne!(
+            locals[0], locals[1],
+            "collapsing them locally would silently clobber one file with the other",
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn remote_entries_sanitize_the_display_name_only() {
+        let e = transport::RemoteEntry::new(
+            "re\u{202E}port.txt".to_string(),
+            EntryKind::File,
+            1,
+            None,
+            None,
+        );
+        assert_eq!(e.raw_name, "re\u{202E}port.txt", "wire name is verbatim");
+        assert_eq!(e.display_name, "re port.txt", "rendered name is sanitized");
     }
 
     #[test]

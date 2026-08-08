@@ -96,10 +96,10 @@ impl App {
             return;
         }
         let mut path = std::path::PathBuf::from(&self.local.path);
-        if entry.name == ".." {
+        if entry.is_parent() {
             path.pop();
         } else {
-            path.push(&entry.name);
+            path.push(&entry.raw_name);
         }
         self.local.path = path.display().to_string();
         self.local.cursor = 0;
@@ -113,10 +113,10 @@ impl App {
         if !entry.is_dir {
             return;
         }
-        let new_path = if entry.name == ".." {
+        let new_path = if entry.is_parent() {
             transport::parent_remote(&self.remote.path)
         } else {
-            transport::join_remote(&self.remote.path, &entry.name)
+            transport::join_remote(&self.remote.path, &entry.raw_name)
         };
         self.refresh_remote_pane(new_path);
     }
@@ -162,24 +162,12 @@ impl App {
         let path = self.local.path.clone();
         // Show just `..` immediately so the user sees the navigation
         // landed even before the read_dir finishes.
-        self.local.set_entries(vec![PaneEntry {
-            name: "..".into(),
-            is_dir: true,
-            size: 0,
-            selected: false,
-            previewable_image: false,
-        }]);
+        self.local.set_entries(vec![PaneEntry::parent()]);
 
         let tx = self.app_event_tx.clone();
         tokio::task::spawn_blocking(move || {
             let pb = std::path::PathBuf::from(&path);
-            let mut entries = vec![PaneEntry {
-                name: "..".into(),
-                is_dir: true,
-                size: 0,
-                selected: false,
-                previewable_image: false,
-            }];
+            let mut entries = vec![PaneEntry::parent()];
             let read = match std::fs::read_dir(&pb) {
                 Ok(r) => r,
                 Err(e) => {
@@ -197,20 +185,18 @@ impl App {
                 };
                 let name = entry.file_name().to_string_lossy().to_string();
                 let is_dir = meta.is_dir();
-                entries.push(PaneEntry {
-                    previewable_image: !is_dir
-                        && crate::preview::is_previewable_image(&name),
+                entries.push(PaneEntry::new(
                     name,
                     is_dir,
-                    size: if is_dir { 0 } else { meta.len() },
-                    selected: false,
-                });
+                    if is_dir { 0 } else { meta.len() },
+                ));
             }
-            // Directories first, then alpha within each group.
+            // Directories first, then alpha within each group — ordered by
+            // what the user reads, matching the remote pane.
             entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
                 (true, false) => std::cmp::Ordering::Less,
                 (false, true) => std::cmp::Ordering::Greater,
-                _ => a.name.cmp(&b.name),
+                _ => a.display_name.cmp(&b.display_name),
             });
             let _ = tx.send(AppEvent::LocalListed { path, entries });
         });

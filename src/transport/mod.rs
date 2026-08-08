@@ -33,6 +33,149 @@ pub(crate) fn part_path(local: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// Sidecar recording which remote file a `.part` holds bytes of.
+///
+/// See [`decide_resume`] for why bytes alone are not enough to resume.
+pub(crate) fn part_meta_path(local: &Path) -> PathBuf {
+    let mut s = part_path(local).into_os_string();
+    s.push(".meta");
+    PathBuf::from(s)
+}
+
+/// Provenance of a partial download, stored next to the `.part` file.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct PartMeta {
+    /// The remote path these bytes came from.
+    pub remote_path: String,
+    /// The size the server reported when the partial was started, if it
+    /// reported one. A change means the file was replaced between attempts.
+    pub size: Option<u64>,
+}
+
+/// What to do with an existing `.part` file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeDecision {
+    /// Discard any partial and download from byte zero.
+    Fresh,
+    /// Continue from this offset.
+    Resume(u64),
+}
+
+/// Decide whether an existing partial download can be continued.
+///
+/// A `.part` file records bytes and nothing else, so length alone cannot
+/// answer "are these the right bytes?". Two downloads that land on the same
+/// local name — `/a/report.pdf` interrupted, then `/b/report.pdf` started —
+/// produce one partial and one resume that appends the second file's tail to
+/// the first file's head, fsyncs it, and renames it into place looking like
+/// a completed download. The corruption is silent and survives.
+///
+/// So resume requires positive identification: a sidecar naming the same
+/// remote path, and a server-reported size that hasn't moved since. Anything
+/// unproven restarts. Restarting costs bandwidth; resuming the wrong bytes
+/// costs the user a corrupt file they have no reason to re-check.
+///
+/// Pure so the policy can be tested without touching a filesystem or a
+/// server; [`resume_offset`] does the I/O around it.
+pub(crate) fn decide_resume(
+    part_len: Option<u64>,
+    meta: Option<&PartMeta>,
+    remote_path: &str,
+    reported_size: Option<u64>,
+) -> ResumeDecision {
+    // No partial, or an empty one — nothing to continue.
+    let Some(part_len) = part_len.filter(|n| *n > 0) else {
+        return ResumeDecision::Fresh;
+    };
+
+    // Unidentified bytes: a partial from an older blink, or one whose
+    // sidecar was lost. We cannot tell what it is, so we don't trust it.
+    let Some(meta) = meta else {
+        return ResumeDecision::Fresh;
+    };
+
+    if meta.remote_path != remote_path {
+        return ResumeDecision::Fresh;
+    }
+
+    // The file was replaced between attempts: same path, different content.
+    if let (Some(then), Some(now)) = (meta.size, reported_size)
+        && then != now
+    {
+        return ResumeDecision::Fresh;
+    }
+
+    // More bytes than the file has: the remote shrank, or the partial is
+    // not what it claims.
+    if let Some(now) = reported_size
+        && part_len > now
+    {
+        return ResumeDecision::Fresh;
+    }
+
+    ResumeDecision::Resume(part_len)
+}
+
+/// Resolve the resume offset for a download, cleaning up a stale partial.
+///
+/// Returns the byte offset to start from. On [`ResumeDecision::Fresh`] the
+/// existing `.part` and its sidecar are removed, so the caller can create
+/// the file from scratch.
+pub(crate) async fn resume_offset(
+    local_path: &Path,
+    remote_path: &str,
+    reported_size: Option<u64>,
+) -> u64 {
+    let part = part_path(local_path);
+    let meta_path = part_meta_path(local_path);
+
+    let part_len = tokio::fs::metadata(&part).await.ok().map(|m| m.len());
+    let meta: Option<PartMeta> = match tokio::fs::read(&meta_path).await {
+        Ok(raw) => serde_json::from_slice(&raw).ok(),
+        Err(_) => None,
+    };
+
+    match decide_resume(part_len, meta.as_ref(), remote_path, reported_size) {
+        ResumeDecision::Resume(offset) => offset,
+        ResumeDecision::Fresh => {
+            if part_len.is_some() {
+                tracing::debug!(
+                    part = %part.display(),
+                    remote = %remote_path,
+                    "discarding a partial that cannot be identified as this file",
+                );
+            }
+            let _ = tokio::fs::remove_file(&part).await;
+            let _ = tokio::fs::remove_file(&meta_path).await;
+            0
+        }
+    }
+}
+
+/// Record which remote file the in-flight `.part` belongs to.
+///
+/// Best-effort: a failure here costs a restart on the next attempt, never
+/// correctness, because a missing sidecar reads as "unidentified" and forces
+/// a fresh download.
+pub(crate) async fn write_part_meta(
+    local_path: &Path,
+    remote_path: &str,
+    reported_size: Option<u64>,
+) {
+    let meta = PartMeta {
+        remote_path: remote_path.to_string(),
+        size: reported_size,
+    };
+    if let Ok(raw) = serde_json::to_vec(&meta) {
+        let _ = tokio::fs::write(part_meta_path(local_path), raw).await;
+    }
+}
+
+/// Drop the sidecar once the download has been renamed into place.
+pub(crate) async fn clear_part_meta(local_path: &Path) {
+    let _ = tokio::fs::remove_file(part_meta_path(local_path)).await;
+}
+
 pub(crate) mod error_map;
 pub mod ftp;
 pub(crate) mod ftp_impl;
@@ -41,9 +184,27 @@ pub mod scp;
 pub mod sftp;
 
 /// One entry from a remote directory listing.
+///
+/// The name is deliberately split in two, because the string that is safe to
+/// *render* is not the string that is safe to *address*.
+///
+/// [`crate::error::sanitize`] replaces control and bidi-format characters
+/// with a space and truncates past a length cap — necessary before a
+/// server-controlled name reaches the terminal, and lossy by construction.
+/// A sanitized name therefore identifies a different file than the one the
+/// server listed, or no file at all; worse, two distinct names can sanitize
+/// to the same string, so an operation aimed at one can land on the other.
+///
+/// Keeping both under distinct names means the compiler asks the question at
+/// every use site: rendering takes [`Self::display_name`], and anything that
+/// builds a path — `join_remote`, download, delete, rename — takes
+/// [`Self::raw_name`].
 #[derive(Debug, Clone)]
 pub struct RemoteEntry {
-    pub name: String,
+    /// The name exactly as the server sent it. Use for every path.
+    pub raw_name: String,
+    /// Sanitized for terminal rendering. Never use to address anything.
+    pub display_name: String,
     pub kind: EntryKind,
     pub size: u64,
     /// Populated by SFTP/SCP; `None` for FTP (protocol doesn't report it in LIST).
@@ -64,6 +225,30 @@ pub enum EntryKind {
 }
 
 impl RemoteEntry {
+    /// Build an entry from the name the server reported, deriving the
+    /// rendered form from it.
+    ///
+    /// This is the only constructor transports should use: it makes the
+    /// sanitized name impossible to forget and impossible to drift from the
+    /// raw one.
+    pub fn new(
+        raw_name: String,
+        kind: EntryKind,
+        size: u64,
+        modified: Option<chrono::DateTime<chrono::Utc>>,
+        mode: Option<u32>,
+    ) -> Self {
+        let display_name = crate::error::sanitize(raw_name.clone());
+        Self {
+            raw_name,
+            display_name,
+            kind,
+            size,
+            modified,
+            mode,
+        }
+    }
+
     pub fn is_dir(&self) -> bool {
         matches!(self.kind, EntryKind::Directory)
     }
@@ -155,18 +340,25 @@ pub struct Connected {
 ///
 /// `app_event_tx` is forwarded to the SFTP/SCP handler for the host-key
 /// confirmation flow. FTP/FTPS do not use host-key verification.
+///
+/// `trust` carries the keys the user accepted for this session without
+/// saving them. It must be the *same* store for every connection a connected
+/// session opens — the interactive one and each transfer worker's — or an
+/// "accept once" is re-asked per connection. See
+/// [`crate::known_hosts::SessionTrust`].
 pub async fn open(
     session: &Session,
     password: Option<&str>,
     app_event_tx: mpsc::UnboundedSender<crate::tui::event::AppEvent>,
+    trust: crate::known_hosts::SessionTrust,
 ) -> Result<Connected> {
     let (transport, new_cert_pin): (Box<dyn Transport>, Option<String>) = match session.protocol {
         Protocol::Sftp => (
-            Box::new(sftp::SftpTransport::connect(session, password, app_event_tx).await?),
+            Box::new(sftp::SftpTransport::connect(session, password, app_event_tx, trust).await?),
             None,
         ),
         Protocol::Scp => (
-            Box::new(scp::ScpTransport::connect(session, password, app_event_tx).await?),
+            Box::new(scp::ScpTransport::connect(session, password, app_event_tx, trust).await?),
             None,
         ),
         Protocol::Ftp => (
@@ -315,17 +507,17 @@ pub(crate) mod mock {
                     let full = format!("{}{}", p, name);
                     files.get(&full).map(|b| b.len() as u64).unwrap_or(0)
                 };
-                out.push(RemoteEntry {
+                out.push(RemoteEntry::new(
                     name,
-                    kind: if is_dir {
+                    if is_dir {
                         EntryKind::Directory
                     } else {
                         EntryKind::File
                     },
                     size,
-                    modified: None,
-                    mode: None,
-                });
+                    None,
+                    None,
+                ));
             }
             Ok(out)
         }
@@ -421,13 +613,13 @@ pub(crate) mod mock {
                     .find(|s| !s.is_empty())
                     .unwrap_or(remote_path)
                     .to_string();
-                return Ok(Some(RemoteEntry {
+                return Ok(Some(RemoteEntry::new(
                     name,
-                    kind: EntryKind::File,
-                    size: data.len() as u64,
-                    modified: None,
-                    mode: None,
-                }));
+                    EntryKind::File,
+                    data.len() as u64,
+                    None,
+                    None,
+                )));
             }
             if dirs.contains(&remote_path.to_string()) {
                 let name = remote_path
@@ -435,13 +627,13 @@ pub(crate) mod mock {
                     .find(|s| !s.is_empty())
                     .unwrap_or(remote_path)
                     .to_string();
-                return Ok(Some(RemoteEntry {
+                return Ok(Some(RemoteEntry::new(
                     name,
-                    kind: EntryKind::Directory,
-                    size: 0,
-                    modified: None,
-                    mode: None,
-                }));
+                    EntryKind::Directory,
+                    0,
+                    None,
+                    None,
+                )));
             }
             Ok(None)
         }
@@ -468,6 +660,96 @@ pub(crate) mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- resume provenance -------------------------------------------------
+    //
+    // A `.part` file records only bytes, not which remote file they came
+    // from. Resuming on length alone means an interrupted download of one
+    // file can be "completed" with the tail of a different file that happens
+    // to share a local name — silently, and with a successful-looking rename
+    // at the end. These pin the identity check that makes resume safe.
+
+    fn meta(remote: &str, size: Option<u64>) -> PartMeta {
+        PartMeta {
+            remote_path: remote.to_string(),
+            size,
+        }
+    }
+
+    #[test]
+    fn resumes_a_partial_of_the_same_remote_file() {
+        let d = decide_resume(Some(4_000), Some(&meta("/a/report.pdf", Some(9_000))), "/a/report.pdf", Some(9_000));
+        assert_eq!(d, ResumeDecision::Resume(4_000));
+    }
+
+    #[test]
+    fn restarts_when_the_partial_belongs_to_a_different_remote_file() {
+        // The bug this exists for: same local name, different source. The
+        // old code appended file B onto file A's bytes and renamed the
+        // result into place as a completed download.
+        let d = decide_resume(Some(4_000), Some(&meta("/a/report.pdf", Some(9_000))), "/b/report.pdf", Some(9_000));
+        assert_eq!(d, ResumeDecision::Fresh, "a partial of another file must not be resumed");
+    }
+
+    #[test]
+    fn restarts_when_the_partial_has_no_provenance() {
+        // A `.part` left by an older blink, or one whose sidecar was lost.
+        // Nothing identifies it, so it cannot be trusted.
+        let d = decide_resume(Some(4_000), None, "/a/report.pdf", Some(9_000));
+        assert_eq!(d, ResumeDecision::Fresh);
+    }
+
+    #[test]
+    fn restarts_when_the_remote_file_changed_size_since_the_partial() {
+        // Same path, but the file was replaced between attempts.
+        let d = decide_resume(Some(4_000), Some(&meta("/a/report.pdf", Some(9_000))), "/a/report.pdf", Some(12_000));
+        assert_eq!(d, ResumeDecision::Fresh);
+    }
+
+    #[test]
+    fn restarts_when_the_partial_is_longer_than_the_remote_file() {
+        let d = decide_resume(Some(20_000), Some(&meta("/a/report.pdf", Some(9_000))), "/a/report.pdf", Some(9_000));
+        assert_eq!(d, ResumeDecision::Fresh);
+    }
+
+    #[test]
+    fn starts_fresh_when_there_is_no_partial() {
+        assert_eq!(
+            decide_resume(None, None, "/a/report.pdf", Some(9_000)),
+            ResumeDecision::Fresh
+        );
+    }
+
+    #[test]
+    fn resumes_with_an_unknown_remote_size_when_provenance_matches() {
+        // FTP servers may not answer SIZE. The old guard was written
+        // `total > 0 && offset > total`, so an unknown size skipped the
+        // staleness check entirely and resumed unconditionally. Identity is
+        // checked independently of size, so this is now safe — and a
+        // mismatched path is still refused (next test).
+        let d = decide_resume(Some(4_000), Some(&meta("/a/report.pdf", None)), "/a/report.pdf", None);
+        assert_eq!(d, ResumeDecision::Resume(4_000));
+    }
+
+    #[test]
+    fn restarts_with_an_unknown_remote_size_when_provenance_differs() {
+        let d = decide_resume(Some(4_000), Some(&meta("/a/report.pdf", None)), "/b/report.pdf", None);
+        assert_eq!(d, ResumeDecision::Fresh);
+    }
+
+    #[test]
+    fn empty_partial_starts_fresh() {
+        let d = decide_resume(Some(0), Some(&meta("/a/report.pdf", Some(9_000))), "/a/report.pdf", Some(9_000));
+        assert_eq!(d, ResumeDecision::Fresh, "nothing to resume from");
+    }
+
+    #[test]
+    fn part_meta_path_sits_beside_the_partial() {
+        assert_eq!(
+            part_meta_path(Path::new("/tmp/file.iso")),
+            PathBuf::from("/tmp/file.iso.part.meta")
+        );
+    }
 
     // part_path
     #[test]
@@ -578,7 +860,7 @@ mod tests {
         let mut m = mock::MockTransport::new().with_file("/hello.txt", b"world");
         let entries = m.list("/").await.unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "hello.txt");
+        assert_eq!(entries[0].raw_name, "hello.txt");
         assert!(!entries[0].is_dir());
         assert_eq!(entries[0].size, 5);
     }
@@ -589,7 +871,7 @@ mod tests {
         m.mkdir("/subdir").await.unwrap();
         let entries = m.list("/").await.unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "subdir");
+        assert_eq!(entries[0].raw_name, "subdir");
     }
 
     #[tokio::test]
@@ -617,7 +899,7 @@ mod tests {
         m.rename("/old.txt", "/new.txt").await.unwrap();
         let entries = m.list("/").await.unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "new.txt");
+        assert_eq!(entries[0].raw_name, "new.txt");
         assert!(m.metadata("/old.txt").await.unwrap().is_none());
         assert!(m.metadata("/new.txt").await.unwrap().is_some());
     }
@@ -630,7 +912,7 @@ mod tests {
         m.delete_file("/a.txt").await.unwrap();
         let entries = m.list("/").await.unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].name, "b.txt");
+        assert_eq!(entries[0].raw_name, "b.txt");
     }
 
     #[tokio::test]
@@ -656,7 +938,7 @@ mod tests {
     async fn mock_metadata_file() {
         let mut m = mock::MockTransport::new().with_file("/f", b"12345");
         let meta = m.metadata("/f").await.unwrap().unwrap();
-        assert_eq!(meta.name, "f");
+        assert_eq!(meta.raw_name, "f");
         assert!(!meta.is_dir());
         assert_eq!(meta.size, 5);
     }

@@ -137,7 +137,7 @@ use suppaftp::FtpError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use crate::error::{self, BlinkError, Result};
+use crate::error::{BlinkError, Result};
 use crate::transport::error_map::map_ftp;
 use crate::transport::{EntryKind, ProgressUpdate, RemoteEntry};
 
@@ -195,8 +195,10 @@ pub async fn ftp_list<T: TokioTlsStream + Send>(
             Ok(f) => f,
             Err(_) => continue,
         };
-        let name = error::sanitize(parsed.name().to_string());
-        if name == "." || name == ".." {
+        // The server's own bytes — see `RemoteEntry::new`. Sanitizing here
+        // would produce a name that no longer addresses the file.
+        let raw_name = parsed.name().to_string();
+        if raw_name == "." || raw_name == ".." {
             continue;
         }
         let kind = if parsed.is_directory() {
@@ -208,13 +210,13 @@ pub async fn ftp_list<T: TokioTlsStream + Send>(
         } else {
             EntryKind::Other
         };
-        out.push(RemoteEntry {
-            name,
+        out.push(RemoteEntry::new(
+            raw_name,
             kind,
-            size: parsed.size() as u64,
-            modified: None,
-            mode: None,
-        });
+            parsed.size() as u64,
+            None,
+            None,
+        ));
     }
     Ok(out)
 }
@@ -233,38 +235,23 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     // [`crate::transport::part_path`] for the rationale.
     let part = super::part_path(local_path);
 
-    // Resume support: if a partial `.part` exists, seek to its end so
-    // interrupted transfers pick up where they left off (FTP REST command).
-    let offset = tokio::fs::metadata(&part)
-        .await
-        .ok()
-        .map(|m| m.len())
-        .unwrap_or(0);
-
     // Wrap size() in a timeout too — a server that hangs on SIZE would
-    // pin the whole download here. On timeout / error treat size as
-    // unknown (0) so the transfer proceeds; the progress bar just
-    // can't show a percentage.
-    let total = tokio::time::timeout(FTP_OP_TIMEOUT, stream.size(remote_path))
+    // pin the whole download here. On timeout / error the size is simply
+    // unknown; the progress bar just can't show a percentage.
+    let reported_size = tokio::time::timeout(FTP_OP_TIMEOUT, stream.size(remote_path))
         .await
         .ok()
         .and_then(|r| r.ok())
-        .map(|n| n as u64)
-        .unwrap_or(0);
+        .map(|n| n as u64);
+    let total = reported_size.unwrap_or(0);
 
-    // If the partial file is larger than the server file, it's stale — restart.
-    let offset = if total > 0 && offset > total {
-        tracing::warn!(
-            remote = %remote_path,
-            local_bytes = offset,
-            server_bytes = total,
-            "FTP partial file is larger than server file — restarting download",
-        );
-        let _ = tokio::fs::remove_file(&part).await;
-        0
-    } else {
-        offset
-    };
+    // Resume only a partial identifiable as this file — see
+    // `transport::decide_resume`. The previous guard here compared lengths
+    // and was written `total > 0 && offset > total`, so a server that
+    // doesn't answer SIZE skipped the staleness check entirely and resumed
+    // whatever happened to be on disk. Identity is checked independently of
+    // size, so an unknown size no longer means an unchecked resume.
+    let offset = super::resume_offset(local_path, remote_path, reported_size).await;
 
     if offset > 0 {
         timed_ftp("rest", remote_path, stream.resume_transfer(offset as usize)).await?;
@@ -280,6 +267,8 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     } else {
         tokio::fs::File::create(&part).await?
     };
+    // Identify the partial before writing to it — see the SFTP path.
+    super::write_part_meta(local_path, remote_path, reported_size).await;
 
     let mut buf = vec![0u8; 64 * 1024];
     let mut done: u64 = offset;
@@ -320,6 +309,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     tokio::fs::rename(&part, local_path)
         .await
         .map_err(|e| BlinkError::transport(format!("rename {}: {e}", local_path.display())))?;
+    super::clear_part_meta(local_path).await;
 
     Ok(())
 }
@@ -490,13 +480,13 @@ pub async fn ftp_metadata<T: TokioTlsStream + Send>(
         } else {
             EntryKind::Other
         };
-        return Ok(Some(RemoteEntry {
-            name: basename,
+        return Ok(Some(RemoteEntry::new(
+            basename,
             kind,
-            size: parsed.size() as u64,
-            modified: None,
-            mode: None,
-        }));
+            parsed.size() as u64,
+            None,
+            None,
+        )));
     }
     Ok(None)
 }

@@ -25,25 +25,41 @@ impl App {
     /// Handle 'v' on the main view: classify the cursor file, open the viewer
     /// modal in `Loading` state, and spawn the appropriate fetch task.
     pub(super) fn handle_view_request(&mut self) {
-        let (name, size, source) = match self.active_pane {
+        // `raw_name` addresses the file; `name` is what the modal and the log
+        // show. Keeping them apart matters most here: the viewer is the one
+        // place a file's own bytes are rendered, so a name that round-tripped
+        // through sanitization would open the wrong file (or none).
+        let (raw_name, name, size, source) = match self.active_pane {
             Pane::Local => {
                 let entry = match self.local.entries.get(self.local.cursor) {
                     Some(e) if !e.is_dir => e.clone(),
                     _ => return,
                 };
-                (entry.name.clone(), entry.size, ViewSource::Local)
+                (
+                    entry.raw_name,
+                    entry.display_name,
+                    entry.size,
+                    ViewSource::Local,
+                )
             }
             Pane::Remote => {
                 let entry = match self.remote.entries.get(self.remote.cursor) {
                     Some(e) if !e.is_dir => e.clone(),
                     _ => return,
                 };
-                (entry.name.clone(), entry.size, ViewSource::Remote)
+                (
+                    entry.raw_name,
+                    entry.display_name,
+                    entry.size,
+                    ViewSource::Remote,
+                )
             }
             Pane::Log | Pane::Transfers => return,
         };
 
-        let kind = preview::detect_view_kind(&name, size);
+        // Classify on the real name: the extension is what decides text vs.
+        // image, and it has to be the extension the file actually has.
+        let kind = preview::detect_view_kind(&raw_name, size);
         if let FileViewKind::Unsupported(reason) = &kind {
             self.push_log(
                 LogLevel::Warn,
@@ -64,7 +80,7 @@ impl App {
         let tx = self.app_event_tx.clone();
         match source {
             ViewSource::Local => {
-                let path = std::path::PathBuf::from(&self.local.path).join(&name);
+                let path = std::path::PathBuf::from(&self.local.path).join(&raw_name);
                 tokio::spawn(async move {
                     let event = match tokio::fs::read(&path).await {
                         Ok(buf) => AppEvent::ViewLoaded {
@@ -86,7 +102,7 @@ impl App {
                     self.screen = self.previous_screen.clone();
                     return;
                 };
-                let remote_path = transport::join_remote(&self.remote.path, &name);
+                let remote_path = transport::join_remote(&self.remote.path, &raw_name);
                 tokio::spawn(async move {
                     let mut transport = t.lock().await;
                     let event = match transport.read_to_bytes(&remote_path).await {

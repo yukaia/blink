@@ -233,11 +233,18 @@ impl App {
             return;
         }
         let entry = match self.remote.entries.get(self.remote.cursor) {
-            Some(e) if e.name != ".." => e.clone(),
+            Some(e) if !e.is_parent() => e.clone(),
             _ => return,
         };
-        self.rename_input = entry.name.clone();
-        self.rename_original = entry.name;
+        // The form is rendered, so it gets the sanitized name; the wire
+        // source is kept beside it. A name carrying control characters
+        // therefore shows up readable and can only be renamed *to* a clean
+        // name — `remote_name_error` refuses to send those characters back
+        // out — which is a reasonable way to fix such a file rather than a
+        // limitation worth working around.
+        self.rename_input = entry.display_name.clone();
+        self.rename_original = entry.display_name;
+        self.rename_source = entry.raw_name;
         self.rename_error = None;
         self.screen = Screen::Rename;
     }
@@ -248,15 +255,17 @@ impl App {
             self.rename_error = Some(reason.into());
             return;
         }
-        if new_name == self.rename_original {
+        // Compare against the wire name: for an ordinary file the two are
+        // identical, and for one carrying control characters the user cannot
+        // type it back, so any submit there is a genuine rename.
+        if new_name == self.rename_source {
             // No-op rename — just close.
-            self.rename_input.clear();
-            self.rename_original.clear();
+            self.clear_rename_form();
             self.screen = Screen::Main;
             return;
         }
 
-        let from = transport::join_remote(&self.remote.path, &self.rename_original);
+        let from = transport::join_remote(&self.remote.path, &self.rename_source);
         let to = transport::join_remote(&self.remote.path, &new_name);
 
         // Collision check against the cached pane listing. If the user navigated
@@ -266,7 +275,7 @@ impl App {
             .remote
             .entries
             .iter()
-            .any(|e| e.name != ".." && e.name == new_name);
+            .any(|e| !e.is_parent() && e.raw_name == new_name);
         if collides {
             self.pending_overwrite = Some(OverwritePending::Rename {
                 from,
@@ -277,10 +286,18 @@ impl App {
             return;
         }
 
-        self.rename_input.clear();
-        self.rename_original.clear();
+        self.clear_rename_form();
         self.screen = Screen::Main;
         self.start_rename(from, to);
+    }
+
+    /// Reset every field of the rename form together, so a new field can't
+    /// be left behind when one of the several exit paths clears the others.
+    pub(super) fn clear_rename_form(&mut self) {
+        self.rename_input.clear();
+        self.rename_original.clear();
+        self.rename_source.clear();
+        self.rename_error = None;
     }
 
     pub(super) fn start_rename(&mut self, from: String, to: String) {
@@ -371,12 +388,15 @@ impl App {
             return;
         }
         let entry = match self.remote.entries.get(self.remote.cursor) {
-            Some(e) if e.name != ".." => e.clone(),
+            Some(e) if !e.is_parent() => e.clone(),
             _ => return,
         };
-        let remote_path = transport::join_remote(&self.remote.path, &entry.name);
+        // Delete addresses the real name; the modal shows the readable one.
+        // Conflating them is how a confirmation for one file ends up
+        // unlinking another whose name merely renders the same.
+        let remote_path = transport::join_remote(&self.remote.path, &entry.raw_name);
         self.pending_delete = Some(PendingDelete {
-            name: entry.name,
+            name: entry.display_name,
             is_dir: entry.is_dir,
             remote_path,
         });
