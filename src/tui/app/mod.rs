@@ -582,7 +582,15 @@ impl App {
                 crate::tui::views::confirm_host_key::render(f, self);
             }
             Screen::HostKeyChanged => {
-                crate::tui::views::session_select::render(f, self);
+                // Same reasoning as ConfirmHostKey: a worker can raise this
+                // mid-session, and the connection is still up while the
+                // warning is on screen — dismissing it is what tears the
+                // session down. Draw what is actually behind the modal.
+                if self.transport.is_some() {
+                    crate::tui::views::main::render(f, self);
+                } else {
+                    crate::tui::views::session_select::render(f, self);
+                }
                 crate::tui::views::host_key_changed::render(f, self);
             }
             Screen::Help => {
@@ -653,8 +661,23 @@ impl App {
                     | KeyCode::Char('q')
                     | KeyCode::Char('Q') => {
                         self.host_key_changed_info = None;
-                        self.pending_session = None;
-                        self.screen = Screen::SessionSelect;
+                        // Every connection a session opens runs the host-key
+                        // check, so a transfer worker can raise this while the
+                        // user is connected. Returning to the selector while
+                        // the transport and dispatcher kept running left the
+                        // next connect to reassign `self.dispatcher` and
+                        // orphan the old loop — and left a session up whose
+                        // peer just failed to prove its identity. Tear it
+                        // down; `disconnect` lands on the selector itself.
+                        if self.transport.is_some() {
+                            self.disconnect();
+                        } else {
+                            // Raised during the initial connect: nothing was
+                            // established, so there is nothing to tear down
+                            // and nothing to report as a disconnect.
+                            self.pending_session = None;
+                            self.screen = Screen::SessionSelect;
+                        }
                     }
                     _ => {}
                 }
@@ -1123,6 +1146,84 @@ mod tests {
             Screen::Main,
             "the return screen must survive a second prompt",
         );
+    }
+
+    // -- changed host key --------------------------------------------------
+    //
+    // A worker connection can raise this while a session is up. Dismissing it
+    // returned to the selector but left the transport, manager and dispatcher
+    // running behind it — so the next connect reassigned `App::dispatcher`
+    // and orphaned the previous loop. A key that *changed* mid-session is
+    // also the one case where the connection is definitely not trustworthy,
+    // so tearing it down is right on its own merits.
+
+    fn changed_info() -> HostKeyChangedInfo {
+        HostKeyChangedInfo {
+            host: "h".into(),
+            lookup_host: "h".into(),
+            lookup_port: 22,
+            stored_key_type: "ssh-ed25519".into(),
+            presented_key_type: "ssh-rsa".into(),
+            fingerprint: "SHA256:abc".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dismissing_a_changed_host_key_tears_down_a_live_connection() {
+        let mut a = app();
+        a.transport = Some(Arc::new(Mutex::new(
+            Box::new(crate::transport::mock::MockTransport::new()) as Box<dyn Transport>,
+        )));
+        a.current_session = Some(Session::from_url("sftp://me@host").unwrap());
+        a.transfer_manager = Some(TransferManager::new(2).0);
+        a.screen = Screen::HostKeyChanged;
+        a.host_key_changed_info = Some(changed_info());
+
+        a.handle_key(press(KeyCode::Enter));
+
+        assert!(
+            a.transport.is_none(),
+            "the connection must not outlive the mismatch warning",
+        );
+        assert!(a.transfer_manager.is_none(), "manager must be cleared too");
+        assert!(a.current_session.is_none());
+        assert_eq!(a.screen, Screen::SessionSelect);
+        assert!(a.host_key_changed_info.is_none(), "modal state must clear");
+    }
+
+    #[tokio::test]
+    async fn dismissing_a_changed_host_key_during_the_initial_connect_is_quiet() {
+        // No connection was ever established, so there is nothing to tear
+        // down and nothing to report as a disconnect.
+        let mut a = app();
+        a.pending_session = Some(Session::from_url("sftp://me@host").unwrap());
+        a.screen = Screen::HostKeyChanged;
+        a.host_key_changed_info = Some(changed_info());
+
+        a.handle_key(press(KeyCode::Enter));
+
+        assert_eq!(a.screen, Screen::SessionSelect);
+        assert!(a.pending_session.is_none());
+        assert!(
+            !a.log.iter().any(|l| l.message.contains("disconnected from")),
+            "nothing was connected, so nothing was disconnected",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_changed_host_key_warning_still_ignores_stray_keys() {
+        let mut a = app();
+        a.screen = Screen::HostKeyChanged;
+        a.host_key_changed_info = Some(changed_info());
+
+        for code in [KeyCode::Char('y'), KeyCode::Char('x'), KeyCode::Tab] {
+            a.handle_key(press(code));
+            assert_eq!(
+                a.screen,
+                Screen::HostKeyChanged,
+                "{code:?} must not dismiss a MITM warning",
+            );
+        }
     }
 
     // -- rename form -------------------------------------------------------

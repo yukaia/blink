@@ -41,9 +41,34 @@ const SPEED_SAMPLE_MS: u128 = 250;
 use crate::transport::CONNECT_TIMEOUT;
 
 /// Handle to a running dispatcher.
+///
+/// `join` is an `Option` only so [`Self::shutdown`] can take it: moving a
+/// field out of a type that implements `Drop` is not allowed, and the `Drop`
+/// impl below is what guarantees the loop stops even when the handle is
+/// discarded rather than shut down politely.
 pub struct Dispatcher {
     shutdown: Arc<AtomicBool>,
-    join: JoinHandle<()>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl Drop for Dispatcher {
+    /// Stop the loop when the handle goes away.
+    ///
+    /// Dropping a `JoinHandle` detaches its task rather than aborting it, so
+    /// without this the loop kept its flag unset and ran for the life of the
+    /// process — polling every [`POLL_INTERVAL`], holding its pooled
+    /// connections open, and keeping a `TransferManager` clone alive (which
+    /// in turn kept the event channel open, so the forwarder task never
+    /// exited either). The `Connected` handler reaches exactly this case: it
+    /// reassigns `App::dispatcher`, dropping the previous handle.
+    ///
+    /// Signalling is all `Drop` can do — it cannot await — and all it needs
+    /// to do. The loop notices within one poll interval and still runs its
+    /// own teardown, closing pooled connections at the protocol level on the
+    /// way out. Aborting the task instead would skip that.
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
 }
 
 impl Dispatcher {
@@ -83,15 +108,24 @@ impl Dispatcher {
             app_event_tx,
             trust,
         ));
-        Self { shutdown, join }
+        Self {
+            shutdown,
+            join: Some(join),
+        }
     }
 
-    /// Stop the dispatcher loop. In-flight workers finish what they're doing;
-    /// no new jobs will be picked up after this returns. Idle pooled
-    /// connections are closed before this resolves.
-    pub async fn shutdown(self) {
+    /// Stop the dispatcher loop and wait for it to finish. In-flight workers
+    /// finish what they're doing; no new jobs will be picked up after this
+    /// returns. Idle pooled connections are closed before this resolves.
+    ///
+    /// Stronger than simply dropping the handle, which signals the loop but
+    /// returns immediately — use this where the pool must be closed before
+    /// the caller proceeds.
+    pub async fn shutdown(mut self) {
         self.shutdown.store(true, Ordering::Release);
-        let _ = self.join.await;
+        if let Some(join) = self.join.take() {
+            let _ = join.await;
+        }
     }
 }
 
@@ -418,5 +452,89 @@ mod tests {
         pool.put(boxed(), 4);
         pool.put(boxed(), 4);
         assert_eq!(pool.close().len(), 2);
+    }
+
+    // -- teardown ----------------------------------------------------------
+
+    fn idle_session() -> Session {
+        // The loop never connects: nothing is ever queued, so host and port
+        // are never used.
+        Session {
+            name: "idle".to_string(),
+            protocol: crate::session::Protocol::Sftp,
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            username: "u".to_string(),
+            remote_dir: "/".to_string(),
+            local_dir: None,
+            auth: crate::session::AuthMethod::Password,
+            parallel_downloads: None,
+            theme: None,
+            accept_invalid_certs: false,
+            cert_sha256: None,
+        }
+    }
+
+    /// Dropping the handle must stop the loop.
+    ///
+    /// `shutdown()` is the polite path, but it is not the only one: the
+    /// `Connected` handler reassigns `App::dispatcher`, which drops the
+    /// previous handle. Without a `Drop` impl the loop never sees its flag
+    /// set, so it polls every 100ms for the life of the process while
+    /// holding its pooled connections and a `TransferManager` clone.
+    ///
+    /// Observed through the event channel: the loop owns the last manager
+    /// clone once the caller drops theirs, so the channel closes only when
+    /// the loop actually returns.
+    #[tokio::test]
+    async fn dropping_the_handle_stops_the_loop() {
+        let (manager, mut events_rx) = TransferManager::new(1);
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let dispatcher = Dispatcher::spawn(
+            manager.clone(),
+            idle_session(),
+            None,
+            ev_tx,
+            crate::known_hosts::SessionTrust::new(),
+        );
+
+        drop(manager); // the App's copy
+        drop(dispatcher); // must signal the loop, not just detach
+
+        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+            while events_rx.recv().await.is_some() {}
+        })
+        .await;
+
+        assert!(
+            drained.is_ok(),
+            "loop still running after its handle was dropped",
+        );
+    }
+
+    /// `shutdown()` keeps its stronger guarantee: it returns only once the
+    /// loop has actually finished, so idle pooled connections are closed
+    /// before the caller proceeds.
+    #[tokio::test]
+    async fn shutdown_still_waits_for_the_loop_to_finish() {
+        let (manager, mut events_rx) = TransferManager::new(1);
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let dispatcher = Dispatcher::spawn(
+            manager.clone(),
+            idle_session(),
+            None,
+            ev_tx,
+            crate::known_hosts::SessionTrust::new(),
+        );
+
+        dispatcher.shutdown().await;
+        drop(manager);
+
+        // The loop is already done, so this drains immediately.
+        let drained = tokio::time::timeout(Duration::from_secs(5), async {
+            while events_rx.recv().await.is_some() {}
+        })
+        .await;
+        assert!(drained.is_ok(), "shutdown must leave no loop behind");
     }
 }
