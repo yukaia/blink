@@ -61,8 +61,17 @@ A cross-platform terminal SFTP / SCP / FTP / FTPS client with a three-pane TUI, 
   first job runs; each job is marked `in_progress` when it starts and
   `done` when it finishes. If the session is interrupted, press `r`
   (resume downloads) or `R` (resume uploads) in the Transfers pane to
-  re-queue only the jobs that didn't complete. Use `blink checkpoints`
-  to inspect pending checkpoints from the command line.
+  re-queue only the jobs that didn't complete.
+  Connecting to a session that has an unfinished batch offers to resume it,
+  with a summary of what is left. `[r]` resumes, `[d]` discards the
+  checkpoint *and* the partial downloads it is the only record of, and
+  `[esc]` defers — the offer returns on the next connect. Use `blink
+  checkpoints` to inspect pending checkpoints from the command line.
+- **Checkpoint keying** — checkpoints are keyed by session *name*, not by
+  host. An ad-hoc `blink connect sftp://host` therefore matches a
+  checkpoint belonging to a saved session called `host`, and editing a
+  saved session's host leaves its old checkpoint in place. Check the paths
+  in the summary if that is a possibility.
 
 ### Sessions
 
@@ -496,7 +505,7 @@ src/
         ├── mod.rs       struct + new / with_session / run + draw + handle_key dispatcher + connect / disconnect / push_log
         ├── handlers.rs  per-screen key handlers (one impl App block, all handle_* methods)
         ├── events.rs    handle_app_event + handle_transfer_event (background-task drain)
-        ├── checkpoint_glue.rs  dispatch_plan / resume_walk / discard_active_checkpoint
+        ├── checkpoint_glue.rs  dispatch_plan / resume_walk / settle_checkpoint
         ├── transfers.rs orchestration: enqueue / walk-spawn / confirm overwrite → dispatch
         ├── actions.rs   modal openers + submitters + async kickoffs (rename / mkdir / delete / edit-session / search / save-session)
         ├── panes.rs     pane navigation, cursor, refresh (refresh_local_pane runs on the blocking pool)
