@@ -739,11 +739,21 @@ fn write_due(
 /// Only `Done` jobs are skipped: their `.part` was already renamed away, and
 /// a file at that path now would belong to some other transfer.
 ///
-/// Deliberately confined to the `blink checkpoints` CLI path, which runs when
-/// no transfers are in flight. Doing the same sweep on an in-app batch cancel
-/// would race the worker still writing the file: on Unix the unlink succeeds,
-/// the worker keeps writing to the now-unlinked inode, and its final rename
-/// fails — turning a clean cancel into an error.
+/// Called from two places: the `blink checkpoints` CLI (a separate process
+/// invocation, never concurrent with a running batch) and the TUI's
+/// `discard` offer. In the TUI, resume offers are built at connect time,
+/// before any job of that direction has been enqueued for the *new*
+/// session — so pressing `d` never races a worker the current session
+/// itself just started.
+///
+/// It can still race a worker from the session that was just left, though:
+/// `App::disconnect` spawns the dispatcher's `shutdown()` rather than
+/// awaiting it, so a worker from the previous connection can still be
+/// mid-write on a `.part` file when the reconnect completes and its
+/// checkpoint is offered again. Unlinking out from under that worker races
+/// it: on Unix the unlink succeeds, the worker keeps writing to the
+/// now-unlinked inode, and its final rename fails — turning what should be
+/// a clean discard into a spurious transfer failure.
 /// What a checkpoint teardown removed, and what it could not.
 ///
 /// Returned rather than printed: the CLI writes failures to stderr, but the
@@ -986,13 +996,6 @@ pub(crate) mod test_support {
     impl CheckpointCleanup {
         pub fn new(session: impl Into<String>) -> Self {
             Self(session.into())
-        }
-
-        // Not read by this task's callers; a later task in this plan needs it
-        // to look up the session a resume prompt is offering.
-        #[allow(dead_code)]
-        pub fn session(&self) -> &str {
-            &self.0
         }
     }
 
@@ -1298,6 +1301,51 @@ mod offer_tests {
         assert_eq!(offers.len(), 2);
         assert!(offers.iter().any(|o| o.kind == CheckpointKind::Download));
         assert!(offers.iter().any(|o| o.kind == CheckpointKind::Upload));
+    }
+
+    #[test]
+    fn mkdir_jobs_count_toward_remaining_and_total() {
+        // The plan's denominator is item count, not file-transfer count: a
+        // batch that is mostly directory creation must not under-report how
+        // much work is left just because every fixture elsewhere in this
+        // module happens to be a `Download`.
+        let cp = Checkpoint::new(
+            "s",
+            CheckpointKind::Upload,
+            vec![
+                CheckpointJob::Mkdir {
+                    remote_path: "/srv/backup/photos".into(),
+                    status: JobStatus::Done,
+                },
+                CheckpointJob::Mkdir {
+                    remote_path: "/srv/backup/videos".into(),
+                    status: JobStatus::Pending,
+                },
+                CheckpointJob::Upload {
+                    local_path: PathBuf::from("/home/me/photos/a.cr2"),
+                    remote_path: "/srv/backup/photos/a.cr2".into(),
+                    status: JobStatus::Pending,
+                },
+            ],
+        );
+
+        let offer = cp.to_offer(None);
+
+        assert_eq!(offer.remaining, 2, "the pending mkdir plus the pending upload");
+        assert_eq!(offer.total, 3, "all three jobs, the done mkdir included");
+
+        // `source_path` reads the remote side for a `Mkdir`, so an upload
+        // offer's samples can include a remote path alongside local ones —
+        // that's the existing, correct behaviour for this job type, not
+        // something this test should paper over.
+        assert_eq!(
+            offer.sample_paths,
+            vec![
+                "/srv/backup/videos".to_string(),
+                "/home/me/photos/a.cr2".to_string(),
+            ],
+            "an upload offer can legitimately sample a remote path for its mkdir entries",
+        );
     }
 
     #[test]

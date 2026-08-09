@@ -778,9 +778,14 @@ impl App {
         // it. The next connection gets a fresh TransferManager whose job
         // ids restart at 1, so a surviving map would alias new jobs onto
         // old checkpoint entries — and a surviving checkpoint would make
-        // `resume_walk` refuse a resume the user was just offered.
+        // `resume_walk` refuse a resume the user was just offered. Queued
+        // offers are the same class of leftover: `Connected` assigns
+        // `pending_offers` wholesale, so leaving a stale queue here is
+        // harmless today, but clearing it removes the coupling on that
+        // assignment always happening.
         self.active_checkpoints.clear();
         self.checkpoint_job_map.clear();
+        self.pending_offers.clear();
         self.transfer_manager = None;
         self.current_session = None;
         self.pending_password = None;
@@ -1501,6 +1506,13 @@ mod tests {
                 Screen::OfferResumeCheckpoint,
                 "{code:?} must not dismiss the offer",
             );
+            assert_eq!(
+                a.pending_offers.len(),
+                1,
+                "{code:?} must not pop the queue — render bails early on a \
+                 non-matching front, which would leave an invisible modal \
+                 over Main",
+            );
         }
     }
 
@@ -1546,6 +1558,7 @@ mod tests {
         // with a stale entry and mark the wrong checkpoint entry done.
         let (mut a, _cleanup) = checkpoint_app("disconnect");
         a.dispatch_plan(vec![download(0), download(1)], Direction::Download);
+        a.pending_offers = std::collections::VecDeque::from(vec![offer(CheckpointKind::Download)]);
         assert!(!a.active_checkpoints.is_empty(), "fixture must set up state");
         assert!(!a.checkpoint_job_map.is_empty());
 
@@ -1556,6 +1569,10 @@ mod tests {
             "a checkpoint from the previous connection must not survive it",
         );
         assert!(a.checkpoint_job_map.is_empty(), "stale job ids must not survive");
+        assert!(
+            a.pending_offers.is_empty(),
+            "a queued offer from the previous connection must not survive it",
+        );
     }
 
     // -- the completion path must not fsync per job ------------------------

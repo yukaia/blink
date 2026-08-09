@@ -800,7 +800,7 @@ impl App {
                 }
                 self.show_next_offer();
             }
-            KeyCode::Esc | KeyCode::Char('l') | KeyCode::Char('L') => {
+            KeyCode::Esc => {
                 self.pending_offers.pop_front();
                 self.push_log(
                     LogLevel::Info,

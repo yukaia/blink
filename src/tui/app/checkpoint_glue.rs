@@ -1,7 +1,7 @@
 //! Glue between the recursive-walk planner, the dispatcher, and the
 //! checkpoint file on disk.
 //!
-//! These three methods own the checkpoint state on `App`:
+//! These methods own the checkpoint state on `App`:
 //!
 //! - [`App::dispatch_plan`] takes a finalised `Vec<PlannedJob>`, writes a
 //!   fresh checkpoint to disk *before* enqueuing anything, then hands
@@ -11,9 +11,9 @@
 //! - [`App::resume_walk`] loads a previously persisted checkpoint, drops
 //!   the done entries, and re-queues the remainder through
 //!   `dispatch_plan`.
-//! - [`App::discard_active_checkpoint`] tears down the in-memory state
-//!   and removes the file (called on whole-batch cancel and on
-//!   disconnect after a failure).
+//! - [`App::cancel_batch_in_checkpoint`] marks a cancelled batch's entries
+//!   and hands off to [`App::settle_checkpoint`], which drops the
+//!   checkpoint once nothing resumable is left, or flushes it otherwise.
 //!
 //! Pulled out of `mod.rs` so the checkpoint side of the app reads as a
 //! cohesive unit instead of being threaded through the lifecycle code.

@@ -1093,7 +1093,12 @@ pub mod offer_resume_checkpoint {
         };
 
         let area = f.area();
-        let modal = super::centered_rect(60, 42, area);
+        // 56% leaves >=11 usable inner rows on an 80x24 terminal — the worst
+        // case for this panel's content (greeting + headline + up to three
+        // sample paths + "…and N more" + the `[r]/[d]/[esc]` hint line). At
+        // 42% only 8 rows were available, so the hint line — the only
+        // indication that `d` is destructive — was the first thing clipped.
+        let modal = super::centered_rect(60, 56, area);
         f.render_widget(Clear, modal);
 
         let block = Block::default()
