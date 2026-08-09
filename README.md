@@ -30,8 +30,12 @@ A cross-platform terminal SFTP / SCP / FTP / FTPS client with a three-pane TUI, 
 - Three-pane TUI (local / remote, plus a switchable transfers/log panel)
 - Recursive **download** and **upload** with parallel slot dispatch
 - **Rename**, **create directories**, **delete files**, **delete directories** (recursive)
-- **Substring filter** per pane (`/`), persists across refresh
-- **Refresh** active pane (F5)
+- **Substring filter** per pane (`/`), persists across refresh — selections
+  made while filtered survive clearing or narrowing the filter too; the
+  footer's selection count and size cover the whole selection, including
+  entries the filter is currently hiding
+- **Refresh** active pane (F5) — refreshing in place no longer blanks the
+  pane while the new listing is fetched
 - **Disconnect** and return to the session selector (`Ctrl-X`)
 - **View** text files inline (scrollable, line-numbered, syntax-highlighted) —
   control and ANSI escape characters are stripped before display to prevent
@@ -56,12 +60,23 @@ A cross-platform terminal SFTP / SCP / FTP / FTPS client with a three-pane TUI, 
   active and queued job from the same `Ctrl-D` / `Ctrl-U`
 - **Overwrite confirmation** with three choices — overwrite all / skip
   conflicts / cancel — for both downloads and uploads, single-file or
-  recursive
+  recursive. Preparing an upload now fails outright if its destination
+  directory can't be listed for any reason other than "doesn't exist yet" —
+  a server that refuses `LIST` on a writable directory is surfaced as an
+  error rather than silently treated as conflict-free
+- **Recursive walks share the connection.** A walk locks the transport only
+  for the directory it's currently listing, not for the whole tree, so an
+  F5 refresh or a navigation elsewhere doesn't wait for a large recursive
+  walk to finish
 - **Walk checkpointing** — the transfer plan is written to disk before the
   first job runs; each job is marked `in_progress` when it starts and
   `done` when it finishes. If the session is interrupted, press `r`
   (resume downloads) or `R` (resume uploads) in the Transfers pane to
-  re-queue only the jobs that didn't complete.
+  re-queue only the jobs that didn't complete. Starting a second batch in
+  the same direction while the first is still running appends to that
+  batch's checkpoint rather than overwriting it, and `r` / `R` refuses to
+  resume while a batch of that direction is still in flight (finish or
+  cancel it first).
   Connecting to a session that has an unfinished batch offers to resume it,
   with a summary of what is left. `[r]` resumes, `[d]` discards the
   checkpoint *and* the partial downloads it is the only record of, and
@@ -72,6 +87,16 @@ A cross-platform terminal SFTP / SCP / FTP / FTPS client with a three-pane TUI, 
   checkpoint belonging to a saved session called `host`, and editing a
   saved session's host leaves its old checkpoint in place. Check the paths
   in the summary if that is a possibility.
+- **Checkpoint file format** is versioned (currently version 3, which adds
+  a `cancelled` job status); checkpoints written by older blink versions
+  (version 2) still load and resume normally.
+- **Download resume is provenance-checked.** A `.part` file records bytes,
+  not which remote file they came from, so blink writes a `<dest>.part.meta`
+  sidecar alongside it naming the remote path and the size the server
+  reported. Resume only happens when the sidecar identifies the same remote
+  file at the same reported size; anything unproven — including a `.part`
+  left by a pre-sidecar version of blink — restarts from byte zero instead
+  of risking a silently corrupt file.
 
 ### Sessions
 
@@ -226,7 +251,8 @@ blink checkpoints --clean
 
 # Remove all checkpoint files unconditionally
 blink checkpoints --force
-# (both also delete the .part files left by the batches they remove)
+# (both also delete the .part files, and their .part.meta sidecars, left
+#  by the batches they remove)
 
 # Forget a stored SSH host key (see "known_hosts" below before running this)
 blink known-hosts remove host.example.com
@@ -285,9 +311,19 @@ with the server's SHA-256 fingerprint and three choices:
 | `t` | Trust once — accept for this session only, don't save |
 | `n` / Esc | Reject — abort the connection |
 
+"This session" for `t` means the whole connected session, not just the
+connection the prompt interrupted: every connection the session opens
+afterwards — including each parallel transfer worker, which opens its own
+connection — honours the same accept-once decision instead of re-prompting.
+The trust is forgotten as soon as the session disconnects.
+
 If a host's key changes after being saved, blink hard-rejects the
 connection and shows a warning screen that only `Enter` / `Esc` / `q`
-dismisses (so a held key can't blow past the warning). The screen prints
+dismisses (so a held key can't blow past the warning). Dismissing it tears
+down the connection — including a session that was already connected and
+transferring, since a worker's own connection can trip this mid-session —
+and returns to the session selector rather than leaving a live session
+whose peer just failed to prove its identity. The screen prints
 the exact command that clears the stored entry:
 
 ```sh
@@ -322,6 +358,13 @@ confirm_quit = true
 [terminal]
 image_preview = auto        ; auto | kitty | sixel | iterm2 | none
 ```
+
+An out-of-range `parallel_downloads` (`0`, or above the maximum) is not
+rejected — it's clamped into range instead, so a hand-edited or stale
+config file doesn't stop blink from starting. `config.ini` only logs a
+warning for `0`; the per-session override below (`[transfer]
+parallel_downloads`) logs a warning for any clamp, including one above the
+maximum.
 
 ### `sessions/<name>.ini` — per session
 
@@ -479,11 +522,11 @@ src/
 ├── config.rs            global config.ini load / save (preserves unknown keys)
 ├── session.rs           per-session .ini load / save / list / URL parser
 ├── theme.rs             theme model + 7 built-ins + file loader
-├── checkpoint.rs        walk-plan checkpointing: persist, update, remove batch state; debounced fsync writes
-├── known_hosts.rs       SSH host-key store: check / append / remove, OpenSSH-style matching, file lock
+├── checkpoint.rs        walk-plan checkpointing: persist, append, remove batch state; debounced fsync writes; version-3 format with v1/v2 migration
+├── known_hosts.rs       SSH host-key store: check / append / remove, OpenSSH-style matching, file lock, SessionTrust (per-session "trust once")
 ├── highlight.rs         syntax highlighter for the text viewer (single-pass, zero deps)
 ├── transport/           connection layer
-│   ├── mod.rs           Transport trait + factory + Connected struct + part_path helper
+│   ├── mod.rs           Transport trait + factory + Connected struct + part_path / part_meta_path + resume provenance (decide_resume)
 │   ├── sftp.rs          SFTP via russh + russh-sftp (SSH keepalive, rsa-sha2-512)
 │   ├── scp.rs           transparent SFTP wrapper (matches OpenSSH 9.0+); delegates via the delegate_inner_transport! macro
 │   ├── ftp.rs           FTP via suppaftp tokio backend
@@ -603,6 +646,11 @@ Applied to:
   user's destination tree, and an A→B→A symlink cycle can't loop the
   walker. Single-file `View` of a symlink still works — that's an
   explicit per-file action.
+- **Recursive uploads skip local file names that aren't valid UTF-8.**
+  Sending a lossily-decoded name (`\u{FFFD}` in place of the bad bytes)
+  would upload the file under a name that isn't its own and that nothing
+  can map back. The skip is counted and reported in the log, the same way
+  a skipped symlink is.
 - **Directories count against the recursive-walk budget.** A remote
   download walk emits jobs only for files, so a server serving a deep or
   very wide tree of *empty* directories would otherwise expand the walk
@@ -683,7 +731,12 @@ RGBA buffer is already allocated.
   resume — never silently skipped.
 - Downloads write to a `<local>.part` sibling and rename onto the final
   name only after `flush` + `sync_all`. The user's existing file (if any)
-  isn't truncated until the new download has fsynced cleanly.
+  isn't truncated until the new download has fsynced cleanly. A
+  `<local>.part.meta` sidecar is written alongside it, recording the remote
+  path and the size the server reported — the provenance a resume needs to
+  tell "my interrupted download" from "an unrelated file that happens to
+  share this local name" (see "download resume is provenance-checked"
+  under Transfers).
 - Uploads mirror this on the remote side: bytes stream into
   `<remote>.part` and the final name is only created by rename after the
   upload completes (and fsyncs, where the server supports
@@ -756,7 +809,11 @@ A few things worth knowing before you use this in anger:
   re-queued, InProgress → re-queued, Done → re-run). Partial downloads
   live at `<name>.part`; the final name is only created via rename
   after fsync. `mkdir` is idempotent on the remote side, so re-runs are
-  safe across the board.
+  safe across the board. A resumed `.part` is only trusted if its
+  `.part.meta` sidecar names the same remote path at the same reported
+  size — a `.part` from before this check existed, or one whose sidecar
+  didn't survive the crash, restarts instead of risking a silently
+  corrupted file.
 - **Transfers don't auto-refresh the local pane.** Use F5 to refresh after
   downloads complete.
 
