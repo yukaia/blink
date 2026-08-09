@@ -789,6 +789,15 @@ impl App {
         self.transfer_manager = None;
         self.current_session = None;
         self.pending_password = None;
+        // Same class of leftover: a host-key prompt or "changed" modal
+        // belongs to the connection attempt that raised it, not to whatever
+        // connects next. Clearing `pending_host_key` here drops its
+        // `PendingHostKey`, whose `Drop` answers the still-pending one-shot
+        // with `Reject` — deliberately: the connection it was guarding is
+        // being torn down right now, so the connect task waiting on that
+        // decision should unwind rather than block forever.
+        self.pending_host_key = None;
+        self.host_key_changed_info = None;
         // Forget any "trust once" acceptance — it was scoped to the
         // connection we just tore down.
         self.pending_trust = crate::known_hosts::SessionTrust::new();
@@ -1572,6 +1581,27 @@ mod tests {
         assert!(
             a.pending_offers.is_empty(),
             "a queued offer from the previous connection must not survive it",
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnecting_clears_host_key_modal_state() {
+        // Same class of connection-scoped leftover as the checkpoint maps
+        // above: a pending host-key prompt or "changed" modal belongs to the
+        // connection being torn down, not to whatever connects next.
+        let mut a = app();
+        a.pending_host_key = Some(pending_host_key());
+        a.host_key_changed_info = Some(changed_info());
+
+        a.disconnect();
+
+        assert!(
+            a.pending_host_key.is_none(),
+            "a stale host-key prompt must not survive disconnect",
+        );
+        assert!(
+            a.host_key_changed_info.is_none(),
+            "a stale host-key-changed modal must not survive disconnect",
         );
     }
 

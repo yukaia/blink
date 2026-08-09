@@ -776,17 +776,31 @@ impl App {
                 match crate::checkpoint::discard(&offer.session, offer.kind) {
                     Ok(outcome) => {
                         let parts = outcome.parts_removed;
-                        self.push_log(
-                            LogLevel::Info,
-                            if parts > 0 {
+                        // `failures` can now include the checkpoint file
+                        // itself failing to remove (not just a stray
+                        // partial), so "discarded" is only accurate when
+                        // nothing in that list is left unresolved.
+                        if outcome.failures.is_empty() {
+                            self.push_log(
+                                LogLevel::Info,
+                                if parts > 0 {
+                                    format!(
+                                        "discarded the {} checkpoint and {parts} partial download(s)",
+                                        offer.kind.as_str()
+                                    )
+                                } else {
+                                    format!("discarded the {} checkpoint", offer.kind.as_str())
+                                },
+                            );
+                        } else {
+                            self.push_log(
+                                LogLevel::Warn,
                                 format!(
-                                    "discarded the {} checkpoint and {parts} partial download(s)",
+                                    "could not fully discard the {} checkpoint ({parts} partial download(s) removed)",
                                     offer.kind.as_str()
-                                )
-                            } else {
-                                format!("discarded the {} checkpoint", offer.kind.as_str())
-                            },
-                        );
+                                ),
+                            );
+                        }
                         for failure in outcome.failures {
                             self.push_log(LogLevel::Warn, failure);
                         }

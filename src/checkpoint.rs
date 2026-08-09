@@ -265,7 +265,7 @@ impl Checkpoint {
     /// other's checkpoint. Append the first eight hex chars of
     /// `sha256(session)` to disambiguate; the suffix derives from the raw
     /// session name (no sanitisation), so it's stable per logical name.
-    pub(crate) fn path_for(session: &str, kind: CheckpointKind) -> Result<PathBuf> {
+    fn path_for(session: &str, kind: CheckpointKind) -> Result<PathBuf> {
         use sha2::{Digest, Sha256};
         let safe_name: String = session
             .chars()
@@ -689,7 +689,7 @@ pub fn offers_for(session: &str) -> Vec<CheckpointOffer> {
 ///
 /// Idempotent: a checkpoint that is already gone reports nothing removed.
 pub fn discard(session: &str, kind: CheckpointKind) -> Result<DiscardOutcome> {
-    let outcome = match Checkpoint::load(session, kind) {
+    let mut outcome = match Checkpoint::load(session, kind) {
         Ok(Some(cp)) => remove_orphan_parts(&cp),
         // Absent, or unreadable — either way there is nothing to sweep, but
         // the file (if any) should still go.
@@ -699,7 +699,15 @@ pub fn discard(session: &str, kind: CheckpointKind) -> Result<DiscardOutcome> {
             DiscardOutcome::default()
         }
     };
-    Checkpoint::remove(session, kind)?;
+    // Record a failure here rather than propagating it with `?`: the sweep
+    // above may already have removed partials, and returning `Err` would
+    // discard that count along with it, leaving the caller unable to report
+    // what *did* get cleaned up.
+    if let Err(e) = Checkpoint::remove(session, kind) {
+        outcome
+            .failures
+            .push(format!("could not remove the checkpoint file: {e}"));
+    }
     Ok(outcome)
 }
 
@@ -1070,18 +1078,31 @@ mod sweep_tests {
     fn the_sweep_reports_what_it_removed() {
         let dir = scratch("reports");
         let unfinished = job(&dir, "a.bin", JobStatus::Pending);
+        let in_progress = job(&dir, "c.bin", JobStatus::InProgress);
         let finished = job(&dir, "b.bin", JobStatus::Done);
-        // Both have a partial on disk; only the unfinished one is orphaned.
-        for j in [&unfinished, &finished] {
+        // All three have a partial on disk; only the unfinished ones (pending
+        // and in-progress) are orphaned.
+        for j in [&unfinished, &in_progress, &finished] {
             let CheckpointJob::Download { local_path, .. } = j else { unreachable!() };
             std::fs::write(crate::transport::part_path(local_path), b"x").unwrap();
         }
-        let cp = Checkpoint::new("s", CheckpointKind::Download, vec![unfinished, finished]);
+        let cp = Checkpoint::new(
+            "s",
+            CheckpointKind::Download,
+            vec![unfinished, in_progress, finished],
+        );
 
         let outcome = remove_orphan_parts(&cp);
 
-        assert_eq!(outcome.parts_removed, 1, "only the unfinished job's partial");
+        assert_eq!(
+            outcome.parts_removed, 2,
+            "the pending job's partial and the in-progress job's partial",
+        );
         assert!(outcome.failures.is_empty());
+        assert!(
+            std::fs::metadata(crate::transport::part_path(&dir.join("c.bin"))).is_err(),
+            "an in-progress job's transfer never finished, so its partial is orphaned too",
+        );
         assert!(
             std::fs::metadata(crate::transport::part_path(&dir.join("b.bin"))).is_ok(),
             "a completed job's partial belongs to some other transfer",
@@ -1130,6 +1151,77 @@ mod sweep_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_removal_failure_is_recorded_rather_than_propagated() {
+        // The property this guards: before this fix, `Checkpoint::remove`
+        // failing at the end of `discard` propagated with `?`, and the
+        // caller lost the whole `DiscardOutcome` — including any partials
+        // the sweep had *already* removed — along with it. After the fix,
+        // the failure is folded into `outcome.failures` and `discard` still
+        // returns `Ok`.
+        //
+        // Getting only the final unlink to fail, with the load/sweep still
+        // succeeding, turns out not to be portably constructible here:
+        // replacing the checkpoint file with a directory (the suggested
+        // technique — `remove_file` refuses a directory) also makes the file
+        // unreadable, since reading a directory's bytes fails with the same
+        // `IsADirectory` error as removing it. So this exercises "unreadable
+        // *and* undeletable" rather than "reads fine, only the unlink
+        // fails" — `outcome.parts_removed` is 0 here because the load itself
+        // takes the unreadable-checkpoint branch, not because the fix
+        // dropped a nonzero count.
+        //
+        // The alternative that *would* isolate the two — making the parent
+        // directory briefly non-writable, or redirecting `checkpoints_dir`
+        // via an env var — touches state shared with every other checkpoint
+        // test in this binary, several of which flush to the real
+        // checkpoints dir with `.expect(...)` and run concurrently on
+        // process-unique names rather than serialized. Either would risk
+        // flaking the rest of the suite for the sake of this one assertion,
+        // so this test settles for exercising the exact changed line (the
+        // failed `Checkpoint::remove` recorded into `outcome.failures`
+        // instead of propagated) without also claiming a nonzero sweep
+        // count under a failed removal — that half of the property is
+        // covered structurally by `the_sweep_reports_what_it_removed`
+        // (sweep count) and `discarding_removes_the_file_and_its_partials`
+        // (both together on the success path) instead.
+        let name = format!("blink-test-remove-fail-{}", std::process::id());
+        let path = Checkpoint::path_for(&name, CheckpointKind::Download).unwrap();
+        std::fs::create_dir(&path).expect("stand a directory in for the checkpoint file");
+
+        let result = discard(&name, CheckpointKind::Download);
+
+        // Clean up the substituted directory immediately — `Checkpoint::remove`
+        // (and so `CheckpointCleanup`'s `Drop`) calls `remove_file`, which
+        // cannot remove a directory, so nothing else will.
+        let _ = std::fs::remove_dir_all(&path);
+
+        let outcome =
+            result.expect("discard must return Ok, not propagate the removal failure");
+        assert_eq!(
+            outcome.failures.len(), 1,
+            "the failed unlink must be recorded rather than silently dropped",
+        );
+    }
+
+    #[test]
+    fn discarding_an_unreadable_checkpoint_removes_the_file_and_sweeps_nothing() {
+        let name = format!("blink-test-corrupt-discard-{}", std::process::id());
+        let path = Checkpoint::path_for(&name, CheckpointKind::Download).unwrap();
+        std::fs::write(&path, b"{ not json").unwrap();
+
+        let outcome = discard(&name, CheckpointKind::Download).expect("must not error");
+
+        assert_eq!(
+            outcome,
+            DiscardOutcome::default(),
+            "nothing could be swept from an unreadable file",
+        );
+        assert!(!path.exists(), "the unreadable file must still be removed");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -1533,7 +1625,23 @@ mod tests {
 
     #[test]
     fn flush_if_due_fires_after_interval() {
-        let mut cp = sample(1);
+        // This is the one test in this module where `flush_if_due` can
+        // actually reach disk (the gate lets the write through), so unlike
+        // `sample`'s fixed "session" name elsewhere in this file, it needs a
+        // process-unique name and the cleanup guard — a stray `session-*`
+        // checkpoint file would collide with, and be resume-offered
+        // alongside, a real user session named "session".
+        let name = format!("blink-test-flush-{}", std::process::id());
+        let _cleanup = test_support::CheckpointCleanup::new(&name);
+        let mut cp = Checkpoint::new(
+            &name,
+            CheckpointKind::Download,
+            vec![CheckpointJob::Download {
+                remote_path: "/remote/file0".into(),
+                local_path: PathBuf::from("/local/file0"),
+                status: JobStatus::Pending,
+            }],
+        );
         cp.dirty = true;
         // Backdate the last save to just past the interval.
         cp.last_save = Some(Instant::now() - CHECKPOINT_FLUSH_INTERVAL - Duration::from_millis(50));
