@@ -38,8 +38,11 @@ pub fn themes_dir() -> Result<PathBuf> {
 
 /// Directory holding walk checkpoint `.json` files. Created if missing.
 ///
-/// One file per (session, direction) pair; overwritten on each new walk so
-/// stale files don't accumulate.
+/// One file per (session, direction) pair. A second batch of the same
+/// direction *appends* to the existing file rather than replacing it —
+/// overwriting used to destroy the plan of a batch that was still running,
+/// taking its resumability with it. A file is removed once nothing in it
+/// still needs to run.
 pub fn checkpoints_dir() -> Result<PathBuf> {
     let dir = root_dir()?.join("checkpoints");
     create_app_dir(&dir)?;
