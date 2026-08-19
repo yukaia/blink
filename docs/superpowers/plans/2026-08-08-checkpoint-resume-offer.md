@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Implemented and shipped in 0.6.0; all coded steps verified against the tree on 2026-08-19 (`cargo test`: 366 passed). The Manual Verification Checklist at the end is unticked because it needs a live server and an interactive run.
+
 **Goal:** Offer to resume an interrupted transfer batch when connecting to a session that has a checkpoint on disk, via a post-connect panel with a short summary.
 
 **Architecture:** Discovery (`checkpoint::offers_for`) produces display-only summaries. A `VecDeque<PostConnectOffer>` on `App` owns post-connect sequencing — checkpoints first, then the existing save-session offer. One panel per checkpoint, shown in turn. Resume delegates to the existing `App::resume_walk`; discard sweeps orphaned `.part` files and removes the file.
@@ -47,7 +49,7 @@ A `Drop` guard fixes it without threading a directory through every call site. E
 - Consumes: nothing.
 - Produces: `checkpoint::test_support::CheckpointCleanup::new(session: impl Into<String>) -> CheckpointCleanup`, which removes both of a session's checkpoints when dropped.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `src/checkpoint.rs`, before `mod merge_tests`:
 
@@ -122,16 +124,16 @@ mod cleanup_tests {
 
 `Checkpoint::path_for` is private. Change its signature to `pub(crate) fn path_for` — Task 4 needs it too.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --quiet cleanup_tests`
 Expected: FAIL to compile — `cannot find module test_support`, `path_for` is private.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 The module above *is* the implementation — it is test-only code. Add it, make `path_for` `pub(crate)`, and re-run.
 
-- [ ] **Step 4: Adopt it in the existing App tests**
+- [x] **Step 4: Adopt it in the existing App tests**
 
 In `src/tui/app/mod.rs`, change `checkpoint_app` to hand back a guard alongside the app, and delete `clean_checkpoints`:
 
@@ -164,7 +166,7 @@ to:
         // …  (drop the trailing clean_checkpoints call)
 ```
 
-- [ ] **Step 5: Run tests and confirm nothing is left behind**
+- [x] **Step 5: Run tests and confirm nothing is left behind**
 
 Run:
 ```bash
@@ -173,7 +175,7 @@ ls ~/.config/blink/checkpoints/ | grep blink-test && echo "STRAY FILES" || echo 
 ```
 Expected: all pass, clippy silent, `clean`.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/checkpoint.rs src/tui/app/mod.rs
@@ -198,7 +200,7 @@ Prerequisite from the spec. `disconnect` leaves `active_checkpoints` and `checkp
 - Consumes: nothing.
 - Produces: nothing new. Later tasks rely on `disconnect` leaving `active_checkpoints` empty.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `tests` module in `src/tui/app/mod.rs`, next to the other checkpoint tests:
 
@@ -225,12 +227,12 @@ async fn disconnecting_clears_checkpoint_state() {
 
 The guard owns cleanup, which matters here: `disconnect` clears `current_session`, so a test that cleaned up from `a` afterwards would have nothing to clean up *by*.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --quiet disconnecting_clears_checkpoint_state`
 Expected: FAIL — `a checkpoint from the previous connection must not survive it`
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `src/tui/app/mod.rs`, `disconnect`, in the "Clear connection-scoped state" block alongside `self.transfer_manager = None;`:
 
@@ -244,12 +246,12 @@ In `src/tui/app/mod.rs`, `disconnect`, in the "Clear connection-scoped state" bl
         self.checkpoint_job_map.clear();
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test --quiet && cargo clippy --all-targets -- -D warnings`
 Expected: all pass, clippy silent.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/tui/app/mod.rs
@@ -274,7 +276,7 @@ makes resume_walk refuse a resume that is legitimately available."
 - Consumes: nothing.
 - Produces: `pub struct DiscardOutcome { pub parts_removed: usize, pub failures: Vec<String> }`; `fn remove_orphan_parts(cp: &Checkpoint) -> DiscardOutcome`.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add a new module in `src/checkpoint.rs`, before `mod merge_tests`:
 
@@ -344,12 +346,12 @@ mod sweep_tests {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --quiet sweep_tests`
 Expected: FAIL to compile — `cannot find type DiscardOutcome`, and `remove_orphan_parts` returns `usize` not a struct.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `src/checkpoint.rs`, replace `remove_orphan_parts` and add the struct above it:
 
@@ -398,12 +400,12 @@ Update the call site in `list_and_clean`, which currently reads `parts_removed +
             }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test --quiet && cargo clippy --all-targets -- -D warnings`
 Expected: all pass, clippy silent.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/checkpoint.rs
@@ -428,7 +430,7 @@ prints, and the resume panel will log."
   - `pub struct CheckpointOffer { pub kind: CheckpointKind, pub session: String, pub remaining: usize, pub total: usize, pub age: Option<Duration>, pub sample_paths: Vec<String> }`
   - `pub fn offers_for(session: &str) -> Vec<CheckpointOffer>`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `src/checkpoint.rs`, before `mod merge_tests`:
 
@@ -610,12 +612,12 @@ mod offer_tests {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --quiet offer_tests`
 Expected: FAIL to compile — `cannot find type CheckpointOffer`, `no method to_offer`, `cannot find function offers_for`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `src/checkpoint.rs`, add `SystemTime` to the imports:
 
@@ -716,7 +718,7 @@ pub fn offers_for(session: &str) -> Vec<CheckpointOffer> {
 
 `path_for` is currently private. Change its signature to `pub(crate) fn path_for` so the test module and `offers_for` can both reach it.
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test --quiet offer_tests`
 Expected: PASS (10 tests).
@@ -726,7 +728,7 @@ Then confirm the sanitization test is load-bearing — it is the one most likely
 Run: `cargo test --quiet sample_paths_are_sanitized`
 Expected: FAIL — `bidi override reached the panel`. Restore the sanitize call.
 
-- [ ] **Step 5: Full suite and commit**
+- [x] **Step 5: Full suite and commit**
 
 Run: `cargo test --quiet && cargo clippy --all-targets -- -D warnings`
 
@@ -753,7 +755,7 @@ never fail because of a checkpoint."
 - Consumes: `DiscardOutcome` and `remove_orphan_parts` (Task 3).
 - Produces: `pub fn discard(session: &str, kind: CheckpointKind) -> Result<DiscardOutcome>`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `mod sweep_tests` in `src/checkpoint.rs`:
 
@@ -791,12 +793,12 @@ Add to `mod sweep_tests` in `src/checkpoint.rs`:
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --quiet discarding`
 Expected: FAIL to compile — `cannot find function discard`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add to `src/checkpoint.rs`, after `offers_for`:
 
@@ -825,12 +827,12 @@ pub fn discard(session: &str, kind: CheckpointKind) -> Result<DiscardOutcome> {
 }
 ```
 
-- [ ] **Step 4: Run tests**
+- [x] **Step 4: Run tests**
 
 Run: `cargo test --quiet && cargo clippy --all-targets -- -D warnings`
 Expected: all pass, clippy silent.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/checkpoint.rs
@@ -869,7 +871,7 @@ gate and the commit are at the end of Part C.
   - `App::pending_offers: VecDeque<PostConnectOffer>`
   - `App::show_next_offer(&mut self)`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `tests` module in `src/tui/app/mod.rs`:
 
@@ -913,12 +915,12 @@ Add to the `tests` module in `src/tui/app/mod.rs`:
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --quiet offer_queue`
 Expected: FAIL to compile — `cannot find type PostConnectOffer`, `no field pending_offers`, `no variant OfferResumeCheckpoint`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 In `src/tui/state.rs`, add after the `PaneState` impl:
 
@@ -1017,7 +1019,7 @@ arms. Continue straight to Part B.
 - Consumes: `PostConnectOffer`, `show_next_offer` (Task 6); `discard` (Task 5); existing `App::resume_walk`.
 - Produces: `App::handle_offer_resume_checkpoint(&mut self, key: KeyEvent)`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `tests` module in `src/tui/app/mod.rs`:
 
@@ -1105,12 +1107,12 @@ Add to the `tests` module in `src/tui/app/mod.rs`:
     }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --quiet offer_ | grep -E "resuming_from|discarding_from|deferring"`
 Expected: FAIL to compile — `no method handle_offer_resume_checkpoint`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add to `impl App` in `src/tui/app/handlers.rs`:
 
@@ -1234,7 +1236,7 @@ arms arrive in Part C. Continue.
 
 There is no terminal harness in this repo, so this task's gate is a compiling, clippy-clean build plus the manual check at the end of the plan. The one piece of pure logic — age formatting — is unit-tested.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create the module in `src/tui/views.rs` after `pub mod offer_save_session`, containing **only** `human_age` and its tests for now — `render` arrives in Step 3:
 
@@ -1295,12 +1297,12 @@ mod age_tests {
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test --quiet age_tests`
 Expected: FAIL to compile — `cannot find function human_age`.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Add `render` to the `offer_resume_checkpoint` module created in Step 1, above `mod age_tests`:
 
@@ -1451,7 +1453,7 @@ In `handle_key`, next to the `Screen::OfferSaveSession` arm:
             Screen::OfferResumeCheckpoint => self.handle_offer_resume_checkpoint(key),
 ```
 
-- [ ] **Step 4: Run the whole task's tests**
+- [x] **Step 4: Run the whole task's tests**
 
 This is the first point since Part A at which the crate compiles.
 
@@ -1462,7 +1464,7 @@ If any of the queue or handler tests compiled straight to green, re-break the
 implementation to confirm they catch it: make `show_next_offer` always return
 `Screen::Main` and check the queue test fails; restore it.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/tui/state.rs src/tui/app/mod.rs src/tui/app/handlers.rs src/tui/app/events.rs src/tui/views.rs src/tui/widgets.rs
@@ -1494,7 +1496,7 @@ match arms, the handler, and the view had to land together."
 
 **Interfaces:** none.
 
-- [ ] **Step 1: Document the panel**
+- [x] **Step 1: Document the panel**
 
 In the walk-checkpointing bullet (around line 60), after the sentence ending "…re-queue only the jobs that didn't complete", add:
 
@@ -1508,7 +1510,7 @@ In the walk-checkpointing bullet (around line 60), after the sentence ending "�
 
 Remove the now-duplicated "Use `blink checkpoints` to inspect…" sentence from the original bullet.
 
-- [ ] **Step 2: Note the name-keying consequence**
+- [x] **Step 2: Note the name-keying consequence**
 
 In the same section, add:
 
@@ -1520,7 +1522,7 @@ In the same section, add:
   possibility.
 ```
 
-- [ ] **Step 3: Fix the stale source-tree reference**
+- [x] **Step 3: Fix the stale source-tree reference**
 
 Line 499 reads:
 
@@ -1534,12 +1536,12 @@ Line 499 reads:
         ├── checkpoint_glue.rs  dispatch_plan / resume_walk / settle_checkpoint
 ```
 
-- [ ] **Step 4: Verify**
+- [x] **Step 4: Verify**
 
 Run: `grep -n "discard_active_checkpoint" README.md`
 Expected: no matches.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add README.md

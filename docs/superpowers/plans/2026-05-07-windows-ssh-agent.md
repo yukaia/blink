@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Implemented; all coded steps verified against the tree on 2026-08-19 (`cargo check` and `cargo check --target x86_64-pc-windows-gnu` both clean). The Windows-only Manual Verification Checklist at the end is unticked because it needs a Windows machine.
+
 **Goal:** Replace the Windows ssh-agent stub in `src/transport/sftp.rs` with working support for the Windows OpenSSH named pipe and Pageant, matching the auth UX on Unix.
 
 **Architecture:** Two `#[cfg]` blocks replace the current `#[cfg(target_os = "windows")]` stub and `#[cfg(not(target_os = "windows"))]` Unix block. The Windows block tries `\\.\pipe\openssh-ssh-agent` first; on failure falls back to Pageant. Both sides call `.dynamic()` to unify types before the shared identity loop. No new files, no new dependencies.
@@ -81,7 +83,7 @@ AuthMethod::Agent => {
 }
 ```
 
-- [ ] **Step 1: Replace the `AuthMethod::Agent` arm**
+- [x] **Step 1: Replace the `AuthMethod::Agent` arm**
 
 Replace lines 232–282 with the following. The Unix block is logically identical — only the cfg annotation changes from `#[cfg(not(target_os = "windows"))]` to `#[cfg(unix)]`. The Windows block is new.
 
@@ -182,7 +184,7 @@ Replace lines 232–282 with the following. The Unix block is logically identica
             }
 ```
 
-- [ ] **Step 2: Verify the Linux build is clean**
+- [x] **Step 2: Verify the Linux build is clean**
 
 ```bash
 cargo check 2>&1
@@ -190,7 +192,7 @@ cargo check 2>&1
 
 Expected: no errors, no warnings about the changed code. The `#[cfg(windows)]` block is dead code on Linux and will not be compiled — that's correct.
 
-- [ ] **Step 3: Cross-compile check for Windows (if target is installed)**
+- [x] **Step 3: Cross-compile check for Windows (if target is installed)**
 
 ```bash
 cargo check --target x86_64-pc-windows-gnu 2>&1
@@ -204,7 +206,7 @@ rustup target add x86_64-pc-windows-gnu
 
 Expected once target is present: no errors.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add src/transport/sftp.rs
@@ -219,7 +221,7 @@ git commit -m "feat: add Windows ssh-agent support (OpenSSH pipe + Pageant fallb
 - Modify: `README.md` lines 19–20 (feature bullet)
 - Modify: `README.md` lines 489–493 (Honest Caveats paragraph)
 
-- [ ] **Step 1: Update the connectivity feature bullet (lines 19–20)**
+- [x] **Step 1: Update the connectivity feature bullet (lines 19–20)**
 
 Current text:
 ```
@@ -234,7 +236,7 @@ Replace with:
   falling back to Pageant
 ```
 
-- [ ] **Step 2: Remove the Windows ssh-agent caveat (lines 489–493)**
+- [x] **Step 2: Remove the Windows ssh-agent caveat (lines 489–493)**
 
 Current text to remove:
 ```
@@ -247,7 +249,7 @@ Current text to remove:
 
 Delete those five lines entirely. The surrounding caveats (TLS cert validation above, passwords-in-memory below) remain unchanged.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add README.md
