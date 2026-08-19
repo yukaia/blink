@@ -798,11 +798,98 @@ fn remove_orphan_parts(cp: &Checkpoint) -> DiscardOutcome {
     outcome
 }
 
+/// Why a checkpoint file is being removed.
+///
+/// This is what the user sees in the report, so where two reasons both
+/// apply the precedence is pinned by tests rather than left to the order of
+/// an `if`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoveReason {
+    Forced,
+    Completed,
+    Orphaned,
+}
+
+impl RemoveReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Forced => "forced",
+            Self::Completed => "completed",
+            Self::Orphaned => "orphaned",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    Remove(RemoveReason),
+    Keep { orphaned: bool },
+}
+
+/// Decide what happens to one checkpoint.
+///
+/// Split out from the directory walk and the printing so the rule can be
+/// tested at all: removing a checkpoint strands the `.part` files of its
+/// unfinished downloads, because nothing else records where they are. A
+/// wrong answer here destroys transfers the user could have resumed.
+fn disposition(pending: usize, orphaned: bool, clean: bool, force: bool) -> Disposition {
+    if force {
+        return Disposition::Remove(RemoveReason::Forced);
+    }
+    if clean && pending == 0 {
+        return Disposition::Remove(RemoveReason::Completed);
+    }
+    if clean && orphaned {
+        return Disposition::Remove(RemoveReason::Orphaned);
+    }
+    Disposition::Keep { orphaned }
+}
+
+/// The saved-session names, plus whether that list is the whole story.
+struct KnownSessions {
+    names: std::collections::HashSet<String>,
+    /// True only when every session on disk was read successfully. When
+    /// false, a name missing from `names` no longer proves the session is
+    /// gone, so orphanhood cannot be judged.
+    complete: bool,
+    /// Why the list is incomplete, phrased for a warning. `None` when it is
+    /// complete.
+    why: Option<String>,
+}
+
+/// Build the known-session set, recording whether it can be trusted.
+///
+/// This used to be `list_all().unwrap_or_default()`, which turned "I could
+/// not read your sessions" into "you have no sessions": every checkpoint
+/// then looked orphaned and `--clean` quietly did the job of `--force`. A
+/// single unparseable `.ini` did the same to one session, deleting the
+/// resume data of a session still sitting in the sessions directory.
+fn known_sessions(listing: Result<crate::session::SessionListing>) -> KnownSessions {
+    match listing {
+        Ok(listing) => {
+            let why = (!listing.skipped.is_empty()).then(|| {
+                let n = listing.skipped.len();
+                let files = if n == 1 { "file" } else { "files" };
+                format!("{n} session {files} could not be read")
+            });
+            KnownSessions {
+                names: listing.sessions.into_iter().map(|s| s.name).collect(),
+                complete: why.is_none(),
+                why,
+            }
+        }
+        Err(e) => KnownSessions {
+            names: std::collections::HashSet::new(),
+            complete: false,
+            why: Some(format!("the session list could not be read ({e})")),
+        },
+    }
+}
+
 /// Print checkpoint info. Pass `clean` to remove completed/orphaned files,
 /// `force` to remove every file unconditionally.
 pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
     use crate::session::Session;
-    use std::collections::HashSet;
     use std::fs;
 
     let dir = paths::checkpoints_dir()?;
@@ -819,11 +906,15 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
         return Ok(());
     }
 
-    let known_sessions: HashSet<String> = Session::list_all()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|s| s.name)
-        .collect();
+    let known = known_sessions(Session::list_all_detailed());
+    if let Some(why) = &known.why
+        && !force
+    {
+        eprintln!(
+            "warning: {why}, so orphaned checkpoints cannot be identified — \
+             any listed below are kept rather than removed"
+        );
+    }
 
     let mut removed = 0usize;
     let mut kept = 0usize;
@@ -842,55 +933,51 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
         let pending = cp.pending_count();
         let done = cp.done_count();
         let total = pending + done;
-        let orphaned = !known_sessions.contains(&cp.session);
+        // A name missing from a list we know to be partial proves nothing,
+        // so orphanhood is only claimed when the list is complete.
+        let orphaned = known.complete && !known.names.contains(&cp.session);
 
-        let should_remove = force || (clean && (pending == 0 || orphaned));
-
-        if should_remove {
-            // Removing the checkpoint makes the batch unresumable, which
-            // strands the `.part` files its unfinished downloads left
-            // behind — nothing else records where they are. Sweep them
-            // while we still know.
-            let swept = remove_orphan_parts(&cp);
-            parts_removed += swept.parts_removed;
-            for failure in swept.failures {
-                eprintln!("warning: {failure}");
-            }
-            match fs::remove_file(path) {
-                Ok(()) => {
-                    let reason = if force {
-                        "forced"
-                    } else if pending == 0 {
-                        "completed"
-                    } else {
-                        "orphaned"
-                    };
-                    println!(
-                        "removed  {:<20}  {:<8}  {}/{} done  ({})",
-                        crate::error::sanitize_display(&cp.session),
-                        cp.kind.as_str(),
-                        done,
-                        total,
-                        reason,
-                    );
-                    removed += 1;
+        match disposition(pending, orphaned, clean, force) {
+            Disposition::Remove(reason) => {
+                // Removing the checkpoint makes the batch unresumable, which
+                // strands the `.part` files its unfinished downloads left
+                // behind — nothing else records where they are. Sweep them
+                // while we still know.
+                let swept = remove_orphan_parts(&cp);
+                parts_removed += swept.parts_removed;
+                for failure in swept.failures {
+                    eprintln!("warning: {failure}");
                 }
-                Err(e) => {
-                    eprintln!("error: could not remove {}: {e}", path.display());
+                match fs::remove_file(path) {
+                    Ok(()) => {
+                        println!(
+                            "removed  {:<20}  {:<8}  {}/{} done  ({})",
+                            crate::error::sanitize_display(&cp.session),
+                            cp.kind.as_str(),
+                            done,
+                            total,
+                            reason.as_str(),
+                        );
+                        removed += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("error: could not remove {}: {e}", path.display());
+                    }
                 }
             }
-        } else {
-            let flag = if orphaned { " [orphaned]" } else { "" };
-            println!(
-                "{:<20}  {:<8}  {}/{} done  ({} remaining){}",
-                crate::error::sanitize_display(&cp.session),
-                cp.kind.as_str(),
-                done,
-                total,
-                pending,
-                flag,
-            );
-            kept += 1;
+            Disposition::Keep { orphaned } => {
+                let flag = if orphaned { " [orphaned]" } else { "" };
+                println!(
+                    "{:<20}  {:<8}  {}/{} done  ({} remaining){}",
+                    crate::error::sanitize_display(&cp.session),
+                    cp.kind.as_str(),
+                    done,
+                    total,
+                    pending,
+                    flag,
+                );
+                kept += 1;
+            }
         }
     }
 
@@ -908,6 +995,111 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+    use crate::session::{Session, SessionListing};
+
+    fn session(name: &str) -> Session {
+        let mut s = Session::from_url("sftp://me@host").expect("valid url");
+        s.name = name.to_string();
+        s
+    }
+
+    // -- what `--clean` and `--force` actually remove -----------------------
+
+    #[test]
+    fn force_removes_a_checkpoint_that_still_has_work() {
+        assert_eq!(
+            disposition(3, false, false, true),
+            Disposition::Remove(RemoveReason::Forced),
+        );
+    }
+
+    #[test]
+    fn force_outranks_completed() {
+        assert_eq!(
+            disposition(0, false, true, true),
+            Disposition::Remove(RemoveReason::Forced),
+        );
+    }
+
+    #[test]
+    fn clean_removes_a_finished_checkpoint() {
+        assert_eq!(
+            disposition(0, false, true, false),
+            Disposition::Remove(RemoveReason::Completed),
+        );
+    }
+
+    #[test]
+    fn clean_removes_an_orphan_that_still_has_work() {
+        assert_eq!(
+            disposition(3, true, true, false),
+            Disposition::Remove(RemoveReason::Orphaned),
+        );
+    }
+
+    #[test]
+    fn a_finished_orphan_is_reported_as_completed() {
+        // Both rules apply; "completed" wins. Pinned because the reason is
+        // what the user sees, and either label would be defensible — so it
+        // should not change by accident.
+        assert_eq!(
+            disposition(0, true, true, false),
+            Disposition::Remove(RemoveReason::Completed),
+        );
+    }
+
+    #[test]
+    fn clean_keeps_a_live_checkpoint_with_work_left() {
+        assert_eq!(
+            disposition(3, false, true, false),
+            Disposition::Keep { orphaned: false },
+        );
+    }
+
+    #[test]
+    fn without_either_flag_nothing_is_removed() {
+        assert_eq!(
+            disposition(0, true, false, false),
+            Disposition::Keep { orphaned: true },
+            "a plain listing reports, it never deletes",
+        );
+    }
+
+    // -- when the session list cannot be trusted ----------------------------
+
+    #[test]
+    fn a_listing_that_failed_outright_is_not_complete() {
+        let known = known_sessions(Err(BlinkError::config("sessions dir unreadable")));
+        assert!(!known.complete);
+        assert!(known.names.is_empty());
+    }
+
+    #[test]
+    fn a_listing_with_skipped_files_is_not_complete() {
+        // One unparseable `.ini` is enough: that session exists but is
+        // invisible here, so every checkpoint would look orphaned.
+        let known = known_sessions(Ok(SessionListing {
+            sessions: vec![session("prod")],
+            skipped: vec!["broken.ini: bad protocol".to_string()],
+        }));
+        assert!(!known.complete);
+        assert!(known.names.contains("prod"), "what did parse is still usable");
+    }
+
+    #[test]
+    fn a_clean_listing_is_complete() {
+        let known = known_sessions(Ok(SessionListing {
+            sessions: vec![session("prod"), session("backup")],
+            skipped: Vec::new(),
+        }));
+        assert!(known.complete);
+        assert_eq!(known.names.len(), 2);
+    }
 }
 
 #[cfg(test)]
