@@ -1368,15 +1368,16 @@ mod tests {
     // where they are.
 
     /// An app whose checkpoints go under a name no real session will use,
-    /// plus a guard that removes them however the test ends.
-    fn checkpoint_app(tag: &str) -> (App, crate::checkpoint::test_support::CheckpointCleanup) {
+    /// plus the test home that keeps them out of every other test's way.
+    fn checkpoint_app(tag: &str) -> (App, crate::paths::TestHome) {
+        let home = crate::paths::test_home();
         let mut a = app();
         let name = format!("blink-test-{tag}-{}", std::process::id());
         let mut s = Session::from_url("sftp://me@host").unwrap();
         s.name = name.clone();
         a.current_session = Some(s);
         a.transfer_manager = Some(TransferManager::new(1).0);
-        (a, crate::checkpoint::test_support::CheckpointCleanup::new(name))
+        (a, home)
     }
 
     fn download(n: u32) -> crate::tui::plan::PlannedJob {
@@ -1444,7 +1445,7 @@ mod tests {
     /// plus the cleanup guard the caller must hold for the test's lifetime.
     fn app_with_queued_offer(
         tag: &str,
-    ) -> (App, crate::checkpoint::test_support::CheckpointCleanup) {
+    ) -> (App, crate::paths::TestHome) {
         let (mut a, cleanup) = checkpoint_app(tag);
         let name = a.current_session.as_ref().unwrap().name.clone();
         let mut cp = crate::checkpoint::Checkpoint::new(

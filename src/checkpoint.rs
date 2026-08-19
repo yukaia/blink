@@ -990,69 +990,6 @@ mod debounce_tests {
 }
 
 #[cfg(test)]
-pub(crate) mod test_support {
-    use super::{Checkpoint, CheckpointKind};
-
-    /// Removes a test session's checkpoints when it drops.
-    ///
-    /// Tests resolve through the user's real checkpoint directory — there is
-    /// no injection point on `paths::checkpoints_dir` — so cleanup on the
-    /// last line of a test leaves a file behind whenever that test panics,
-    /// which is precisely when it matters.
-    pub struct CheckpointCleanup(String);
-
-    impl CheckpointCleanup {
-        pub fn new(session: impl Into<String>) -> Self {
-            Self(session.into())
-        }
-    }
-
-    impl Drop for CheckpointCleanup {
-        fn drop(&mut self) {
-            for kind in [CheckpointKind::Download, CheckpointKind::Upload] {
-                let _ = Checkpoint::remove(&self.0, kind);
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod cleanup_tests {
-    use super::test_support::CheckpointCleanup;
-    use super::*;
-
-    #[test]
-    fn the_guard_removes_the_checkpoint_when_it_drops() {
-        let name = format!("blink-test-guard-{}", std::process::id());
-        let path = Checkpoint::path_for(&name, CheckpointKind::Download).unwrap();
-        {
-            let _guard = CheckpointCleanup::new(&name);
-            let mut cp = Checkpoint::new(&name, CheckpointKind::Download, Vec::new());
-            cp.flush().expect("write the checkpoint");
-            assert!(path.exists(), "fixture must have written something");
-        }
-        assert!(!path.exists(), "the guard must clean up on drop");
-    }
-
-    #[test]
-    fn the_guard_cleans_up_even_when_a_test_panics() {
-        let name = format!("blink-test-panic-{}", std::process::id());
-        let path = Checkpoint::path_for(&name, CheckpointKind::Download).unwrap();
-
-        let name_inner = name.clone();
-        let result = std::panic::catch_unwind(move || {
-            let _guard = CheckpointCleanup::new(&name_inner);
-            let mut cp = Checkpoint::new(&name_inner, CheckpointKind::Download, Vec::new());
-            cp.flush().expect("write the checkpoint");
-            panic!("as a failing test would");
-        });
-
-        assert!(result.is_err(), "the closure must have panicked");
-        assert!(!path.exists(), "unwinding must still run the guard");
-    }
-}
-
-#[cfg(test)]
 mod sweep_tests {
     use super::*;
     use std::path::PathBuf;
@@ -1132,7 +1069,7 @@ mod sweep_tests {
     fn discarding_removes_the_file_and_its_partials() {
         let dir = scratch("discard");
         let name = format!("blink-test-discard-{}", std::process::id());
-        let _cleanup = super::test_support::CheckpointCleanup::new(&name);
+        let _home = paths::test_home();
         let unfinished = job(&dir, "a.bin", JobStatus::Pending);
         let CheckpointJob::Download { local_path, .. } = &unfinished else { unreachable!() };
         std::fs::write(crate::transport::part_path(local_path), b"x").unwrap();
@@ -1193,9 +1130,9 @@ mod sweep_tests {
 
         let result = discard(&name, CheckpointKind::Download);
 
-        // Clean up the substituted directory immediately — `Checkpoint::remove`
-        // (and so `CheckpointCleanup`'s `Drop`) calls `remove_file`, which
-        // cannot remove a directory, so nothing else will.
+        // Clean up the substituted directory immediately: `Checkpoint::remove`
+        // calls `remove_file`, which cannot remove a directory, so the test
+        // home's own cleanup would leave it behind.
         let _ = std::fs::remove_dir_all(&path);
 
         let outcome =
@@ -1346,7 +1283,7 @@ mod offer_tests {
     #[test]
     fn a_pending_checkpoint_on_disk_produces_one_offer() {
         let name = format!("blink-test-offer-{}", std::process::id());
-        let _cleanup = test_support::CheckpointCleanup::new(&name);
+        let _home = paths::test_home();
         let mut cp = Checkpoint::new(
             &name,
             CheckpointKind::Download,
@@ -1365,7 +1302,7 @@ mod offer_tests {
     #[test]
     fn a_finished_checkpoint_produces_no_offer() {
         let name = format!("blink-test-done-{}", std::process::id());
-        let _cleanup = test_support::CheckpointCleanup::new(&name);
+        let _home = paths::test_home();
         let mut cp = Checkpoint::new(
             &name,
             CheckpointKind::Download,
@@ -1382,7 +1319,7 @@ mod offer_tests {
     #[test]
     fn both_directions_each_produce_an_offer() {
         let name = format!("blink-test-both-{}", std::process::id());
-        let _cleanup = test_support::CheckpointCleanup::new(&name);
+        let _home = paths::test_home();
         for kind in [CheckpointKind::Download, CheckpointKind::Upload] {
             let mut cp = Checkpoint::new(&name, kind, vec![dl(0, JobStatus::Pending)]);
             cp.flush().expect("write the checkpoint");
@@ -1632,7 +1569,7 @@ mod tests {
         // checkpoint file would collide with, and be resume-offered
         // alongside, a real user session named "session".
         let name = format!("blink-test-flush-{}", std::process::id());
-        let _cleanup = test_support::CheckpointCleanup::new(&name);
+        let _home = paths::test_home();
         let mut cp = Checkpoint::new(
             &name,
             CheckpointKind::Download,
