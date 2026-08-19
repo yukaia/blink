@@ -49,8 +49,105 @@ pub fn checkpoints_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
-#[cfg(target_os = "linux")]
+/// Root of the application's data directory.
+///
+/// Under test this never resolves to the user's real directory — see
+/// [`test_home`].
 fn base_dir() -> Result<PathBuf> {
+    #[cfg(test)]
+    {
+        Ok(test_home::current())
+    }
+    #[cfg(not(test))]
+    {
+        real_base_dir()
+    }
+}
+
+/// A private config home for one test, active until the guard drops.
+///
+/// Tests that write through `paths` need each other's writes kept apart:
+/// without this they share one directory and race, which is why the
+/// `discard` removal-failure property could not be tested before.
+#[cfg(test)]
+pub fn test_home() -> TestHome {
+    test_home::acquire()
+}
+
+#[cfg(test)]
+pub use test_home::TestHome;
+
+#[cfg(test)]
+mod test_home {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The config home for the current test.
+    ///
+    /// Thread-local because the test harness runs each `#[test]` on its own
+    /// thread, and every async test in this crate is `#[tokio::test]` with
+    /// the default current-thread flavor, so tasks it spawns stay on that
+    /// thread. A `#[tokio::test(flavor = "multi_thread")]` that touched
+    /// `paths` would see the shared home below instead of its own — read
+    /// this comment before adding one.
+    thread_local! {
+        static OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+    /// The home in force on this thread: a guard's private directory if one
+    /// is held, otherwise the shared per-process scratch directory.
+    ///
+    /// The shared fallback is what makes the real directory unreachable
+    /// rather than merely avoidable: a test written later that calls
+    /// `Session::save()` without thinking about isolation lands here, not in
+    /// the user's config.
+    pub fn current() -> PathBuf {
+        OVERRIDE
+            .with(|o| o.borrow().clone())
+            .unwrap_or_else(shared)
+    }
+
+    fn shared() -> PathBuf {
+        std::env::temp_dir().join(format!("blink-test-{}", std::process::id()))
+    }
+
+    pub struct TestHome {
+        dir: PathBuf,
+    }
+
+    impl TestHome {
+        pub fn path(&self) -> &Path {
+            &self.dir
+        }
+    }
+
+    pub fn acquire() -> TestHome {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join(format!("blink-test-{}-{n}", std::process::id()));
+        // A previous run with the same pid could have left this behind.
+        let _ = std::fs::remove_dir_all(&dir);
+        OVERRIDE.with(|o| *o.borrow_mut() = Some(dir.clone()));
+        TestHome { dir }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            // Clear the override *before* removing the tree: if the removal
+            // fails, a later call on this thread must not keep resolving to
+            // a directory we just tried to delete.
+            OVERRIDE.with(|o| *o.borrow_mut() = None);
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[cfg_attr(test, allow(dead_code))]
+fn real_base_dir() -> Result<PathBuf> {
     if let Ok(xdg) = env::var("XDG_CONFIG_HOME")
         && !xdg.is_empty() {
             let p = PathBuf::from(&xdg);
@@ -70,7 +167,8 @@ fn base_dir() -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "macos")]
-fn base_dir() -> Result<PathBuf> {
+#[cfg_attr(test, allow(dead_code))]
+fn real_base_dir() -> Result<PathBuf> {
     // macOS convention is `$HOME/Library/Application Support/<App>`. Honour
     // XDG_CONFIG_HOME if the user has explicitly set it (some cross-platform
     // Mac users prefer the XDG layout), otherwise fall back to the standard
@@ -98,7 +196,8 @@ fn base_dir() -> Result<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
-fn base_dir() -> Result<PathBuf> {
+#[cfg_attr(test, allow(dead_code))]
+fn real_base_dir() -> Result<PathBuf> {
     let user_profile = env::var("USERPROFILE")
         .map_err(|_| BlinkError::config("%USERPROFILE% is not set"))?;
     let profile_path = PathBuf::from(&user_profile);
@@ -109,7 +208,8 @@ fn base_dir() -> Result<PathBuf> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-fn base_dir() -> Result<PathBuf> {
+#[cfg_attr(test, allow(dead_code))]
+fn real_base_dir() -> Result<PathBuf> {
     if let Some(proj) = directories::ProjectDirs::from("", "", APP_DIR_NAME) {
         return Ok(proj.config_dir().to_path_buf());
     }
@@ -198,4 +298,80 @@ pub fn default_local_dir() -> PathBuf {
             PathBuf::from("/")
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_guard_redirects_away_from_the_shared_home() {
+        let shared = base_dir().expect("shared home");
+        assert_eq!(
+            shared,
+            std::env::temp_dir().join(format!("blink-test-{}", std::process::id())),
+            "without a guard, tests share one per-process scratch home",
+        );
+
+        let _home = test_home();
+        assert_ne!(base_dir().expect("private home"), shared);
+    }
+
+    #[test]
+    fn the_override_is_cleared_when_the_guard_drops() {
+        let shared = base_dir().expect("shared home");
+        {
+            let _home = test_home();
+        }
+        assert_eq!(
+            base_dir().expect("shared home again"),
+            shared,
+            "a dropped guard must not leave the thread pointing at a deleted directory",
+        );
+    }
+
+    #[test]
+    fn guards_on_different_threads_get_different_homes() {
+        let _home = test_home();
+        let mine = base_dir().expect("my home");
+        let theirs = std::thread::spawn(|| {
+            let _home = test_home();
+            base_dir().expect("their home")
+        })
+        .join()
+        .expect("the spawned thread must not panic");
+        assert_ne!(mine, theirs, "isolation is per-test, not per-process");
+    }
+
+    #[test]
+    fn a_guard_removes_its_tree_even_when_a_test_panics() {
+        // Drop-on-unwind is the whole reason this is a guard rather than a
+        // cleanup call at the end of a test: a test that fails is exactly
+        // when its directory would otherwise be left behind.
+        let payload = std::panic::catch_unwind(|| {
+            let home = test_home();
+            let sessions = sessions_dir().expect("sessions dir");
+            std::fs::write(sessions.join("t.ini"), b"x").expect("write a session file");
+            std::panic::panic_any(home.path().to_path_buf());
+        })
+        .expect_err("the closure must have panicked");
+
+        let dir = *payload
+            .downcast::<PathBuf>()
+            .expect("the panic payload carries the guard's directory");
+        assert!(!dir.exists(), "unwinding must still run the guard's Drop");
+    }
+
+    #[test]
+    fn a_file_written_under_a_guard_is_gone_when_the_guard_drops() {
+        let dir;
+        {
+            let home = test_home();
+            dir = home.path().to_path_buf();
+            let sessions = sessions_dir().expect("sessions dir");
+            std::fs::write(sessions.join("t.ini"), b"x").expect("write a session file");
+            assert!(sessions.join("t.ini").exists());
+        }
+        assert!(!dir.exists(), "the guard must remove its whole tree");
+    }
 }
