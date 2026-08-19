@@ -337,25 +337,37 @@ mod tests {
 
     #[test]
     fn guards_on_different_threads_get_different_homes() {
+        use std::sync::mpsc;
+
         let _home = test_home();
         let mine = base_dir().expect("my home");
-        let theirs = std::thread::spawn(|| {
+
+        let (acquired_tx, acquired_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let other = std::thread::spawn(move || {
             let _home = test_home();
-            base_dir().expect("their home")
-        })
-        .join()
-        .expect("the spawned thread must not panic");
-        assert_ne!(
-            mine, theirs,
-            "each thread's guard must resolve to its own directory",
-        );
+            acquired_tx
+                .send(base_dir().expect("their home"))
+                .expect("report this thread's home");
+            // Hold the guard open until the main thread has read its own.
+            release_rx.recv().expect("wait for the main thread");
+        });
+
+        let theirs = acquired_rx.recv().expect("the other thread must report its home");
+
+        // The load-bearing read: another thread's guard is alive right now.
+        // With a process-global override this returns `theirs`; only a
+        // thread-local one still answers `mine`.
         assert_eq!(
-            base_dir().expect("my home again"),
+            base_dir().expect("my home while theirs is live"),
             mine,
-            "the spawned thread acquiring and dropping its own guard must not \
-             disturb this thread's override; a process-global override \
-             (instead of a thread-local one) would fail this assertion",
+            "a live guard on another thread must not change this thread's home",
         );
+        assert_ne!(mine, theirs, "each thread's guard gets its own directory");
+
+        release_tx.send(()).expect("release the other thread");
+        other.join().expect("the spawned thread must not panic");
     }
 
     #[test]
