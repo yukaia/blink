@@ -17,8 +17,10 @@
 - The thread-local override is sound only because each `#[test]` gets its own thread and every async test is `#[tokio::test]` with the default current-thread flavor. Do not add a `#[tokio::test(flavor = "multi_thread")]` that touches `paths`.
 - The acceptance check for Tasks 1 and 2 is that `XDG_CONFIG_HOME=<empty dir> cargo test` leaves that directory completely empty.
 - No existing test may regress. Expected totals, which the tasks assert: 366 at
-  baseline, 371 after Task 1, 369 after Task 2 (it deletes the two `cleanup_tests`
-  tests along with the guard they cover), 370 after Task 3.
+  baseline, 372 after Task 1, 370 after Task 2 (it deletes the two `cleanup_tests`
+  tests along with the guard they cover), 371 after Task 3.
+- This crate is a binary with no `[lib]` target, so `cargo test --lib` selects
+  nothing. Use `cargo test <filter>`.
 
 ---
 
@@ -130,7 +132,7 @@ mod tests {
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test --lib paths::tests 2>&1 | tail -20`
+Run: `cargo test paths::tests 2>&1 | tail -20`
 
 Expected: compile failure — `cannot find function 'test_home' in this scope`.
 
@@ -259,7 +261,7 @@ mod test_home {
 
 - [ ] **Step 5: Run the new tests**
 
-Run: `cargo test --lib paths::tests 2>&1 | tail -20`
+Run: `cargo test paths::tests 2>&1 | tail -20`
 
 Expected: PASS, 5 tests.
 
@@ -267,7 +269,7 @@ Expected: PASS, 5 tests.
 
 Run: `cargo test 2>&1 | tail -5`
 
-Expected: 371 passed (366 existing + 5 new), 0 failed.
+Expected: 372 passed (366 existing + 6 new), 0 failed.
 
 - [ ] **Step 7: Run the acceptance check**
 
@@ -378,7 +380,7 @@ Its body already binds the guard as `cleanup` from `checkpoint_app` and returns 
 
 Run: `cargo test 2>&1 | tail -5`
 
-Expected: **369** passed, 0 failed. The count *falls* by two: `cleanup_tests`
+Expected: **370** passed, 0 failed. The count *falls* by two: `cleanup_tests`
 held two tests of the guard being deleted, and `TestHome`'s equivalent properties
 are already covered by Task 1's `a_file_written_under_a_guard_is_gone_when_the_guard_drops`
 and `a_guard_removes_its_tree_even_when_a_test_panics`. Do not add tests to reach a
@@ -483,7 +485,7 @@ Add to the `sweep_tests` module in `src/checkpoint.rs`, after `a_removal_failure
 
 - [ ] **Step 2: Run it to verify it passes, then prove it is load-bearing**
 
-Run: `cargo test --lib a_removal_failure_keeps 2>&1 | tail -10`
+Run: `cargo test a_removal_failure_keeps 2>&1 | tail -10`
 
 Expected: PASS. This is a characterization test of behaviour that is already correct, so it cannot fail first. Prove it guards something by temporarily breaking the production code: in `discard` (`src/checkpoint.rs:691`), replace
 
@@ -525,7 +527,7 @@ Keep the first paragraph ("The property this guards: …") as it is.
 
 Run: `cargo test 2>&1 | tail -5`
 
-Expected: 370 passed, 0 failed.
+Expected: 371 passed, 0 failed.
 
 - [ ] **Step 5: Commit**
 
