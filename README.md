@@ -359,12 +359,13 @@ confirm_quit = true
 image_preview = auto        ; auto | kitty | sixel | iterm2 | none
 ```
 
-An out-of-range `parallel_downloads` (`0`, or above the maximum) is not
-rejected — it's clamped into range instead, so a hand-edited or stale
-config file doesn't stop blink from starting. `config.ini` only logs a
-warning for `0`; the per-session override below (`[transfer]
-parallel_downloads`) logs a warning for any clamp, including one above the
-maximum.
+An out-of-range `parallel_downloads` — `0`, or anything above the maximum —
+is clamped into range rather than rejected, in `config.ini` and in the
+per-session `[transfer]` override alike, so a hand-edited or stale file
+never stops blink from starting. A value that is not a number at all has no
+sensible correction, and the two files differ deliberately: `config.ini`
+rejects it outright, while a session file ignores the override and falls
+back to the global setting rather than locking you out of that host.
 
 ### `sessions/<name>.ini` — per session
 

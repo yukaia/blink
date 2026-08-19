@@ -467,10 +467,14 @@ impl Session {
         let parallel_downloads = ini
             .section(Some("transfer"))
             .and_then(|s| s.get("parallel_downloads"))
-            .and_then(|v| v.trim().parse::<u8>().ok())
+            // Parsed wider than the field it lands in: as a `u8`, anything
+            // above 255 failed to parse and `.ok()` dropped it, so the
+            // override silently did not apply and the global default was
+            // used instead. Any integer now clamps into range.
+            .and_then(|v| v.trim().parse::<u32>().ok())
             .map(|n| {
-                let clamped = n.clamp(1, config::MAX_PARALLEL);
-                if clamped != n {
+                let clamped = n.clamp(1, u32::from(config::MAX_PARALLEL)) as u8;
+                if u32::from(clamped) != n {
                     tracing::warn!(
                         path = %path.display(),
                         requested = n,
@@ -1084,6 +1088,41 @@ mod tests {
         let loaded = Session::load_from(&path);
         let _ = std::fs::remove_dir_all(&dir);
         loaded
+    }
+
+    /// A minimal session file carrying one `[transfer] parallel_downloads`
+    /// value, loaded back.
+    fn parallel_from(tag: &str, value: &str) -> Option<u8> {
+        let body = format!(
+            "[session]\nname = t\nprotocol = sftp\nhost = h\nusername = u\n\
+             \n[transfer]\nparallel_downloads = {value}\n"
+        );
+        load_written(tag, &body)
+            .expect("the session itself is valid")
+            .parallel_downloads
+    }
+
+    #[test]
+    fn an_override_above_the_maximum_is_clamped_to_it() {
+        assert_eq!(parallel_from("high", "50"), Some(MAX_PARALLEL_FOR_TEST));
+    }
+
+    #[test]
+    fn an_override_too_large_for_a_byte_is_clamped_rather_than_dropped() {
+        // A `u8` parse failed here and `.ok()` swallowed it, so the override
+        // silently did not apply and the global default was used instead —
+        // with nothing to distinguish that from never setting it.
+        assert_eq!(parallel_from("huge", "300"), Some(MAX_PARALLEL_FOR_TEST));
+    }
+
+    #[test]
+    fn a_zero_override_is_clamped_up_to_one() {
+        assert_eq!(parallel_from("zero", "0"), Some(1));
+    }
+
+    #[test]
+    fn an_override_that_is_not_a_number_leaves_the_global_setting_in_place() {
+        assert_eq!(parallel_from("word", "banana"), None);
     }
 
     const MINIMAL: &str = "[session]\nname = t\nprotocol = sftp\nhost = h\nusername = u\n";

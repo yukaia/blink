@@ -100,18 +100,25 @@ impl Config {
                 cfg.general.theme = name.to_string();
             }
             if let Some(v) = s.get("parallel_downloads") {
-                let n: u8 = v.trim().parse().map_err(|_| {
+                // Parsed wider than the field it lands in: as a `u8`, a
+                // value above 255 failed to parse and took the whole config
+                // with it, while 11..=255 clamped quietly — an accidental
+                // cliff at a number nothing else in blink cares about. Any
+                // integer now clamps; only a non-number is an error.
+                let n: u32 = v.trim().parse().map_err(|_| {
                     BlinkError::config(format!(
                         "parallel_downloads must be an integer between 1 and {MAX_PARALLEL}: {v}"
                     ))
                 })?;
-                if n == 0 {
+                let clamped = n.clamp(1, u32::from(MAX_PARALLEL)) as u8;
+                if u32::from(clamped) != n {
                     tracing::warn!(
-                        "config: parallel_downloads = 0 is out of range; \
-                         clamped to 1"
+                        requested = n,
+                        used = clamped,
+                        "config: parallel_downloads is out of range; clamped"
                     );
                 }
-                cfg.general.parallel_downloads = n.clamp(1, MAX_PARALLEL);
+                cfg.general.parallel_downloads = clamped;
             }
             if let Some(v) = s.get("confirm_quit") {
                 cfg.general.confirm_quit = parse_bool(v)?;
@@ -247,6 +254,50 @@ fn parse_bool(s: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- parallel_downloads clamping ---------------------------------------
+    //
+    // The cap exists because each parallel download holds its own
+    // connection. An out-of-range value in a hand-edited or stale file is
+    // corrected rather than rejected, so a bad number never stops blink
+    // from starting.
+
+    fn parallel_from(tag: &str, value: &str) -> Result<u8> {
+        let dir = std::env::temp_dir()
+            .join(format!("blink-cfg-clamp-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.ini");
+        std::fs::write(&path, format!("[general]\nparallel_downloads = {value}\n"))
+            .unwrap();
+        let loaded = Config::load_from(&path).map(|c| c.general.parallel_downloads);
+        let _ = std::fs::remove_dir_all(&dir);
+        loaded
+    }
+
+    #[test]
+    fn a_value_above_the_maximum_is_clamped_to_it() {
+        assert_eq!(parallel_from("high", "50").expect("must load"), MAX_PARALLEL);
+    }
+
+    #[test]
+    fn a_value_too_large_for_a_byte_is_clamped_rather_than_rejected() {
+        // 300 used to fail the `u8` parse and take the whole config down
+        // with it, even though the README promises an out-of-range value is
+        // clamped so a stale file cannot stop blink from starting.
+        assert_eq!(parallel_from("huge", "300").expect("must load"), MAX_PARALLEL);
+    }
+
+    #[test]
+    fn zero_is_clamped_up_to_one() {
+        assert_eq!(parallel_from("zero", "0").expect("must load"), 1);
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_number_is_still_rejected() {
+        // Out of range has an obvious correction; a typo does not.
+        let err = parallel_from("word", "banana").expect_err("not a number");
+        assert!(err.to_string().contains("parallel_downloads"), "{err}");
+    }
 
     // -- bounded reads -----------------------------------------------------
     //
