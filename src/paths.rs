@@ -120,29 +120,56 @@ mod test_home {
             .unwrap_or_else(shared)
     }
 
+    /// Create `dir`, refusing to adopt anything already at that path.
+    ///
+    /// [`super::create_app_dir`] deliberately tolerates `AlreadyExists`,
+    /// which is right for `~/.config/blink`: only the user can write its
+    /// parent, so anything already there is the user's own. Here the parent
+    /// is world-writable `temp_dir()`, where that same tolerance is exactly
+    /// what would let a local attacker leave a symlink behind and have every
+    /// unguarded test write through it into the victim's real config.
+    ///
+    /// `mkdir(2)` is atomic and fails on anything already at the path,
+    /// symlinks included. That is what makes the sweep in [`claim_dir`] safe
+    /// rather than merely likely to work: an attacker who replants in the
+    /// window between the two calls loses the path instead of winning it.
+    pub fn create_exclusive(dir: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).create(dir)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::create_dir(dir)
+        }
+    }
+
+    /// Clear `dir` of whatever is there and claim it as ours.
+    ///
+    /// The sweep handles the ordinary case — a previous run with the same
+    /// pid, or an attacker's pre-planted link. `remove_dir_all` on a symlink
+    /// removes the link itself and leaves its target alone, so sweeping
+    /// cannot be turned into a deletion primitive. The exclusive create then
+    /// refuses the path outright if anything reappears.
+    pub fn claim_dir(dir: &Path) -> std::io::Result<()> {
+        let _ = std::fs::remove_dir_all(dir);
+        create_exclusive(dir)
+    }
+
     fn shared() -> PathBuf {
-        // `temp_dir()` is world-writable. If we merely returned a path here
-        // and let `create_app_dir`'s idempotent `AlreadyExists` handling
-        // paper over whatever is already there, a local attacker who
-        // pre-creates `blink-test-<pid>` as a symlink to the victim's real
-        // config directory would get every unguarded test writing straight
-        // through it — silently defeating this whole module's guarantee.
-        // So, once per process, sweep whatever is there (removing a planted
-        // symlink itself, not its target) before creating our own directory
-        // in its place. Do not delete this sweep as redundant with
-        // `create_app_dir`'s `AlreadyExists` tolerance: that tolerance is
-        // what makes the attack possible without it.
         static SHARED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         SHARED
             .get_or_init(|| {
                 let dir = std::env::temp_dir()
                     .join(format!("blink-test-{}", std::process::id()));
-                let _ = std::fs::remove_dir_all(&dir);
-                super::create_app_dir(&dir)
-                    .unwrap_or_else(|e| panic!(
-                        "failed to create the shared test config home at {}: {e}",
+                claim_dir(&dir).unwrap_or_else(|e| {
+                    panic!(
+                        "refusing to run: cannot claim a private config home at {} — \
+                         something else holds that path: {e}",
                         dir.display(),
-                    ));
+                    )
+                });
                 dir
             })
             .clone()
@@ -176,8 +203,18 @@ mod test_home {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir()
             .join(format!("blink-test-{}-{n}", std::process::id()));
-        // A previous run with the same pid could have left this behind.
-        let _ = std::fs::remove_dir_all(&dir);
+        // Claim the directory eagerly. Leaving it to the first `root_dir()`
+        // call would mean `create_app_dir` creating it, and its
+        // `AlreadyExists` tolerance would adopt anything planted in the
+        // meantime — a wider window than the shared home's, since the gap
+        // spans everything the test does before its first path resolution.
+        claim_dir(&dir).unwrap_or_else(|e| {
+            panic!(
+                "refusing to run this test: cannot claim a private config home \
+                 at {} — something else holds that path: {e}",
+                dir.display(),
+            )
+        });
         let previous = OVERRIDE.with(|o| o.borrow_mut().replace(dir.clone()));
         TestHome {
             dir,
@@ -450,6 +487,72 @@ mod tests {
             .downcast::<PathBuf>()
             .expect("the panic payload carries the guard's directory");
         assert!(!dir.exists(), "unwinding must still run the guard's Drop");
+    }
+
+    /// Plants a symlink at `<base>/planted` pointing at a populated
+    /// `<base>/victim`, standing in for an attacker who got there first.
+    #[cfg(unix)]
+    fn plant_symlink(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir()
+            .join(format!("blink-claim-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("scratch base");
+
+        let victim = base.join("victim");
+        std::fs::create_dir(&victim).expect("victim dir");
+        std::fs::write(victim.join("secret"), b"x").expect("victim file");
+
+        let planted = base.join("planted");
+        symlink(&victim, &planted).expect("plant the symlink");
+
+        (base, victim, planted)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_occupied_path_is_refused_rather_than_adopted() {
+        // This is what closes the race: even if an attacker replants between
+        // the sweep and the creation, `mkdir` refuses the path outright
+        // instead of writing through whatever is there.
+        let (base, victim, planted) = plant_symlink("refuse");
+
+        let err = test_home::create_exclusive(&planted)
+            .expect_err("an occupied path must be refused, never adopted");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(
+            victim.join("secret").exists(),
+            "refusing must not disturb whatever the link pointed at",
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn claiming_a_path_removes_a_planted_symlink_without_following_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (base, victim, planted) = plant_symlink("claim");
+
+        test_home::claim_dir(&planted).expect("the sweep must clear the way");
+
+        let meta = std::fs::symlink_metadata(&planted).expect("claimed path");
+        assert!(meta.file_type().is_dir(), "the claimed path is a real directory");
+        assert!(!meta.file_type().is_symlink(), "and no longer the planted link");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o700,
+            "a config home must not be readable by other users",
+        );
+        assert!(
+            victim.join("secret").exists(),
+            "only the link is removed, never its target",
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
