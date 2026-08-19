@@ -299,7 +299,7 @@ directory cannot be reached even by a test that never considered it."
 ## Task 2: Retire `CheckpointCleanup`
 
 **Files:**
-- Modify: `src/checkpoint.rs` — delete `test_support` (lines 991–1017) and `cleanup_tests` (lines 1019–1053); convert 5 call sites; rewrite one comment. All line numbers here are as of the start of this task; Step 2's deletion shifts everything below it, which is why Step 3 locates its target by name.
+- Modify: `src/checkpoint.rs` — delete `test_support` (lines 992–1017) and `cleanup_tests` (lines 1019–1053); convert 5 call sites; rewrite one comment. All line numbers here are as of the start of this task; Step 2's deletion shifts everything below it, which is why Step 3 locates its target by name.
 - Modify: `src/tui/app/mod.rs:1372` and `:1445` — the guard type returned by two helpers
 
 **Interfaces:**
@@ -327,7 +327,7 @@ let _home = paths::test_home();
 
 - [ ] **Step 2: Delete the guard and its tests**
 
-Delete the whole `#[cfg(test)] pub(crate) mod test_support { ... }` block (lines 991–1017) and the whole `#[cfg(test)] mod cleanup_tests { ... }` block that follows it (lines 1019–1053). The two `CheckpointCleanup::new` uses inside `cleanup_tests` go with it — they are the guard testing itself.
+Delete the whole `#[cfg(test)] pub(crate) mod test_support { ... }` block (lines 992–1017) and the whole `#[cfg(test)] mod cleanup_tests { ... }` block that follows it (lines 1019–1053). The two `CheckpointCleanup::new` uses inside `cleanup_tests` go with it — they are the guard testing itself.
 
 - [ ] **Step 3: Rewrite the stale comment**
 
