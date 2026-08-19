@@ -52,7 +52,12 @@ pub fn checkpoints_dir() -> Result<PathBuf> {
 /// Root of the application's data directory.
 ///
 /// Under test this never resolves to the user's real directory — see
-/// [`test_home`].
+/// [`test_home`]. That guarantee rests on `cfg(test)` being set for every
+/// test that runs, which holds only because this crate has no `[lib]`
+/// target and every test lives inline behind `#[cfg(test)] mod tests`; a
+/// `[lib]` target plus a `tests/` integration-test directory would compile
+/// this crate as a normal (non-`cfg(test)`) dependency and reach
+/// `real_base_dir` instead.
 fn base_dir() -> Result<PathBuf> {
     #[cfg(test)]
     {
@@ -69,13 +74,18 @@ fn base_dir() -> Result<PathBuf> {
 /// Tests that write through `paths` need each other's writes kept apart:
 /// without this they share one directory and race, which is why the
 /// `discard` removal-failure property could not be tested before.
+///
+/// Prefer parameter injection (`load_from(&Path)`, as in `config.rs`,
+/// `session.rs`, and `theme.rs`) when the code under test accepts a path
+/// directly; reach for `test_home()` only when the call goes through
+/// `paths` and so has no path parameter to inject into.
 #[cfg(test)]
-pub fn test_home() -> TestHome {
+pub(crate) fn test_home() -> TestHome {
     test_home::acquire()
 }
 
 #[cfg(test)]
-pub use test_home::TestHome;
+pub(crate) use test_home::TestHome;
 
 #[cfg(test)]
 mod test_home {
@@ -111,7 +121,31 @@ mod test_home {
     }
 
     fn shared() -> PathBuf {
-        std::env::temp_dir().join(format!("blink-test-{}", std::process::id()))
+        // `temp_dir()` is world-writable. If we merely returned a path here
+        // and let `create_app_dir`'s idempotent `AlreadyExists` handling
+        // paper over whatever is already there, a local attacker who
+        // pre-creates `blink-test-<pid>` as a symlink to the victim's real
+        // config directory would get every unguarded test writing straight
+        // through it — silently defeating this whole module's guarantee.
+        // So, once per process, sweep whatever is there (removing a planted
+        // symlink itself, not its target) before creating our own directory
+        // in its place. Do not delete this sweep as redundant with
+        // `create_app_dir`'s `AlreadyExists` tolerance: that tolerance is
+        // what makes the attack possible without it.
+        static SHARED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        SHARED
+            .get_or_init(|| {
+                let dir = std::env::temp_dir()
+                    .join(format!("blink-test-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&dir);
+                super::create_app_dir(&dir)
+                    .unwrap_or_else(|e| panic!(
+                        "failed to create the shared test config home at {}: {e}",
+                        dir.display(),
+                    ));
+                dir
+            })
+            .clone()
     }
 
     pub struct TestHome {
@@ -121,6 +155,15 @@ mod test_home {
         // override to `None` unconditionally, silently demoting a
         // still-alive outer guard to the shared per-process directory.
         previous: Option<PathBuf>,
+        // Makes `TestHome` `!Send`. The override it manipulates is
+        // thread-local, so a guard dropped on a thread other than the one
+        // that acquired it would restore *that* thread's override, not its
+        // own — silently demoting the acquiring thread to the shared
+        // per-process directory while its own override still points at a
+        // tree `drop` just deleted. That's the same failure the nested-guard
+        // fix above closes, reachable a different way, so it is made a
+        // compile error instead of a runtime one.
+        _not_send: std::marker::PhantomData<*const ()>,
     }
 
     impl TestHome {
@@ -136,7 +179,11 @@ mod test_home {
         // A previous run with the same pid could have left this behind.
         let _ = std::fs::remove_dir_all(&dir);
         let previous = OVERRIDE.with(|o| o.borrow_mut().replace(dir.clone()));
-        TestHome { dir, previous }
+        TestHome {
+            dir,
+            previous,
+            _not_send: std::marker::PhantomData,
+        }
     }
 
     impl Drop for TestHome {

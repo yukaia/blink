@@ -1325,6 +1325,7 @@ mod offer_tests {
 
     #[test]
     fn a_session_with_no_checkpoints_has_no_offers() {
+        let _home = paths::test_home();
         let name = format!("blink-test-none-{}", std::process::id());
         assert!(offers_for(&name).is_empty());
     }
@@ -1428,6 +1429,7 @@ mod offer_tests {
 
     #[test]
     fn an_unreadable_checkpoint_is_skipped_rather_than_propagated() {
+        let _home = paths::test_home();
         // Connecting must never fail because a checkpoint won't parse.
         let name = format!("blink-test-corrupt-{}", std::process::id());
         let path = Checkpoint::path_for(&name, CheckpointKind::Download).unwrap();

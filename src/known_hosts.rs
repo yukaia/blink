@@ -614,9 +614,11 @@ mod tests {
         );
     }
 
-    // Note: append() tests touch the real user's known_hosts file and are
-    // therefore environment-dependent. The validation paths are covered here
-    // without actually appending.
+    // Note: append() resolves paths::root_dir(), which under test redirects
+    // to the test home rather than the real user's known_hosts file — so
+    // end-to-end coverage of append() (writing an entry and reading it back)
+    // is possible now and simply hasn't been written yet. Only the
+    // validation paths are covered here for the moment.
 
     #[test]
     fn append_rejects_newline_in_host() {
@@ -644,9 +646,12 @@ mod tests {
 
     // -- remove_host ------------------------------------------------------
     //
-    // `remove_host` itself resolves the real user's known_hosts path, so the
-    // filtering logic is tested through `filter_out_host` — the same split
-    // `check` / `check_in_str` already uses.
+    // `remove_host` resolves paths::root_dir(), which under test redirects
+    // to the test home, not the real user's known_hosts path — so
+    // end-to-end coverage of remove_host() is possible now and simply
+    // hasn't been written yet. For the moment the filtering logic is tested
+    // through `filter_out_host` — the same split `check` / `check_in_str`
+    // already uses.
 
     #[test]
     fn remove_drops_the_canonical_entry() {
