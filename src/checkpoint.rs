@@ -1167,12 +1167,16 @@ mod sweep_tests {
             return;
         }
 
-        let outcome = discard(name, CheckpointKind::Download)
-            .expect("discard must return Ok, not propagate the removal failure");
+        let result = discard(name, CheckpointKind::Download);
 
-        // Restore before asserting: a failing assertion panics, and the test
-        // home cannot remove a tree it has no write permission on.
+        // Restore before anything can panic — `expect` below is itself a
+        // failure point, and the test home cannot remove a tree it has no
+        // write permission on. Getting this order wrong strands a 0500
+        // directory in /tmp on exactly the run where this test earns its keep.
         std::fs::set_permissions(&cp_dir, original).unwrap();
+
+        let outcome =
+            result.expect("discard must return Ok, not propagate the removal failure");
 
         assert_eq!(
             outcome.parts_removed, 1,
