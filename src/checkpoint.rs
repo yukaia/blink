@@ -1099,31 +1099,13 @@ mod sweep_tests {
         // the failure is folded into `outcome.failures` and `discard` still
         // returns `Ok`.
         //
-        // Getting only the final unlink to fail, with the load/sweep still
-        // succeeding, turns out not to be portably constructible here:
-        // replacing the checkpoint file with a directory (the suggested
-        // technique — `remove_file` refuses a directory) also makes the file
-        // unreadable, since reading a directory's bytes fails with the same
-        // `IsADirectory` error as removing it. So this exercises "unreadable
-        // *and* undeletable" rather than "reads fine, only the unlink
-        // fails" — `outcome.parts_removed` is 0 here because the load itself
-        // takes the unreadable-checkpoint branch, not because the fix
-        // dropped a nonzero count.
-        //
-        // The alternative that *would* isolate the two — making the parent
-        // directory briefly non-writable, or redirecting `checkpoints_dir`
-        // via an env var — touches state shared with every other checkpoint
-        // test in this binary, several of which flush to the real
-        // checkpoints dir with `.expect(...)` and run concurrently on
-        // process-unique names rather than serialized. Either would risk
-        // flaking the rest of the suite for the sake of this one assertion,
-        // so this test settles for exercising the exact changed line (the
-        // failed `Checkpoint::remove` recorded into `outcome.failures`
-        // instead of propagated) without also claiming a nonzero sweep
-        // count under a failed removal — that half of the property is
-        // covered structurally by `the_sweep_reports_what_it_removed`
-        // (sweep count) and `discarding_removes_the_file_and_its_partials`
-        // (both together on the success path) instead.
+        // This exercises "unreadable *and* undeletable": replacing the
+        // checkpoint file with a directory makes reading it fail with the
+        // same `IsADirectory` error as removing it, so `parts_removed` is 0
+        // here because the load took the unreadable branch, not because the
+        // fix dropped a count. The case where the load succeeds and only the
+        // unlink fails is
+        // `a_removal_failure_keeps_the_count_the_sweep_already_earned`.
         let _home = paths::test_home();
         let name = format!("blink-test-remove-fail-{}", std::process::id());
         let path = Checkpoint::path_for(&name, CheckpointKind::Download).unwrap();
@@ -1142,6 +1124,66 @@ mod sweep_tests {
             outcome.failures.len(), 1,
             "the failed unlink must be recorded rather than silently dropped",
         );
+    }
+
+    /// The other half of `a_removal_failure_is_recorded_rather_than_propagated`:
+    /// a checkpoint that reads fine, so the sweep runs and finds partials,
+    /// but cannot be unlinked. Before the fix the `?` on `Checkpoint::remove`
+    /// threw the whole `DiscardOutcome` away, losing a count of files that
+    /// had *already* been deleted — the caller could not report what it had
+    /// cleaned up. Only constructible with a test-private checkpoint
+    /// directory: it works by making that directory read-only.
+    #[cfg(unix)]
+    #[test]
+    fn a_removal_failure_keeps_the_count_the_sweep_already_earned() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _home = paths::test_home();
+        let dir = scratch("remove-fail-sweep");
+        let name = "remove-fail-sweep";
+
+        let unfinished = job(&dir, "a.bin", JobStatus::Pending);
+        let CheckpointJob::Download { local_path, .. } = &unfinished else {
+            unreachable!()
+        };
+        std::fs::write(crate::transport::part_path(local_path), b"x").unwrap();
+
+        let mut cp = Checkpoint::new(name, CheckpointKind::Download, vec![unfinished]);
+        cp.flush().expect("write the checkpoint");
+
+        let cp_dir = paths::checkpoints_dir().expect("checkpoints dir");
+        let original = std::fs::metadata(&cp_dir).unwrap().permissions();
+        std::fs::set_permissions(&cp_dir, std::fs::Permissions::from_mode(0o500))
+            .expect("make the checkpoint directory read-only");
+
+        // Root ignores the permission bits, so confirm the setup actually
+        // bites before asserting on it.
+        let probe = cp_dir.join("probe");
+        if std::fs::write(&probe, b"x").is_ok() {
+            let _ = std::fs::remove_file(&probe);
+            std::fs::set_permissions(&cp_dir, original).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            eprintln!("skipped: this runner writes through a 0500 directory (root?)");
+            return;
+        }
+
+        let outcome = discard(name, CheckpointKind::Download)
+            .expect("discard must return Ok, not propagate the removal failure");
+
+        // Restore before asserting: a failing assertion panics, and the test
+        // home cannot remove a tree it has no write permission on.
+        std::fs::set_permissions(&cp_dir, original).unwrap();
+
+        assert_eq!(
+            outcome.parts_removed, 1,
+            "the partial was already deleted — that count must survive the failed unlink",
+        );
+        assert_eq!(
+            outcome.failures.len(), 1,
+            "and the failed unlink must still be reported",
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
