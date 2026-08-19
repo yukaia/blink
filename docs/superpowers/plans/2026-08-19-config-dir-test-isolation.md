@@ -16,7 +16,9 @@
 - No production signature changes. `paths`' public functions keep their names, arguments and return types.
 - The thread-local override is sound only because each `#[test]` gets its own thread and every async test is `#[tokio::test]` with the default current-thread flavor. Do not add a `#[tokio::test(flavor = "multi_thread")]` that touches `paths`.
 - The acceptance check for Tasks 1 and 2 is that `XDG_CONFIG_HOME=<empty dir> cargo test` leaves that directory completely empty.
-- All 366 existing tests must keep passing at every commit.
+- No existing test may regress. Expected totals, which the tasks assert: 366 at
+  baseline, 371 after Task 1, 369 after Task 2 (it deletes the two `cleanup_tests`
+  tests along with the guard they cover), 370 after Task 3.
 
 ---
 
@@ -90,6 +92,25 @@ mod tests {
         .join()
         .expect("the spawned thread must not panic");
         assert_ne!(mine, theirs, "isolation is per-test, not per-process");
+    }
+
+    #[test]
+    fn a_guard_removes_its_tree_even_when_a_test_panics() {
+        // Drop-on-unwind is the whole reason this is a guard rather than a
+        // cleanup call at the end of a test: a test that fails is exactly
+        // when its directory would otherwise be left behind.
+        let payload = std::panic::catch_unwind(|| {
+            let home = test_home();
+            let sessions = sessions_dir().expect("sessions dir");
+            std::fs::write(sessions.join("t.ini"), b"x").expect("write a session file");
+            std::panic::panic_any(home.path().to_path_buf());
+        })
+        .expect_err("the closure must have panicked");
+
+        let dir = *payload
+            .downcast::<PathBuf>()
+            .expect("the panic payload carries the guard's directory");
+        assert!(!dir.exists(), "unwinding must still run the guard's Drop");
     }
 
     #[test]
@@ -240,13 +261,13 @@ mod test_home {
 
 Run: `cargo test --lib paths::tests 2>&1 | tail -20`
 
-Expected: PASS, 4 tests.
+Expected: PASS, 5 tests.
 
 - [ ] **Step 6: Run the whole suite**
 
 Run: `cargo test 2>&1 | tail -5`
 
-Expected: 370 passed (366 existing + 4 new), 0 failed.
+Expected: 371 passed (366 existing + 5 new), 0 failed.
 
 - [ ] **Step 7: Run the acceptance check**
 
@@ -357,7 +378,11 @@ Its body already binds the guard as `cleanup` from `checkpoint_app` and returns 
 
 Run: `cargo test 2>&1 | tail -5`
 
-Expected: 370 passed, 0 failed. A failure here means a test depended on the cleanup guard's exact semantics (removing a known session's checkpoints afterwards) rather than on isolation; read the failing test before changing anything else.
+Expected: **369** passed, 0 failed. The count *falls* by two: `cleanup_tests`
+held two tests of the guard being deleted, and `TestHome`'s equivalent properties
+are already covered by Task 1's `a_file_written_under_a_guard_is_gone_when_the_guard_drops`
+and `a_guard_removes_its_tree_even_when_a_test_panics`. Do not add tests to reach a
+higher number. A failure here means a test depended on the cleanup guard's exact semantics (removing a known session's checkpoints afterwards) rather than on isolation; read the failing test before changing anything else.
 
 - [ ] **Step 6: Confirm the guard is really gone**
 
@@ -500,7 +525,7 @@ Keep the first paragraph ("The property this guards: …") as it is.
 
 Run: `cargo test 2>&1 | tail -5`
 
-Expected: 371 passed, 0 failed.
+Expected: 370 passed, 0 failed.
 
 - [ ] **Step 5: Commit**
 
