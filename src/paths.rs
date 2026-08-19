@@ -83,14 +83,14 @@ mod test_home {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// The config home for the current test.
-    ///
-    /// Thread-local because the test harness runs each `#[test]` on its own
-    /// thread, and every async test in this crate is `#[tokio::test]` with
-    /// the default current-thread flavor, so tasks it spawns stay on that
-    /// thread. A `#[tokio::test(flavor = "multi_thread")]` that touched
-    /// `paths` would see the shared home below instead of its own — read
-    /// this comment before adding one.
+    // The config home for the current test.
+    //
+    // Thread-local because the test harness runs each `#[test]` on its own
+    // thread, and every async test in this crate is `#[tokio::test]` with
+    // the default current-thread flavor, so tasks it spawns stay on that
+    // thread. A `#[tokio::test(flavor = "multi_thread")]` that touched
+    // `paths` would see the shared home below instead of its own — read
+    // this comment before adding one.
     thread_local! {
         static OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
     }
@@ -116,6 +116,11 @@ mod test_home {
 
     pub struct TestHome {
         dir: PathBuf,
+        // The override this guard displaced, restored when this guard
+        // drops. Without this, a nested guard's Drop would clear the
+        // override to `None` unconditionally, silently demoting a
+        // still-alive outer guard to the shared per-process directory.
+        previous: Option<PathBuf>,
     }
 
     impl TestHome {
@@ -130,16 +135,16 @@ mod test_home {
             .join(format!("blink-test-{}-{n}", std::process::id()));
         // A previous run with the same pid could have left this behind.
         let _ = std::fs::remove_dir_all(&dir);
-        OVERRIDE.with(|o| *o.borrow_mut() = Some(dir.clone()));
-        TestHome { dir }
+        let previous = OVERRIDE.with(|o| o.borrow_mut().replace(dir.clone()));
+        TestHome { dir, previous }
     }
 
     impl Drop for TestHome {
         fn drop(&mut self) {
-            // Clear the override *before* removing the tree: if the removal
-            // fails, a later call on this thread must not keep resolving to
-            // a directory we just tried to delete.
-            OVERRIDE.with(|o| *o.borrow_mut() = None);
+            // Restore the previous override *before* removing the tree: if
+            // the removal fails, a later call on this thread must not keep
+            // resolving to a directory we just tried to delete.
+            OVERRIDE.with(|o| *o.borrow_mut() = self.previous.take());
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
@@ -340,7 +345,33 @@ mod tests {
         })
         .join()
         .expect("the spawned thread must not panic");
-        assert_ne!(mine, theirs, "isolation is per-test, not per-process");
+        assert_ne!(
+            mine, theirs,
+            "each thread's guard must resolve to its own directory",
+        );
+        assert_eq!(
+            base_dir().expect("my home again"),
+            mine,
+            "the spawned thread acquiring and dropping its own guard must not \
+             disturb this thread's override; a process-global override \
+             (instead of a thread-local one) would fail this assertion",
+        );
+    }
+
+    #[test]
+    fn a_nested_guard_does_not_demote_the_outer_guard_when_it_drops() {
+        let outer = test_home();
+        let outer_dir = outer.path().to_path_buf();
+        {
+            let inner = test_home();
+            assert_ne!(inner.path(), outer_dir);
+        }
+        assert_eq!(
+            base_dir().expect("outer home restored"),
+            outer_dir,
+            "dropping the inner guard must restore the outer guard's \
+             directory, not demote it to the shared per-process directory",
+        );
     }
 
     #[test]
