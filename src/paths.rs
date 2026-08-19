@@ -234,66 +234,85 @@ mod test_home {
     }
 }
 
+/// Validate one environment value as an absolute path.
+///
+/// A relative config home is refused rather than resolved against the
+/// current directory: where the config lands would then depend on where
+/// blink happened to be started from.
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+fn require_absolute(value: &str, var: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(BlinkError::config(format!(
+            "{var} must be an absolute path"
+        )));
+    }
+    Ok(path)
+}
+
+/// Resolve the base directory from the two environment values that decide
+/// it, taking them as arguments so the rules can be tested without mutating
+/// the process environment.
+///
+/// An empty `XDG_CONFIG_HOME` counts as unset, matching the XDG spec and
+/// what every other XDG-aware tool does with it.
+#[cfg(target_os = "linux")]
+fn base_dir_from(xdg: Option<&str>, home: Option<&str>) -> Result<PathBuf> {
+    if let Some(xdg) = xdg.filter(|v| !v.is_empty()) {
+        return Ok(require_absolute(xdg, "XDG_CONFIG_HOME")?.join(APP_DIR_NAME));
+    }
+    let home = home.ok_or_else(|| BlinkError::config("$HOME is not set"))?;
+    Ok(require_absolute(home, "$HOME")?
+        .join(".config")
+        .join(APP_DIR_NAME))
+}
+
 #[cfg(target_os = "linux")]
 #[cfg_attr(test, allow(dead_code))]
 fn real_base_dir() -> Result<PathBuf> {
-    if let Ok(xdg) = env::var("XDG_CONFIG_HOME")
-        && !xdg.is_empty() {
-            let p = PathBuf::from(&xdg);
-            if !p.is_absolute() {
-                return Err(BlinkError::config(
-                    "XDG_CONFIG_HOME must be an absolute path",
-                ));
-            }
-            return Ok(p.join(APP_DIR_NAME));
-        }
-    let home = env::var("HOME").map_err(|_| BlinkError::config("$HOME is not set"))?;
-    let home_path = PathBuf::from(&home);
-    if !home_path.is_absolute() {
-        return Err(BlinkError::config("$HOME must be an absolute path"));
+    let xdg = env::var("XDG_CONFIG_HOME").ok();
+    let home = env::var("HOME").ok();
+    base_dir_from(xdg.as_deref(), home.as_deref())
+}
+
+/// macOS convention is `$HOME/Library/Application Support/<App>`. Honour
+/// `XDG_CONFIG_HOME` if the user has explicitly set it (some cross-platform
+/// Mac users prefer the XDG layout), otherwise fall back to the standard
+/// location — which is what the README documents.
+#[cfg(target_os = "macos")]
+fn base_dir_from(xdg: Option<&str>, home: Option<&str>) -> Result<PathBuf> {
+    if let Some(xdg) = xdg.filter(|v| !v.is_empty()) {
+        return Ok(require_absolute(xdg, "XDG_CONFIG_HOME")?.join(APP_DIR_NAME));
     }
-    Ok(home_path.join(".config").join(APP_DIR_NAME))
+    let home = home.ok_or_else(|| BlinkError::config("$HOME is not set"))?;
+    Ok(require_absolute(home, "$HOME")?
+        .join("Library")
+        .join("Application Support")
+        .join(APP_DIR_NAME))
 }
 
 #[cfg(target_os = "macos")]
 #[cfg_attr(test, allow(dead_code))]
 fn real_base_dir() -> Result<PathBuf> {
-    // macOS convention is `$HOME/Library/Application Support/<App>`. Honour
-    // XDG_CONFIG_HOME if the user has explicitly set it (some cross-platform
-    // Mac users prefer the XDG layout), otherwise fall back to the standard
-    // location — which is what the README documents.
-    if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            let p = PathBuf::from(&xdg);
-            if !p.is_absolute() {
-                return Err(BlinkError::config(
-                    "XDG_CONFIG_HOME must be an absolute path",
-                ));
-            }
-            return Ok(p.join(APP_DIR_NAME));
-        }
-    }
-    let home = env::var("HOME").map_err(|_| BlinkError::config("$HOME is not set"))?;
-    let home_path = PathBuf::from(&home);
-    if !home_path.is_absolute() {
-        return Err(BlinkError::config("$HOME must be an absolute path"));
-    }
-    Ok(home_path
-        .join("Library")
-        .join("Application Support")
+    let xdg = env::var("XDG_CONFIG_HOME").ok();
+    let home = env::var("HOME").ok();
+    base_dir_from(xdg.as_deref(), home.as_deref())
+}
+
+#[cfg(target_os = "windows")]
+fn base_dir_from(user_profile: Option<&str>) -> Result<PathBuf> {
+    let profile =
+        user_profile.ok_or_else(|| BlinkError::config("%USERPROFILE% is not set"))?;
+    Ok(require_absolute(profile, "%USERPROFILE%")?
+        .join("Documents")
         .join(APP_DIR_NAME))
 }
 
 #[cfg(target_os = "windows")]
 #[cfg_attr(test, allow(dead_code))]
 fn real_base_dir() -> Result<PathBuf> {
-    let user_profile = env::var("USERPROFILE")
-        .map_err(|_| BlinkError::config("%USERPROFILE% is not set"))?;
-    let profile_path = PathBuf::from(&user_profile);
-    if !profile_path.is_absolute() {
-        return Err(BlinkError::config("%USERPROFILE% must be an absolute path"));
-    }
-    Ok(profile_path.join("Documents").join(APP_DIR_NAME))
+    let user_profile = env::var("USERPROFILE").ok();
+    base_dir_from(user_profile.as_deref())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -487,6 +506,100 @@ mod tests {
             .downcast::<PathBuf>()
             .expect("the panic payload carries the guard's directory");
         assert!(!dir.exists(), "unwinding must still run the guard's Drop");
+    }
+
+    // -- environment validation ------------------------------------------
+    //
+    // These cover `real_base_dir`'s rules without touching the process
+    // environment: `base_dir_from` takes the values as arguments, so the
+    // logic is reachable without `unsafe` env mutation (which would also
+    // race every other test in this binary).
+
+    #[test]
+    fn an_absolute_env_value_is_accepted() {
+        let p = require_absolute("/srv/config", "$HOME").expect("absolute is valid");
+        assert_eq!(p, PathBuf::from("/srv/config"));
+    }
+
+    #[test]
+    fn a_relative_env_value_is_rejected_and_names_the_variable() {
+        let err = require_absolute("relative/path", "$HOME")
+            .expect_err("a relative path cannot be a config home");
+        assert!(err.to_string().contains("$HOME"), "{err}");
+        assert!(err.to_string().contains("absolute"), "{err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xdg_config_home_wins_when_it_is_absolute() {
+        let dir = base_dir_from(Some("/xdg"), Some("/home/u")).expect("valid");
+        assert_eq!(dir, PathBuf::from("/xdg/blink"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_relative_xdg_config_home_is_an_error_rather_than_a_fallback() {
+        // Falling back to $HOME here would silently ignore a setting the
+        // user got wrong, putting their config somewhere they did not ask
+        // for. The error is the point.
+        let err = base_dir_from(Some("relative"), Some("/home/u"))
+            .expect_err("a relative XDG_CONFIG_HOME must not be tolerated");
+        assert!(err.to_string().contains("XDG_CONFIG_HOME"), "{err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_empty_xdg_config_home_falls_through_to_home() {
+        // Set-but-empty means "unset" here. It is invisible, load-bearing,
+        // and one edit away from becoming a bare `is_some()` check.
+        let dir = base_dir_from(Some(""), Some("/home/u")).expect("valid");
+        assert_eq!(dir, PathBuf::from("/home/u/.config/blink"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn home_is_used_when_xdg_config_home_is_unset() {
+        let dir = base_dir_from(None, Some("/home/u")).expect("valid");
+        assert_eq!(dir, PathBuf::from("/home/u/.config/blink"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unset_home_is_an_error() {
+        let err = base_dir_from(None, None).expect_err("nothing left to resolve from");
+        assert!(err.to_string().contains("$HOME is not set"), "{err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_relative_home_is_an_error() {
+        let err = base_dir_from(None, Some("u")).expect_err("relative $HOME");
+        assert!(err.to_string().contains("$HOME"), "{err}");
+        assert!(err.to_string().contains("absolute"), "{err}");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_falls_back_to_the_application_support_directory() {
+        let dir = base_dir_from(None, Some("/Users/u")).expect("valid");
+        assert_eq!(
+            dir,
+            PathBuf::from("/Users/u/Library/Application Support/blink"),
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_puts_the_config_under_the_user_profile() {
+        let dir = base_dir_from(Some(r"C:\Users\u")).expect("valid");
+        assert_eq!(dir, PathBuf::from(r"C:\Users\u\Documents\blink"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn an_unset_user_profile_is_an_error() {
+        let err = base_dir_from(None).expect_err("nothing to resolve from");
+        assert!(err.to_string().contains("%USERPROFILE%"), "{err}");
     }
 
     /// Plants a symlink at `<base>/planted` pointing at a populated

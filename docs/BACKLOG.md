@@ -6,24 +6,6 @@ spec in `docs/superpowers/specs/` instead.
 
 ---
 
-## `real_base_dir`'s environment validation has no test coverage
-
-**Noted:** 2026-08-19, while making the config directory unreachable from tests.
-
-The four platform `real_base_dir` implementations carry
-`#[cfg_attr(test, allow(dead_code))]`, because `base_dir()` never calls them
-under `cfg(test)`. Their validation — `$XDG_CONFIG_HOME` and `$HOME` must be
-absolute, `%USERPROFILE%` must be set — is therefore never exercised, and
-cannot be without `unsafe` env-var manipulation, which is also racy across
-test threads.
-
-Extracting a pure `base_dir_from(xdg: Option<&str>, home: Option<&str>)` that
-takes the two values as arguments instead of reading them makes the logic
-directly testable, leaving the env reads in a thin wrapper. Small, and the
-validation is the part with the actual rules in it.
-
----
-
 ## `list_and_clean` decides and prints in one pass, so its policy is untested
 
 **Noted:** 2026-08-19, while settling the `CheckpointStore` question.
