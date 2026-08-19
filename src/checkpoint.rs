@@ -1124,15 +1124,16 @@ mod sweep_tests {
         // covered structurally by `the_sweep_reports_what_it_removed`
         // (sweep count) and `discarding_removes_the_file_and_its_partials`
         // (both together on the success path) instead.
+        let _home = paths::test_home();
         let name = format!("blink-test-remove-fail-{}", std::process::id());
         let path = Checkpoint::path_for(&name, CheckpointKind::Download).unwrap();
         std::fs::create_dir(&path).expect("stand a directory in for the checkpoint file");
 
         let result = discard(&name, CheckpointKind::Download);
 
-        // Clean up the substituted directory immediately: `Checkpoint::remove`
-        // calls `remove_file`, which cannot remove a directory, so the test
-        // home's own cleanup would leave it behind.
+        // `discard` could not remove the substituted directory — `remove_file`
+        // refuses one — so take it out here. The test home sweeps the tree at
+        // drop anyway; doing it now keeps the cleanup next to its reason.
         let _ = std::fs::remove_dir_all(&path);
 
         let outcome =
@@ -1145,6 +1146,7 @@ mod sweep_tests {
 
     #[test]
     fn discarding_an_unreadable_checkpoint_removes_the_file_and_sweeps_nothing() {
+        let _home = paths::test_home();
         let name = format!("blink-test-corrupt-discard-{}", std::process::id());
         let path = Checkpoint::path_for(&name, CheckpointKind::Download).unwrap();
         std::fs::write(&path, b"{ not json").unwrap();
@@ -1163,6 +1165,7 @@ mod sweep_tests {
 
     #[test]
     fn discarding_a_checkpoint_that_is_already_gone_is_fine() {
+        let _home = paths::test_home();
         let name = format!("blink-test-absent-{}", std::process::id());
         let outcome = discard(&name, CheckpointKind::Download).expect("must not error");
         assert_eq!(outcome, DiscardOutcome::default());
