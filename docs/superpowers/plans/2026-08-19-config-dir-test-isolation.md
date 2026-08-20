@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Implemented and merged on 2026-08-19 (commits 42ef1d1..3ddbfbd, plus 9d123c9 closing a TOCTOU window found in review). Executed task-by-task with a review after each; every step below was carried out. No manual checklist — the plan's claims are all checked by `cargo test` and the `XDG_CONFIG_HOME` acceptance check in Task 1.
+
 **Goal:** Make it impossible for a test to read or write the user's real config directory, and use that to test the one `discard` property that is currently unreachable.
 
 **Architecture:** `paths::base_dir()` is the single chokepoint every path function flows through. It gains a `#[cfg(test)]` branch returning a temporary directory — a private one per test when a `TestHome` guard is held, otherwise one shared per-process scratch directory. No production signature changes. The `CheckpointCleanup` drop guard, which existed only to compensate for the missing injection point, is then deleted.
@@ -48,7 +50,7 @@
 
 `src/paths.rs` has no test module today; Step 1 creates one.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `src/paths.rs`:
 
@@ -130,13 +132,13 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test paths::tests 2>&1 | tail -20`
 
 Expected: compile failure — `cannot find function 'test_home' in this scope`.
 
-- [ ] **Step 3: Rename the platform implementations**
+- [x] **Step 3: Rename the platform implementations**
 
 In `src/paths.rs`, rename all four `base_dir` functions to `real_base_dir`, leaving their bodies and `#[cfg]` attributes untouched, and mark each unused-under-test. The four are the `target_os = "linux"`, `target_os = "macos"`, `target_os = "windows"` and the `not(any(...))` fallback.
 
@@ -157,7 +159,7 @@ fn real_base_dir() -> Result<PathBuf> {
 
 Apply the same two-line change to the other three. Do not touch anything inside the bodies.
 
-- [ ] **Step 4: Add the dispatcher and the guard**
+- [x] **Step 4: Add the dispatcher and the guard**
 
 Insert immediately above the first `real_base_dir` in `src/paths.rs`:
 
@@ -259,19 +261,19 @@ mod test_home {
 }
 ```
 
-- [ ] **Step 5: Run the new tests**
+- [x] **Step 5: Run the new tests**
 
 Run: `cargo test paths::tests 2>&1 | tail -20`
 
 Expected: PASS, 5 tests.
 
-- [ ] **Step 6: Run the whole suite**
+- [x] **Step 6: Run the whole suite**
 
 Run: `cargo test 2>&1 | tail -5`
 
 Expected: 372 passed (366 existing + 6 new), 0 failed.
 
-- [ ] **Step 7: Run the acceptance check**
+- [x] **Step 7: Run the acceptance check**
 
 ```bash
 D=$(mktemp -d)
@@ -281,7 +283,7 @@ find "$D"
 
 Expected: the tests pass, and `find` prints **only** `$D` itself. Before this task it printed `$D/blink`, `$D/blink/checkpoints`, `$D/blink/sessions` and `$D/blink/themes`.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add src/paths.rs
@@ -308,7 +310,7 @@ directory cannot be reached even by a test that never considered it."
 
 **No new test in this task.** It replaces test scaffolding with stronger scaffolding; the 370 tests from Task 1 are the test, and they must all still pass. Do not invent a test to satisfy TDD here.
 
-- [ ] **Step 1: Convert the five `checkpoint.rs` call sites**
+- [x] **Step 1: Convert the five `checkpoint.rs` call sites**
 
 At each of lines 1135, 1349, 1368, 1385 and 1635, replace the cleanup guard with a home guard. The three forms currently in the file are:
 
@@ -325,11 +327,11 @@ let _home = paths::test_home();
 
 `paths` is already in scope in `checkpoint.rs`. Leave the surrounding `let name = format!("blink-test-...-{}", std::process::id());` lines alone — the pid in the name is now redundant but harmless, and removing it is churn this task does not need.
 
-- [ ] **Step 2: Delete the guard and its tests**
+- [x] **Step 2: Delete the guard and its tests**
 
 Delete the whole `#[cfg(test)] pub(crate) mod test_support { ... }` block (lines 992–1017) and the whole `#[cfg(test)] mod cleanup_tests { ... }` block that follows it (lines 1019–1053). The two `CheckpointCleanup::new` uses inside `cleanup_tests` go with it — they are the guard testing itself.
 
-- [ ] **Step 3: Rewrite the stale comment**
+- [x] **Step 3: Rewrite the stale comment**
 
 Step 2 shifted every line number below 991, so find this by name: inside the test `a_removal_failure_is_recorded_rather_than_propagated`, a comment now describes a type that no longer exists:
 
@@ -347,7 +349,7 @@ Replace with:
         // home's own cleanup would leave it behind.
 ```
 
-- [ ] **Step 4: Convert the two `tui/app/mod.rs` helpers**
+- [x] **Step 4: Convert the two `tui/app/mod.rs` helpers**
 
 At line 1372, change the signature and acquire the guard **first**, so everything the helper does afterwards resolves to the private directory:
 
@@ -376,7 +378,7 @@ At line 1445, change only the return type of `app_with_queued_offer`:
 
 Its body already binds the guard as `cleanup` from `checkpoint_app` and returns it as `(a, cleanup)`; leave that alone. The 10 `let (mut a, _cleanup) = ...` call sites need no change — only the type flowing through them differs.
 
-- [ ] **Step 5: Run the whole suite**
+- [x] **Step 5: Run the whole suite**
 
 Run: `cargo test 2>&1 | tail -5`
 
@@ -386,13 +388,13 @@ are already covered by Task 1's `a_file_written_under_a_guard_is_gone_when_the_g
 and `a_guard_removes_its_tree_even_when_a_test_panics`. Do not add tests to reach a
 higher number. A failure here means a test depended on the cleanup guard's exact semantics (removing a known session's checkpoints afterwards) rather than on isolation; read the failing test before changing anything else.
 
-- [ ] **Step 6: Confirm the guard is really gone**
+- [x] **Step 6: Confirm the guard is really gone**
 
 Run: `grep -rn "CheckpointCleanup\|test_support" src`
 
 Expected: no matches.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add src/checkpoint.rs src/tui/app/mod.rs
@@ -417,7 +419,7 @@ whereas the directory is now the test's alone for its whole life."
 
 `discard` sweeps orphaned `.part` files, then removes the checkpoint file. If that removal fails it records the failure in `outcome.failures` instead of returning `Err`, precisely so the sweep count survives. The existing test covers a checkpoint that is *unreadable and* undeletable, where the count is 0 anyway. The half that has never been tested is a **nonzero** count surviving a failed removal, which needs a checkpoint that reads fine but cannot be unlinked — a non-writable parent directory, which was unsafe to do while every test shared that directory.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `sweep_tests` module in `src/checkpoint.rs`, after `a_removal_failure_is_recorded_rather_than_propagated`:
 
@@ -483,7 +485,7 @@ Add to the `sweep_tests` module in `src/checkpoint.rs`, after `a_removal_failure
     }
 ```
 
-- [ ] **Step 2: Run it to verify it passes, then prove it is load-bearing**
+- [x] **Step 2: Run it to verify it passes, then prove it is load-bearing**
 
 Run: `cargo test a_removal_failure_keeps 2>&1 | tail -10`
 
@@ -507,7 +509,7 @@ Run the test again.
 
 Expected: FAIL on `discard must return Ok, not propagate the removal failure`. **Restore the original code before continuing** — `git diff src/checkpoint.rs` must show only the new test.
 
-- [ ] **Step 3: Trim the superseded comment**
+- [x] **Step 3: Trim the superseded comment**
 
 The 24-line comment in `a_removal_failure_is_recorded_rather_than_propagated` (from "Getting only the final unlink to fail…" down to "…instead.") argues that this case is not constructible. That is no longer true. Replace those paragraphs with:
 
@@ -523,13 +525,13 @@ The 24-line comment in `a_removal_failure_is_recorded_rather_than_propagated` (f
 
 Keep the first paragraph ("The property this guards: …") as it is.
 
-- [ ] **Step 4: Run the whole suite**
+- [x] **Step 4: Run the whole suite**
 
 Run: `cargo test 2>&1 | tail -5`
 
 Expected: 371 passed, 0 failed.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add src/checkpoint.rs

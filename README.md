@@ -123,7 +123,8 @@ the choice persisted to `config.ini` automatically.
 
 ### Prerequisites
 
-- **Rust 1.85+** with the 2024 edition
+- **Rust 1.88+** with the 2024 edition (1.88 is where let-chains stabilised;
+  the crate uses them throughout)
 
 That's it. Every TLS-using dependency is pure Rust (rustls), so there's no
 need for `libssl-dev` or any other system TLS library on any platform.
@@ -248,6 +249,11 @@ blink checkpoints
 
 # Remove completed and orphaned checkpoint files
 blink checkpoints --clean
+# (a checkpoint counts as orphaned when no saved session bears its name. If
+#  the session list itself can't be read — an unreadable sessions directory,
+#  or a session file that won't parse — orphan detection is skipped and a
+#  warning is printed, so `--clean` removes only completed checkpoints
+#  rather than deleting resume data it can't vouch for)
 
 # Remove all checkpoint files unconditionally
 blink checkpoints --force
