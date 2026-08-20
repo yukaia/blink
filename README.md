@@ -123,8 +123,10 @@ the choice persisted to `config.ini` automatically.
 
 ### Prerequisites
 
-- **Rust 1.88+** with the 2024 edition (1.88 is where let-chains stabilised;
-  the crate uses them throughout)
+- **Rust 1.89+** with the 2024 edition (1.89 is where `File::lock` stabilised,
+  which `known_hosts` uses to make accept-and-save atomic across processes;
+  1.88 is the floor below that, where let-chains stabilised, and the crate
+  uses those throughout)
 
 That's it. Every TLS-using dependency is pure Rust (rustls), so there's no
 need for `libssl-dev` or any other system TLS library on any platform.
