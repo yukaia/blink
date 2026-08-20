@@ -708,6 +708,14 @@ impl Session {
 
         validate_network_field("host", &host)?;
         validate_network_field("username", &username)?;
+        // `remote_dir` is percent-decoded above, so `%0D%0A` in the URL
+        // arrives here as a real CRLF. On FTP/FTPS that path is interpolated
+        // straight into a newline-terminated control command, making the tail
+        // a second command the server executes — with the user's credentials,
+        // from nothing more than a `blink connect ftp://…` line they were
+        // handed. `load_from` has always applied this check to the same field
+        // read from a session file; the URL path simply never did.
+        validate_network_field("remote_dir", &remote_dir)?;
 
         Ok(Self {
             name: host.clone(),
@@ -928,6 +936,45 @@ mod tests {
     fn from_url_rejects_percent_escape_to_invalid_utf8() {
         // 0xC3 0x28 is invalid UTF-8 (start of multi-byte but bad continuation).
         assert!(Session::from_url("sftp://host/%C3%28").is_err());
+    }
+
+    #[test]
+    fn from_url_rejects_crlf_in_the_remote_path() {
+        // `%0D%0A` decodes to a real CRLF, and an FTP control command is
+        // newline-terminated: `LIST /pub\r\nDELE /important.txt` is two
+        // commands, the second of the attacker's choosing. `from_url` used to
+        // validate `host` and `username` but not `remote_dir`, and never
+        // called `validate()`, so this URL produced a usable session.
+        let err = Session::from_url("ftp://user@host/pub%0D%0ADELE%20%2Fimportant.txt")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("remote_dir"),
+            "expected remote_dir to be refused, got: {err}"
+        );
+    }
+
+    #[test]
+    fn from_url_rejects_bare_lf_and_cr_in_the_remote_path() {
+        // Either half alone is enough on a server that terminates on one.
+        for bad in ["ftp://host/pub%0Aevil", "ftp://host/pub%0Devil"] {
+            assert!(Session::from_url(bad).is_err(), "{bad} should be refused");
+        }
+    }
+
+    #[test]
+    fn from_url_rejects_nul_in_the_remote_path() {
+        assert!(Session::from_url("ftp://host/pub%00evil").is_err());
+    }
+
+    #[test]
+    fn from_url_agrees_with_validate_on_every_network_field() {
+        // The bug was a divergence, not a missing check: `validate()` already
+        // rejected this path, but `from_url` neither ran it nor mirrored it.
+        // Anything `from_url` accepts must survive `validate()`, or the same
+        // gap reopens the next time a field is added.
+        let s = Session::from_url("sftp://bob@example.com:2222/var/www").unwrap();
+        assert!(s.validate().is_ok(), "from_url built a session validate() rejects");
     }
 
     #[test]
