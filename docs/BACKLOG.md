@@ -14,9 +14,11 @@ name reaches the screen without one — the transfers pane has
 `transfer_row_name_is_sanitized` and `transfer_row_name_strips_escape_sequences`
 pinning the opposite policy a few files over.
 
-Not an injection: ratatui 0.29's `Buffer::set_stringn` filters `char::is_control`
-and drops zero-width graphemes, and U+202E, U+200B, U+200E, U+FEFF, U+2067 and
-U+061C all measure zero width, so none of them reach the terminal. What survives
+Not an injection: `ratatui-core`'s `Buffer::set_stringn` filters
+`char::is_control` and drops zero-width graphemes, and U+202E, U+200B, U+200E,
+U+FEFF, U+2067 and U+061C all measure zero width, so none of them reach the
+terminal. That filter was checked again on the 0.30 bump and is unchanged, so
+this entry does not depend on the ratatui version. What survives
 is that ratatui *deletes* those characters where blink *replaces them with a
 space* — deliberately, per `is_deceptive_format`, whose doc comment gives the
 reason as stopping a name that would "disguise a name the user already cleared
@@ -60,29 +62,3 @@ a server serving a deep or wide enough tree exhausts memory instead.
 
 No infinite-loop risk — symlinks are correctly treated as leaves in both walks.
 Fix: reuse `MAX_QUEUED_JOBS` and the message `walk_remote` already produces.
-
-## Bump ratatui to 0.30 to clear three advisories
-
-`cargo audit` reports no vulnerabilities but three warnings, all transitive
-through ratatui 0.29:
-
-| ID | Crate | Kind |
-|---|---|---|
-| RUSTSEC-2026-0002 | lru 0.12.5 | unsound — `IterMut` violates Stacked Borrows |
-| RUSTSEC-2026-0253 | lru 0.12.5 | unsound — UAF via panic in `LruCache::pop()` |
-| RUSTSEC-2024-0436 | paste 1.0.15 | unmaintained |
-
-Neither `lru` issue sits on an attacker-reachable path — it backs ratatui's
-internal layout cache. The reason to act is `.cargo/audit.toml`'s standing rule
-that every warning carries a written rationale: these three have none, and an
-unexplained warning is how the whole signal starts getting ignored.
-
-Checked against 0.30.2: it pulls `lru 0.18.2` and no `paste` at all, so the bump
-clears all three rather than needing three ignore entries. It also keeps a
-`crossterm_0_28` feature, so the crossterm 0.28 pin does not have to move in the
-same change — select it explicitly, since the default `crossterm` feature
-resolves to 0.29 and enabling both pulls in two copies.
-
-The cost is the 0.30 split into `ratatui-core` / `ratatui-widgets` /
-`ratatui-crossterm` and whatever import churn that implies. If it turns out to
-be more than churn, this wants a spec rather than a backlog entry.
