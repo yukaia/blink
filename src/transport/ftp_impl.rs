@@ -56,6 +56,8 @@ macro_rules! delegate_ftp_transport {
             }
 
             async fn rename(&mut self, from: &str, to: &str) -> $crate::error::Result<()> {
+                $crate::transport::ftp_impl::check_ftp_path("rnfr", from)?;
+                $crate::transport::ftp_impl::check_ftp_path("rnto", to)?;
                 let label = format!("{from} -> {to}");
                 $crate::transport::ftp_impl::timed_ftp(
                     "rename",
@@ -69,6 +71,7 @@ macro_rules! delegate_ftp_transport {
                 &mut self,
                 remote_path: &str,
             ) -> $crate::error::Result<()> {
+                $crate::transport::ftp_impl::check_ftp_path("dele", remote_path)?;
                 $crate::transport::ftp_impl::timed_ftp(
                     "dele",
                     remote_path,
@@ -161,6 +164,37 @@ pub(crate) const MAX_PREVIEW_BYTES: u64 = crate::preview::IMAGE_VIEW_LIMIT;
 /// data channel shows up as 0 MB/s. The user can cancel via `c`.
 pub(crate) const FTP_OP_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Refuse a remote path that would break out of one FTP command into another.
+///
+/// FTP commands are newline-terminated text — suppaftp builds them as
+/// `format!("RETR {p}")` and appends `\r\n` with no escaping whatsoever — so a
+/// path carrying CR or LF is not a path, it is a second command the server
+/// will run under the user's credentials. On a shared server that is a
+/// privilege escalation: another tenant names a file `x\r\nDELE //…`, and it
+/// fires the moment the victim lists or downloads it. NUL goes with them
+/// because no filesystem blink talks to accepts one, and a C-string server
+/// would truncate the command there.
+///
+/// This lives at the FTP boundary rather than in
+/// [`crate::transport::join_remote`] on purpose. SFTP's wire format is
+/// length-prefixed, so a name containing a newline addresses exactly the file
+/// it names and is safe to fetch; rejecting it there would cost SFTP users
+/// access to legitimately-named files to fix a bug that is purely FTP's.
+///
+/// Every entry point that puts a path on the control channel calls this, so a
+/// path is checked once, on the way in, rather than at each of the commands it
+/// may fan out into.
+pub(crate) fn check_ftp_path(op: &str, path: &str) -> Result<()> {
+    if path.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0')) {
+        // `BlinkError::transport` sanitizes, so the offending bytes render as
+        // spaces rather than reaching the terminal on their way to the log.
+        return Err(BlinkError::transport(format!(
+            "{op}: refusing remote path containing a newline or null byte: {path}"
+        )));
+    }
+    Ok(())
+}
+
 /// Run an FTP control-channel call with a deadline and classify the
 /// result. On timeout: `Disconnected`. On underlying error:
 /// [`map_ftp`]. Combines the timeout and the error-mapping that every
@@ -184,6 +218,7 @@ pub async fn ftp_list<T: TokioTlsStream + Send>(
     stream: &mut ImplAsyncFtpStream<T>,
     remote_path: &str,
 ) -> Result<Vec<RemoteEntry>> {
+    check_ftp_path("list", remote_path)?;
     let lines = timed_ftp("list", remote_path, stream.list(Some(remote_path))).await?;
 
     let mut out = Vec::with_capacity(lines.len());
@@ -227,6 +262,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     local_path: &Path,
     progress: Option<mpsc::UnboundedSender<ProgressUpdate>>,
 ) -> Result<()> {
+    check_ftp_path("retr", remote_path)?;
     if let Some(parent) = local_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -320,6 +356,8 @@ pub async fn ftp_upload<T: TokioTlsStream + Send>(
     remote_path: &str,
     progress: Option<mpsc::UnboundedSender<ProgressUpdate>>,
 ) -> Result<()> {
+    // Guards `part` too: it is `remote_path` plus a literal suffix.
+    check_ftp_path("stor", remote_path)?;
     let total = tokio::fs::metadata(local_path).await?.len();
     let mut local = tokio::fs::File::open(local_path).await?;
 
@@ -380,6 +418,7 @@ pub async fn ftp_delete_dir<T: TokioTlsStream + Send>(
     remote_path: &str,
     recursive: bool,
 ) -> Result<()> {
+    check_ftp_path("rmd", remote_path)?;
     if !recursive {
         return timed_ftp("rmd", remote_path, stream.rmdir(remote_path)).await;
     }
@@ -416,6 +455,17 @@ pub async fn ftp_delete_dir<T: TokioTlsStream + Send>(
                         );
                         continue;
                     };
+                    // The name came off this server's own listing, so the
+                    // path built from it is no more trustworthy than the
+                    // bytes were. Skip it rather than failing the whole
+                    // delete: one hostile entry should not strand the rest.
+                    if check_ftp_path("dele", &child).is_err() {
+                        tracing::warn!(
+                            dir = %path,
+                            "skipping entry whose name would break the control channel",
+                        );
+                        continue;
+                    }
                     if parsed.is_directory() {
                         subdirs.push(Op::Visit(child));
                     } else {
@@ -438,6 +488,7 @@ pub async fn ftp_mkdir<T: TokioTlsStream + Send>(
     stream: &mut ImplAsyncFtpStream<T>,
     remote_path: &str,
 ) -> Result<()> {
+    check_ftp_path("mkd", remote_path)?;
     if let Ok(Some(existing)) = ftp_metadata(stream, remote_path).await {
         if existing.is_dir() {
             return Ok(());
@@ -453,6 +504,8 @@ pub async fn ftp_metadata<T: TokioTlsStream + Send>(
     stream: &mut ImplAsyncFtpStream<T>,
     remote_path: &str,
 ) -> Result<Option<RemoteEntry>> {
+    // Guards `parent` too: it is a prefix of `remote_path`.
+    check_ftp_path("metadata list", remote_path)?;
     let (parent, basename) = match remote_path.rsplit_once('/') {
         Some(("", b)) => ("/".to_string(), b.to_string()),
         Some((p, b)) => (p.to_string(), b.to_string()),
@@ -503,6 +556,7 @@ pub async fn ftp_read_to_bytes<T: TokioTlsStream + Send + 'static>(
     stream: &mut ImplAsyncFtpStream<T>,
     remote_path: &str,
 ) -> Result<Bytes> {
+    check_ftp_path("retr", remote_path)?;
     let remote_path_owned = remote_path.to_string();
     let buf = timed_ftp(
         "retr",
@@ -527,4 +581,62 @@ pub async fn ftp_read_to_bytes<T: TokioTlsStream + Send + 'static>(
     )
     .await?;
     Ok(Bytes::from(buf))
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::check_ftp_path;
+
+    #[test]
+    fn an_ordinary_path_is_allowed() {
+        assert!(check_ftp_path("list", "/var/www/html").is_ok());
+    }
+
+    #[test]
+    fn spaces_and_unicode_stay_allowed() {
+        // The check is about the control channel's line framing, not about
+        // what makes a tidy filename. Narrowing it further would start
+        // refusing files people legitimately have.
+        assert!(check_ftp_path("retr", "/srv/my report (final).pdf").is_ok());
+        assert!(check_ftp_path("retr", "/srv/résumé — 2026.txt").is_ok());
+    }
+
+    #[test]
+    fn crlf_is_refused() {
+        // The whole point: `LIST /pub\r\nDELE /important.txt` is two commands.
+        let err = check_ftp_path("list", "/pub\r\nDELE /important.txt")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("newline"), "unhelpful message: {err}");
+    }
+
+    #[test]
+    fn a_bare_lf_or_cr_is_refused_on_its_own() {
+        // Servers disagree about which byte ends a command; refuse both
+        // rather than betting on the peer being strict about CRLF.
+        assert!(check_ftp_path("retr", "/srv/evil\nDELE /x").is_err());
+        assert!(check_ftp_path("retr", "/srv/evil\rDELE /x").is_err());
+    }
+
+    #[test]
+    fn a_nul_byte_is_refused() {
+        assert!(check_ftp_path("retr", "/srv/evil\0truncated").is_err());
+    }
+
+    #[test]
+    fn the_offending_bytes_do_not_reach_the_message_verbatim() {
+        // The path is echoed back so the user can tell which entry was
+        // refused, and it is the attacker's string — so it must arrive
+        // sanitized, not raw, on its way to the log and the TUI.
+        let err = check_ftp_path("list", "/pub\r\n\x1b[2JDELE /x")
+            .unwrap_err()
+            .to_string();
+        assert!(!err.contains('\r'), "CR reached the message: {err:?}");
+        assert!(!err.contains('\n'), "LF reached the message: {err:?}");
+        assert!(!err.contains('\x1b'), "ESC reached the message: {err:?}");
+    }
 }
