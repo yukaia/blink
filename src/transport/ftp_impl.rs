@@ -973,7 +973,7 @@ mod integration {
             .await
             .insert("/big.bin".to_string(), payload.clone());
 
-        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
@@ -987,8 +987,18 @@ mod integration {
         let got = std::fs::read(&local).unwrap();
         assert_eq!(got.len(), payload.len());
         assert_eq!(got, payload);
+
+        // Progress reporting depends on a real size, not a guess: the
+        // download must consult SIZE before transfer.
+        let issued = log.lock().await.clone();
+        assert!(
+            issued.iter().any(|c| c == "SIZE /big.bin"),
+            "the download must consult SIZE for its progress total; commands issued: {issued:?}",
+        );
     }
 
+    /// `ftp_metadata` resolves size from a LIST of the parent directory, not
+    /// from a SIZE command, so this exercises LIST's size field, not SIZE.
     #[tokio::test]
     async fn metadata_reports_the_size_the_server_gave() {
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
