@@ -764,8 +764,9 @@ mod integration {
     }
 
     /// Binds :0, spawns the accept loop, returns the bound port and a count of
-    /// accepted control connections. The dispatcher opens one per worker; the
-    /// counter is how reuse is asserted, as in the SFTP harness.
+    /// accepted control connections. Only the connect test reads the counter,
+    /// to assert a single connection; FTP has no equivalent of the SFTP
+    /// harness's pool-reuse test, so nothing here asserts reuse.
     pub(super) async fn start_server(store: Store, faults: Faults) -> (u16, Arc<AtomicUsize>, Log) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1527,7 +1528,7 @@ mod integration {
     /// file the last token, so any non-empty line parses. `ftp_list` calls the
     /// LIST parsers directly instead, and an unparsable line is skipped.
     #[tokio::test]
-    async fn an_unparsable_listing_line_is_an_error_not_a_panic() {
+    async fn an_unparsable_listing_line_becomes_no_entry_at_all() {
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
         store.lock().await.insert("/a.txt".to_string(), b"x".to_vec());
 
