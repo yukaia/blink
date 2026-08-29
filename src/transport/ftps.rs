@@ -258,5 +258,39 @@ mod pinning {
                 .with_root_certificates(RootCertStore::empty())
                 .with_no_client_auth();
         }
+
+        /// blink builds `ring` only. `russh` would otherwise pull `aws-lc-rs`
+        /// through its default features, and `aws-lc-sys` assembles its
+        /// Windows objects with NASM — a build-time tool the Windows
+        /// cross-compile has no reason to require, and did not have.
+        ///
+        /// The manifest turns that feature off, but a manifest is not a
+        /// guarantee: cargo unifies features across the graph, so *any*
+        /// dependency that enables `russh/aws-lc-rs` switches it back on for
+        /// everyone. russh only refuses to compile when *neither* backend is
+        /// enabled — with both, `aws-lc-rs` silently wins its `cfg` branches.
+        /// That is the same shape as the `tokio-rustls` default-features bug
+        /// that made every FTPS connect panic, and it fails on a platform
+        /// nobody builds day to day.
+        ///
+        /// Reading the lockfile is the cheapest way to notice, and it fails
+        /// on Linux rather than waiting for someone to cross-compile.
+        #[test]
+        fn aws_lc_stays_out_of_the_dependency_graph() {
+            let lock = std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/Cargo.lock"
+            ))
+            .expect("Cargo.lock should be readable from the manifest dir");
+
+            for crate_name in ["aws-lc-sys", "aws-lc-rs"] {
+                assert!(
+                    !lock.contains(&format!("name = \"{crate_name}\"")),
+                    "{crate_name} is back in Cargo.lock — something enabled \
+                     russh's aws-lc-rs feature. That reintroduces the NASM \
+                     build requirement for x86_64-pc-windows-gnu.",
+                );
+            }
+        }
     }
 }

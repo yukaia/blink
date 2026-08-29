@@ -89,6 +89,13 @@ the git history for those.
 
 - suppaftp 8 → 10, russh 0.60 → 0.63, sha2 0.10 → 0.11, base64 0.22 → 0.23,
   icy_sixel 0.5 → 0.6, ratatui → 0.30.2, crossterm → 0.29.
+- **`russh` now builds against `ring` rather than its default `aws-lc-rs`**,
+  which drops `aws-lc-sys` from the graph (416 → 408 crates). The two are
+  interchangeable implementations of the same SSH ciphers, and `ring` was
+  already being compiled for TLS, so this leaves one crypto backend instead of
+  two. It also fixes `cargo build --target x86_64-pc-windows-gnu`, which
+  failed on any machine without NASM — `aws-lc-sys` assembles its Windows
+  objects with it. The Windows cross-compile now needs only `mingw-w64`.
 - Moved off the yanked chacha20 0.10.1; dropped the unused `tokio-util`
   dependency.
 - russh 0.63 drops its `internal-russh-forked-ssh-key` fork for upstream

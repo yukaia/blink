@@ -24,7 +24,16 @@ async-trait = "0.1"
 futures = "0.3"
 
 # SSH / SFTP (pure-Rust async)
-russh = "0.63"
+#
+# `ring`, not russh's default `aws-lc-rs`. The two are interchangeable
+# implementations of the same SSH ciphers (AES-GCM, ChaCha20-Poly1305) — russh
+# imports identical algorithm constants from either — but `aws-lc-rs` drags in
+# `aws-lc-sys`, which assembles its Windows objects with NASM and so breaks
+# `--target x86_64-pc-windows-gnu` on any machine without it. `ring` is also
+# already in the graph for TLS via suppaftp, so this leaves one crypto backend
+# compiled instead of two. `flate2` and `rsa` are the rest of russh's defaults,
+# kept as they were. See aws_lc_stays_out_of_the_dependency_graph in ftps.rs.
+russh = { version = "0.63", default-features = false, features = ["ring", "flate2", "rsa"] }
 russh-sftp = "2.0"
 
 # FTP / FTPS

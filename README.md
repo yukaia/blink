@@ -219,7 +219,10 @@ The first build downloads ~700 MB of SDK headers and libs into
 
 If you'd rather use the GNU toolchain (no Microsoft CRT), MinGW-w64
 works for blink because nothing in the dependency tree needs MSVC-only
-features.
+features, and nothing needs an external assembler either — `russh` is built
+against `ring` rather than its default `aws-lc-rs` precisely so that
+`aws-lc-sys` (which assembles its Windows objects with NASM) stays out of the
+graph. `mingw-w64` below is the only system package required.
 
 ```sh
 # Debian / Ubuntu
