@@ -14,10 +14,15 @@
 ignore = [
   # RUSTSEC-2023-0071 — "Marvin Attack" timing sidechannel in `rsa`.
   #
-  # Reached transitively: blink -> russh -> internal-russh-forked-ssh-key -> rsa.
-  # There is no fixed release of `rsa` (the advisory itself says "No fixed
-  # upgrade is available"), and the only way to drop it entirely would be to
-  # drop RSA key support from the SSH client.
+  # Reached transitively: blink -> russh -> rsa, and also
+  # blink -> russh -> ssh-key -> rsa. (Before russh 0.63 this ran through
+  # russh's `internal-russh-forked-ssh-key` fork; 0.63 dropped the fork for
+  # upstream `ssh-key`.) There is no fixed release of `rsa` (the advisory
+  # itself says "No fixed upgrade is available"), and the only way to drop it
+  # entirely would be to drop RSA key support from the SSH client.
+  #
+  # Note russh pins `rsa` with an exact `=0.10.0-rc.18` requirement, so this
+  # cannot be bumped from blink's side — it moves when russh moves.
   #
   # Exposure: the attack recovers an RSA *private* key from timing variation in
   # decryption/signing, and needs many precisely-timed oracle queries. blink

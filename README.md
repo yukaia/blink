@@ -22,7 +22,8 @@ A cross-platform terminal SFTP / SCP / FTP / FTPS client with a three-pane TUI, 
 - **Host-key verification** for SFTP/SCP — unknown keys trigger an
   interactive prompt (accept & save / trust once / reject); changed keys are
   hard-rejected with a clear warning. Keys are stored in
-  `~/.config/blink/known_hosts` in standard OpenSSH format.
+  `~/.config/blink/known_hosts` in standard OpenSSH format. A server
+  presenting an SSH *host certificate* is refused rather than pinned.
 - One-key disconnect, return to selector
 
 ### Browsing & file operations
@@ -597,6 +598,13 @@ terminal. The following properties are enforced in the current codebase.
   Matching follows OpenSSH `(host, keytype)` semantics: multi-algorithm
   hosts (an ed25519 *and* an rsa entry) coexist normally; "changed key"
   only fires when the same keytype has a different blob.
+- **SSH host certificates are refused, fail-closed.** `known_hosts` maps a
+  host to a literal key and blink has no `@cert-authority` support, so
+  nothing here can check a certificate's CA signature, principals, or
+  validity window. Pinning one by its key would look like verification
+  while checking none of that, so a certificate is rejected outright and
+  the reason is surfaced in the log rather than left as a generic connect
+  failure.
 - **SFTP RSA auth uses rsa-sha2-512.** ssh-rsa with SHA-1 has been disabled
   by default in OpenSSH 8.8+ (September 2021); blink negotiates the
   modern hash so RSA users don't get an opaque "rejected by server"
@@ -784,6 +792,15 @@ A few things worth knowing before you use this in anger:
   every modern server speaks. Implicit FTPS on the deprecated port 990 is
   not supported. If you have a server that only does implicit-mode, you'd
   need a different connect path; the `transport/ftps.rs` seam is small.
+- **FTP directory listings are parsed as POSIX (`ls -l`) or DOS, nothing
+  else.** blink issues `LIST` and never `MLSD`/`MLST`, so it parses with
+  those two parsers only. A server whose listing format is neither shows an
+  empty directory and logs one `skipped N of M unparsable lines` warning per
+  listing. The alternative — the library's fallback parser, which accepts
+  *any* line and names the file after it — put entries in the pane that
+  addressed nothing, which was worse. Real-world dialect coverage is
+  untested: the FTP test suite runs against an in-process server, not
+  vsftpd or IIS.
 - **FTPS uses the embedded Mozilla CA bundle** (`webpki-roots`) for trust
   anchors rather than the system trust store. Self-signed certs and
   privately-rooted CAs aren't trusted by default. The per-session
