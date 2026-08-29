@@ -677,9 +677,10 @@ mod integration {
     /// converted these from panic to `FtpError`; no off-the-shelf server will
     /// produce them on request, which is why this one is hand-rolled.
     ///
-    /// `bad_pasv_octet` and `unparsable_list_line` are read by PASV/LIST
-    /// below. `abrupt_close` is read only by the later RETR/STOR tasks that
-    /// extend `handle_control`.
+    /// All three fields are read as of this commit: `bad_pasv_octet` and
+    /// `unparsable_list_line` by PASV/LIST below, and `abrupt_close` by
+    /// LIST's abrupt-close branch. The later RETR/STOR tasks that extend
+    /// `handle_control` add their own reads of `abrupt_close`.
     #[derive(Clone, Default)]
     pub(super) struct Faults {
         /// PASV reply carrying an out-of-range octet.
@@ -687,10 +688,6 @@ mod integration {
         /// A LIST body no parser can turn into entries.
         pub unparsable_list_line: bool,
         /// Close control and data connections after `150`, sending no `226`.
-        #[allow(
-            dead_code,
-            reason = "read by the RETR/STOR tasks that extend handle_control"
-        )]
         pub abrupt_close: bool,
     }
 
