@@ -24,7 +24,7 @@ async-trait = "0.1"
 futures = "0.3"
 
 # SSH / SFTP (pure-Rust async)
-russh = "0.60"
+russh = "0.63"
 russh-sftp = "2.0"
 
 # FTP / FTPS

@@ -1,7 +1,7 @@
 //! SFTP transport built on russh + russh-sftp.
 //!
 //! NOTE: russh and russh-sftp evolve their APIs across minor versions. The
-//! shape below targets `russh` 0.60.x and `russh-sftp` 2.3.x. If a `cargo build`
+//! shape below targets `russh` 0.63.x and `russh-sftp` 2.4.x. If a `cargo build`
 //! reports method-not-found errors here, check the exact constructor / method
 //! names against the version actually pulled in by `Cargo.lock`. The trait
 //! interface in `transport::Transport` is stable; only this file should need
@@ -13,6 +13,12 @@
 //! `authenticate_publickey_with` takes an explicit `hash_alg`; agent
 //! identities are `AgentIdentity` (key *or* certificate) rather than bare
 //! `PublicKey`; and `PrivateKeyWithHashAlg::new` is infallible.
+//!
+//! And in the 0.60 → 0.63 jump: `check_server_key` receives a
+//! `PublicKeyOrCertificate` rather than a `PublicKey`; the server-side
+//! `channel_open_*` callbacks return `()` and take a `ChannelOpenHandle` that
+//! must be accepted explicitly (dropping it rejects the channel); and russh
+//! dropped its `internal-russh-forked-ssh-key` fork for upstream `ssh-key`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -104,8 +110,27 @@ impl Handler for KnownHostsHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &ssh_key::PublicKey,
+        presented: &russh::keys::PublicKeyOrCertificate,
     ) -> std::result::Result<bool, Self::Error> {
+        // blink has no @cert-authority support: known_hosts stores a host
+        // against a literal key, so there is nothing to validate a
+        // certificate's CA signature, principals, or validity window against.
+        // Pinning one by its key would look like verification while checking
+        // none of that, so refuse — fail closed, as the known-hosts read error
+        // below does. russh 0.60 could not surface a certificate to this
+        // callback, so nothing that works today starts failing.
+        let server_public_key = match presented {
+            russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } => key,
+            russh::keys::PublicKeyOrCertificate::Certificate(_) => {
+                tracing::warn!(
+                    host = %self.display_host(),
+                    "server presented a host certificate — rejecting: \
+                     blink does not support host certificates",
+                );
+                return Ok(false);
+            }
+        };
+
         // Sanitize before any use: a server claiming a non-standard algorithm
         // name could inject ANSI sequences into the host-key modal and log.
         let key_type = error::sanitize(server_public_key.algorithm().as_str().to_string());
@@ -1302,7 +1327,7 @@ mod integration {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use russh::server::{Auth, Msg, Session as ServerSession};
+    use russh::server::{Auth, ChannelOpenHandle, Msg, Session as ServerSession};
     use russh::{Channel, ChannelId};
     use russh_sftp::protocol::{
         Attrs, Data, FileAttributes, Handle as SftpHandle, OpenFlags, Status, StatusCode, Version,
@@ -1336,13 +1361,19 @@ mod integration {
             Ok(Auth::Accept)
         }
 
+        // russh 0.63 replaced the `Ok(true)`/`Ok(false)` return with an
+        // explicit accept/reject handle. Dropping the handle rejects the
+        // channel, so `reply.accept()` is what keeps the SFTP subsystem
+        // reachable — the old `Ok(true)` has no equivalent in the return type.
         async fn channel_open_session(
             &mut self,
             channel: Channel<Msg>,
+            reply: ChannelOpenHandle,
             _session: &mut ServerSession,
-        ) -> Result<bool, Self::Error> {
+        ) -> Result<(), Self::Error> {
             self.channels.lock().await.insert(channel.id(), channel);
-            Ok(true)
+            reply.accept().await;
+            Ok(())
         }
 
         async fn subsystem_request(
@@ -1947,5 +1978,68 @@ mod integration {
         for f in [&a_dst, &b_dst] {
             let _ = tokio::fs::remove_file(f).await;
         }
+    }
+
+    /// Build a self-signed SSH *host* certificate. Nothing validates it — the
+    /// point is only that the callback receives the `Certificate` variant.
+    /// `Builder::sign` refuses an empty principal list ("golden ticket"), so
+    /// `all_principals_valid` is set explicitly.
+    fn host_certificate() -> russh::keys::ssh_key::Certificate {
+        use russh::keys::ssh_key::certificate::{Builder, CertType};
+
+        let ca = russh::keys::PrivateKey::random(
+            &mut rand::rng(),
+            russh::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+        let subject = russh::keys::PrivateKey::random(
+            &mut rand::rng(),
+            russh::keys::Algorithm::Ed25519,
+        )
+        .unwrap();
+
+        let mut builder = Builder::new(
+            [0u8; 16],
+            subject.public_key().key_data().clone(),
+            0,
+            u64::MAX >> 1,
+        )
+        .unwrap();
+        builder.cert_type(CertType::Host).unwrap();
+        builder.all_principals_valid().unwrap();
+        builder.key_id("blink-test").unwrap();
+        builder.sign(&ca).unwrap()
+    }
+
+    /// A server presenting an SSH host *certificate* must be refused. blink's
+    /// known_hosts stores host -> (key type, base64 key) and has no
+    /// @cert-authority support, so it cannot validate a certificate's CA
+    /// signature, principals, or validity window. TOFU-pinning one would look
+    /// like verification while checking none of that; russh 0.60 could not
+    /// surface a certificate here at all, so refusing preserves behaviour.
+    #[tokio::test]
+    async fn a_host_certificate_is_refused() {
+        use russh::client::Handler as _;
+        use russh::keys::PublicKeyOrCertificate;
+
+        let (ev_tx, mut ev_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::tui::event::AppEvent>();
+        let mut handler = super::KnownHostsHandler {
+            host: "example.test".to_string(),
+            port: 22,
+            event_tx: Some(ev_tx),
+            trust: crate::known_hosts::SessionTrust::new(),
+        };
+
+        let accepted = handler
+            .check_server_key(&PublicKeyOrCertificate::Certificate(host_certificate()))
+            .await
+            .expect("the callback itself must not error");
+
+        assert!(!accepted, "a host certificate must be refused");
+        assert!(
+            ev_rx.try_recv().is_err(),
+            "a certificate must not raise the trust-on-first-use prompt",
+        );
     }
 }
