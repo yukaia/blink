@@ -228,10 +228,13 @@ pub async fn ftp_list<T: TokioTlsStream + Send>(
     let lines = timed_ftp("list", remote_path, stream.list(Some(remote_path))).await?;
 
     let mut out = Vec::with_capacity(lines.len());
+    let mut considered = 0usize;
+    let mut skipped = 0usize;
     for line in lines {
         if line.starts_with("total ") {
             continue;
         }
+        considered += 1;
         // blink issues LIST, never MLSD or MLST, so only the LIST parsers
         // are the right ones for this input. `File::from_str` would fall
         // through to the MLSX parsers, which split on `;`, ignore unknown
@@ -240,7 +243,10 @@ pub async fn ftp_list<T: TokioTlsStream + Send>(
         let parsed = match ListParser::parse_posix(&line).or_else(|_| ListParser::parse_dos(&line))
         {
             Ok(f) => f,
-            Err(_) => continue,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
         };
         // The server's own bytes — see `RemoteEntry::new`. Sanitizing here
         // would produce a name that no longer addresses the file.
@@ -264,6 +270,19 @@ pub async fn ftp_list<T: TokioTlsStream + Send>(
             None,
             None,
         ));
+    }
+    // One line per call, not one per skipped line: against a server whose
+    // LIST format neither parser accepts, *every* line is unparsable, and
+    // this runs on every interactive navigation — a per-line warn would
+    // bury the log under one keystroke. Silence was worse still: the pane
+    // just came up empty with nothing anywhere saying why.
+    if skipped > 0 {
+        tracing::warn!(
+            path = %remote_path,
+            skipped,
+            considered,
+            "skipped unparsable listing lines",
+        );
     }
     Ok(out)
 }
@@ -535,14 +554,21 @@ pub async fn ftp_metadata<T: TokioTlsStream + Send>(
         Err(BlinkError::NotFound(_)) => return Ok(None),
         Err(e) => return Err(e),
     };
+    let mut found = None;
+    let mut considered = 0usize;
+    let mut skipped = 0usize;
     for line in lines {
         if line.starts_with("total ") {
             continue;
         }
+        considered += 1;
         let parsed = match ListParser::parse_posix(&line).or_else(|_| ListParser::parse_dos(&line))
         {
             Ok(f) => f,
-            Err(_) => continue,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
         };
         if parsed.name() != basename {
             continue;
@@ -556,15 +582,29 @@ pub async fn ftp_metadata<T: TokioTlsStream + Send>(
         } else {
             EntryKind::Other
         };
-        return Ok(Some(RemoteEntry::new(
-            basename,
+        found = Some(RemoteEntry::new(
+            basename.clone(),
             kind,
             parsed.size() as u64,
             None,
             None,
-        )));
+        ));
+        break;
     }
-    Ok(None)
+    // Aggregated for the same reason as `ftp_list`, and reported against
+    // `remote_path` rather than the parent that was actually listed: the
+    // path the caller asked about is the one they can act on. A stat that
+    // answers "absent" only because the parser rejected every line is
+    // otherwise indistinguishable from a genuinely missing file.
+    if skipped > 0 {
+        tracing::warn!(
+            path = %remote_path,
+            skipped,
+            considered,
+            "skipped unparsable listing lines",
+        );
+    }
+    Ok(found)
 }
 
 pub async fn ftp_read_to_bytes<T: TokioTlsStream + Send + 'static>(
