@@ -77,10 +77,13 @@ the git history for those.
   unparsable lines` warning per listing — aggregated per call rather than per
   line, because listing runs on interactive navigation.
 
-- **Minimum supported Rust is now 1.90**, which is what the dependency graph
-  has required since the first commit (`quantette`, reached through
-  `icy_sixel`). The manifest previously declared 1.89 and had never been
-  buildable at it.
+- **Minimum supported Rust is now declared as 1.98** — the toolchain blink is
+  built and tested on, and the only floor that has been verified. The manifest
+  previously declared 1.89, then 1.90 (the highest `rust-version` in the
+  dependency graph, via `quantette`). Both were metadata claims: a declared
+  `rust-version` records what a crate says, not what it compiles at, and
+  nothing here has ever been built below stable. The floor may well be lower
+  in practice; it will be lowered when someone compiles it there.
 
 ### Dependencies
 
@@ -110,5 +113,6 @@ the git history for those.
   exercised end to end.
 - The FTP harness models a well-behaved server. Real-daemon dialects
   (vsftpd, IIS), NAT-mangled PASV replies, and TLS session reuse are uncovered.
-- The MSRV floor is checked by a `cargo metadata` walk over declared
-  `rust-version` fields, not by compiling at 1.90.
+- The MSRV floor is set to the toolchain used for development rather than
+  probed downward. Lowering it needs a real `cargo +<version> check`, not
+  another metadata walk.

@@ -126,12 +126,19 @@ the choice persisted to `config.ini` automatically.
 
 ### Prerequisites
 
-- **Rust 1.90+** with the 2024 edition. The floor comes from a dependency:
-  `quantette`, reached through `icy_sixel` for sixel image preview, declares
-  1.90, and every published `quantette` release does. blink's own source needs
-  1.89, where `File::lock` stabilised — `known_hosts` uses it to make
-  accept-and-save atomic across processes — over a 1.88 floor for let-chains,
-  which the crate uses throughout.
+- **Rust 1.98+** with the 2024 edition. That is the toolchain blink is built
+  and tested on, and it is deliberately the number in the manifest: it is the
+  only floor anyone has actually verified.
+
+  The *declared* floors underneath are lower — `quantette`, reached through
+  `icy_sixel` for sixel image preview, declares 1.90, and blink's own source
+  needs 1.89, where `File::lock` stabilised for atomic accept-and-save in
+  `known_hosts`. But a declared `rust-version` only records what a crate
+  claims, not what it compiles at, and nothing here has ever been built below
+  1.98. Advertising 1.90 was a promise with no evidence behind it.
+
+  If you need a lower floor, it is one `cargo +<version> check --all-targets`
+  away from being real rather than assumed.
 
 That's it. Every TLS-using dependency is pure Rust (rustls), so there's no
 need for `libssl-dev` or any other system TLS library on any platform.
