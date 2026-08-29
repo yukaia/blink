@@ -148,6 +148,15 @@ pub enum AppEvent {
         fingerprint: String,
     },
 
+    /// The server presented an SSH host certificate, which blink cannot
+    /// validate — hard reject. Carries the reason so the TUI shows it
+    /// instead of a generic connect failure.
+    HostCertificateRejected {
+        /// Display form of the host (bare for the default SSH port,
+        /// `[host]:port` otherwise).
+        host: String,
+    },
+
     /// Transfer dispatcher emitted an event. Reserved for the next wiring pass.
     #[allow(dead_code)]
     Transfer(TransferEvent),

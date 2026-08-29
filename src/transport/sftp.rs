@@ -127,6 +127,17 @@ impl Handler for KnownHostsHandler {
                     "server presented a host certificate — rejecting: \
                      blink does not support host certificates",
                 );
+                // Send the rejection event so the TUI states the real reason
+                // rather than a generic connect failure. Everything here is
+                // derived from fields already held, so the arm still returns
+                // before any known_hosts read — the reject cannot depend on
+                // the filesystem.
+                let event = crate::tui::event::AppEvent::HostCertificateRejected {
+                    host: self.display_host(),
+                };
+                if let Some(tx) = self.event_tx.take() {
+                    let _ = tx.send(event);
+                }
                 return Ok(false);
             }
         };
@@ -2037,9 +2048,21 @@ mod integration {
             .expect("the callback itself must not error");
 
         assert!(!accepted, "a host certificate must be refused");
-        assert!(
-            ev_rx.try_recv().is_err(),
-            "a certificate must not raise the trust-on-first-use prompt",
-        );
+
+        let ev = ev_rx
+            .try_recv()
+            .expect("the rejection must reach the TUI, not just the log");
+        match ev {
+            crate::tui::event::AppEvent::HostCertificateRejected { host } => {
+                assert_eq!(host, "example.test");
+            }
+            // Naming the wrong variant matters more than counting events,
+            // and `AppEvent` is deliberately not `Debug`, so spell out the
+            // one variant that must never appear here.
+            crate::tui::event::AppEvent::HostKeyUnknown { .. } => {
+                panic!("a certificate must not raise the trust-on-first-use prompt")
+            }
+            _ => panic!("expected AppEvent::HostCertificateRejected"),
+        }
     }
 }
