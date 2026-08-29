@@ -1460,6 +1460,119 @@ mod integration {
         );
     }
 
+    /// An out-of-range PASV octet must surface as an error, not a panic and
+    /// not a hang. suppaftp 10.0 changed this from a panic; these tests pin
+    /// the behaviour on both sides of that bump.
+    #[tokio::test]
+    #[ignore = "suppaftp 8.0.5 panics here; unignored by the 10.0 bump in the next task"]
+    async fn a_malformed_pasv_reply_is_an_error_not_a_panic() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store.lock().await.insert("/a.txt".to_string(), b"x".to_vec());
+
+        let faults = Faults {
+            bad_pasv_octet: true,
+            ..Faults::default()
+        };
+        let (port, _c, log) = start_server(Arc::clone(&store), faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let result = transport.list("/").await;
+        assert!(result.is_err(), "a 999 octet must not be accepted");
+
+        // Without the fault the store's one entry would come back and the
+        // assertion above would fail, so this cannot pass with the injection
+        // switched off; the log pins that it got as far as PASV.
+        let issued = log.lock().await.clone();
+        assert!(
+            issued.iter().any(|c| c == "PASV"),
+            "PASV should have been issued; commands issued: {issued:?}",
+        );
+    }
+
+    /// This one does not panic and the 10.0 bump will not change it:
+    /// `File::from_str` falls through to the MLST parser, which splits on `;`
+    /// and names the file the last token, so *any* line becomes an entry.
+    /// `src/list.rs` is unchanged between 8.0.5 and 10.0.2 on that path, so
+    /// the assertion below is left intact and ignored rather than softened —
+    /// closing it needs a guard in `ftp_list`, which is not this task's to add.
+    #[tokio::test]
+    #[ignore = "suppaftp's MLST fallback accepts any line as an entry; unchanged in 10.0, so the next task does not unignore this one"]
+    async fn an_unparsable_listing_line_is_an_error_not_a_panic() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store.lock().await.insert("/a.txt".to_string(), b"x".to_vec());
+
+        let faults = Faults {
+            unparsable_list_line: true,
+            ..Faults::default()
+        };
+        let (port, _c, log) = start_server(Arc::clone(&store), faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        // Either an error or an empty listing is acceptable — a panic is not,
+        // and neither is a garbage entry addressed at a nonexistent path.
+        match transport.list("/").await {
+            Err(_) => {}
+            Ok(entries) => assert!(
+                entries.is_empty(),
+                "an unparsable line must not become an entry: {entries:?}"
+            ),
+        }
+
+        // An empty listing only means anything if the garbage body is what
+        // emptied it: the store holds `/a.txt`, which an unfaulted server
+        // would list, so this pins that LIST was reached and asked for the
+        // directory holding it rather than the exchange failing earlier.
+        let issued = log.lock().await.clone();
+        assert!(
+            issued.iter().any(|c| c == "LIST /"),
+            "LIST / should have been issued; commands issued: {issued:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_dropped_mid_transfer_is_reported_not_hung() {
+        let payload = pseudo_random(50_000);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store.lock().await.insert("/gone.bin".to_string(), payload);
+
+        let faults = Faults {
+            abrupt_close: true,
+            ..Faults::default()
+        };
+        let (port, _c, log) = start_server(Arc::clone(&store), faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let dir = tempdir_for_test("abrupt-close");
+        let local = dir.join("gone.bin");
+
+        // Must not hang: FTP_OP_TIMEOUT is 60s, so a 10s bound proves the
+        // failure comes from the closed socket rather than the deadline.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            transport.download("/gone.bin", &local, None),
+        )
+        .await;
+
+        let inner = result.expect("must fail fast, not wait out the timeout");
+        assert!(inner.is_err(), "a dropped connection must be an error");
+
+        // The store holds the file, so without the fault this download would
+        // succeed and the assertion above would fail; the log pins that the
+        // server dropped the socket at RETR rather than never being asked.
+        let issued = log.lock().await.clone();
+        assert!(
+            issued.iter().any(|c| c == "RETR /gone.bin"),
+            "RETR should have been issued; commands issued: {issued:?}",
+        );
+        assert!(
+            !local.exists(),
+            "a failed download must not land under the final name",
+        );
+    }
+
     /// `227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)` -> port.
     fn parse_pasv_port(line: &str) -> u16 {
         let inner = line
