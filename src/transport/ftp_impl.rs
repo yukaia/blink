@@ -1143,8 +1143,9 @@ mod integration {
 
         let dir = tempdir_for_test("download");
         let local = dir.join("big.bin");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         transport
-            .download("/big.bin", &local, None)
+            .download("/big.bin", &local, Some(tx))
             .await
             .expect("download should succeed");
 
@@ -1158,6 +1159,34 @@ mod integration {
         assert!(
             issued.iter().any(|c| c == "SIZE /big.bin"),
             "the download must consult SIZE for its progress total; commands issued: {issued:?}",
+        );
+
+        // Issuing SIZE is only half of it — its answer has to reach the
+        // progress channel, or the bar has a real number it never shows.
+        // The sender was moved into `download` and dropped when it
+        // returned, so nothing is still in flight and `try_recv` drains
+        // the queue without an await that could hang.
+        let mut updates = Vec::new();
+        while let Ok(u) = rx.try_recv() {
+            updates.push(u);
+        }
+        assert!(
+            !updates.is_empty(),
+            "a download given a progress sender must report at least once",
+        );
+        // `bytes_total` is fixed for the whole transfer, so every update
+        // must carry SIZE's answer. Asserting on all of them rather than on
+        // how many arrived: the chunking that decides the count is not what
+        // is under test, and would make this brittle for no gain.
+        assert!(
+            updates.iter().all(|u| u.bytes_total == payload.len() as u64),
+            "every update must carry SIZE's answer as the total; got {:?}",
+            updates.iter().map(|u| u.bytes_total).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            updates.last().unwrap().bytes_done,
+            payload.len() as u64,
+            "the last update must account for every byte written",
         );
     }
 
@@ -1288,6 +1317,50 @@ mod integration {
             "DELE /doomed.txt",
             "RMD /emptydir",
         ] {
+            assert!(
+                issued.iter().any(|c| c == expected),
+                "{expected} should have been issued; commands issued: {issued:?}",
+            );
+        }
+    }
+
+    /// The same verbs against paths that are not there. The harness answers
+    /// `550` whenever the key is absent, and `map_ftp` reads 550 as
+    /// [`crate::error::BlinkError::NotFound`] — so what is pinned here is the
+    /// *variant*, not merely that something failed. A 550 misfiled as
+    /// `Transport` or `Disconnected` would send the TUI down the "the link
+    /// broke" path instead of telling the user the file isn't there.
+    #[tokio::test]
+    async fn renaming_removing_and_deleting_a_missing_path_each_report_not_found() {
+        // Deliberately empty: every key the operations below name is absent.
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let renamed = transport.rename("/absent.txt", "/wherever.txt").await;
+        assert!(
+            matches!(renamed, Err(crate::error::BlinkError::NotFound(_))),
+            "renaming a file that is not there should be NotFound; got {renamed:?}",
+        );
+
+        let removed = transport.delete_dir("/absentdir", false).await;
+        assert!(
+            matches!(removed, Err(crate::error::BlinkError::NotFound(_))),
+            "removing a directory that is not there should be NotFound; got {removed:?}",
+        );
+
+        let deleted = transport.delete_file("/absent.txt").await;
+        assert!(
+            matches!(deleted, Err(crate::error::BlinkError::NotFound(_))),
+            "deleting a file that is not there should be NotFound; got {deleted:?}",
+        );
+
+        // Each error has to be the server's `550` coming back, not a
+        // client-side guard that refused before issuing anything — those
+        // produce a different variant for a different reason.
+        let issued = log.lock().await.clone();
+        for expected in ["RNTO /wherever.txt", "RMD /absentdir", "DELE /absent.txt"] {
             assert!(
                 issued.iter().any(|c| c == expected),
                 "{expected} should have been issued; commands issued: {issued:?}",
