@@ -130,11 +130,10 @@ pub(crate) use delegate_ftp_transport;
 // ---------------------------------------------------------------------------
 
 use std::path::Path;
-use std::str::FromStr;
 use std::time::Duration;
 
 use bytes::Bytes;
-use suppaftp::list::File as FtpFile;
+use suppaftp::list::ListParser;
 use suppaftp::tokio::{ImplAsyncFtpStream, TokioTlsStream};
 use suppaftp::FtpError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -226,7 +225,13 @@ pub async fn ftp_list<T: TokioTlsStream + Send>(
         if line.starts_with("total ") {
             continue;
         }
-        let parsed = match FtpFile::from_str(&line) {
+        // blink issues LIST, never MLSD or MLST, so only the LIST parsers
+        // are the right ones for this input. `File::from_str` would fall
+        // through to the MLSX parsers, which split on `;`, ignore unknown
+        // facts and name the file the last token — so any non-empty line
+        // parses as a file named after itself.
+        let parsed = match ListParser::parse_posix(&line).or_else(|_| ListParser::parse_dos(&line))
+        {
             Ok(f) => f,
             Err(_) => continue,
         };
@@ -438,7 +443,9 @@ pub async fn ftp_delete_dir<T: TokioTlsStream + Send>(
                     if line.starts_with("total ") {
                         continue;
                     }
-                    let parsed = match FtpFile::from_str(&line) {
+                    let parsed = match ListParser::parse_posix(&line)
+                        .or_else(|_| ListParser::parse_dos(&line))
+                    {
                         Ok(f) => f,
                         Err(_) => continue,
                     };
@@ -525,7 +532,8 @@ pub async fn ftp_metadata<T: TokioTlsStream + Send>(
         if line.starts_with("total ") {
             continue;
         }
-        let parsed = match FtpFile::from_str(&line) {
+        let parsed = match ListParser::parse_posix(&line).or_else(|_| ListParser::parse_dos(&line))
+        {
             Ok(f) => f,
             Err(_) => continue,
         };
@@ -1490,14 +1498,11 @@ mod integration {
         );
     }
 
-    /// This one does not panic and the 10.0 bump will not change it:
-    /// `File::from_str` falls through to the MLST parser, which splits on `;`
-    /// and names the file the last token, so *any* line becomes an entry.
-    /// `src/list.rs` is unchanged between 8.0.5 and 10.0.2 on that path, so
-    /// the assertion below is left intact and ignored rather than softened —
-    /// closing it needs a guard in `ftp_list`, which is not this task's to add.
+    /// A garbage body must not become an entry. `File::from_str` would let it:
+    /// it falls through to the MLSX parsers, which split on `;` and name the
+    /// file the last token, so any non-empty line parses. `ftp_list` calls the
+    /// LIST parsers directly instead, and an unparsable line is skipped.
     #[tokio::test]
-    #[ignore = "suppaftp's MLST fallback accepts any line as an entry; unchanged in 10.0, so the next task does not unignore this one"]
     async fn an_unparsable_listing_line_is_an_error_not_a_panic() {
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
         store.lock().await.insert("/a.txt".to_string(), b"x".to_vec());
