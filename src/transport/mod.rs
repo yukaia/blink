@@ -182,6 +182,9 @@ pub(crate) mod ftp_impl;
 pub mod ftps;
 pub mod scp;
 pub mod sftp;
+/// Throwaway SSH keys used only by `sftp`'s integration tests.
+#[cfg(test)]
+mod sftp_test_keys;
 
 /// One entry from a remote directory listing.
 ///

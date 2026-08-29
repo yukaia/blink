@@ -1250,7 +1250,47 @@ impl Transport for SftpTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::{chunk_offsets, read_local_full, reply_within_request};
+    use super::{chunk_offsets, read_local_full, reply_within_request, rsa_hash_alg};
+
+    /// OpenSSH 8.8+ disabled `ssh-rsa` (SHA-1) by default in Sept 2021, so an
+    /// RSA key that does not ask for `rsa-sha2-512` fails against any current
+    /// server. The README lists that as an enforced property; nothing checked
+    /// it until now.
+    ///
+    /// This pins the *request*, which is the part blink controls. What no test
+    /// here can pin is the algorithm that ends up on the wire: russh does not
+    /// pass the signature algorithm to a server's `auth_publickey` callback,
+    /// and `ssh-key`'s verifier accepts a SHA-1 RSA signature, so the
+    /// integration test would go green either way.
+    #[test]
+    fn rsa_keys_request_sha512_and_others_request_nothing() {
+        use super::ssh_key::{Algorithm, EcdsaCurve, HashAlg};
+
+        assert_eq!(
+            rsa_hash_alg(&Algorithm::Rsa { hash: None }),
+            Some(HashAlg::Sha512),
+            "an RSA key must ask for rsa-sha2-512",
+        );
+        assert_eq!(
+            rsa_hash_alg(&Algorithm::Rsa {
+                hash: Some(HashAlg::Sha256)
+            }),
+            Some(HashAlg::Sha512),
+            "the key's own hash must not lower the requested one",
+        );
+        assert_eq!(
+            rsa_hash_alg(&Algorithm::Ed25519),
+            None,
+            "Ed25519 has no hash to choose",
+        );
+        assert_eq!(
+            rsa_hash_alg(&Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256
+            }),
+            None,
+            "ECDSA carries its hash in the curve",
+        );
+    }
 
     // -- over-long read replies --------------------------------------------
     //
@@ -1369,6 +1409,19 @@ mod integration {
         type Error = russh::Error;
 
         async fn auth_password(&mut self, _u: &str, _p: &str) -> Result<Auth, Self::Error> {
+            Ok(Auth::Accept)
+        }
+
+        /// Accept any key. russh verifies the client's signature against the
+        /// offered public key *before* calling this, so reaching it at all
+        /// means the signature checked out — which is the whole point of the
+        /// key-auth tests: they prove the crypto backend verified an RSA or
+        /// ECDSA signature, not merely that blink sent something.
+        async fn auth_publickey(
+            &mut self,
+            _user: &str,
+            _key: &russh::keys::ssh_key::PublicKey,
+        ) -> Result<Auth, Self::Error> {
             Ok(Auth::Accept)
         }
 
@@ -1572,15 +1625,23 @@ mod integration {
     /// counter of accepted TCP connections (used to assert that the
     /// dispatcher's connection pool actually reuses connections).
     async fn start_server(store: Store) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        start_server_with_host_key(store, super::super::sftp_test_keys::ED25519_KEY).await
+    }
+
+    /// As [`start_server`], but with the host key given as an OpenSSH-format
+    /// private key. The algorithm the server proves its identity with is what
+    /// `check_server_key` verifies and what `known_hosts` records a keytype
+    /// for, so it has to be variable to be tested.
+    async fn start_server_with_host_key(
+        store: Store,
+        host_key: &str,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let config = Arc::new(russh::server::Config {
             keys: vec![
-                russh::keys::PrivateKey::random(
-                    &mut rand::rng(),
-                    russh::keys::Algorithm::Ed25519,
-                )
-                .unwrap(),
+                russh::keys::PrivateKey::from_openssh(host_key)
+                    .expect("test host key should parse"),
             ],
             ..Default::default()
         });
@@ -1704,6 +1765,114 @@ mod integration {
                     }
                 }
             }
+        }
+    }
+
+    /// Connect with `auth`, returning the transport and the host key type the
+    /// TOFU prompt reported. The key type is the only place the negotiated
+    /// host-key algorithm is observable from outside — `SessionTrust` keeps
+    /// the decision in memory, so nothing reaches a `known_hosts` file to
+    /// read back, and test isolation would forbid touching the real one.
+    async fn connect_with(port: u16, auth: AuthMethod) -> (SftpTransport, String) {
+        let session = Session {
+            name: "it".to_string(),
+            protocol: Protocol::Sftp,
+            host: "127.0.0.1".to_string(),
+            port,
+            username: "tester".to_string(),
+            remote_dir: "/".to_string(),
+            local_dir: None,
+            auth,
+            parallel_downloads: None,
+            theme: None,
+            accept_invalid_certs: false,
+            cert_sha256: None,
+        };
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let mut fut = Box::pin(SftpTransport::connect(
+            &session,
+            Some("pw"),
+            ev_tx,
+            crate::known_hosts::SessionTrust::new(),
+        ));
+        let mut seen_key_type = String::new();
+        loop {
+            tokio::select! {
+                res = &mut fut => {
+                    return (res.expect("connect should succeed"), seen_key_type);
+                }
+                Some(ev) = ev_rx.recv() => {
+                    if let AppEvent::HostKeyUnknown { decision_tx, key_type, .. } = ev {
+                        seen_key_type = key_type;
+                        let _ = decision_tx.send(HostKeyDecision::AcceptOnce);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Write a fixture key where `AuthMethod::Key` can find it. Named per
+    /// test so concurrent tests cannot race on one path, as the FTP harness's
+    /// `tempdir_for_test` does.
+    fn write_key_fixture(tag: &str, pem: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("blink-sftp-key-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("id_test");
+        std::fs::write(&path, pem).unwrap();
+        path
+    }
+
+    /// The host key is what `check_server_key` verifies, so its algorithm is
+    /// the crypto path a backend swap actually exercises. Before this, the
+    /// harness only ever offered Ed25519 — the one algorithm whose signatures
+    /// say nothing about whether RSA or ECDSA verification works.
+    #[tokio::test]
+    async fn a_server_host_key_is_verified_for_every_algorithm() {
+        for (label, pem, expected_type) in [
+            ("ed25519", super::super::sftp_test_keys::ED25519_KEY, "ssh-ed25519"),
+            ("ecdsa", super::super::sftp_test_keys::ECDSA_KEY, "ecdsa-sha2-nistp256"),
+            ("rsa", super::super::sftp_test_keys::RSA_KEY, "ssh-rsa"),
+        ] {
+            let store: Store = Arc::new(Mutex::new(HashMap::new()));
+            let (port, _c) = start_server_with_host_key(store, pem).await;
+
+            let (mut transport, key_type) =
+                connect_with(port, AuthMethod::Password).await;
+
+            assert_eq!(
+                key_type, expected_type,
+                "{label}: the prompt should name the host key's own algorithm",
+            );
+            transport.close().await.expect("close should be clean");
+        }
+    }
+
+    /// `AuthMethod::Key` had no coverage against a server at all: every
+    /// existing test authenticates with a password, so the whole key-auth
+    /// path — including the RSA hash negotiation below — was never run.
+    ///
+    /// The server accepts any key, but russh verifies the signature before
+    /// the accept callback runs, so a pass here means the backend really did
+    /// verify an ECDSA or RSA signature.
+    #[tokio::test]
+    async fn client_key_authentication_works_for_every_algorithm() {
+        for (tag, pem) in [
+            ("ed25519", super::super::sftp_test_keys::ED25519_KEY),
+            ("ecdsa", super::super::sftp_test_keys::ECDSA_KEY),
+            ("rsa", super::super::sftp_test_keys::RSA_KEY),
+        ] {
+            let store: Store = Arc::new(Mutex::new(HashMap::new()));
+            let (port, _c) = start_server(store).await;
+            let path = write_key_fixture(tag, pem);
+
+            let (mut transport, _) =
+                connect_with(port, AuthMethod::Key { path: path.clone() }).await;
+
+            transport
+                .close()
+                .await
+                .unwrap_or_else(|e| panic!("{tag}: close should be clean: {e}"));
+            let _ = std::fs::remove_file(&path);
         }
     }
 
