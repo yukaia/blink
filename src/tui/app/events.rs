@@ -439,6 +439,18 @@ impl App {
                 self.pending_session = None;
                 self.screen = Screen::HostKeyChanged;
             }
+            AppEvent::HostCertificateRejected { host } => {
+                // No modal: unlike a changed key there is no recovery command
+                // to print and nothing for the user to decide, so the log line
+                // carrying the real reason is the whole remedy.
+                self.push_log(
+                    LogLevel::Error,
+                    format!(
+                        "HOST CERTIFICATE for {host}: blink cannot validate host \
+                         certificates — connection refused"
+                    ),
+                );
+            }
         }
     }
 

@@ -130,11 +130,10 @@ pub(crate) use delegate_ftp_transport;
 // ---------------------------------------------------------------------------
 
 use std::path::Path;
-use std::str::FromStr;
 use std::time::Duration;
 
 use bytes::Bytes;
-use suppaftp::list::File as FtpFile;
+use suppaftp::list::ListParser;
 use suppaftp::tokio::{ImplAsyncFtpStream, TokioTlsStream};
 use suppaftp::FtpError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -184,6 +183,13 @@ pub(crate) const FTP_OP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Every entry point that puts a path on the control channel calls this, so a
 /// path is checked once, on the way in, rather than at each of the commands it
 /// may fan out into.
+///
+/// suppaftp 10.0.2 also rejects CR/LF at the library boundary, so this is no
+/// longer the only guard. It stays the primary one: it names the operation
+/// and produces a sanitized `BlinkError::transport`, where suppaftp's would
+/// arrive as an opaque `FtpError`. Do not remove it as redundant — and note
+/// upstream's `validate_command_line` covers CR/LF only, so the NUL check
+/// below has no backstop at all.
 pub(crate) fn check_ftp_path(op: &str, path: &str) -> Result<()> {
     if path.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0')) {
         // `BlinkError::transport` sanitizes, so the offending bytes render as
@@ -222,13 +228,25 @@ pub async fn ftp_list<T: TokioTlsStream + Send>(
     let lines = timed_ftp("list", remote_path, stream.list(Some(remote_path))).await?;
 
     let mut out = Vec::with_capacity(lines.len());
+    let mut considered = 0usize;
+    let mut skipped = 0usize;
     for line in lines {
         if line.starts_with("total ") {
             continue;
         }
-        let parsed = match FtpFile::from_str(&line) {
+        considered += 1;
+        // blink issues LIST, never MLSD or MLST, so only the LIST parsers
+        // are the right ones for this input. `File::from_str` would fall
+        // through to the MLSX parsers, which split on `;`, ignore unknown
+        // facts and name the file the last token — so any non-empty line
+        // parses as a file named after itself.
+        let parsed = match ListParser::parse_posix(&line).or_else(|_| ListParser::parse_dos(&line))
+        {
             Ok(f) => f,
-            Err(_) => continue,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
         };
         // The server's own bytes — see `RemoteEntry::new`. Sanitizing here
         // would produce a name that no longer addresses the file.
@@ -252,6 +270,19 @@ pub async fn ftp_list<T: TokioTlsStream + Send>(
             None,
             None,
         ));
+    }
+    // One line per call, not one per skipped line: against a server whose
+    // LIST format neither parser accepts, *every* line is unparsable, and
+    // this runs on every interactive navigation — a per-line warn would
+    // bury the log under one keystroke. Silence was worse still: the pane
+    // just came up empty with nothing anywhere saying why.
+    if skipped > 0 {
+        tracing::warn!(
+            path = %remote_path,
+            skipped,
+            considered,
+            "skipped unparsable listing lines",
+        );
     }
     Ok(out)
 }
@@ -438,7 +469,9 @@ pub async fn ftp_delete_dir<T: TokioTlsStream + Send>(
                     if line.starts_with("total ") {
                         continue;
                     }
-                    let parsed = match FtpFile::from_str(&line) {
+                    let parsed = match ListParser::parse_posix(&line)
+                        .or_else(|_| ListParser::parse_dos(&line))
+                    {
                         Ok(f) => f,
                         Err(_) => continue,
                     };
@@ -521,13 +554,21 @@ pub async fn ftp_metadata<T: TokioTlsStream + Send>(
         Err(BlinkError::NotFound(_)) => return Ok(None),
         Err(e) => return Err(e),
     };
+    let mut found = None;
+    let mut considered = 0usize;
+    let mut skipped = 0usize;
     for line in lines {
         if line.starts_with("total ") {
             continue;
         }
-        let parsed = match FtpFile::from_str(&line) {
+        considered += 1;
+        let parsed = match ListParser::parse_posix(&line).or_else(|_| ListParser::parse_dos(&line))
+        {
             Ok(f) => f,
-            Err(_) => continue,
+            Err(_) => {
+                skipped += 1;
+                continue;
+            }
         };
         if parsed.name() != basename {
             continue;
@@ -541,15 +582,29 @@ pub async fn ftp_metadata<T: TokioTlsStream + Send>(
         } else {
             EntryKind::Other
         };
-        return Ok(Some(RemoteEntry::new(
-            basename,
+        found = Some(RemoteEntry::new(
+            basename.clone(),
             kind,
             parsed.size() as u64,
             None,
             None,
-        )));
+        ));
+        break;
     }
-    Ok(None)
+    // Aggregated for the same reason as `ftp_list`, and reported against
+    // `remote_path` rather than the parent that was actually listed: the
+    // path the caller asked about is the one they can act on. A stat that
+    // answers "absent" only because the parser rejected every line is
+    // otherwise indistinguishable from a genuinely missing file.
+    if skipped > 0 {
+        tracing::warn!(
+            path = %remote_path,
+            skipped,
+            considered,
+            "skipped unparsable listing lines",
+        );
+    }
+    Ok(found)
 }
 
 pub async fn ftp_read_to_bytes<T: TokioTlsStream + Send + 'static>(
@@ -638,5 +693,1037 @@ mod tests {
         assert!(!err.contains('\r'), "CR reached the message: {err:?}");
         assert!(!err.contains('\n'), "LF reached the message: {err:?}");
         assert!(!err.contains('\x1b'), "ESC reached the message: {err:?}");
+    }
+}
+
+/// FTP integration tests against an in-process FTP server. No external
+/// daemon is required. The server speaks only the commands blink issues and
+/// serves data in short slices, so partial reads are exercised rather than
+/// assumed away.
+///
+/// Written against suppaftp 8.0.5 deliberately: a harness written against a
+/// new version cannot tell "encodes current behaviour" from "encodes the new
+/// library's behaviour". Landed first, it is a differential test.
+#[cfg(test)]
+mod integration {
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::Mutex;
+
+    use crate::session::{AuthMethod, Protocol, Session};
+    use crate::transport::Transport;
+    use crate::transport::ftp::FtpTransport;
+
+    /// Absolute path -> file contents. A key ending in `/` is a directory.
+    pub(super) type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
+    /// Every control-channel command the server received, verbatim and in
+    /// order. Some behaviour is invisible from the result alone — a resume
+    /// that silently restarts still lands the correct bytes — so tests assert
+    /// on what was *issued*, not only on what came back.
+    pub(super) type Log = Arc<Mutex<Vec<String>>>;
+
+    /// Protocol-level malformations the server emits on demand. suppaftp 10.0
+    /// converted these from panic to `FtpError`; no off-the-shelf server will
+    /// produce them on request, which is why this one is hand-rolled.
+    ///
+    /// Every field is read: `bad_pasv_octet` and `unparsable_list_line` by
+    /// PASV/LIST below, `abrupt_close` by the abrupt-close branch of LIST,
+    /// RETR and STOR/APPE alike, and `hostile_listing_names` by LIST.
+    #[derive(Clone, Default)]
+    pub(super) struct Faults {
+        /// PASV reply carrying an out-of-range octet.
+        pub bad_pasv_octet: bool,
+        /// A LIST body no parser can turn into entries.
+        pub unparsable_list_line: bool,
+        /// Close control and data connections after `150`, sending no `226`.
+        pub abrupt_close: bool,
+        /// Extra LIST lines carrying names a walk must refuse to act on:
+        /// `.` and `..`, a name that joins to nothing, and one holding a NUL.
+        /// These cannot be injected through the store, because `listing_for`
+        /// derives names from keys and drops any containing a separator.
+        pub hostile_listing_names: bool,
+    }
+
+    /// Bytes per data-connection write. Smaller than the transfer chunk so the
+    /// client's read loop genuinely reassembles across reads.
+    const DATA_SLICE: usize = 4096;
+
+    /// Unix `ls -l` style listing of the immediate children of `dir`.
+    /// suppaftp's parser expects this shape; a key ending in `/` is a
+    /// directory and renders with a `d` mode prefix.
+    fn listing_for(files: &HashMap<String, Vec<u8>>, dir: &str) -> String {
+        let prefix = if dir.ends_with('/') {
+            dir.to_string()
+        } else {
+            format!("{dir}/")
+        };
+
+        let mut out = String::new();
+        for (path, bytes) in files {
+            let Some(rest) = path.strip_prefix(&prefix) else {
+                continue;
+            };
+            let trimmed = rest.trim_end_matches('/');
+            // Immediate children only: no interior separator.
+            if trimmed.is_empty() || trimmed.contains('/') {
+                continue;
+            }
+            let (mode, size) = if path.ends_with('/') {
+                ("drwxr-xr-x", 4096)
+            } else {
+                ("-rw-r--r--", bytes.len())
+            };
+            out.push_str(&format!(
+                "{mode} 1 owner group {size:>12} Nov 01 12:00 {trimmed}\r\n"
+            ));
+        }
+        out
+    }
+
+    fn test_session(port: u16) -> Session {
+        Session {
+            name: "it".to_string(),
+            protocol: Protocol::Ftp,
+            host: "127.0.0.1".to_string(),
+            port,
+            username: "tester".to_string(),
+            remote_dir: "/".to_string(),
+            local_dir: None,
+            auth: AuthMethod::Password,
+            parallel_downloads: None,
+            theme: None,
+            accept_invalid_certs: false,
+            cert_sha256: None,
+        }
+    }
+
+    /// Binds :0, spawns the accept loop, returns the bound port and a count of
+    /// accepted control connections. Only the connect test reads the counter,
+    /// to assert a single connection; FTP has no equivalent of the SFTP
+    /// harness's pool-reuse test, so nothing here asserts reuse.
+    pub(super) async fn start_server(store: Store, faults: Faults) -> (u16, Arc<AtomicUsize>, Log) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let connects_l = Arc::clone(&connects);
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let log_l = Arc::clone(&log);
+
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                connects_l.fetch_add(1, Ordering::SeqCst);
+                let store = Arc::clone(&store);
+                let faults = faults.clone();
+                let log = Arc::clone(&log_l);
+                tokio::spawn(async move {
+                    let _ = handle_control(sock, store, faults, log).await;
+                });
+            }
+        });
+
+        (port, connects, log)
+    }
+
+    /// One control connection. Extended by later tasks; unknown commands get
+    /// `502` so a blink change that starts issuing a new command fails loudly
+    /// instead of hanging.
+    async fn handle_control(
+        mut sock: TcpStream,
+        store: Store,
+        faults: Faults,
+        log: Log,
+    ) -> std::io::Result<()> {
+        let (read_half, mut w) = sock.split();
+        let mut lines = BufReader::new(read_half).lines();
+
+        w.write_all(b"220 blink test server\r\n").await?;
+
+        // Bound by PASV, consumed by the next data command.
+        let mut pasv: Option<TcpListener> = None;
+        // Set by REST, consumed by the next RETR, then cleared.
+        let mut rest: u64 = 0;
+        // Set by RNFR, consumed by the next RNTO.
+        let mut rename_from = String::new();
+
+        while let Some(line) = lines.next_line().await? {
+            let line = line.trim_end();
+            let (cmd, arg) = match line.split_once(' ') {
+                Some((c, a)) => (c.to_ascii_uppercase(), a.to_string()),
+                None => (line.to_ascii_uppercase(), String::new()),
+            };
+            // Every command verbatim, so a test can assert what was issued
+            // rather than only what came back. Resume in particular is
+            // invisible from the result alone: a download that silently
+            // restarts still lands the correct bytes.
+            log.lock().await.push(line.to_string());
+
+            match cmd.as_str() {
+                "USER" => w.write_all(b"331 password required\r\n").await?,
+                "PASS" => w.write_all(b"230 logged in\r\n").await?,
+                "TYPE" => w.write_all(b"200 type set\r\n").await?,
+                "PASV" => {
+                    let data_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+                    let port = data_listener.local_addr()?.port();
+                    pasv = Some(data_listener);
+                    let reply = if faults.bad_pasv_octet {
+                        "227 Entering Passive Mode (127,0,0,1,999,0)\r\n".to_string()
+                    } else {
+                        format!(
+                            "227 Entering Passive Mode (127,0,0,1,{},{})\r\n",
+                            port / 256,
+                            port % 256
+                        )
+                    };
+                    w.write_all(reply.as_bytes()).await?;
+                }
+                "LIST" => {
+                    let Some(data_listener) = pasv.take() else {
+                        w.write_all(b"425 use PASV first\r\n").await?;
+                        continue;
+                    };
+                    let mut body = if faults.unparsable_list_line {
+                        "!! this is not a listing line !!\r\n".to_string()
+                    } else {
+                        let files = store.lock().await;
+                        let dir = if arg.is_empty() { "/" } else { arg.as_str() };
+                        listing_for(&files, dir)
+                    };
+                    if faults.hostile_listing_names {
+                        // Regular files, so a walk that fails to skip one
+                        // reaches DELE rather than recursing into it.
+                        for name in ["..", ".", "/", "bad\0name.txt"] {
+                            body.push_str(&format!(
+                                "-rw-r--r-- 1 owner group {:>12} Nov 01 12:00 {name}\r\n",
+                                0,
+                            ));
+                        }
+                    }
+                    w.write_all(b"150 here comes the listing\r\n").await?;
+                    let (mut data, _) = data_listener.accept().await?;
+                    if faults.abrupt_close {
+                        return Ok(());
+                    }
+                    data.write_all(body.as_bytes()).await?;
+                    data.shutdown().await?;
+                    drop(data);
+                    w.write_all(b"226 transfer complete\r\n").await?;
+                }
+                "REST" => {
+                    rest = arg.trim().parse().unwrap_or(0);
+                    w.write_all(b"350 restart position accepted\r\n").await?;
+                }
+                "SIZE" => {
+                    let files = store.lock().await;
+                    match files.get(&arg) {
+                        Some(bytes) => {
+                            w.write_all(format!("213 {}\r\n", bytes.len()).as_bytes())
+                                .await?
+                        }
+                        None => w.write_all(b"550 no such file\r\n").await?,
+                    }
+                }
+                "RETR" => {
+                    // Consumed unconditionally, even if this RETR fails
+                    // below: a real server clears the restart marker on the
+                    // next transfer command regardless of outcome, so a
+                    // failed RETR must not leave a stale offset for the one
+                    // after it.
+                    let start = std::mem::take(&mut rest) as usize;
+                    let Some(data_listener) = pasv.take() else {
+                        w.write_all(b"425 use PASV first\r\n").await?;
+                        continue;
+                    };
+                    let body = {
+                        let files = store.lock().await;
+                        match files.get(&arg) {
+                            Some(bytes) => bytes.clone(),
+                            None => {
+                                w.write_all(b"550 no such file\r\n").await?;
+                                continue;
+                            }
+                        }
+                    };
+                    let slice = body.get(start..).unwrap_or(&[]).to_vec();
+
+                    w.write_all(b"150 opening data connection\r\n").await?;
+                    let (mut data, _) = data_listener.accept().await?;
+                    if faults.abrupt_close {
+                        return Ok(());
+                    }
+                    for chunk in slice.chunks(DATA_SLICE) {
+                        data.write_all(chunk).await?;
+                    }
+                    data.shutdown().await?;
+                    drop(data);
+                    w.write_all(b"226 transfer complete\r\n").await?;
+                }
+                "STOR" | "APPE" => {
+                    let Some(data_listener) = pasv.take() else {
+                        w.write_all(b"425 use PASV first\r\n").await?;
+                        continue;
+                    };
+                    w.write_all(b"150 ready for data\r\n").await?;
+                    let (mut data, _) = data_listener.accept().await?;
+                    if faults.abrupt_close {
+                        return Ok(());
+                    }
+                    let mut buf = Vec::new();
+                    data.read_to_end(&mut buf).await?;
+                    drop(data);
+                    {
+                        let mut files = store.lock().await;
+                        if cmd == "APPE" {
+                            files.entry(arg.clone()).or_default().extend_from_slice(&buf);
+                        } else {
+                            files.insert(arg.clone(), buf);
+                        }
+                    }
+                    w.write_all(b"226 transfer complete\r\n").await?;
+                }
+                "RNFR" => {
+                    rename_from = arg.clone();
+                    w.write_all(b"350 ready for RNTO\r\n").await?;
+                }
+                "RNTO" => {
+                    let mut files = store.lock().await;
+                    match files.remove(&rename_from) {
+                        Some(bytes) => {
+                            files.insert(arg.clone(), bytes);
+                            drop(files);
+                            w.write_all(b"250 renamed\r\n").await?;
+                        }
+                        None => {
+                            drop(files);
+                            w.write_all(b"550 no such file\r\n").await?;
+                        }
+                    }
+                }
+                // A directory is a key with a trailing slash, so both arms
+                // normalise the argument the client sent.
+                "MKD" => {
+                    let key = format!("{}/", arg.trim_end_matches('/'));
+                    store.lock().await.insert(key, Vec::new());
+                    w.write_all(b"257 directory created\r\n").await?;
+                }
+                "RMD" => {
+                    let key = format!("{}/", arg.trim_end_matches('/'));
+                    let removed = store.lock().await.remove(&key).is_some();
+                    if removed {
+                        w.write_all(b"250 directory removed\r\n").await?;
+                    } else {
+                        w.write_all(b"550 no such directory\r\n").await?;
+                    }
+                }
+                "DELE" => {
+                    let removed = store.lock().await.remove(&arg).is_some();
+                    if removed {
+                        w.write_all(b"250 file deleted\r\n").await?;
+                    } else {
+                        w.write_all(b"550 no such file\r\n").await?;
+                    }
+                }
+                "QUIT" => {
+                    w.write_all(b"221 goodbye\r\n").await?;
+                    break;
+                }
+                _ => w.write_all(b"502 command not implemented\r\n").await?,
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connecting_logs_in_and_sets_binary_mode() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let (port, connects, log) = start_server(Arc::clone(&store), Faults::default()).await;
+
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw"))
+            .await
+            .expect("connect and login should succeed");
+
+        assert_eq!(transport.protocol(), Protocol::Ftp);
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+
+        transport.close().await.expect("close should report success");
+
+        // `close` discards `quit`'s result and returns `Ok(())`, so the call
+        // above asserts nothing on its own — only the log shows QUIT went out.
+        // TYPE I matters more: FTP defaults to ASCII, and a server doing CRLF
+        // translation corrupts every binary transfer if the mode is never set.
+        // The harness answers `200` to any TYPE, so nothing else here can
+        // notice its absence.
+        let issued = log.lock().await.clone();
+        assert_eq!(
+            issued,
+            vec![
+                "USER tester".to_string(),
+                "PASS pw".to_string(),
+                "TYPE I".to_string(),
+                "QUIT".to_string(),
+            ],
+            "connect should log in, set binary mode, then quit",
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_a_directory_returns_its_entries() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/pub/one.txt".to_string(), b"hello".to_vec());
+            files.insert("/pub/two.bin".to_string(), vec![0u8; 4096]);
+            files.insert("/pub/sub/".to_string(), Vec::new());
+            // Not an immediate child; must not appear.
+            files.insert("/pub/sub/deep.txt".to_string(), b"x".to_vec());
+        }
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let mut entries = transport.list("/pub").await.expect("list should succeed");
+        entries.sort_by(|a, b| a.raw_name.cmp(&b.raw_name));
+
+        let names: Vec<&str> = entries.iter().map(|e| e.raw_name.as_str()).collect();
+        assert_eq!(names, vec!["one.txt", "sub", "two.bin"]);
+
+        let one = &entries[0];
+        assert_eq!(one.size, 5);
+        assert_eq!(one.kind, crate::transport::EntryKind::File);
+
+        let sub = &entries[1];
+        assert_eq!(sub.kind, crate::transport::EntryKind::Directory);
+    }
+
+    /// Deterministic pseudo-random bytes (xorshift64), matching the SFTP
+    /// harness's helper so payloads are reproducible across runs.
+    fn pseudo_random(n: usize) -> Vec<u8> {
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.extend_from_slice(&state.to_le_bytes());
+        }
+        out.truncate(n);
+        out
+    }
+
+    /// A unique scratch directory for one test, removed by the OS on
+    /// reboot. Tests that write files use this rather than the repo tree.
+    /// Each caller passes its own distinct tag so concurrent tests never
+    /// collide on the same directory.
+    fn tempdir_for_test(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("blink-ftp-it-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn downloading_preserves_every_byte() {
+        let payload = pseudo_random(200_000);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/big.bin".to_string(), payload.clone());
+
+        let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let dir = tempdir_for_test("download");
+        let local = dir.join("big.bin");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        transport
+            .download("/big.bin", &local, Some(tx))
+            .await
+            .expect("download should succeed");
+
+        let got = std::fs::read(&local).unwrap();
+        assert_eq!(got.len(), payload.len());
+        assert_eq!(got, payload);
+
+        // Progress reporting depends on a real size, not a guess: the
+        // download must consult SIZE before transfer.
+        let issued = log.lock().await.clone();
+        assert!(
+            issued.iter().any(|c| c == "SIZE /big.bin"),
+            "the download must consult SIZE for its progress total; commands issued: {issued:?}",
+        );
+
+        // Issuing SIZE is only half of it — its answer has to reach the
+        // progress channel, or the bar has a real number it never shows.
+        // The sender was moved into `download` and dropped when it
+        // returned, so nothing is still in flight and `try_recv` drains
+        // the queue without an await that could hang.
+        let mut updates = Vec::new();
+        while let Ok(u) = rx.try_recv() {
+            updates.push(u);
+        }
+        assert!(
+            !updates.is_empty(),
+            "a download given a progress sender must report at least once",
+        );
+        // `bytes_total` is fixed for the whole transfer, so every update
+        // must carry SIZE's answer. Asserting on all of them rather than on
+        // how many arrived: the chunking that decides the count is not what
+        // is under test, and would make this brittle for no gain.
+        assert!(
+            updates.iter().all(|u| u.bytes_total == payload.len() as u64),
+            "every update must carry SIZE's answer as the total; got {:?}",
+            updates.iter().map(|u| u.bytes_total).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            updates.last().unwrap().bytes_done,
+            payload.len() as u64,
+            "the last update must account for every byte written",
+        );
+    }
+
+    #[tokio::test]
+    async fn uploading_preserves_every_byte() {
+        let payload = pseudo_random(150_000);
+        let dir = tempdir_for_test("upload");
+        let local = dir.join("up.bin");
+        std::fs::write(&local, &payload).unwrap();
+
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        transport
+            .upload(&local, "/up.bin", None)
+            .await
+            .expect("upload should succeed");
+
+        let files = store.lock().await;
+        assert_eq!(files.get("/up.bin").map(Vec::as_slice), Some(&payload[..]));
+    }
+
+    /// `ftp_metadata` resolves size from a LIST of the parent directory, not
+    /// from a SIZE command, so this exercises LIST's size field, not SIZE.
+    #[tokio::test]
+    async fn metadata_reports_the_size_the_server_gave() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/a.txt".to_string(), b"twelve bytes".to_vec());
+
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let meta = transport.metadata("/a.txt").await.unwrap().expect("present");
+        assert_eq!(meta.size, 12);
+    }
+
+    /// A `.part` file from an interrupted download must continue from its
+    /// length via REST, not restart and not concatenate.
+    #[tokio::test]
+    async fn a_partial_download_resumes_from_its_offset() {
+        let payload = pseudo_random(100_000);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/resume.bin".to_string(), payload.clone());
+
+        let dir = tempdir_for_test("resume-download");
+        let local = dir.join("resume.bin");
+
+        // Seed the partial exactly as an interrupted download leaves it —
+        // BOTH the bytes and the provenance sidecar. `decide_resume` refuses
+        // to continue a partial it cannot identify, so without the sidecar
+        // this test would silently exercise a fresh download instead, and
+        // still pass: restarting from zero also lands the correct bytes.
+        // That is why the REST assertion below is the real assertion.
+        std::fs::write(
+            crate::transport::part_path(&local),
+            &payload[..30_000],
+        )
+        .unwrap();
+        crate::transport::write_part_meta(&local, "/resume.bin", Some(payload.len() as u64))
+            .await;
+
+        let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        transport.download("/resume.bin", &local, None).await.unwrap();
+
+        let got = std::fs::read(&local).unwrap();
+        assert_eq!(got.len(), payload.len(), "resumed file must be whole");
+        assert_eq!(got, payload, "resumed bytes must match, not duplicate");
+
+        let issued = log.lock().await.clone();
+        assert!(
+            issued.iter().any(|c| c == "REST 30000"),
+            "the download must resume from the partial's length, not restart; \
+             commands issued: {issued:?}",
+        );
+    }
+
+    /// The four mutating commands, driven through the transport API. Each
+    /// assertion reads the server's own store rather than the client's return
+    /// value: a command that answered success without touching anything —
+    /// an `MKD` arm that replies `257` and creates no key — must not pass.
+    #[tokio::test]
+    async fn rename_mkdir_rmdir_and_delete_reach_the_server() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/old.txt".to_string(), b"body".to_vec());
+            files.insert("/doomed.txt".to_string(), b"x".to_vec());
+            files.insert("/emptydir/".to_string(), Vec::new());
+        }
+
+        let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        transport.rename("/old.txt", "/new.txt").await.unwrap();
+        transport.mkdir("/fresh").await.unwrap();
+        transport.delete_file("/doomed.txt").await.unwrap();
+        transport.delete_dir("/emptydir", false).await.unwrap();
+
+        let files = store.lock().await;
+        assert!(files.contains_key("/new.txt"), "rename should move the key");
+        assert!(!files.contains_key("/old.txt"), "old name should be gone");
+        assert_eq!(files.get("/new.txt").unwrap().as_slice(), b"body");
+        assert!(files.contains_key("/fresh/"), "mkdir should create a dir key");
+        assert!(!files.contains_key("/doomed.txt"), "delete should remove");
+        assert!(!files.contains_key("/emptydir/"), "rmdir should remove");
+        drop(files);
+
+        // The store alone cannot distinguish `RMD /emptydir` from a `DELE`
+        // that happened to remove the same key, so pin the verbs too.
+        let issued = log.lock().await.clone();
+        for expected in [
+            "RNFR /old.txt",
+            "RNTO /new.txt",
+            "MKD /fresh",
+            "DELE /doomed.txt",
+            "RMD /emptydir",
+        ] {
+            assert!(
+                issued.iter().any(|c| c == expected),
+                "{expected} should have been issued; commands issued: {issued:?}",
+            );
+        }
+    }
+
+    /// The same verbs against paths that are not there. The harness answers
+    /// `550` whenever the key is absent, and `map_ftp` reads 550 as
+    /// [`crate::error::BlinkError::NotFound`] — so what is pinned here is the
+    /// *variant*, not merely that something failed. A 550 misfiled as
+    /// `Transport` or `Disconnected` would send the TUI down the "the link
+    /// broke" path instead of telling the user the file isn't there.
+    #[tokio::test]
+    async fn renaming_removing_and_deleting_a_missing_path_each_report_not_found() {
+        // Deliberately empty: every key the operations below name is absent.
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let renamed = transport.rename("/absent.txt", "/wherever.txt").await;
+        assert!(
+            matches!(renamed, Err(crate::error::BlinkError::NotFound(_))),
+            "renaming a file that is not there should be NotFound; got {renamed:?}",
+        );
+
+        let removed = transport.delete_dir("/absentdir", false).await;
+        assert!(
+            matches!(removed, Err(crate::error::BlinkError::NotFound(_))),
+            "removing a directory that is not there should be NotFound; got {removed:?}",
+        );
+
+        let deleted = transport.delete_file("/absent.txt").await;
+        assert!(
+            matches!(deleted, Err(crate::error::BlinkError::NotFound(_))),
+            "deleting a file that is not there should be NotFound; got {deleted:?}",
+        );
+
+        // Each error has to be the server's `550` coming back, not a
+        // client-side guard that refused before issuing anything — those
+        // produce a different variant for a different reason.
+        let issued = log.lock().await.clone();
+        for expected in ["RNTO /wherever.txt", "RMD /absentdir", "DELE /absent.txt"] {
+            assert!(
+                issued.iter().any(|c| c == expected),
+                "{expected} should have been issued; commands issued: {issued:?}",
+            );
+        }
+    }
+
+    /// Fixture for the two recursive-delete tests. `/sibling.txt` sits
+    /// outside the tree on purpose: a walk that over-reaches takes it too.
+    async fn tree_store() -> Store {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/tree/".to_string(), Vec::new());
+            files.insert("/tree/a.txt".to_string(), b"a".to_vec());
+            files.insert("/tree/sub/".to_string(), Vec::new());
+            files.insert("/tree/sub/b.txt".to_string(), b"b".to_vec());
+            files.insert("/sibling.txt".to_string(), b"keep".to_vec());
+        }
+        store
+    }
+
+    /// Index of `cmd` in the issued log, or a failure naming what was issued.
+    fn issued_at(issued: &[String], cmd: &str) -> usize {
+        issued
+            .iter()
+            .position(|c| c == cmd)
+            .unwrap_or_else(|| panic!("{cmd} was never issued; commands issued: {issued:?}"))
+    }
+
+    /// `delete_dir(.., true)` — the tree walk Task 6 left uncovered, having
+    /// exercised only `recursive: false`. The store shows *what* survived;
+    /// only the log shows the order, and the order is the contract: `RMD` on
+    /// a directory still holding entries draws a 550 from a real server.
+    #[tokio::test]
+    async fn a_recursive_delete_removes_a_nested_tree_bottom_up() {
+        let store = tree_store().await;
+        let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        transport
+            .delete_dir("/tree", true)
+            .await
+            .expect("recursive delete should succeed");
+
+        let mut remaining: Vec<String> = store.lock().await.keys().cloned().collect();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec!["/sibling.txt".to_string()],
+            "the walk should take the tree and nothing else",
+        );
+
+        let issued = log.lock().await.clone();
+        assert!(
+            issued_at(&issued, "DELE /tree/sub/b.txt") < issued_at(&issued, "RMD /tree/sub"),
+            "a directory must be emptied before it is removed; commands issued: {issued:?}",
+        );
+        assert!(
+            issued_at(&issued, "RMD /tree/sub") < issued_at(&issued, "RMD /tree"),
+            "the child directory must go before its parent; commands issued: {issued:?}",
+        );
+    }
+
+    /// The walk's two skip-and-warn guards, whose comments claim one hostile
+    /// entry should not strand the rest. The server appends names the store
+    /// cannot hold: `.` and `..`, a `/` that `join_remote` refuses to join,
+    /// and a NUL-bearing name that `check_ftp_path` refuses to send. Acting
+    /// on any of them is a command the log will show; failing on any of them
+    /// leaves the tree half-deleted.
+    #[tokio::test]
+    async fn a_recursive_delete_skips_hostile_entries_and_finishes() {
+        let store = tree_store().await;
+        let faults = Faults {
+            hostile_listing_names: true,
+            ..Faults::default()
+        };
+        let (port, _c, log) = start_server(Arc::clone(&store), faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        transport
+            .delete_dir("/tree", true)
+            .await
+            .expect("a hostile entry should be skipped, not fail the whole delete");
+
+        let mut remaining: Vec<String> = store.lock().await.keys().cloned().collect();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec!["/sibling.txt".to_string()],
+            "the hostile entries must not stop the tree from being removed",
+        );
+
+        let issued = log.lock().await.clone();
+        assert!(
+            !issued.iter().any(|c| c.contains('\0')),
+            "a NUL must never reach the control channel; commands issued: {issued:?}",
+        );
+        // Bare `/tree` is in the list because it is what the historical bug
+        // produced: an unjoinable name folded onto the directory being
+        // walked, so the walk acted on its own parent instead of skipping.
+        for forbidden in [
+            "DELE /tree/..",
+            "RMD /tree/..",
+            "DELE /tree/.",
+            "RMD /tree/.",
+            "DELE /",
+            "RMD /",
+            "DELE /tree",
+        ] {
+            assert!(
+                !issued.iter().any(|c| c == forbidden),
+                "{forbidden} should never be issued; commands issued: {issued:?}",
+            );
+        }
+    }
+
+    /// Bounds a raw-socket protocol exchange so a test that drives `handle_control`
+    /// by hand fails loudly instead of hanging CI forever when the expected reply
+    /// never comes (e.g. because the command under test isn't implemented yet).
+    async fn with_timeout<F: std::future::Future>(fut: F, what: &str) -> F::Output {
+        tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+    }
+
+    /// APPE must extend the remote file, not truncate it.
+    #[tokio::test]
+    async fn appending_extends_rather_than_truncating() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/app.bin".to_string(), b"first-".to_vec());
+
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+
+        // Drive APPE directly: the client-side resume policy is not what is
+        // under test here, the server contract is.
+        let mut sock = with_timeout(TcpStream::connect(("127.0.0.1", port)), "control connect")
+            .await
+            .unwrap();
+        let (r, mut w) = sock.split();
+        let mut lines = BufReader::new(r).lines();
+        with_timeout(lines.next_line(), "220 banner").await.unwrap(); // 220
+
+        w.write_all(b"PASV\r\n").await.unwrap();
+        let pasv_line = with_timeout(lines.next_line(), "227 PASV reply")
+            .await
+            .unwrap()
+            .unwrap();
+        let data_port = parse_pasv_port(&pasv_line);
+
+        w.write_all(b"APPE /app.bin\r\n").await.unwrap();
+        with_timeout(lines.next_line(), "150 for APPE").await.unwrap(); // 150
+        let mut data = with_timeout(TcpStream::connect(("127.0.0.1", data_port)), "data connect")
+            .await
+            .unwrap();
+        data.write_all(b"second").await.unwrap();
+        data.shutdown().await.unwrap();
+        drop(data);
+        with_timeout(lines.next_line(), "226 after APPE")
+            .await
+            .unwrap(); // 226
+
+        let files = store.lock().await;
+        assert_eq!(files.get("/app.bin").unwrap().as_slice(), b"first-second");
+    }
+
+    /// A failed `RETR` (no such file) must still consume the restart marker,
+    /// the same as a successful one — otherwise a `REST` left over from an
+    /// aborted transfer silently offsets the next, unrelated `RETR`. Task 3
+    /// originally consumed `rest` only on RETR's success path, after the
+    /// early `550`/`425` returns; this drives the raw protocol to prove the
+    /// marker does not survive a failure.
+    #[tokio::test]
+    async fn a_failed_retr_still_consumes_the_restart_marker() {
+        let payload = pseudo_random(500);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/whole.bin".to_string(), payload.clone());
+
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+
+        let mut sock = with_timeout(TcpStream::connect(("127.0.0.1", port)), "control connect")
+            .await
+            .unwrap();
+        let (r, mut w) = sock.split();
+        let mut lines = BufReader::new(r).lines();
+        with_timeout(lines.next_line(), "220 banner").await.unwrap(); // 220
+
+        // Set a restart marker, then fail the transfer it would have applied to.
+        w.write_all(b"REST 100\r\n").await.unwrap();
+        with_timeout(lines.next_line(), "350 after REST")
+            .await
+            .unwrap(); // 350
+
+        w.write_all(b"PASV\r\n").await.unwrap();
+        let pasv_line = with_timeout(lines.next_line(), "227 PASV reply (first)")
+            .await
+            .unwrap()
+            .unwrap();
+        let _unused_data_port = parse_pasv_port(&pasv_line);
+
+        w.write_all(b"RETR /does-not-exist.bin\r\n").await.unwrap();
+        let reply = with_timeout(lines.next_line(), "550 for missing file")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reply.starts_with("550"), "expected 550, got {reply:?}");
+
+        // A fresh, unrelated RETR must not be offset by the stale marker.
+        w.write_all(b"PASV\r\n").await.unwrap();
+        let pasv_line = with_timeout(lines.next_line(), "227 PASV reply (second)")
+            .await
+            .unwrap()
+            .unwrap();
+        let data_port = parse_pasv_port(&pasv_line);
+
+        w.write_all(b"RETR /whole.bin\r\n").await.unwrap();
+        with_timeout(lines.next_line(), "150 for the good RETR")
+            .await
+            .unwrap(); // 150
+
+        let mut data = with_timeout(TcpStream::connect(("127.0.0.1", data_port)), "data connect")
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        with_timeout(data.read_to_end(&mut got), "RETR body")
+            .await
+            .unwrap();
+        drop(data);
+        with_timeout(lines.next_line(), "226 after the good RETR")
+            .await
+            .unwrap(); // 226
+
+        assert_eq!(
+            got, payload,
+            "a failed RETR must not leave a stale REST offsetting the next RETR"
+        );
+    }
+
+    /// An out-of-range PASV octet must surface as an error, not a panic and
+    /// not a hang. suppaftp 10.0 changed this from a panic; these tests pin
+    /// the behaviour on both sides of that bump.
+    #[tokio::test]
+    async fn a_malformed_pasv_reply_is_an_error_not_a_panic() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store.lock().await.insert("/a.txt".to_string(), b"x".to_vec());
+
+        let faults = Faults {
+            bad_pasv_octet: true,
+            ..Faults::default()
+        };
+        let (port, _c, log) = start_server(Arc::clone(&store), faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let result = transport.list("/").await;
+        assert!(result.is_err(), "a 999 octet must not be accepted");
+
+        // Without the fault the store's one entry would come back and the
+        // assertion above would fail, so this cannot pass with the injection
+        // switched off; the log pins that it got as far as PASV.
+        let issued = log.lock().await.clone();
+        assert!(
+            issued.iter().any(|c| c == "PASV"),
+            "PASV should have been issued; commands issued: {issued:?}",
+        );
+    }
+
+    /// A garbage body must not become an entry. `File::from_str` would let it:
+    /// it falls through to the MLSX parsers, which split on `;` and name the
+    /// file the last token, so any non-empty line parses. `ftp_list` calls the
+    /// LIST parsers directly instead, and an unparsable line is skipped.
+    #[tokio::test]
+    async fn an_unparsable_listing_line_becomes_no_entry_at_all() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store.lock().await.insert("/a.txt".to_string(), b"x".to_vec());
+
+        let faults = Faults {
+            unparsable_list_line: true,
+            ..Faults::default()
+        };
+        let (port, _c, log) = start_server(Arc::clone(&store), faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        // Either an error or an empty listing is acceptable — a panic is not,
+        // and neither is a garbage entry addressed at a nonexistent path.
+        match transport.list("/").await {
+            Err(_) => {}
+            Ok(entries) => assert!(
+                entries.is_empty(),
+                "an unparsable line must not become an entry: {entries:?}"
+            ),
+        }
+
+        // An empty listing only means anything if the garbage body is what
+        // emptied it: the store holds `/a.txt`, which an unfaulted server
+        // would list, so this pins that LIST was reached and asked for the
+        // directory holding it rather than the exchange failing earlier.
+        let issued = log.lock().await.clone();
+        assert!(
+            issued.iter().any(|c| c == "LIST /"),
+            "LIST / should have been issued; commands issued: {issued:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_connection_dropped_mid_transfer_is_reported_not_hung() {
+        let payload = pseudo_random(50_000);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store.lock().await.insert("/gone.bin".to_string(), payload);
+
+        let faults = Faults {
+            abrupt_close: true,
+            ..Faults::default()
+        };
+        let (port, _c, log) = start_server(Arc::clone(&store), faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let dir = tempdir_for_test("abrupt-close");
+        let local = dir.join("gone.bin");
+
+        // Must not hang: FTP_OP_TIMEOUT is 60s, so a 10s bound proves the
+        // failure comes from the closed socket rather than the deadline.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            transport.download("/gone.bin", &local, None),
+        )
+        .await;
+
+        let inner = result.expect("must fail fast, not wait out the timeout");
+        assert!(inner.is_err(), "a dropped connection must be an error");
+
+        // The store holds the file, so without the fault this download would
+        // succeed and the assertion above would fail; the log pins that the
+        // server dropped the socket at RETR rather than never being asked.
+        let issued = log.lock().await.clone();
+        assert!(
+            issued.iter().any(|c| c == "RETR /gone.bin"),
+            "RETR should have been issued; commands issued: {issued:?}",
+        );
+        assert!(
+            !local.exists(),
+            "a failed download must not land under the final name",
+        );
+    }
+
+    /// `227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)` -> port.
+    fn parse_pasv_port(line: &str) -> u16 {
+        let inner = line
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(inner, _)| inner)
+            .expect("PASV reply should carry a tuple");
+        let parts: Vec<u16> = inner.split(',').map(|p| p.trim().parse().unwrap()).collect();
+        parts[4] * 256 + parts[5]
     }
 }
