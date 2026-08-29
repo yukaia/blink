@@ -7,6 +7,8 @@ A cross-platform terminal SFTP / SCP / FTP / FTPS client with a three-pane TUI, 
 
 ![blink](images/main-menu.jpg)
 
+Release notes live in [CHANGELOG.md](CHANGELOG.md).
+
 ## Features
 
 ### Connectivity
