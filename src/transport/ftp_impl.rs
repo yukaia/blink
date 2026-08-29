@@ -677,10 +677,9 @@ mod integration {
     /// converted these from panic to `FtpError`; no off-the-shelf server will
     /// produce them on request, which is why this one is hand-rolled.
     ///
-    /// All three fields are read as of this commit: `bad_pasv_octet` and
-    /// `unparsable_list_line` by PASV/LIST below, and `abrupt_close` by
-    /// LIST's abrupt-close branch. The later RETR/STOR tasks that extend
-    /// `handle_control` add their own reads of `abrupt_close`.
+    /// Every field is read: `bad_pasv_octet` and `unparsable_list_line` by
+    /// PASV/LIST below, `abrupt_close` by the abrupt-close branch of LIST,
+    /// RETR and STOR/APPE alike, and `hostile_listing_names` by LIST.
     #[derive(Clone, Default)]
     pub(super) struct Faults {
         /// PASV reply carrying an out-of-range octet.
@@ -689,6 +688,11 @@ mod integration {
         pub unparsable_list_line: bool,
         /// Close control and data connections after `150`, sending no `226`.
         pub abrupt_close: bool,
+        /// Extra LIST lines carrying names a walk must refuse to act on:
+        /// `.` and `..`, a name that joins to nothing, and one holding a NUL.
+        /// These cannot be injected through the store, because `listing_for`
+        /// derives names from keys and drops any containing a separator.
+        pub hostile_listing_names: bool,
     }
 
     /// Bytes per data-connection write. Smaller than the transfer chunk so the
@@ -827,13 +831,23 @@ mod integration {
                         w.write_all(b"425 use PASV first\r\n").await?;
                         continue;
                     };
-                    let body = if faults.unparsable_list_line {
+                    let mut body = if faults.unparsable_list_line {
                         "!! this is not a listing line !!\r\n".to_string()
                     } else {
                         let files = store.lock().await;
                         let dir = if arg.is_empty() { "/" } else { arg.as_str() };
                         listing_for(&files, dir)
                     };
+                    if faults.hostile_listing_names {
+                        // Regular files, so a walk that fails to skip one
+                        // reaches DELE rather than recursing into it.
+                        for name in ["..", ".", "/", "bad\0name.txt"] {
+                            body.push_str(&format!(
+                                "-rw-r--r-- 1 owner group {:>12} Nov 01 12:00 {name}\r\n",
+                                0,
+                            ));
+                        }
+                    }
                     w.write_all(b"150 here comes the listing\r\n").await?;
                     let (mut data, _) = data_listener.accept().await?;
                     if faults.abrupt_close {
@@ -1203,6 +1217,118 @@ mod integration {
             assert!(
                 issued.iter().any(|c| c == expected),
                 "{expected} should have been issued; commands issued: {issued:?}",
+            );
+        }
+    }
+
+    /// Fixture for the two recursive-delete tests. `/sibling.txt` sits
+    /// outside the tree on purpose: a walk that over-reaches takes it too.
+    async fn tree_store() -> Store {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/tree/".to_string(), Vec::new());
+            files.insert("/tree/a.txt".to_string(), b"a".to_vec());
+            files.insert("/tree/sub/".to_string(), Vec::new());
+            files.insert("/tree/sub/b.txt".to_string(), b"b".to_vec());
+            files.insert("/sibling.txt".to_string(), b"keep".to_vec());
+        }
+        store
+    }
+
+    /// Index of `cmd` in the issued log, or a failure naming what was issued.
+    fn issued_at(issued: &[String], cmd: &str) -> usize {
+        issued
+            .iter()
+            .position(|c| c == cmd)
+            .unwrap_or_else(|| panic!("{cmd} was never issued; commands issued: {issued:?}"))
+    }
+
+    /// `delete_dir(.., true)` — the tree walk Task 6 left uncovered, having
+    /// exercised only `recursive: false`. The store shows *what* survived;
+    /// only the log shows the order, and the order is the contract: `RMD` on
+    /// a directory still holding entries draws a 550 from a real server.
+    #[tokio::test]
+    async fn a_recursive_delete_removes_a_nested_tree_bottom_up() {
+        let store = tree_store().await;
+        let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        transport
+            .delete_dir("/tree", true)
+            .await
+            .expect("recursive delete should succeed");
+
+        let mut remaining: Vec<String> = store.lock().await.keys().cloned().collect();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec!["/sibling.txt".to_string()],
+            "the walk should take the tree and nothing else",
+        );
+
+        let issued = log.lock().await.clone();
+        assert!(
+            issued_at(&issued, "DELE /tree/sub/b.txt") < issued_at(&issued, "RMD /tree/sub"),
+            "a directory must be emptied before it is removed; commands issued: {issued:?}",
+        );
+        assert!(
+            issued_at(&issued, "RMD /tree/sub") < issued_at(&issued, "RMD /tree"),
+            "the child directory must go before its parent; commands issued: {issued:?}",
+        );
+    }
+
+    /// The walk's two skip-and-warn guards, whose comments claim one hostile
+    /// entry should not strand the rest. The server appends names the store
+    /// cannot hold: `.` and `..`, a `/` that `join_remote` refuses to join,
+    /// and a NUL-bearing name that `check_ftp_path` refuses to send. Acting
+    /// on any of them is a command the log will show; failing on any of them
+    /// leaves the tree half-deleted.
+    #[tokio::test]
+    async fn a_recursive_delete_skips_hostile_entries_and_finishes() {
+        let store = tree_store().await;
+        let faults = Faults {
+            hostile_listing_names: true,
+            ..Faults::default()
+        };
+        let (port, _c, log) = start_server(Arc::clone(&store), faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        transport
+            .delete_dir("/tree", true)
+            .await
+            .expect("a hostile entry should be skipped, not fail the whole delete");
+
+        let mut remaining: Vec<String> = store.lock().await.keys().cloned().collect();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec!["/sibling.txt".to_string()],
+            "the hostile entries must not stop the tree from being removed",
+        );
+
+        let issued = log.lock().await.clone();
+        assert!(
+            !issued.iter().any(|c| c.contains('\0')),
+            "a NUL must never reach the control channel; commands issued: {issued:?}",
+        );
+        // Bare `/tree` is in the list because it is what the historical bug
+        // produced: an unjoinable name folded onto the directory being
+        // walked, so the walk acted on its own parent instead of skipping.
+        for forbidden in [
+            "DELE /tree/..",
+            "RMD /tree/..",
+            "DELE /tree/.",
+            "RMD /tree/.",
+            "DELE /",
+            "RMD /",
+            "DELE /tree",
+        ] {
+            assert!(
+                !issued.iter().any(|c| c == forbidden),
+                "{forbidden} should never be issued; commands issued: {issued:?}",
             );
         }
     }
