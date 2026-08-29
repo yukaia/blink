@@ -640,3 +640,159 @@ mod tests {
         assert!(!err.contains('\x1b'), "ESC reached the message: {err:?}");
     }
 }
+
+/// FTP integration tests against an in-process FTP server. No external
+/// daemon is required. The server speaks only the commands blink issues and
+/// serves data in short slices, so partial reads are exercised rather than
+/// assumed away.
+///
+/// Written against suppaftp 8.0.5 deliberately: a harness written against a
+/// new version cannot tell "encodes current behaviour" from "encodes the new
+/// library's behaviour". Landed first, it is a differential test.
+#[cfg(test)]
+mod integration {
+    use std::collections::HashMap;
+    use std::net::Ipv4Addr;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::Mutex;
+
+    use crate::session::{AuthMethod, Protocol, Session};
+    use crate::transport::Transport;
+    use crate::transport::ftp::FtpTransport;
+
+    /// Absolute path -> file contents. A key ending in `/` is a directory.
+    pub(super) type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
+    /// Every control-channel command the server received, verbatim and in
+    /// order. Some behaviour is invisible from the result alone — a resume
+    /// that silently restarts still lands the correct bytes — so tests assert
+    /// on what was *issued*, not only on what came back.
+    pub(super) type Log = Arc<Mutex<Vec<String>>>;
+
+    /// Protocol-level malformations the server emits on demand. suppaftp 10.0
+    /// converted these from panic to `FtpError`; no off-the-shelf server will
+    /// produce them on request, which is why this one is hand-rolled.
+    ///
+    /// No task in this skeleton sets these yet; they are read by later PASV,
+    /// LIST, and transfer-abort tasks that extend `handle_control`.
+    #[derive(Clone, Default)]
+    #[allow(
+        dead_code,
+        reason = "read by the PASV/LIST/transfer tasks that extend handle_control"
+    )]
+    pub(super) struct Faults {
+        /// PASV reply carrying an out-of-range octet.
+        pub bad_pasv_octet: bool,
+        /// A LIST body no parser can turn into entries.
+        pub unparsable_list_line: bool,
+        /// Close control and data connections after `150`, sending no `226`.
+        pub abrupt_close: bool,
+    }
+
+    fn test_session(port: u16) -> Session {
+        Session {
+            name: "it".to_string(),
+            protocol: Protocol::Ftp,
+            host: "127.0.0.1".to_string(),
+            port,
+            username: "tester".to_string(),
+            remote_dir: "/".to_string(),
+            local_dir: None,
+            auth: AuthMethod::Password,
+            parallel_downloads: None,
+            theme: None,
+            accept_invalid_certs: false,
+            cert_sha256: None,
+        }
+    }
+
+    /// Binds :0, spawns the accept loop, returns the bound port and a count of
+    /// accepted control connections. The dispatcher opens one per worker; the
+    /// counter is how reuse is asserted, as in the SFTP harness.
+    pub(super) async fn start_server(store: Store, faults: Faults) -> (u16, Arc<AtomicUsize>, Log) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let connects_l = Arc::clone(&connects);
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let log_l = Arc::clone(&log);
+
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                connects_l.fetch_add(1, Ordering::SeqCst);
+                let store = Arc::clone(&store);
+                let faults = faults.clone();
+                let log = Arc::clone(&log_l);
+                tokio::spawn(async move {
+                    let _ = handle_control(sock, store, faults, log).await;
+                });
+            }
+        });
+
+        (port, connects, log)
+    }
+
+    /// One control connection. Extended by later tasks; unknown commands get
+    /// `502` so a blink change that starts issuing a new command fails loudly
+    /// instead of hanging.
+    async fn handle_control(
+        mut sock: TcpStream,
+        _store: Store,
+        _faults: Faults,
+        log: Log,
+    ) -> std::io::Result<()> {
+        let (read_half, mut w) = sock.split();
+        let mut lines = BufReader::new(read_half).lines();
+
+        w.write_all(b"220 blink test server\r\n").await?;
+
+        while let Some(line) = lines.next_line().await? {
+            let line = line.trim_end();
+            // `arg` is unused until later tasks add commands (PASV, RETR,
+            // STOR, ...) that need it; kept here so their diffs only touch
+            // match arms.
+            let (cmd, _arg) = match line.split_once(' ') {
+                Some((c, a)) => (c.to_ascii_uppercase(), a.to_string()),
+                None => (line.to_ascii_uppercase(), String::new()),
+            };
+            // Every command verbatim, so a test can assert what was issued
+            // rather than only what came back. Resume in particular is
+            // invisible from the result alone: a download that silently
+            // restarts still lands the correct bytes.
+            log.lock().await.push(line.to_string());
+
+            match cmd.as_str() {
+                "USER" => w.write_all(b"331 password required\r\n").await?,
+                "PASS" => w.write_all(b"230 logged in\r\n").await?,
+                "TYPE" => w.write_all(b"200 type set\r\n").await?,
+                "QUIT" => {
+                    w.write_all(b"221 goodbye\r\n").await?;
+                    break;
+                }
+                _ => w.write_all(b"502 command not implemented\r\n").await?,
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn connecting_logs_in_and_sets_binary_mode() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let (port, connects, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw"))
+            .await
+            .expect("connect and login should succeed");
+
+        assert_eq!(transport.protocol(), Protocol::Ftp);
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
+
+        transport.close().await.expect("QUIT should be clean");
+    }
+}
