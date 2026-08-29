@@ -677,20 +677,53 @@ mod integration {
     /// converted these from panic to `FtpError`; no off-the-shelf server will
     /// produce them on request, which is why this one is hand-rolled.
     ///
-    /// No task in this skeleton sets these yet; they are read by later PASV,
-    /// LIST, and transfer-abort tasks that extend `handle_control`.
+    /// `bad_pasv_octet` and `unparsable_list_line` are read by PASV/LIST
+    /// below. `abrupt_close` is read only by the later RETR/STOR tasks that
+    /// extend `handle_control`.
     #[derive(Clone, Default)]
-    #[allow(
-        dead_code,
-        reason = "read by the PASV/LIST/transfer tasks that extend handle_control"
-    )]
     pub(super) struct Faults {
         /// PASV reply carrying an out-of-range octet.
         pub bad_pasv_octet: bool,
         /// A LIST body no parser can turn into entries.
         pub unparsable_list_line: bool,
         /// Close control and data connections after `150`, sending no `226`.
+        #[allow(
+            dead_code,
+            reason = "read by the RETR/STOR tasks that extend handle_control"
+        )]
         pub abrupt_close: bool,
+    }
+
+    /// Unix `ls -l` style listing of the immediate children of `dir`.
+    /// suppaftp's parser expects this shape; a key ending in `/` is a
+    /// directory and renders with a `d` mode prefix.
+    fn listing_for(files: &HashMap<String, Vec<u8>>, dir: &str) -> String {
+        let prefix = if dir.ends_with('/') {
+            dir.to_string()
+        } else {
+            format!("{dir}/")
+        };
+
+        let mut out = String::new();
+        for (path, bytes) in files {
+            let Some(rest) = path.strip_prefix(&prefix) else {
+                continue;
+            };
+            let trimmed = rest.trim_end_matches('/');
+            // Immediate children only: no interior separator.
+            if trimmed.is_empty() || trimmed.contains('/') {
+                continue;
+            }
+            let (mode, size) = if path.ends_with('/') {
+                ("drwxr-xr-x", 4096)
+            } else {
+                ("-rw-r--r--", bytes.len())
+            };
+            out.push_str(&format!(
+                "{mode} 1 owner group {size:>12} Nov 01 12:00 {trimmed}\r\n"
+            ));
+        }
+        out
     }
 
     fn test_session(port: u16) -> Session {
@@ -741,8 +774,8 @@ mod integration {
     /// instead of hanging.
     async fn handle_control(
         mut sock: TcpStream,
-        _store: Store,
-        _faults: Faults,
+        store: Store,
+        faults: Faults,
         log: Log,
     ) -> std::io::Result<()> {
         let (read_half, mut w) = sock.split();
@@ -750,12 +783,12 @@ mod integration {
 
         w.write_all(b"220 blink test server\r\n").await?;
 
+        // Bound by PASV, consumed by the next data command.
+        let mut pasv: Option<TcpListener> = None;
+
         while let Some(line) = lines.next_line().await? {
             let line = line.trim_end();
-            // `arg` is unused until later tasks add commands (PASV, RETR,
-            // STOR, ...) that need it; kept here so their diffs only touch
-            // match arms.
-            let (cmd, _arg) = match line.split_once(' ') {
+            let (cmd, arg) = match line.split_once(' ') {
                 Some((c, a)) => (c.to_ascii_uppercase(), a.to_string()),
                 None => (line.to_ascii_uppercase(), String::new()),
             };
@@ -769,6 +802,43 @@ mod integration {
                 "USER" => w.write_all(b"331 password required\r\n").await?,
                 "PASS" => w.write_all(b"230 logged in\r\n").await?,
                 "TYPE" => w.write_all(b"200 type set\r\n").await?,
+                "PASV" => {
+                    let data_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+                    let port = data_listener.local_addr()?.port();
+                    pasv = Some(data_listener);
+                    let reply = if faults.bad_pasv_octet {
+                        "227 Entering Passive Mode (127,0,0,1,999,0)\r\n".to_string()
+                    } else {
+                        format!(
+                            "227 Entering Passive Mode (127,0,0,1,{},{})\r\n",
+                            port / 256,
+                            port % 256
+                        )
+                    };
+                    w.write_all(reply.as_bytes()).await?;
+                }
+                "LIST" => {
+                    let Some(data_listener) = pasv.take() else {
+                        w.write_all(b"425 use PASV first\r\n").await?;
+                        continue;
+                    };
+                    let body = if faults.unparsable_list_line {
+                        "!! this is not a listing line !!\r\n".to_string()
+                    } else {
+                        let files = store.lock().await;
+                        let dir = if arg.is_empty() { "/" } else { arg.as_str() };
+                        listing_for(&files, dir)
+                    };
+                    w.write_all(b"150 here comes the listing\r\n").await?;
+                    let (mut data, _) = data_listener.accept().await?;
+                    if faults.abrupt_close {
+                        return Ok(());
+                    }
+                    data.write_all(body.as_bytes()).await?;
+                    data.shutdown().await?;
+                    drop(data);
+                    w.write_all(b"226 transfer complete\r\n").await?;
+                }
                 "QUIT" => {
                     w.write_all(b"221 goodbye\r\n").await?;
                     break;
@@ -794,5 +864,35 @@ mod integration {
         assert_eq!(connects.load(Ordering::SeqCst), 1);
 
         transport.close().await.expect("QUIT should be clean");
+    }
+
+    #[tokio::test]
+    async fn listing_a_directory_returns_its_entries() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/pub/one.txt".to_string(), b"hello".to_vec());
+            files.insert("/pub/two.bin".to_string(), vec![0u8; 4096]);
+            files.insert("/pub/sub/".to_string(), Vec::new());
+            // Not an immediate child; must not appear.
+            files.insert("/pub/sub/deep.txt".to_string(), b"x".to_vec());
+        }
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let mut entries = transport.list("/pub").await.expect("list should succeed");
+        entries.sort_by(|a, b| a.raw_name.cmp(&b.raw_name));
+
+        let names: Vec<&str> = entries.iter().map(|e| e.raw_name.as_str()).collect();
+        assert_eq!(names, vec!["one.txt", "sub", "two.bin"]);
+
+        let one = &entries[0];
+        assert_eq!(one.size, 5);
+        assert_eq!(one.kind, crate::transport::EntryKind::File);
+
+        let sub = &entries[1];
+        assert_eq!(sub.kind, crate::transport::EntryKind::Directory);
     }
 }
