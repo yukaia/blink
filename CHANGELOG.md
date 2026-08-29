@@ -6,6 +6,59 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.7.0 predate this file and are not reconstructed here; see
 the git history for those.
 
+## [0.7.1] — 2026-08-29
+
+### Fixed
+
+- **`cargo build --target x86_64-pc-windows-gnu` failed on any machine without
+  NASM.** `russh`'s default features pull `aws-lc-rs`, and `aws-lc-sys`
+  assembles its Windows objects with NASM — a tool the README's MinGW
+  instructions never mentioned. Linux takes a different assembly path, so a
+  native build never noticed and the failure appeared only when
+  cross-compiling. The Windows cross-compile now needs only `mingw-w64`.
+
+### Changed
+
+- **`russh` is built against `ring` rather than its default `aws-lc-rs`,**
+  which removes `aws-lc-sys` from the dependency graph entirely (416 → 408
+  crates) and is what fixes the Windows build above. The two are
+  interchangeable implementations of the same SSH ciphers — russh's `ring` and
+  `aws-lc-rs` branches import identical constants for AES-128/256-GCM and
+  ChaCha20-Poly1305, and it refuses to compile with neither enabled. `ring`
+  was already being built for TLS through `rustls`, so blink now compiles one
+  crypto backend instead of two.
+
+  Note the SFTP integration harness generates only Ed25519 keys, so the test
+  suite does not exercise RSA or ECDSA against the swapped backend; the
+  feature-level parity above is the evidence, not the test run.
+
+  A test reads `Cargo.lock` and fails if `aws-lc` returns. russh only rejects
+  *neither* backend being enabled, so any dependency that switches
+  `aws-lc-rs` back on through feature unification would win silently — and
+  break a target nobody builds daily.
+
+- **Minimum supported Rust declared as 1.98**, replacing the 1.90 shipped in
+  0.7.0. Both 1.89 and 1.90 were metadata claims: a declared `rust-version`
+  records what a crate says about itself, not what it compiles at, and nothing
+  here has ever been built below stable. 1.98 is the only floor anyone has
+  verified. It is likely higher than the true floor, which is the honest
+  direction to be wrong in — lowering it needs a real
+  `cargo +<version> check --all-targets`, not another metadata walk.
+
+### Documentation
+
+- Added this changelog, starting at 0.7.0.
+- Recorded that SSH host certificates are refused, and that FTP listings are
+  parsed as POSIX or DOS only, in the feature list, security notes and
+  caveats.
+- Credited `ring`, now the crypto behind every connection, under its actual
+  Apache-2.0 AND ISC license. Corrected the `tokio-rustls` and `tokio-util`
+  credit rows: both were dropped as direct dependencies in 0.7.0 but still
+  ship transitively, through `suppaftp` and `russh-sftp`.
+- Corrected the `.cargo/audit.toml` rationale for RUSTSEC-2023-0071, which
+  named a dependency path through russh's `internal-russh-forked-ssh-key`
+  fork that russh 0.63 had already dropped.
+
 ## [0.7.0] — 2026-08-29
 
 ### Security
@@ -77,25 +130,15 @@ the git history for those.
   unparsable lines` warning per listing — aggregated per call rather than per
   line, because listing runs on interactive navigation.
 
-- **Minimum supported Rust is now declared as 1.98** — the toolchain blink is
-  built and tested on, and the only floor that has been verified. The manifest
-  previously declared 1.89, then 1.90 (the highest `rust-version` in the
-  dependency graph, via `quantette`). Both were metadata claims: a declared
-  `rust-version` records what a crate says, not what it compiles at, and
-  nothing here has ever been built below stable. The floor may well be lower
-  in practice; it will be lowered when someone compiles it there.
+- **Minimum supported Rust raised to 1.90.** The manifest declared 1.89 but
+  had never been buildable at it: `quantette`, reached through `icy_sixel`,
+  declares 1.90 and every published release does. (Superseded in 0.7.1 — see
+  below.)
 
 ### Dependencies
 
 - suppaftp 8 → 10, russh 0.60 → 0.63, sha2 0.10 → 0.11, base64 0.22 → 0.23,
   icy_sixel 0.5 → 0.6, ratatui → 0.30.2, crossterm → 0.29.
-- **`russh` now builds against `ring` rather than its default `aws-lc-rs`**,
-  which drops `aws-lc-sys` from the graph (416 → 408 crates). The two are
-  interchangeable implementations of the same SSH ciphers, and `ring` was
-  already being compiled for TLS, so this leaves one crypto backend instead of
-  two. It also fixes `cargo build --target x86_64-pc-windows-gnu`, which
-  failed on any machine without NASM — `aws-lc-sys` assembles its Windows
-  objects with it. The Windows cross-compile now needs only `mingw-w64`.
 - Moved off the yanked chacha20 0.10.1; dropped the unused `tokio-util`
   dependency.
 - russh 0.63 drops its `internal-russh-forked-ssh-key` fork for upstream
@@ -120,6 +163,5 @@ the git history for those.
   exercised end to end.
 - The FTP harness models a well-behaved server. Real-daemon dialects
   (vsftpd, IIS), NAT-mangled PASV replies, and TLS session reuse are uncovered.
-- The MSRV floor is set to the toolchain used for development rather than
-  probed downward. Lowering it needs a real `cargo +<version> check`, not
-  another metadata walk.
+- The MSRV floor is checked by a `cargo metadata` walk over declared
+  `rust-version` fields, not by compiling at that version.
