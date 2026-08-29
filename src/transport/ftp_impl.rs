@@ -853,6 +853,12 @@ mod integration {
                     }
                 }
                 "RETR" => {
+                    // Consumed unconditionally, even if this RETR fails
+                    // below: a real server clears the restart marker on the
+                    // next transfer command regardless of outcome, so a
+                    // failed RETR must not leave a stale offset for the one
+                    // after it.
+                    let start = std::mem::take(&mut rest) as usize;
                     let Some(data_listener) = pasv.take() else {
                         w.write_all(b"425 use PASV first\r\n").await?;
                         continue;
@@ -867,7 +873,6 @@ mod integration {
                             }
                         }
                     };
-                    let start = std::mem::take(&mut rest) as usize;
                     let slice = body.get(start..).unwrap_or(&[]).to_vec();
 
                     w.write_all(b"150 opening data connection\r\n").await?;
