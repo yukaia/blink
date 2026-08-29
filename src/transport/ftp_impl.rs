@@ -844,6 +844,10 @@ mod integration {
                     drop(data);
                     w.write_all(b"226 transfer complete\r\n").await?;
                 }
+                "REST" => {
+                    rest = arg.trim().parse().unwrap_or(0);
+                    w.write_all(b"350 restart position accepted\r\n").await?;
+                }
                 "SIZE" => {
                     let files = store.lock().await;
                     match files.get(&arg) {
@@ -889,7 +893,7 @@ mod integration {
                     drop(data);
                     w.write_all(b"226 transfer complete\r\n").await?;
                 }
-                "STOR" => {
+                "STOR" | "APPE" => {
                     let Some(data_listener) = pasv.take() else {
                         w.write_all(b"425 use PASV first\r\n").await?;
                         continue;
@@ -904,7 +908,11 @@ mod integration {
                     drop(data);
                     {
                         let mut files = store.lock().await;
-                        files.insert(arg.clone(), buf);
+                        if cmd == "APPE" {
+                            files.entry(arg.clone()).or_default().extend_from_slice(&buf);
+                        } else {
+                            files.insert(arg.clone(), buf);
+                        }
                     }
                     w.write_all(b"226 transfer complete\r\n").await?;
                 }
@@ -1086,5 +1094,189 @@ mod integration {
 
         let meta = transport.metadata("/a.txt").await.unwrap().expect("present");
         assert_eq!(meta.size, 12);
+    }
+
+    /// A `.part` file from an interrupted download must continue from its
+    /// length via REST, not restart and not concatenate.
+    #[tokio::test]
+    async fn a_partial_download_resumes_from_its_offset() {
+        let payload = pseudo_random(100_000);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/resume.bin".to_string(), payload.clone());
+
+        let dir = tempdir_for_test("resume-download");
+        let local = dir.join("resume.bin");
+
+        // Seed the partial exactly as an interrupted download leaves it —
+        // BOTH the bytes and the provenance sidecar. `decide_resume` refuses
+        // to continue a partial it cannot identify, so without the sidecar
+        // this test would silently exercise a fresh download instead, and
+        // still pass: restarting from zero also lands the correct bytes.
+        // That is why the REST assertion below is the real assertion.
+        std::fs::write(
+            crate::transport::part_path(&local),
+            &payload[..30_000],
+        )
+        .unwrap();
+        crate::transport::write_part_meta(&local, "/resume.bin", Some(payload.len() as u64))
+            .await;
+
+        let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        transport.download("/resume.bin", &local, None).await.unwrap();
+
+        let got = std::fs::read(&local).unwrap();
+        assert_eq!(got.len(), payload.len(), "resumed file must be whole");
+        assert_eq!(got, payload, "resumed bytes must match, not duplicate");
+
+        let issued = log.lock().await.clone();
+        assert!(
+            issued.iter().any(|c| c == "REST 30000"),
+            "the download must resume from the partial's length, not restart; \
+             commands issued: {issued:?}",
+        );
+    }
+
+    /// Bounds a raw-socket protocol exchange so a test that drives `handle_control`
+    /// by hand fails loudly instead of hanging CI forever when the expected reply
+    /// never comes (e.g. because the command under test isn't implemented yet).
+    async fn with_timeout<F: std::future::Future>(fut: F, what: &str) -> F::Output {
+        tokio::time::timeout(std::time::Duration::from_secs(5), fut)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+    }
+
+    /// APPE must extend the remote file, not truncate it.
+    #[tokio::test]
+    async fn appending_extends_rather_than_truncating() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/app.bin".to_string(), b"first-".to_vec());
+
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+
+        // Drive APPE directly: the client-side resume policy is not what is
+        // under test here, the server contract is.
+        let mut sock = with_timeout(TcpStream::connect(("127.0.0.1", port)), "control connect")
+            .await
+            .unwrap();
+        let (r, mut w) = sock.split();
+        let mut lines = BufReader::new(r).lines();
+        with_timeout(lines.next_line(), "220 banner").await.unwrap(); // 220
+
+        w.write_all(b"PASV\r\n").await.unwrap();
+        let pasv_line = with_timeout(lines.next_line(), "227 PASV reply")
+            .await
+            .unwrap()
+            .unwrap();
+        let data_port = parse_pasv_port(&pasv_line);
+
+        w.write_all(b"APPE /app.bin\r\n").await.unwrap();
+        with_timeout(lines.next_line(), "150 for APPE").await.unwrap(); // 150
+        let mut data = with_timeout(TcpStream::connect(("127.0.0.1", data_port)), "data connect")
+            .await
+            .unwrap();
+        data.write_all(b"second").await.unwrap();
+        data.shutdown().await.unwrap();
+        drop(data);
+        with_timeout(lines.next_line(), "226 after APPE")
+            .await
+            .unwrap(); // 226
+
+        let files = store.lock().await;
+        assert_eq!(files.get("/app.bin").unwrap().as_slice(), b"first-second");
+    }
+
+    /// A failed `RETR` (no such file) must still consume the restart marker,
+    /// the same as a successful one — otherwise a `REST` left over from an
+    /// aborted transfer silently offsets the next, unrelated `RETR`. Task 3
+    /// originally consumed `rest` only on RETR's success path, after the
+    /// early `550`/`425` returns; this drives the raw protocol to prove the
+    /// marker does not survive a failure.
+    #[tokio::test]
+    async fn a_failed_retr_still_consumes_the_restart_marker() {
+        let payload = pseudo_random(500);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/whole.bin".to_string(), payload.clone());
+
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+
+        let mut sock = with_timeout(TcpStream::connect(("127.0.0.1", port)), "control connect")
+            .await
+            .unwrap();
+        let (r, mut w) = sock.split();
+        let mut lines = BufReader::new(r).lines();
+        with_timeout(lines.next_line(), "220 banner").await.unwrap(); // 220
+
+        // Set a restart marker, then fail the transfer it would have applied to.
+        w.write_all(b"REST 100\r\n").await.unwrap();
+        with_timeout(lines.next_line(), "350 after REST")
+            .await
+            .unwrap(); // 350
+
+        w.write_all(b"PASV\r\n").await.unwrap();
+        let pasv_line = with_timeout(lines.next_line(), "227 PASV reply (first)")
+            .await
+            .unwrap()
+            .unwrap();
+        let _unused_data_port = parse_pasv_port(&pasv_line);
+
+        w.write_all(b"RETR /does-not-exist.bin\r\n").await.unwrap();
+        let reply = with_timeout(lines.next_line(), "550 for missing file")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(reply.starts_with("550"), "expected 550, got {reply:?}");
+
+        // A fresh, unrelated RETR must not be offset by the stale marker.
+        w.write_all(b"PASV\r\n").await.unwrap();
+        let pasv_line = with_timeout(lines.next_line(), "227 PASV reply (second)")
+            .await
+            .unwrap()
+            .unwrap();
+        let data_port = parse_pasv_port(&pasv_line);
+
+        w.write_all(b"RETR /whole.bin\r\n").await.unwrap();
+        with_timeout(lines.next_line(), "150 for the good RETR")
+            .await
+            .unwrap(); // 150
+
+        let mut data = with_timeout(TcpStream::connect(("127.0.0.1", data_port)), "data connect")
+            .await
+            .unwrap();
+        let mut got = Vec::new();
+        with_timeout(data.read_to_end(&mut got), "RETR body")
+            .await
+            .unwrap();
+        drop(data);
+        with_timeout(lines.next_line(), "226 after the good RETR")
+            .await
+            .unwrap(); // 226
+
+        assert_eq!(
+            got, payload,
+            "a failed RETR must not leave a stale REST offsetting the next RETR"
+        );
+    }
+
+    /// `227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)` -> port.
+    fn parse_pasv_port(line: &str) -> u16 {
+        let inner = line
+            .split_once('(')
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(inner, _)| inner)
+            .expect("PASV reply should carry a tuple");
+        let parts: Vec<u16> = inner.split(',').map(|p| p.trim().parse().unwrap()).collect();
+        parts[4] * 256 + parts[5]
     }
 }
