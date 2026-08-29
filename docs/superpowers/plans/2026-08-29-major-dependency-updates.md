@@ -65,7 +65,7 @@ The harness lives in `ftp_impl.rs` rather than a new file because that is where 
 
 **Interfaces:**
 - Consumes: `FtpTransport::connect` (`src/transport/ftp.rs`), `Session` (`crate::session`), `Transport` trait (`crate::transport`).
-- Produces: `type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>`; `struct Faults` (all fields default `false`); `async fn start_server(store: Store, faults: Faults) -> (u16, Arc<AtomicUsize>)`; `fn test_session(port: u16) -> Session`; `async fn handle_control(sock: TcpStream, store: Store, faults: Faults) -> std::io::Result<()>`. Tasks 2–7 extend `handle_control`'s match arms and reuse all of these unchanged.
+- Produces: `type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>`; `type Log = Arc<Mutex<Vec<String>>>`; `struct Faults` (all fields default `false`); `async fn start_server(store: Store, faults: Faults) -> (u16, Arc<AtomicUsize>, Log)`; `fn test_session(port: u16) -> Session`; `async fn handle_control(sock: TcpStream, store: Store, faults: Faults, log: Log) -> std::io::Result<()>`. Tasks 2–7 extend `handle_control`'s match arms and reuse all of these unchanged.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -97,6 +97,12 @@ mod integration {
 
     /// Absolute path -> file contents. A key ending in `/` is a directory.
     pub(super) type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
+    /// Every control-channel command the server received, verbatim and in
+    /// order. Some behaviour is invisible from the result alone — a resume
+    /// that silently restarts still lands the correct bytes — so tests assert
+    /// on what was *issued*, not only on what came back.
+    pub(super) type Log = Arc<Mutex<Vec<String>>>;
 
     /// Protocol-level malformations the server emits on demand. suppaftp 10.0
     /// converted these from panic to `FtpError`; no off-the-shelf server will
@@ -131,24 +137,27 @@ mod integration {
     /// Binds :0, spawns the accept loop, returns the bound port and a count of
     /// accepted control connections. The dispatcher opens one per worker; the
     /// counter is how reuse is asserted, as in the SFTP harness.
-    pub(super) async fn start_server(store: Store, faults: Faults) -> (u16, Arc<AtomicUsize>) {
+    pub(super) async fn start_server(store: Store, faults: Faults) -> (u16, Arc<AtomicUsize>, Log) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let connects = Arc::new(AtomicUsize::new(0));
         let connects_l = Arc::clone(&connects);
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let log_l = Arc::clone(&log);
 
         tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
                 connects_l.fetch_add(1, Ordering::SeqCst);
                 let store = Arc::clone(&store);
                 let faults = faults.clone();
+                let log = Arc::clone(&log_l);
                 tokio::spawn(async move {
-                    let _ = handle_control(sock, store, faults).await;
+                    let _ = handle_control(sock, store, faults, log).await;
                 });
             }
         });
 
-        (port, connects)
+        (port, connects, log)
     }
 
     /// One control connection. Extended by later tasks; unknown commands get
@@ -158,6 +167,7 @@ mod integration {
         mut sock: TcpStream,
         _store: Store,
         _faults: Faults,
+        log: Log,
     ) -> std::io::Result<()> {
         let (read_half, mut w) = sock.split();
         let mut lines = BufReader::new(read_half).lines();
@@ -170,7 +180,11 @@ mod integration {
                 Some((c, a)) => (c.to_ascii_uppercase(), a.to_string()),
                 None => (line.to_ascii_uppercase(), String::new()),
             };
-            let _ = &arg;
+            // Every command verbatim, so a test can assert what was issued
+            // rather than only what came back. Resume in particular is
+            // invisible from the result alone: a download that silently
+            // restarts still lands the correct bytes.
+            log.lock().await.push(line.to_string());
 
             match cmd.as_str() {
                 "USER" => w.write_all(b"331 password required\r\n").await?,
@@ -190,7 +204,7 @@ mod integration {
     #[tokio::test]
     async fn connecting_logs_in_and_sets_binary_mode() {
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
-        let (port, connects) = start_server(Arc::clone(&store), Faults::default()).await;
+        let (port, connects, _log) = start_server(Arc::clone(&store), Faults::default()).await;
 
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw"))
@@ -269,7 +283,7 @@ Add inside `mod integration`:
             // Not an immediate child; must not appear.
             files.insert("/pub/sub/deep.txt".to_string(), b"x".to_vec());
         }
-        let (port, _c) = start_server(Arc::clone(&store), Faults::default()).await;
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
 
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
@@ -444,7 +458,7 @@ fixture string."
             .await
             .insert("/big.bin".to_string(), payload.clone());
 
-        let (port, _c) = start_server(Arc::clone(&store), Faults::default()).await;
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
@@ -468,7 +482,7 @@ fixture string."
             .await
             .insert("/a.txt".to_string(), b"twelve bytes".to_vec());
 
-        let (port, _c) = start_server(Arc::clone(&store), Faults::default()).await;
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
@@ -605,7 +619,7 @@ uses 200 KB — larger than a transfer chunk — so the loop is real."
         std::fs::write(&local, &payload).unwrap();
 
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
-        let (port, _c) = start_server(Arc::clone(&store), Faults::default()).await;
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
@@ -694,11 +708,22 @@ These are the highest-value tests in the harness: resume is the FTP behaviour mo
 
         let dir = tempdir_for_test();
         let local = dir.join("resume.bin");
-        // Pre-seed the partial exactly as an interrupted download leaves it.
-        let part = local.with_extension("bin.part");
-        std::fs::write(&part, &payload[..30_000]).unwrap();
 
-        let (port, _c) = start_server(Arc::clone(&store), Faults::default()).await;
+        // Seed the partial exactly as an interrupted download leaves it —
+        // BOTH the bytes and the provenance sidecar. `decide_resume` refuses
+        // to continue a partial it cannot identify, so without the sidecar
+        // this test would silently exercise a fresh download instead, and
+        // still pass: restarting from zero also lands the correct bytes.
+        // That is why the REST assertion below is the real assertion.
+        std::fs::write(
+            crate::transport::part_path(&local),
+            &payload[..30_000],
+        )
+        .unwrap();
+        crate::transport::write_part_meta(&local, "/resume.bin", Some(payload.len() as u64))
+            .await;
+
+        let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
@@ -707,6 +732,13 @@ These are the highest-value tests in the harness: resume is the FTP behaviour mo
         let got = std::fs::read(&local).unwrap();
         assert_eq!(got.len(), payload.len(), "resumed file must be whole");
         assert_eq!(got, payload, "resumed bytes must match, not duplicate");
+
+        let issued = log.lock().await.clone();
+        assert!(
+            issued.iter().any(|c| c == "REST 30000"),
+            "the download must resume from the partial's length, not restart; \
+             commands issued: {issued:?}",
+        );
     }
 
     /// APPE must extend the remote file, not truncate it.
@@ -718,7 +750,7 @@ These are the highest-value tests in the harness: resume is the FTP behaviour mo
             .await
             .insert("/app.bin".to_string(), b"first-".to_vec());
 
-        let (port, _c) = start_server(Arc::clone(&store), Faults::default()).await;
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
 
         // Drive APPE directly: the client-side resume policy is not what is
         // under test here, the server contract is.
@@ -833,7 +865,7 @@ and not duplicated."
             files.insert("/emptydir/".to_string(), Vec::new());
         }
 
-        let (port, _c) = start_server(Arc::clone(&store), Faults::default()).await;
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
@@ -957,7 +989,7 @@ This is the task that justifies hand-rolling the server. suppaftp 10.0 converted
             bad_pasv_octet: true,
             ..Faults::default()
         };
-        let (port, _c) = start_server(Arc::clone(&store), faults).await;
+        let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
@@ -974,7 +1006,7 @@ This is the task that justifies hand-rolling the server. suppaftp 10.0 converted
             unparsable_list_line: true,
             ..Faults::default()
         };
-        let (port, _c) = start_server(Arc::clone(&store), faults).await;
+        let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
@@ -999,7 +1031,7 @@ This is the task that justifies hand-rolling the server. suppaftp 10.0 converted
             abrupt_close: true,
             ..Faults::default()
         };
-        let (port, _c) = start_server(Arc::clone(&store), faults).await;
+        let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
