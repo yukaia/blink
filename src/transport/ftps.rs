@@ -72,8 +72,9 @@ impl FtpsTransport {
                 .with_no_client_auth()
         };
 
-        let connector =
-            AsyncRustlsConnector::from(tokio_rustls::TlsConnector::from(Arc::new(config)));
+        let connector = AsyncRustlsConnector::from(
+            suppaftp::tokio_rustls::TlsConnector::from(Arc::new(config)),
+        );
         let mut stream = plain
             .into_secure(connector, &session.host)
             .await
@@ -242,6 +243,20 @@ mod pinning {
         #[test]
         fn hex_empty() {
             assert_eq!(to_hex(&[]), "");
+        }
+
+        /// `ClientConfig::builder()` picks rustls' crypto provider from the
+        /// enabled crate features, and panics outright when both `ring` and
+        /// `aws-lc-rs` are on. Nothing in the process installs a provider by
+        /// hand, so exactly one backend must reach rustls — a dependency that
+        /// drags in the other turns every FTPS connect into a panic.
+        #[test]
+        fn exactly_one_crypto_provider_reaches_rustls() {
+            use suppaftp::rustls::{ClientConfig, RootCertStore};
+
+            let _ = ClientConfig::builder()
+                .with_root_certificates(RootCertStore::empty())
+                .with_no_client_auth();
         }
     }
 }

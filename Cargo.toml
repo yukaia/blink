@@ -31,7 +31,6 @@ russh-sftp = "2.0"
 # FTP / FTPS
 suppaftp = { version = "8.0", features = ["tokio", "rustls-ring", "tokio-rustls-ring"] }
 webpki-roots = "1.0"
-tokio-rustls = "0.26"
 
 # Config / serialization
 rust-ini = "0.21"
