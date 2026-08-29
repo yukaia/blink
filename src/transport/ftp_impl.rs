@@ -187,7 +187,9 @@ pub(crate) const FTP_OP_TIMEOUT: Duration = Duration::from_secs(60);
 /// suppaftp 10.0.2 also rejects CR/LF at the library boundary, so this is no
 /// longer the only guard. It stays the primary one: it names the operation
 /// and produces a sanitized `BlinkError::transport`, where suppaftp's would
-/// arrive as an opaque `FtpError`. Do not remove it as redundant.
+/// arrive as an opaque `FtpError`. Do not remove it as redundant — and note
+/// upstream's `validate_command_line` covers CR/LF only, so the NUL check
+/// below has no backstop at all.
 pub(crate) fn check_ftp_path(op: &str, path: &str) -> Result<()> {
     if path.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0')) {
         // `BlinkError::transport` sanitizes, so the offending bytes render as
