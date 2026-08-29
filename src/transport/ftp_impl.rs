@@ -1001,7 +1001,7 @@ mod integration {
     #[tokio::test]
     async fn connecting_logs_in_and_sets_binary_mode() {
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
-        let (port, connects, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let (port, connects, log) = start_server(Arc::clone(&store), Faults::default()).await;
 
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw"))
@@ -1011,7 +1011,25 @@ mod integration {
         assert_eq!(transport.protocol(), Protocol::Ftp);
         assert_eq!(connects.load(Ordering::SeqCst), 1);
 
-        transport.close().await.expect("QUIT should be clean");
+        transport.close().await.expect("close should report success");
+
+        // `close` discards `quit`'s result and returns `Ok(())`, so the call
+        // above asserts nothing on its own — only the log shows QUIT went out.
+        // TYPE I matters more: FTP defaults to ASCII, and a server doing CRLF
+        // translation corrupts every binary transfer if the mode is never set.
+        // The harness answers `200` to any TYPE, so nothing else here can
+        // notice its absence.
+        let issued = log.lock().await.clone();
+        assert_eq!(
+            issued,
+            vec![
+                "USER tester".to_string(),
+                "PASS pw".to_string(),
+                "TYPE I".to_string(),
+                "QUIT".to_string(),
+            ],
+            "connect should log in, set binary mode, then quit",
+        );
     }
 
     #[tokio::test]
