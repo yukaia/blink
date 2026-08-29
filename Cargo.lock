@@ -335,7 +335,6 @@ dependencies = [
  "suppaftp",
  "thiserror 2.0.20",
  "tokio",
- "tokio-util",
  "tracing",
  "tracing-subscriber",
  "webpki-roots",
