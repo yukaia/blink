@@ -656,7 +656,7 @@ mod integration {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::Mutex;
 
@@ -788,6 +788,8 @@ mod integration {
         let mut pasv: Option<TcpListener> = None;
         // Set by REST, consumed by the next RETR, then cleared.
         let mut rest: u64 = 0;
+        // Set by RNFR, consumed by the next RNTO.
+        let mut rename_from = String::new();
 
         while let Some(line) = lines.next_line().await? {
             let line = line.trim_end();
@@ -886,6 +888,51 @@ mod integration {
                     data.shutdown().await?;
                     drop(data);
                     w.write_all(b"226 transfer complete\r\n").await?;
+                }
+                "STOR" => {
+                    let Some(data_listener) = pasv.take() else {
+                        w.write_all(b"425 use PASV first\r\n").await?;
+                        continue;
+                    };
+                    w.write_all(b"150 ready for data\r\n").await?;
+                    let (mut data, _) = data_listener.accept().await?;
+                    if faults.abrupt_close {
+                        return Ok(());
+                    }
+                    let mut buf = Vec::new();
+                    data.read_to_end(&mut buf).await?;
+                    drop(data);
+                    {
+                        let mut files = store.lock().await;
+                        files.insert(arg.clone(), buf);
+                    }
+                    w.write_all(b"226 transfer complete\r\n").await?;
+                }
+                "RNFR" => {
+                    rename_from = arg.clone();
+                    w.write_all(b"350 ready for RNTO\r\n").await?;
+                }
+                "RNTO" => {
+                    let mut files = store.lock().await;
+                    match files.remove(&rename_from) {
+                        Some(bytes) => {
+                            files.insert(arg.clone(), bytes);
+                            drop(files);
+                            w.write_all(b"250 renamed\r\n").await?;
+                        }
+                        None => {
+                            drop(files);
+                            w.write_all(b"550 no such file\r\n").await?;
+                        }
+                    }
+                }
+                "DELE" => {
+                    let removed = store.lock().await.remove(&arg).is_some();
+                    if removed {
+                        w.write_all(b"250 file deleted\r\n").await?;
+                    } else {
+                        w.write_all(b"550 no such file\r\n").await?;
+                    }
                 }
                 "QUIT" => {
                     w.write_all(b"221 goodbye\r\n").await?;
@@ -1000,6 +1047,27 @@ mod integration {
             issued.iter().any(|c| c == "SIZE /big.bin"),
             "the download must consult SIZE for its progress total; commands issued: {issued:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn uploading_preserves_every_byte() {
+        let payload = pseudo_random(150_000);
+        let dir = tempdir_for_test("upload");
+        let local = dir.join("up.bin");
+        std::fs::write(&local, &payload).unwrap();
+
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        transport
+            .upload(&local, "/up.bin", None)
+            .await
+            .expect("upload should succeed");
+
+        let files = store.lock().await;
+        assert_eq!(files.get("/up.bin").map(Vec::as_slice), Some(&payload[..]));
     }
 
     /// `ftp_metadata` resolves size from a LIST of the parent directory, not
