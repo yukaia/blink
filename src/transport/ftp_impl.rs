@@ -183,6 +183,11 @@ pub(crate) const FTP_OP_TIMEOUT: Duration = Duration::from_secs(60);
 /// Every entry point that puts a path on the control channel calls this, so a
 /// path is checked once, on the way in, rather than at each of the commands it
 /// may fan out into.
+///
+/// suppaftp 10.0.2 also rejects CR/LF at the library boundary, so this is no
+/// longer the only guard. It stays the primary one: it names the operation
+/// and produces a sanitized `BlinkError::transport`, where suppaftp's would
+/// arrive as an opaque `FtpError`. Do not remove it as redundant.
 pub(crate) fn check_ftp_path(op: &str, path: &str) -> Result<()> {
     if path.bytes().any(|b| matches!(b, b'\r' | b'\n' | b'\0')) {
         // `BlinkError::transport` sanitizes, so the offending bytes render as
@@ -1472,7 +1477,6 @@ mod integration {
     /// not a hang. suppaftp 10.0 changed this from a panic; these tests pin
     /// the behaviour on both sides of that bump.
     #[tokio::test]
-    #[ignore = "suppaftp 8.0.5 panics here; unignored by the 10.0 bump in the next task"]
     async fn a_malformed_pasv_reply_is_an_error_not_a_panic() {
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
         store.lock().await.insert("/a.txt".to_string(), b"x".to_vec());

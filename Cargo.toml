@@ -28,7 +28,7 @@ russh = "0.60"
 russh-sftp = "2.0"
 
 # FTP / FTPS
-suppaftp = { version = "8.0", features = ["tokio", "rustls-ring", "tokio-rustls-ring"] }
+suppaftp = { version = "10.0", features = ["tokio", "rustls-ring", "tokio-rustls-ring"] }
 webpki-roots = "1.0"
 
 # Config / serialization
