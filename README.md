@@ -123,10 +123,12 @@ the choice persisted to `config.ini` automatically.
 
 ### Prerequisites
 
-- **Rust 1.89+** with the 2024 edition (1.89 is where `File::lock` stabilised,
-  which `known_hosts` uses to make accept-and-save atomic across processes;
-  1.88 is the floor below that, where let-chains stabilised, and the crate
-  uses those throughout)
+- **Rust 1.90+** with the 2024 edition. The floor comes from a dependency:
+  `quantette`, reached through `icy_sixel` for sixel image preview, declares
+  1.90, and every published `quantette` release does. blink's own source needs
+  1.89, where `File::lock` stabilised — `known_hosts` uses it to make
+  accept-and-save atomic across processes — over a 1.88 floor for let-chains,
+  which the crate uses throughout.
 
 That's it. Every TLS-using dependency is pure Rust (rustls), so there's no
 need for `libssl-dev` or any other system TLS library on any platform.
