@@ -178,12 +178,11 @@ cargo build --release --target x86_64-unknown-linux-musl
 Output: `target/x86_64-unknown-linux-musl/release/blink` — a static-PIE
 executable (`ldd` reports `statically linked`).
 
-The musl C compiler (`musl-gcc`) is required because a couple of crypto
-dependencies (`aws-lc-rs`, `ring`) compile C code. The repo's
-`.cargo/config.toml` already points the musl target at `musl-gcc` and sets
-the matching `CC`, so no environment variables are needed — the command
-above works as-is and leaves your normal `cargo build` for local dev
-untouched.
+The musl C compiler (`musl-gcc`) is required because `ring`, the crypto
+backend, compiles C code. The repo's `.cargo/config.toml` already points the
+musl target at `musl-gcc` and sets the matching `CC`, so no environment
+variables are needed — the command above works as-is and leaves your normal
+`cargo build` for local dev untouched.
 
 ### Cross-platform notes
 
@@ -626,6 +625,12 @@ terminal. The following properties are enforced in the current codebase.
   (which can run into minutes).
 - **FTPS** — explicit TLS only (RFC 4217), verified against the Mozilla CA
   bundle via rustls (pure Rust, no system OpenSSL).
+- **One crypto backend, not two.** `ring` serves both transports: rustls uses
+  it for FTPS, and `russh` is built against it rather than its default
+  `aws-lc-rs`. Compiling two backends is how the FTPS transport once came to
+  panic on every connect — rustls refuses to choose between `ring` and
+  `aws-lc-rs` when both are enabled — so the manifest pins one and a test
+  fails if the other returns through feature unification.
 - **FTPS hostname + signature verification are mandatory.** Even when
   `accept_invalid_certs = true` bypasses CA-chain trust, the cert's SAN
   must still match the configured hostname and the handshake signature
@@ -874,7 +879,7 @@ and do not affect blink's MIT license except where noted.
 | [ratatui](https://github.com/ratatui/ratatui) | ratatui contributors | TUI layout and rendering |
 | [crossterm](https://github.com/crossterm-rs/crossterm) | TimonPost et al. | Cross-platform terminal I/O |
 | [tokio](https://github.com/tokio-rs/tokio) | Tokio contributors | Async runtime |
-| [tokio-util](https://github.com/tokio-rs/tokio) | Tokio contributors | Async I/O utilities |
+| [tokio-util](https://github.com/tokio-rs/tokio) | Tokio contributors | Async I/O utilities (reached through `russh-sftp`) |
 | [tracing](https://github.com/tokio-rs/tracing) | Tokio contributors | Structured logging |
 | [tracing-subscriber](https://github.com/tokio-rs/tracing) | Tokio contributors | Log sink / filter |
 | [bytes](https://github.com/tokio-rs/bytes) | Tokio contributors | Byte buffer utilities |
@@ -889,7 +894,7 @@ and do not affect blink's MIT license except where noted.
 | [async-trait](https://github.com/dtolnay/async-trait) | David Tolnay | Async trait support |
 | [futures](https://github.com/rust-lang/futures-rs) | Alex Crichton et al. | Future combinators |
 | [suppaftp](https://github.com/veeso/suppaftp) | Christian Visintin | FTP / FTPS client |
-| [tokio-rustls](https://github.com/rustls/tokio-rustls) | rustls contributors | Async TLS via rustls |
+| [tokio-rustls](https://github.com/rustls/tokio-rustls) | rustls contributors | Async TLS via rustls (reached through `suppaftp`, which re-exports it) |
 | [serde](https://github.com/serde-rs/serde) | David Tolnay, Erick Tryzelaar | Serialisation framework |
 | [serde_json](https://github.com/serde-rs/json) | David Tolnay, Erick Tryzelaar | JSON serialisation (checkpoints) |
 | [directories](https://github.com/dirs-dev/directories-rs) | Simon Ochsenreither | Platform config-dir paths |
@@ -913,3 +918,9 @@ and do not affect blink's MIT license except where noted.
 | Crate | Author(s) | Use in blink |
 | ----- | --------- | ------------ |
 | [webpki-roots](https://github.com/rustls/webpki-roots) | Mozilla / rustls contributors | Mozilla CA root certificates for FTPS |
+
+### Apache-2.0 AND ISC
+
+| Crate | Author(s) | Use in blink |
+| ----- | --------- | ------------ |
+| [ring](https://github.com/briansmith/ring) | Brian Smith et al. | Crypto primitives behind both transports — reached through `rustls` for FTPS and selected explicitly for `russh` (see `Cargo.toml`) so one backend serves both |
