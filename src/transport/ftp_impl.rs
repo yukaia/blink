@@ -691,6 +691,10 @@ mod integration {
         pub abrupt_close: bool,
     }
 
+    /// Bytes per data-connection write. Smaller than the transfer chunk so the
+    /// client's read loop genuinely reassembles across reads.
+    const DATA_SLICE: usize = 4096;
+
     /// Unix `ls -l` style listing of the immediate children of `dir`.
     /// suppaftp's parser expects this shape; a key ending in `/` is a
     /// directory and renders with a `d` mode prefix.
@@ -782,6 +786,8 @@ mod integration {
 
         // Bound by PASV, consumed by the next data command.
         let mut pasv: Option<TcpListener> = None;
+        // Set by REST, consumed by the next RETR, then cleared.
+        let mut rest: u64 = 0;
 
         while let Some(line) = lines.next_line().await? {
             let line = line.trim_end();
@@ -832,6 +838,46 @@ mod integration {
                         return Ok(());
                     }
                     data.write_all(body.as_bytes()).await?;
+                    data.shutdown().await?;
+                    drop(data);
+                    w.write_all(b"226 transfer complete\r\n").await?;
+                }
+                "SIZE" => {
+                    let files = store.lock().await;
+                    match files.get(&arg) {
+                        Some(bytes) => {
+                            w.write_all(format!("213 {}\r\n", bytes.len()).as_bytes())
+                                .await?
+                        }
+                        None => w.write_all(b"550 no such file\r\n").await?,
+                    }
+                }
+                "RETR" => {
+                    let Some(data_listener) = pasv.take() else {
+                        w.write_all(b"425 use PASV first\r\n").await?;
+                        continue;
+                    };
+                    let body = {
+                        let files = store.lock().await;
+                        match files.get(&arg) {
+                            Some(bytes) => bytes.clone(),
+                            None => {
+                                w.write_all(b"550 no such file\r\n").await?;
+                                continue;
+                            }
+                        }
+                    };
+                    let start = std::mem::take(&mut rest) as usize;
+                    let slice = body.get(start..).unwrap_or(&[]).to_vec();
+
+                    w.write_all(b"150 opening data connection\r\n").await?;
+                    let (mut data, _) = data_listener.accept().await?;
+                    if faults.abrupt_close {
+                        return Ok(());
+                    }
+                    for chunk in slice.chunks(DATA_SLICE) {
+                        data.write_all(chunk).await?;
+                    }
                     data.shutdown().await?;
                     drop(data);
                     w.write_all(b"226 transfer complete\r\n").await?;
@@ -891,5 +937,71 @@ mod integration {
 
         let sub = &entries[1];
         assert_eq!(sub.kind, crate::transport::EntryKind::Directory);
+    }
+
+    /// Deterministic pseudo-random bytes (xorshift64), matching the SFTP
+    /// harness's helper so payloads are reproducible across runs.
+    fn pseudo_random(n: usize) -> Vec<u8> {
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            out.extend_from_slice(&state.to_le_bytes());
+        }
+        out.truncate(n);
+        out
+    }
+
+    /// A unique scratch directory for one test, removed by the OS on
+    /// reboot. Tests that write files use this rather than the repo tree.
+    /// Each caller passes its own distinct tag so concurrent tests never
+    /// collide on the same directory.
+    fn tempdir_for_test(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("blink-ftp-it-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn downloading_preserves_every_byte() {
+        let payload = pseudo_random(200_000);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/big.bin".to_string(), payload.clone());
+
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let dir = tempdir_for_test("download");
+        let local = dir.join("big.bin");
+        transport
+            .download("/big.bin", &local, None)
+            .await
+            .expect("download should succeed");
+
+        let got = std::fs::read(&local).unwrap();
+        assert_eq!(got.len(), payload.len());
+        assert_eq!(got, payload);
+    }
+
+    #[tokio::test]
+    async fn metadata_reports_the_size_the_server_gave() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/a.txt".to_string(), b"twelve bytes".to_vec());
+
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let meta = transport.metadata("/a.txt").await.unwrap().expect("present");
+        assert_eq!(meta.size, 12);
     }
 }
