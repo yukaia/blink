@@ -934,6 +934,22 @@ mod integration {
                         }
                     }
                 }
+                // A directory is a key with a trailing slash, so both arms
+                // normalise the argument the client sent.
+                "MKD" => {
+                    let key = format!("{}/", arg.trim_end_matches('/'));
+                    store.lock().await.insert(key, Vec::new());
+                    w.write_all(b"257 directory created\r\n").await?;
+                }
+                "RMD" => {
+                    let key = format!("{}/", arg.trim_end_matches('/'));
+                    let removed = store.lock().await.remove(&key).is_some();
+                    if removed {
+                        w.write_all(b"250 directory removed\r\n").await?;
+                    } else {
+                        w.write_all(b"550 no such directory\r\n").await?;
+                    }
+                }
                 "DELE" => {
                     let removed = store.lock().await.remove(&arg).is_some();
                     if removed {
@@ -1140,6 +1156,55 @@ mod integration {
             "the download must resume from the partial's length, not restart; \
              commands issued: {issued:?}",
         );
+    }
+
+    /// The four mutating commands, driven through the transport API. Each
+    /// assertion reads the server's own store rather than the client's return
+    /// value: a command that answered success without touching anything —
+    /// an `MKD` arm that replies `257` and creates no key — must not pass.
+    #[tokio::test]
+    async fn rename_mkdir_rmdir_and_delete_reach_the_server() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/old.txt".to_string(), b"body".to_vec());
+            files.insert("/doomed.txt".to_string(), b"x".to_vec());
+            files.insert("/emptydir/".to_string(), Vec::new());
+        }
+
+        let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        transport.rename("/old.txt", "/new.txt").await.unwrap();
+        transport.mkdir("/fresh").await.unwrap();
+        transport.delete_file("/doomed.txt").await.unwrap();
+        transport.delete_dir("/emptydir", false).await.unwrap();
+
+        let files = store.lock().await;
+        assert!(files.contains_key("/new.txt"), "rename should move the key");
+        assert!(!files.contains_key("/old.txt"), "old name should be gone");
+        assert_eq!(files.get("/new.txt").unwrap().as_slice(), b"body");
+        assert!(files.contains_key("/fresh/"), "mkdir should create a dir key");
+        assert!(!files.contains_key("/doomed.txt"), "delete should remove");
+        assert!(!files.contains_key("/emptydir/"), "rmdir should remove");
+        drop(files);
+
+        // The store alone cannot distinguish `RMD /emptydir` from a `DELE`
+        // that happened to remove the same key, so pin the verbs too.
+        let issued = log.lock().await.clone();
+        for expected in [
+            "RNFR /old.txt",
+            "RNTO /new.txt",
+            "MKD /fresh",
+            "DELE /doomed.txt",
+            "RMD /emptydir",
+        ] {
+            assert!(
+                issued.iter().any(|c| c == expected),
+                "{expected} should have been issued; commands issued: {issued:?}",
+            );
+        }
     }
 
     /// Bounds a raw-socket protocol exchange so a test that drives `handle_control`
