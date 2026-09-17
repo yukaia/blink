@@ -6,6 +6,32 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Releases before 0.7.0 predate this file and are not reconstructed here; see
 the git history for those.
 
+## [Unreleased]
+
+### Security
+
+- **`rustls` 0.23.43 -> 0.23.45, closing
+  [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285)**
+  (medium, 5.3) — TLS 1.3 handshake messages were accepted across encryption
+  level boundaries. Reached through `suppaftp` and `tokio-rustls`, so it sat
+  in the path of every FTPS connection. Lockfile only; the manifest never
+  named `rustls` directly.
+
+- **`wnaf` 0.14.0 -> 0.14.1, off a yanked release.** Reached through
+  `russh -> p256/p384/p521 -> primeorder`. No advisory, but a yanked crate in
+  the graph is a signal not to sit on.
+
+### Changed
+
+- **Semver-compatible sweep across the rest of the graph** (`cargo update`,
+  40 packages). Notable: `russh` 0.63.1 -> 0.63.3, `clap` 4.6.6 -> 4.6.7,
+  `smallvec` 1.15.2 -> 1.16.1, `syn` 3.0.4 -> 3.0.6. russh 0.63.3 drops its
+  `internal-russh-num-bigint` fork for upstream `num-bigint` 0.5, taking the
+  graph from 408 to 407 crates.
+
+  Still deliberately out of scope, because each needs code changes:
+  `russh-sftp` 2.4 -> 3.0, `suppaftp` 10.0 -> 12.0, `icy_sixel` 0.6 -> 0.7.
+
 ## [0.7.1] — 2026-08-29
 
 ### Fixed
