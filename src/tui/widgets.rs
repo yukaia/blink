@@ -420,6 +420,38 @@ pub mod bottom_pane {
         fn ordinary_transfer_row_name_is_the_basename() {
             assert_eq!(display_name_for(&job("/srv/data/report.pdf")), "report.pdf");
         }
+
+        // The overwrite-confirmation modal is the third place a
+        // server-supplied name reaches the screen, and it sits next to the
+        // two above deliberately: all three state one policy. The modal is
+        // the prompt `is_deceptive_format` exists for — its doc comment gives
+        // the reason as stopping a name that would "disguise a name the user
+        // already cleared through the overwrite prompt" — so two distinct
+        // remote names must not render identically in it.
+        #[test]
+        fn overwrite_modal_name_is_sanitized() {
+            use crate::tui::views::conflict_row_name;
+            let name = conflict_row_name("/srv/re\u{202E}port.txt");
+            assert!(
+                !name.contains('\u{202E}'),
+                "bidi override reached the modal: {name:?}",
+            );
+            assert_eq!(name, "re port.txt");
+        }
+
+        #[test]
+        fn overwrite_modal_name_strips_escape_sequences() {
+            use crate::tui::views::conflict_row_name;
+            let name = conflict_row_name("/srv/a\u{1b}[31mb.txt");
+            assert!(!name.contains('\u{1b}'), "ESC reached the modal: {name:?}");
+        }
+
+        #[test]
+        fn ordinary_overwrite_modal_name_is_the_basename() {
+            use crate::tui::views::conflict_row_name;
+            assert_eq!(conflict_row_name("/srv/data/report.pdf"), "report.pdf");
+        }
+
     }
 }
 

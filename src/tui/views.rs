@@ -1646,8 +1646,8 @@ pub mod confirm_overwrite {
         let shown: usize = n.min(max_show);
         for &idx in conflict_indices.iter().take(max_show) {
             let name = match &plan[idx] {
-                PlannedJob::Download { remote_path, .. } => basename(remote_path),
-                PlannedJob::Upload { remote_path, .. } => basename(remote_path),
+                PlannedJob::Download { remote_path, .. } => conflict_row_name(remote_path),
+                PlannedJob::Upload { remote_path, .. } => conflict_row_name(remote_path),
                 PlannedJob::Mkdir { .. } => continue, // shouldn't appear
             };
             lines.push(Line::from(vec![
@@ -1682,12 +1682,26 @@ pub mod confirm_overwrite {
         );
     }
 
-    fn basename(path: &str) -> String {
+}
+
+
+/// The name shown for one conflicting file in the overwrite-confirmation
+/// modal.
+///
+/// Sanitized, like every other site that renders a server-supplied name.
+/// `ratatui` would drop the deceptive formatters on its own — `Buffer::set_stringn`
+/// filters `char::is_control` and zero-width graphemes — but dropping them
+/// and replacing them with a space are different policies, and this is the
+/// prompt `is_deceptive_format` was written for: two remote names that differ
+/// only by a bidi override must not render identically in the dialog the user
+/// clears them through.
+pub(crate) fn conflict_row_name(path: &str) -> String {
+    crate::error::sanitize(
         path.rsplit('/')
             .find(|s| !s.is_empty())
             .unwrap_or(path)
-            .to_string()
-    }
+            .to_string(),
+    )
 }
 
 // ---------------------------------------------------------------------------
