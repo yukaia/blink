@@ -20,6 +20,7 @@
 //! must be accepted explicitly (dropping it rejects the channel); and russh
 //! dropped its `internal-russh-forked-ssh-key` fork for upstream `ssh-key`.
 
+use crate::transfer::MAX_QUEUED_JOBS;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -615,6 +616,104 @@ impl SftpTransport {
         }
         Ok(self.transfer.as_ref().unwrap())
     }
+
+    /// `delete_dir` with the pending-work ceiling spelled out, so the guard
+    /// can be exercised without standing up a tree of `MAX_QUEUED_JOBS`
+    /// entries.
+    async fn delete_dir_capped(
+        &mut self,
+        remote_path: &str,
+        recursive: bool,
+        limit: usize,
+    ) -> Result<()> {
+        if !recursive {
+            return self
+                .sftp
+                .remove_dir(remote_path)
+                .await
+                .map_err(|e| map_sftp("rmdir", remote_path, e));
+        }
+
+        enum Op {
+            Visit(String),
+            Remove(String),
+        }
+
+        let mut stack = vec![Op::Visit(remote_path.to_string())];
+        while let Some(op) = stack.pop() {
+            // Same ceiling, and the same reason, as `walk_remote`: a server
+            // is free to serve a tree deeper or wider than this process can
+            // hold, and the stack is what grows with it. Checked after the
+            // pop so the count is the work still outstanding, matching the
+            // walk.
+            if stack.len() > limit {
+                return Err(BlinkError::transport(format!(
+                    "recursive delete exceeded {limit} entries — \
+                     narrow the target or remove it in smaller parts",
+                )));
+            }
+            match op {
+                Op::Visit(path) => {
+                    let entries = self
+                        .sftp
+                        .read_dir(&path)
+                        .await
+                        .map_err(|e| map_sftp("readdir", &path, e))?;
+
+                    stack.push(Op::Remove(path.clone()));
+
+                    let mut to_recurse: Vec<Op> = Vec::new();
+                    for e in entries {
+                        let name = e.file_name();
+                        if name == "." || name == ".." {
+                            continue;
+                        }
+                        // A name that can't be joined (`..`, `.`) is a
+                        // hostile or broken listing entry. Skip it; joining
+                        // used to fall back to `path` itself, so this
+                        // unlinked the directory being walked.
+                        let Some(child) = super::join_remote(&path, &name) else {
+                            tracing::warn!(
+                                dir = %path,
+                                "skipping unusable entry name in recursive delete",
+                            );
+                            continue;
+                        };
+                        let attrs = e.metadata();
+                        // is_symlink() before is_dir(): some SFTP servers
+                        // report symlink-to-directory entries with both
+                        // bits set. If we recursed into one, we'd walk
+                        // outside the subtree the user asked to delete
+                        // (and possibly outside the connection's chroot).
+                        // Treat any symlink as a leaf and unlink it.
+                        if attrs.is_symlink() {
+                            self.sftp
+                                .remove_file(&child)
+                                .await
+                                .map_err(|err| map_sftp("remove", &child, err))?;
+                        } else if attrs.is_dir() {
+                            to_recurse.push(Op::Visit(child));
+                        } else {
+                            self.sftp
+                                .remove_file(&child)
+                                .await
+                                .map_err(|err| map_sftp("remove", &child, err))?;
+                        }
+                    }
+                    for op in to_recurse.into_iter().rev() {
+                        stack.push(op);
+                    }
+                }
+                Op::Remove(path) => {
+                    self.sftp
+                        .remove_dir(&path)
+                        .await
+                        .map_err(|e| map_sftp("rmdir", &path, e))?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Read the byte range `[offset, offset + len)` fully into a `Vec`, looping to
@@ -1093,84 +1192,9 @@ impl Transport for SftpTransport {
     }
 
     async fn delete_dir(&mut self, remote_path: &str, recursive: bool) -> Result<()> {
-        if !recursive {
-            return self
-                .sftp
-                .remove_dir(remote_path)
-                .await
-                .map_err(|e| map_sftp("rmdir", remote_path, e));
-        }
-
-        enum Op {
-            Visit(String),
-            Remove(String),
-        }
-
-        let mut stack = vec![Op::Visit(remote_path.to_string())];
-        while let Some(op) = stack.pop() {
-            match op {
-                Op::Visit(path) => {
-                    let entries = self
-                        .sftp
-                        .read_dir(&path)
-                        .await
-                        .map_err(|e| map_sftp("readdir", &path, e))?;
-
-                    stack.push(Op::Remove(path.clone()));
-
-                    let mut to_recurse: Vec<Op> = Vec::new();
-                    for e in entries {
-                        let name = e.file_name();
-                        if name == "." || name == ".." {
-                            continue;
-                        }
-                        // A name that can't be joined (`..`, `.`) is a
-                        // hostile or broken listing entry. Skip it; joining
-                        // used to fall back to `path` itself, so this
-                        // unlinked the directory being walked.
-                        let Some(child) = super::join_remote(&path, &name) else {
-                            tracing::warn!(
-                                dir = %path,
-                                "skipping unusable entry name in recursive delete",
-                            );
-                            continue;
-                        };
-                        let attrs = e.metadata();
-                        // is_symlink() before is_dir(): some SFTP servers
-                        // report symlink-to-directory entries with both
-                        // bits set. If we recursed into one, we'd walk
-                        // outside the subtree the user asked to delete
-                        // (and possibly outside the connection's chroot).
-                        // Treat any symlink as a leaf and unlink it.
-                        if attrs.is_symlink() {
-                            self.sftp
-                                .remove_file(&child)
-                                .await
-                                .map_err(|err| map_sftp("remove", &child, err))?;
-                        } else if attrs.is_dir() {
-                            to_recurse.push(Op::Visit(child));
-                        } else {
-                            self.sftp
-                                .remove_file(&child)
-                                .await
-                                .map_err(|err| map_sftp("remove", &child, err))?;
-                        }
-                    }
-                    for op in to_recurse.into_iter().rev() {
-                        stack.push(op);
-                    }
-                }
-                Op::Remove(path) => {
-                    self.sftp
-                        .remove_dir(&path)
-                        .await
-                        .map_err(|e| map_sftp("rmdir", &path, e))?;
-                }
-            }
-        }
-        Ok(())
+        self.delete_dir_capped(remote_path, recursive, MAX_QUEUED_JOBS)
+            .await
     }
-
     async fn mkdir(&mut self, remote_path: &str) -> Result<()> {
         if let Ok(Some(existing)) = self.metadata(remote_path).await {
             if existing.is_dir() {
@@ -1385,7 +1409,7 @@ mod integration {
     };
     use tokio::sync::Mutex;
 
-    use super::{HostKeyDecision, SftpTransport};
+    use super::{HostKeyDecision, MAX_QUEUED_JOBS, SftpTransport};
     use crate::session::{AuthMethod, Protocol, Session};
     use crate::transport::Transport;
     use crate::tui::event::AppEvent;
@@ -1456,6 +1480,7 @@ mod integration {
                 session.channel_success(id)?;
                 let sftp = SftpServer {
                     store: self.store.clone(),
+                    drained: std::collections::HashSet::new(),
                 };
                 // Spawn instead of awaiting: blink opens a second channel for
                 // the pipelined transfer session, and awaiting the sftp loop
@@ -1472,6 +1497,39 @@ mod integration {
 
     struct SftpServer {
         store: Store,
+        /// Directory handles already drained. SFTP has no "no more entries"
+        /// field: `readdir` is called repeatedly and signals the end by
+        /// returning `Eof`, so the server has to remember which handles it
+        /// has already answered.
+        drained: std::collections::HashSet<String>,
+    }
+
+    /// POSIX mode bits for the two kinds this store can hold. `FileAttributes`
+    /// derives `is_dir` from these, and `is_dir` is what the client's walk
+    /// branches on.
+    const MODE_DIR: u32 = 0o040_755;
+    const MODE_FILE: u32 = 0o100_644;
+
+    /// Immediate children of `dir` as (name, is_dir). A key ending in `/` is
+    /// a directory, matching the FTP harness's convention.
+    fn children_of(files: &HashMap<String, Vec<u8>>, dir: &str) -> Vec<(String, bool)> {
+        let prefix = if dir.ends_with('/') {
+            dir.to_string()
+        } else {
+            format!("{dir}/")
+        };
+        let mut out = Vec::new();
+        for path in files.keys() {
+            let Some(rest) = path.strip_prefix(&prefix) else {
+                continue;
+            };
+            let trimmed = rest.trim_end_matches('/');
+            if trimmed.is_empty() || trimmed.contains('/') {
+                continue;
+            }
+            out.push((trimmed.to_string(), path.ends_with('/')));
+        }
+        out
     }
 
     fn ok_status(id: u32) -> Status {
@@ -1562,13 +1620,73 @@ mod integration {
         async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
             let store = self.store.lock().await;
             let size = store.get(&handle).map(|c| c.len() as u64).unwrap_or(0);
+            // A directory is stored under a key ending in `/`, but the client
+            // asks about it without one.
+            let is_dir = store.contains_key(&format!("{handle}/"));
             Ok(Attrs {
                 id,
                 attrs: FileAttributes {
                     size: Some(size),
+                    permissions: Some(if is_dir { MODE_DIR } else { MODE_FILE }),
                     ..Default::default()
                 },
             })
+        }
+
+        async fn opendir(&mut self, id: u32, path: String) -> Result<SftpHandle, Self::Error> {
+            let key = format!("{}/", path.trim_end_matches('/'));
+            if !self.store.lock().await.contains_key(&key) {
+                return Err(StatusCode::NoSuchFile);
+            }
+            // Namespaced so a directory handle cannot be mistaken for the
+            // file handle of the same path, which `fstat` would size.
+            let handle = format!("dir:{key}");
+            self.drained.remove(&handle);
+            Ok(SftpHandle { id, handle })
+        }
+
+        async fn readdir(
+            &mut self,
+            id: u32,
+            handle: String,
+        ) -> Result<russh_sftp::protocol::Name, Self::Error> {
+            if !self.drained.insert(handle.clone()) {
+                return Err(StatusCode::Eof);
+            }
+            let Some(dir) = handle.strip_prefix("dir:") else {
+                return Err(StatusCode::Failure);
+            };
+            let store = self.store.lock().await;
+            let files = children_of(&store, dir)
+                .into_iter()
+                .map(|(name, is_dir)| {
+                    russh_sftp::protocol::File::new(
+                        name,
+                        FileAttributes {
+                            size: Some(0),
+                            permissions: Some(if is_dir { MODE_DIR } else { MODE_FILE }),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect();
+            Ok(russh_sftp::protocol::Name { id, files })
+        }
+
+        async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
+            let key = format!("{}/", path.trim_end_matches('/'));
+            let mut store = self.store.lock().await;
+            if !store.contains_key(&key) {
+                return Err(StatusCode::NoSuchFile);
+            }
+            // Real servers refuse to unlink a directory that still holds
+            // entries; the walk's bottom-up order is only a contract if the
+            // server would punish getting it wrong.
+            if !children_of(&store, &key).is_empty() {
+                return Err(StatusCode::Failure);
+            }
+            store.remove(&key);
+            Ok(ok_status(id))
         }
 
         async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
@@ -1730,6 +1848,116 @@ mod integration {
             accept_invalid_certs: false,
             cert_sha256: None,
         }
+    }
+
+    /// A nested tree under `/tree`, plus a sibling the walk must not touch.
+    /// Mirrors the FTP harness's `tree_store`.
+    async fn tree_store() -> Store {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/tree/".to_string(), Vec::new());
+            files.insert("/tree/a.txt".to_string(), b"a".to_vec());
+            files.insert("/tree/sub/".to_string(), Vec::new());
+            files.insert("/tree/sub/b.txt".to_string(), b"b".to_vec());
+            files.insert("/sibling.txt".to_string(), b"keep".to_vec());
+        }
+        store
+    }
+
+    /// `n` sibling directories under `/wide`. Only directories accumulate on
+    /// the delete walk's stack — files are unlinked inline — so width is what
+    /// drives it towards the ceiling.
+    async fn wide_store(n: usize) -> Store {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/wide/".to_string(), Vec::new());
+            for i in 0..n {
+                files.insert(format!("/wide/d{i}/"), Vec::new());
+            }
+        }
+        store
+    }
+
+    /// The recursive SFTP delete walk, which had no coverage at all until the
+    /// harness learned to list directories. The server refuses `rmdir` on a
+    /// directory that still holds entries, so bottom-up order is not merely
+    /// asserted here — getting it wrong fails the delete outright.
+    #[tokio::test]
+    async fn a_recursive_delete_removes_a_nested_tree_bottom_up() {
+        let store = tree_store().await;
+        let (port, _connects) = start_server(store.clone()).await;
+        let mut transport = connect(port).await;
+
+        transport
+            .delete_dir("/tree", true)
+            .await
+            .expect("recursive delete should succeed");
+
+        let mut remaining: Vec<String> = store.lock().await.keys().cloned().collect();
+        remaining.sort();
+        assert_eq!(
+            remaining,
+            vec!["/sibling.txt".to_string()],
+            "the walk should take the tree and nothing else",
+        );
+    }
+
+    /// The guard itself: a listing wider than the ceiling must stop the walk
+    /// rather than let the stack grow with it. Run at a small limit so the
+    /// behaviour is visible without a tree of `MAX_QUEUED_JOBS` entries;
+    /// `a_recursive_delete_refuses_a_tree_wider_than_the_real_cap` pins that
+    /// the production entry point supplies the real one.
+    #[tokio::test]
+    async fn a_recursive_delete_stops_once_pending_work_passes_the_cap() {
+        let store = wide_store(4).await;
+        let (port, _connects) = start_server(store.clone()).await;
+        let mut transport = connect(port).await;
+
+        let err = transport
+            .delete_dir_capped("/wide", true, 2)
+            .await
+            .expect_err("a listing wider than the ceiling must be refused");
+
+        assert!(
+            err.to_string().contains("exceeded") && err.to_string().contains('2'),
+            "expected the delete budget error naming the limit, got: {err}",
+        );
+
+        // The guard has to fire before the walk acts, not after: a partially
+        // deleted tree would be worse than a refused one.
+        assert_eq!(
+            store.lock().await.len(),
+            5,
+            "nothing should have been removed",
+        );
+    }
+
+    /// The production entry point must supply the *real* ceiling, not merely
+    /// have one. Cheap despite its size: with the guard in place the walk
+    /// stops on the iteration after the first listing, so this reads one
+    /// directory and removes nothing.
+    #[tokio::test]
+    async fn a_recursive_delete_refuses_a_tree_wider_than_the_real_cap() {
+        let store = wide_store(MAX_QUEUED_JOBS + 1).await;
+        let (port, _connects) = start_server(store.clone()).await;
+        let mut transport = connect(port).await;
+
+        let err = transport
+            .delete_dir("/wide", true)
+            .await
+            .expect_err("a tree this wide must not be walked");
+
+        assert!(
+            err.to_string().contains(&MAX_QUEUED_JOBS.to_string()),
+            "the error must name the real ceiling, got: {err}",
+        );
+        assert_eq!(
+            store.lock().await.len(),
+            MAX_QUEUED_JOBS + 2,
+            "nothing should have been removed",
+        );
     }
 
     async fn connect(port: u16) -> SftpTransport {

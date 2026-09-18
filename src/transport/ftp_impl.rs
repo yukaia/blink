@@ -140,6 +140,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::error::{BlinkError, Result};
+use crate::transfer::MAX_QUEUED_JOBS;
 use crate::transport::error_map::map_ftp;
 use crate::transport::{EntryKind, ProgressUpdate, RemoteEntry};
 
@@ -449,6 +450,17 @@ pub async fn ftp_delete_dir<T: TokioTlsStream + Send>(
     remote_path: &str,
     recursive: bool,
 ) -> Result<()> {
+    ftp_delete_dir_capped(stream, remote_path, recursive, MAX_QUEUED_JOBS).await
+}
+
+/// `ftp_delete_dir` with the pending-work ceiling spelled out, so the guard
+/// can be exercised without standing up a tree of `MAX_QUEUED_JOBS` entries.
+pub async fn ftp_delete_dir_capped<T: TokioTlsStream + Send>(
+    stream: &mut ImplAsyncFtpStream<T>,
+    remote_path: &str,
+    recursive: bool,
+    limit: usize,
+) -> Result<()> {
     check_ftp_path("rmd", remote_path)?;
     if !recursive {
         return timed_ftp("rmd", remote_path, stream.rmdir(remote_path)).await;
@@ -460,6 +472,16 @@ pub async fn ftp_delete_dir<T: TokioTlsStream + Send>(
     }
     let mut stack = vec![Op::Visit(remote_path.to_string())];
     while let Some(op) = stack.pop() {
+        // Same ceiling, and the same reason, as `walk_remote`: a server is
+        // free to serve a tree deeper or wider than this process can hold,
+        // and the stack is what grows with it. Checked after the pop so the
+        // count is the work still outstanding, matching the walk.
+        if stack.len() > limit {
+            return Err(BlinkError::transport(format!(
+                "recursive delete exceeded {limit} entries — \
+                 narrow the target or remove it in smaller parts",
+            )));
+        }
         match op {
             Op::Visit(path) => {
                 let lines = timed_ftp("list", &path, stream.list(Some(&path))).await?;
@@ -1381,6 +1403,87 @@ mod integration {
             files.insert("/sibling.txt".to_string(), b"keep".to_vec());
         }
         store
+    }
+
+    /// A store holding `n` sibling directories under `/wide`, and nothing
+    /// else. Only directories accumulate on the delete walk's stack — files
+    /// are unlinked inline — so width is what drives it towards the ceiling.
+    async fn wide_store(n: usize) -> Store {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/wide/".to_string(), Vec::new());
+            for i in 0..n {
+                files.insert(format!("/wide/d{i}/"), Vec::new());
+            }
+        }
+        store
+    }
+
+    /// A logged-in control connection, for the paths that take a raw stream
+    /// rather than a `FtpTransport`.
+    async fn raw_stream(port: u16) -> suppaftp::tokio::AsyncFtpStream {
+        let mut stream = suppaftp::tokio::AsyncFtpStream::connect(&format!("127.0.0.1:{port}"))
+            .await
+            .expect("connect");
+        stream.login("tester", "pw").await.expect("login");
+        stream
+    }
+
+    /// The guard itself: a listing wider than the ceiling must stop the walk
+    /// rather than let the stack grow with it. Run at a small limit so the
+    /// behaviour is visible without a tree of `MAX_QUEUED_JOBS` entries;
+    /// `a_recursive_delete_refuses_a_tree_wider_than_the_real_cap` pins that
+    /// the production entry point supplies the real one.
+    #[tokio::test]
+    async fn a_recursive_delete_stops_once_pending_work_passes_the_cap() {
+        let store = wide_store(4).await;
+        let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let mut stream = raw_stream(port).await;
+
+        let err = super::ftp_delete_dir_capped(&mut stream, "/wide", true, 2)
+            .await
+            .expect_err("a listing wider than the ceiling must be refused");
+
+        assert!(
+            err.to_string().contains("exceeded") && err.to_string().contains('2'),
+            "expected the delete budget error naming the limit, got: {err}",
+        );
+
+        // The guard has to fire before the walk acts, not after: a partially
+        // deleted tree would be worse than a refused one.
+        let issued = log.lock().await.clone();
+        assert!(
+            !issued.iter().any(|c| c.starts_with("RMD")),
+            "nothing should have been removed; commands issued: {issued:?}",
+        );
+    }
+
+    /// The production entry point must supply the *real* ceiling, not merely
+    /// have one. Cheap despite its size: with the guard in place the walk
+    /// stops on the iteration after the first listing, so this issues one
+    /// LIST and removes nothing.
+    #[tokio::test]
+    async fn a_recursive_delete_refuses_a_tree_wider_than_the_real_cap() {
+        let store = wide_store(crate::transfer::MAX_QUEUED_JOBS + 1).await;
+        let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let mut stream = raw_stream(port).await;
+
+        let err = super::ftp_delete_dir(&mut stream, "/wide", true)
+            .await
+            .expect_err("a tree this wide must not be walked");
+
+        assert!(
+            err.to_string()
+                .contains(&crate::transfer::MAX_QUEUED_JOBS.to_string()),
+            "the error must name the real ceiling, got: {err}",
+        );
+
+        let issued = log.lock().await.clone();
+        assert!(
+            !issued.iter().any(|c| c.starts_with("RMD")),
+            "nothing should have been removed; commands issued: {issued:?}",
+        );
     }
 
     /// Index of `cmd` in the issued log, or a failure naming what was issued.
