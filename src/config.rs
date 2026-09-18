@@ -224,8 +224,15 @@ pub(crate) fn validate_theme_name(name: &str) -> Result<()> {
     if name.is_empty() {
         return Err(BlinkError::config("theme name must not be empty"));
     }
-    // Reject path separators and null bytes outright.
-    if name.contains(['/', '\\', '\0']) {
+    // Reject path separators and null bytes outright. `:` joins them: on
+    // Windows a component carrying a drive prefix but no root replaces the
+    // whole buffer, so `themes_dir().join("C:evil")` resolves outside the
+    // themes directory. `safe_local_name_for` documents and blocks the same
+    // hazard for server-supplied download names, where it is Windows-only
+    // because a colon is a legal Unix filename character. Here it is refused
+    // everywhere, as `\` already is: a theme name is an identifier the user
+    // types into their own config, not a filename.
+    if name.contains(['/', '\\', '\0', ':']) {
         return Err(BlinkError::config(
             "theme name must not contain path separators",
         ));
@@ -392,6 +399,19 @@ mod tests {
     fn theme_name_dotdot_errors() {
         assert!(validate_theme_name("..").is_err());
         assert!(validate_theme_name("a..b").is_err());
+    }
+
+    /// A component carrying a drive prefix but no root replaces the whole
+    /// buffer on Windows, so `themes_dir().join("C:evil")` resolves outside
+    /// the themes directory entirely — the same hazard `safe_local_name_for`
+    /// documents and blocks for server-supplied download names. Rejected on
+    /// every platform, as `\\` already is: a theme name is an identifier the
+    /// user types into their own config, not a filename, and none of them
+    /// legitimately carries a colon.
+    #[test]
+    fn theme_name_colon_errors() {
+        assert!(validate_theme_name("C:evil").is_err());
+        assert!(validate_theme_name("a:b").is_err());
     }
 
     #[test]
