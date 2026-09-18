@@ -10,6 +10,32 @@ the git history for those.
 
 ### Security
 
+- **The recursive remote delete is bounded on both transports.**
+  `SftpTransport::delete_dir` and `ftp_delete_dir` grew their walk stack with
+  no ceiling, so a server serving a deep or wide enough tree exhausted memory
+  instead of drawing an error. Both now stop at `MAX_QUEUED_JOBS` — the same
+  ceiling, and the same reason, as `walk_remote` — and refuse before removing
+  anything, rather than half-deleting the tree and then failing. Symlinks were
+  already treated as leaves in both walks, so there was never an infinite-loop
+  risk, only an unbounded one.
+
+- **The overwrite-confirmation modal sanitizes the remote name.** It was the
+  one place a server-supplied name reached the screen without it. Not an
+  injection — `ratatui`'s `Buffer::set_stringn` drops control characters and
+  zero-width graphemes before they reach the terminal — but ratatui *deletes*
+  those characters where blink *replaces them with a space*, so two remote
+  names differing only by a bidi override rendered identically in the very
+  prompt the user clears them through. That is the case `is_deceptive_format`
+  was written for.
+
+- **`validate_theme_name` rejects `:`.** On Windows a path component carrying
+  a drive prefix but no root replaces the whole buffer, so
+  `themes_dir().join("C:evil")` resolved outside the themes directory
+  entirely. `safe_local_name_for` already documented and blocked the same
+  hazard for server-supplied download names. Low reach — a theme name comes
+  from the user's own config, not from a server — but the asymmetry was the
+  kind that gets copied into the next validator.
+
 - **`rustls` 0.23.43 -> 0.23.45, closing
   [RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285)**
   (medium, 5.3) — TLS 1.3 handshake messages were accepted across encryption
@@ -20,6 +46,15 @@ the git history for those.
 - **`wnaf` 0.14.0 -> 0.14.1, off a yanked release.** Reached through
   `russh -> p256/p384/p521 -> primeorder`. No advisory, but a yanked crate in
   the graph is a signal not to sit on.
+
+### Internal
+
+- **The SFTP test harness can list directories.** Its `russh_sftp` handler
+  implemented no directory operations at all, which left `delete_dir`, `list`
+  and `mkdir` with no coverage on the SFTP side. It now serves `opendir`,
+  `readdir` and `rmdir`, and refuses `rmdir` on a directory that still holds
+  entries, so the walk's bottom-up order is enforced by the server rather than
+  merely asserted. 430 tests -> 439.
 
 ### Changed
 

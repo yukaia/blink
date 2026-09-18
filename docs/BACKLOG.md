@@ -6,28 +6,6 @@ spec in `docs/superpowers/specs/` instead.
 
 ---
 
-## Sanitize the remote name in the overwrite-confirmation modal
-
-`src/tui/views.rs:1649-1650` renders `basename(remote_path)` into a
-`Span::styled` with no `sanitize` call. It is the only place a server-supplied
-name reaches the screen without one — the transfers pane has
-`transfer_row_name_is_sanitized` and `transfer_row_name_strips_escape_sequences`
-pinning the opposite policy a few files over.
-
-Not an injection: `ratatui-core`'s `Buffer::set_stringn` filters
-`char::is_control` and drops zero-width graphemes, and U+202E, U+200B, U+200E,
-U+FEFF, U+2067 and U+061C all measure zero width, so none of them reach the
-terminal. That filter was checked again on the 0.30 bump and is unchanged, so
-this entry does not depend on the ratatui version. What survives
-is that ratatui *deletes* those characters where blink *replaces them with a
-space* — deliberately, per `is_deceptive_format`, whose doc comment gives the
-reason as stopping a name that would "disguise a name the user already cleared
-through the overwrite prompt". This modal is that prompt, and two distinct
-remote names render identically in it.
-
-Fix: wrap both arms in `crate::error::sanitize`. Test next to the transfers-pane
-pair so the three render sites state one policy.
-
 ## Warn when FTP sends credentials in the clear
 
 `src/transport/ftp.rs` issues `USER` / `PASS` and moves every byte over an
@@ -40,25 +18,31 @@ Fix: a `LogLevel::Warn` line on connect, and a line in the README's protocol
 list. Consider a marker in the session selector next to `ftp` sessions. No
 behaviour change — the user chose the protocol and can keep using it.
 
-## `validate_theme_name` should reject `:` as well
+Note the transports hold no logger: `grep LogLevel src/transport/` returns
+nothing, and the host-certificate rejection reached the log by way of an
+`AppEvent` instead. The natural seam is `AppEvent::Connected`
+(`src/tui/app/events.rs:34`), which has the session and so the protocol, and
+which already carries the FTPS pin messages.
 
-`src/config.rs:223` rejects `/`, `\`, `\0` and `..`, but not `:`. On Windows a
-path component carrying a drive prefix but no root replaces the whole buffer, so
-`themes_dir().join("C:evil.ini")` resolves outside the themes directory
-entirely. `safe_local_name_for` already documents and blocks exactly this
-hazard for downloaded filenames; the two validators should agree.
+## `list` and `delete_dir` disagree about both-bits-set entries
 
-Low reach — the name comes from the user's own `config.ini` or session file, not
-from a server. Worth closing anyway because the asymmetry is the kind that gets
-copied into the next validator.
+`SftpTransport::delete_dir` checks `is_symlink()` *before* `is_dir()`
+(`src/transport/sftp.rs`), with a comment giving the reason: some SFTP servers
+report a symlink-to-directory with both bits set, and recursing into one walks
+outside the subtree the user named — possibly outside the connection's chroot.
+`SftpTransport::list` checks them in the opposite order, so the same entry
+comes back as `EntryKind::Directory`.
 
-## Cap the recursive remote delete
+`walk_remote` skips on `EntryKind::Symlink` (`src/tui/plan.rs:228`), so it never
+sees a symlink there and recurses into exactly the entry `delete_dir` refuses to
+touch. The download planner is the unsafe side of the disagreement.
 
-`SftpTransport::delete_dir` (`src/transport/sftp.rs:1073`) and
-`ftp_delete_dir` (`src/transport/ftp_impl.rs`) grow their `Op` stack with no
-ceiling. `walk_remote` guards the same shape with `MAX_QUEUED_JOBS` and returns
-a real error naming the limit; the two delete walks never got the equivalent, so
-a server serving a deep or wide enough tree exhausts memory instead.
+Not yet established: whether a real server actually sets both bits. The claim
+lives only in `delete_dir`'s comment and no test or server is cited. Settle that
+first — if it is theoretical, the ordering is harmless and this entry closes as
+a comment fix.
 
-No infinite-loop risk — symlinks are correctly treated as leaves in both walks.
-Fix: reuse `MAX_QUEUED_JOBS` and the message `walk_remote` already produces.
+Fix, if it is real: flip `list` to test `is_symlink()` first so both paths agree.
+That also changes how a symlinked directory renders in the file pane, which is a
+call worth making deliberately rather than as a side effect. The SFTP test
+harness can list directories as of the delete-cap work, so this is now testable.
