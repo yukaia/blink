@@ -56,6 +56,21 @@ impl Protocol {
         }
     }
 
+    /// Whether this protocol carries credentials and file data over an
+    /// unencrypted socket.
+    ///
+    /// The one place that fact is stated. The connect warning and the session
+    /// selector's colouring both read it, so neither re-derives it — two
+    /// sites disagreeing about the same security property is how
+    /// `list`/`delete_dir` ended up in the backlog.
+    ///
+    /// FTPS is *explicit* TLS (RFC 4217): the control connection starts in
+    /// the clear and is upgraded by `AUTH TLS` before any credential is sent,
+    /// so it does not belong here.
+    pub fn is_cleartext(&self) -> bool {
+        matches!(self, Self::Ftp)
+    }
+
     pub fn default_port(&self) -> u16 {
         match self {
             Self::Sftp | Self::Scp => 22,
@@ -799,6 +814,17 @@ fn validate_network_field(field: &str, value: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Both the connect warning and the selector's colouring branch on this,
+    /// so a protocol landing on the wrong side of it either warns about an
+    /// encrypted connection or stays silent about a cleartext one.
+    #[test]
+    fn only_plain_ftp_is_cleartext() {
+        assert!(Protocol::Ftp.is_cleartext());
+        assert!(!Protocol::Ftps.is_cleartext(), "FTPS upgrades via AUTH TLS");
+        assert!(!Protocol::Sftp.is_cleartext());
+        assert!(!Protocol::Scp.is_cleartext());
+    }
 
     // validate_network_field
     #[test]

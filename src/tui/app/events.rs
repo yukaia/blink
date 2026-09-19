@@ -133,6 +133,7 @@ impl App {
                 self.transfer_manager = Some(manager);
                 self.dispatcher = Some(dispatcher);
                 let is_scp = session.protocol == crate::session::Protocol::Scp;
+                let is_cleartext = session.protocol.is_cleartext();
                 // Ask about unfinished work before asking about saving the
                 // session: checkpoints are keyed by session *name*, and
                 // accepting the save offer can rename it.
@@ -161,6 +162,21 @@ impl App {
                         LogLevel::Warn,
                         "scp:// is routed through SFTP internally; \
                          full file-manager operations are available".into(),
+                    );
+                }
+                // Every other protocol tells the user something about how it
+                // protects them — an unknown host key prompts, a certificate
+                // gets pinned. Plain FTP is the one that protects nothing and
+                // said nothing about it. Phrased around the connection rather
+                // than the credential, so it stays true of an anonymous login
+                // too: there is no password worth stealing there, but the file
+                // contents are in the clear either way.
+                if is_cleartext {
+                    self.push_log(
+                        LogLevel::Warn,
+                        "ftp:// is unencrypted — credentials, file names and \
+                         file contents are all sent in the clear. Use ftps:// \
+                         or sftp:// if the server offers it".into(),
                     );
                 }
                 self.refresh_remote_pane(remote_dir);

@@ -8,6 +8,30 @@ the git history for those.
 
 ## [Unreleased]
 
+### Added
+
+- **Plain FTP now says that it is unencrypted.** Every other protocol tells
+  the user something about how it protects them — an unknown SSH host key
+  prompts, an FTPS certificate gets pinned — while `ftp://` protected nothing
+  and said nothing about it. Connecting over FTP now logs a warning, and the
+  README's protocol list and security notes say the same thing. The wording is
+  anchored on the connection rather than the credential, so it stays true of
+  an anonymous login: there is no password worth stealing there, but the file
+  names and contents are in the clear either way.
+
+  No behaviour change — the user chose the protocol and everything keeps
+  working.
+
+### Fixed
+
+- **The session selector no longer shows FTPS as being as risky as FTP.**
+  `Protocol::Ftp | Protocol::Ftps` shared one arm of the protocol-tag
+  colouring, both rendering in the theme's warning colour. That was wrong in
+  both directions: it cautioned against the encrypted protocol, and it gave
+  no way to tell the cleartext one apart from it at a glance. FTPS now reads
+  like SFTP, and the warning colour is reserved for protocols where
+  `Protocol::is_cleartext()` holds.
+
 ### Security
 
 - **The recursive remote delete is bounded on both transports.**

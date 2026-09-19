@@ -6,6 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
+use crate::session::Protocol;
 use crate::tui::app::{App, Pane};
 use crate::tui::widgets;
 
@@ -35,7 +36,6 @@ pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
 
 pub mod session_select {
     use super::*;
-    use crate::session::Protocol;
 
     pub fn render(f: &mut Frame, app: &App) {
         let area = f.area();
@@ -132,11 +132,7 @@ pub mod session_select {
                 } else {
                     Style::default().fg(app.theme.dim)
                 };
-                let proto_style = match s.protocol {
-                    Protocol::Sftp => Style::default().fg(app.theme.success),
-                    Protocol::Scp => Style::default().fg(app.theme.directory),
-                    Protocol::Ftp | Protocol::Ftps => Style::default().fg(app.theme.warning),
-                };
+                let proto_style = protocol_style(&s.protocol, &app.theme);
 
                 let line_spans = vec![
                     prefix,
@@ -400,6 +396,58 @@ fn cancellation_warning(active: usize, pending: usize) -> Option<String> {
             format!("{a} in-flight and {p} queued transfer{plural} will be cancelled.")
         }
     })
+}
+
+/// Colour for a session's protocol tag in the selector.
+///
+/// `theme.warning` is reserved for the protocols where
+/// [`Protocol::is_cleartext`] holds. FTPS used to share that arm with FTP,
+/// which told the user the encrypted protocol was as risky as the cleartext
+/// one and left no way to tell them apart in the list.
+pub(crate) fn protocol_style(protocol: &Protocol, theme: &crate::theme::Theme) -> Style {
+    match protocol {
+        Protocol::Sftp | Protocol::Ftps => Style::default().fg(theme.success),
+        Protocol::Scp => Style::default().fg(theme.directory),
+        Protocol::Ftp => Style::default().fg(theme.warning),
+    }
+}
+
+#[cfg(test)]
+mod protocol_style_tests {
+    use super::protocol_style;
+    use ratatui::style::Style;
+    use crate::session::Protocol;
+    use crate::theme::Theme;
+
+    /// FTP and FTPS shared one arm, so the selector told the user the
+    /// encrypted protocol was exactly as risky as the cleartext one — and
+    /// gave no way to tell them apart at a glance. They must not read the
+    /// same.
+    #[test]
+    fn ftp_and_ftps_do_not_share_a_colour() {
+        let theme = Theme::load("dracula").unwrap();
+        assert_ne!(
+            protocol_style(&Protocol::Ftp, &theme),
+            protocol_style(&Protocol::Ftps, &theme),
+            "the cleartext protocol must not look like the encrypted one",
+        );
+    }
+
+    /// The cleartext protocol is the one that gets the caution colour, and
+    /// the verified ones read like SFTP.
+    #[test]
+    fn only_the_cleartext_protocol_is_coloured_as_a_caution() {
+        let theme = Theme::load("dracula").unwrap();
+        let caution = Style::default().fg(theme.warning);
+        for p in [Protocol::Sftp, Protocol::Scp, Protocol::Ftp, Protocol::Ftps] {
+            assert_eq!(
+                protocol_style(&p, &theme) == caution,
+                p.is_cleartext(),
+                "{} is coloured as a caution iff it is cleartext",
+                p.as_str(),
+            );
+        }
+    }
 }
 
 #[cfg(test)]

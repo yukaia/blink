@@ -15,7 +15,11 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
 
 - **SFTP** with password, SSH key, and encrypted-key (passphrase prompt) auth
 - **SCP** as transparent SFTP — matches OpenSSH 9.0+ behavior, full feature parity
-- **FTP** with anonymous and password auth
+- **FTP** with anonymous and password auth — *unencrypted*: credentials,
+  file names and file contents all cross the network in the clear. blink
+  warns on every `ftp://` connect and colours the protocol tag as a
+  caution in the session selector. Prefer FTPS or SFTP where the server
+  offers them.
 - **FTPS** with explicit TLS (RFC 4217) via rustls — pure Rust, no system
   TLS library needed
 - **ssh-agent** auth on Unix (uses `$SSH_AUTH_SOCK`); on Windows, the
@@ -625,6 +629,14 @@ terminal. The following properties are enforced in the current codebase.
   (which can run into minutes).
 - **FTPS** — explicit TLS only (RFC 4217), verified against the Mozilla CA
   bundle via rustls (pure Rust, no system OpenSSL).
+- **Plain FTP is unencrypted, and says so.** `USER` / `PASS` and every byte
+  of every transfer cross the network in the clear, and an observer on the
+  path can read or alter them. There is no protocol-level fix for this —
+  it is what `ftp://` is — so blink does the one useful thing instead:
+  a warning in the log on every connect, and the protocol tag coloured as a
+  caution in the session selector. FTPS no longer shares that colour, having
+  previously been shown with the same caution as plain FTP despite being
+  encrypted.
 - **One crypto backend, not two.** `ring` serves both transports: rustls uses
   it for FTPS, and `russh` is built against it rather than its default
   `aws-lc-rs`. Compiling two backends is how the FTPS transport once came to
