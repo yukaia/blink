@@ -28,17 +28,3 @@ Watch `russh` rather than `ssh-key` and `rsa` directly: it pins both with exact
 `=` requirements, so they move when it moves. Both are still pre-GA
 (`ssh-key 0.7.0-rc.11`, `rsa 0.10.0-rc.18`), and `rsa` reaching a release is
 what would retire the RUSTSEC-2023-0071 ignore in `.cargo/audit.toml`.
-
-## Decide whether `cargo fmt` applies to this tree
-
-`cargo fmt --check` fails with 308 hunks across 33 files. It is not whitespace
-noise: the source is hand-wrapped narrower than rustfmt's default, so the tool
-wants to re-flow real code. There is no `rustfmt.toml` and no formatting commit
-anywhere in the history, so the question has never actually been answered.
-
-Two honest options. Add a `rustfmt.toml` describing the wrapping the tree
-already uses, so `cargo fmt` becomes a no-op and stays available as a check; or
-record that formatting is deliberately manual and leave it. What should not
-happen by accident is someone running `cargo fmt` and committing a 340-line
-reflow across the whole tree, which is the current default outcome and would
-flatten `git blame` over every file.

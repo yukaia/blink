@@ -1,0 +1,10 @@
+# Commits `git blame` should look through: mechanical changes that touch many
+# lines and mean nothing about any of them. GitHub reads this file on its own;
+# locally, opt in once per clone with
+#
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# Only commits whose diff is entirely tool output belong here.
+
+# style: run `cargo fmt` over the tree
+43a43a8f93ed136490704fcbc79650fb42cda8db
