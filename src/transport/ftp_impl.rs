@@ -123,6 +123,8 @@ pub(crate) use delegate_ftp_transport;
 // ---------------------------------------------------------------------------
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -644,29 +646,46 @@ pub async fn ftp_read_to_bytes<T: TokioTlsStream + Send + 'static>(
 ) -> Result<Bytes> {
     check_ftp_path("retr", remote_path)?;
     let remote_path_owned = remote_path.to_string();
-    let buf = timed_ftp(
+    // The cap is signalled out of band rather than as the callback's error.
+    // An `Err` from the callback makes `retr` return without finalising the
+    // transfer, which left the connection refusing every later data command
+    // on suppaftp 10; and any `FtpError` it could carry maps to the wrong
+    // thing — `ConnectionError` reads as a disconnect. So the callback always
+    // returns `Ok`, `retr` finalises, and the flag decides the outcome.
+    let over_cap = Arc::new(AtomicBool::new(false));
+    let result = timed_ftp(
         "retr",
         remote_path,
-        stream.retr(&remote_path_owned, move |reader| {
-            Box::pin(async move {
-                let mut buf = Vec::new();
-                let mut limited = reader.take(MAX_PREVIEW_BYTES + 1);
-                limited
-                    .read_to_end(&mut buf)
-                    .await
-                    .map_err(suppaftp::FtpError::ConnectionError)?;
-                let reader = limited.into_inner();
-                if buf.len() as u64 > MAX_PREVIEW_BYTES {
-                    return Err(suppaftp::FtpError::ConnectionError(std::io::Error::other(
-                        "file exceeds preview size limit",
-                    )));
-                }
-                Ok((buf, reader))
-            })
+        stream.retr(&remote_path_owned, {
+            let over_cap = Arc::clone(&over_cap);
+            move |reader| {
+                // Cloned per call: `retr` takes an `FnMut`, so the closure
+                // cannot give its own handle away to the future.
+                let over_cap = Arc::clone(&over_cap);
+                Box::pin(async move {
+                    let mut buf = Vec::new();
+                    let mut limited = reader.take(MAX_PREVIEW_BYTES + 1);
+                    limited
+                        .read_to_end(&mut buf)
+                        .await
+                        .map_err(suppaftp::FtpError::ConnectionError)?;
+                    if buf.len() as u64 > MAX_PREVIEW_BYTES {
+                        over_cap.store(true, Ordering::Relaxed);
+                    }
+                    Ok((buf, limited.into_inner()))
+                })
+            }
         }),
     )
-    .await?;
-    Ok(Bytes::from(buf))
+    .await;
+    // Checked before `result`: having stopped reading early, the server
+    // usually answers 426, and that is not the error that happened.
+    if over_cap.load(Ordering::Relaxed) {
+        return Err(BlinkError::transport(format!(
+            "retr {remote_path}: file exceeds preview size limit"
+        )));
+    }
+    Ok(Bytes::from(result?))
 }
 
 // ---------------------------------------------------------------------------
@@ -987,11 +1006,24 @@ mod integration {
                     if faults.abrupt_close {
                         return Ok(());
                     }
-                    for chunk in slice.chunks(DATA_SLICE) {
-                        data.write_all(chunk).await?;
+                    // A client may close the data connection before the body
+                    // is sent — a preview stops reading at its size cap. A
+                    // real daemon answers 426 and keeps serving; letting the
+                    // write error escape would end the whole control
+                    // connection instead, and whether it did would depend on
+                    // how much of the body fit in the socket buffer.
+                    let sent: std::io::Result<()> = async {
+                        for chunk in slice.chunks(DATA_SLICE) {
+                            data.write_all(chunk).await?;
+                        }
+                        data.shutdown().await
                     }
-                    data.shutdown().await?;
+                    .await;
                     drop(data);
+                    if sent.is_err() {
+                        w.write_all(b"426 transfer aborted\r\n").await?;
+                        continue;
+                    }
                     w.write_all(b"226 transfer complete\r\n").await?;
                 }
                 "STOR" | "APPE" => {
@@ -1847,6 +1879,46 @@ mod integration {
             !local.exists(),
             "a failed download must not land under the final name",
         );
+    }
+
+    /// Hitting the preview cap is not a dropped connection. It used to be
+    /// reported as one — the cap was raised as `FtpError::ConnectionError`,
+    /// which `map_ftp` classifies as `Disconnected` — and raising it from the
+    /// `retr` callback also skipped finalisation, so on suppaftp 10 the
+    /// connection refused every later data command. The preview runs on the
+    /// browsing connection, so the next listing has to work.
+    #[tokio::test]
+    async fn an_oversized_preview_is_a_transport_error_and_the_connection_survives() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert(
+                "/big.bin".to_string(),
+                vec![7u8; super::MAX_PREVIEW_BYTES as usize + 1024],
+            );
+            files.insert("/small.txt".to_string(), b"hello".to_vec());
+        }
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let err = with_timeout(transport.read_to_bytes("/big.bin"), "oversized preview")
+            .await
+            .expect_err("a file over the cap must not preview");
+        assert!(
+            matches!(err, crate::error::BlinkError::Transport(_)),
+            "the cap is not a disconnect: {err:?}",
+        );
+        assert!(err.to_string().contains("preview size limit"), "{err}");
+
+        let entries = with_timeout(transport.list("/"), "list after the preview")
+            .await
+            .expect("the connection must still serve a listing");
+        assert_eq!(entries.len(), 2);
+        let small = with_timeout(transport.read_to_bytes("/small.txt"), "second preview")
+            .await
+            .expect("and a preview under the cap");
+        assert_eq!(&small[..], b"hello");
     }
 
     /// `227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)` -> port.
