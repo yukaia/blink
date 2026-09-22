@@ -6,23 +6,7 @@ spec in `docs/superpowers/specs/` instead.
 
 ---
 
-## The next round of major dependency updates
-
-Three direct dependencies have majors that need code changes, and are held back
-from the semver-compatible sweeps for that reason:
-
-    russh-sftp   2.4.0  -> 3.0.0
-    suppaftp     10.0.2 -> 12.0.0   (two majors)
-    icy_sixel    0.6.0  -> 0.7.0
-
-This wants a spec, not a backlog entry that grows — the 0.7.0 round got
-`docs/superpowers/specs/2026-08-29-major-dependency-updates.md` and the same
-shape applies. Two things carry over from that round. The FTP harness built to
-land suppaftp 8 -> 10 differentially is still there and still the right tool for
-10 -> 12, and the SFTP harness can now list directories too, so `russh-sftp`
-3.0 has more to test against than 2.4 ever did. And `icy_sixel` renders through
-a path no test can reach: the suite never rasterises sixel, so that upgrade ends
-in a manual check the way 0.5 -> 0.6 did.
+## `ssh-key` and `rsa` reach a release
 
 Watch `russh` rather than `ssh-key` and `rsa` directly: it pins both with exact
 `=` requirements, so they move when it moves. Both are still pre-GA

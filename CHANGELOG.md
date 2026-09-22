@@ -42,6 +42,24 @@ the git history for those.
   files, unlinked as leaves. The directory listing, `metadata`, and the
   recursive delete now share one classifier rather than three copies of it.
 
+- **A failed FTP preview no longer breaks the connection it ran on.**
+  Previews use the browsing connection. When one failed partway — a file
+  over the preview cap, or a data connection that dropped mid-read — the
+  transfer was never finalised, and every later listing or preview on that
+  connection was refused with "Data connection is already open" until you
+  reconnected. The over-cap case is fixed in blink; the dropped-connection
+  case by suppaftp 12, whose transfers finalise themselves.
+
+- **Hitting the FTP preview cap is no longer reported as a disconnect.** It
+  read `Connection error: file exceeds preview size limit` and was classed
+  as a dropped connection. It is now a plain transport error:
+  `retr <path>: file exceeds preview size limit`.
+
+- **FTPS downloads from strict TLS 1.3 servers no longer fail at the end.**
+  suppaftp 11 sends a TLS `close_notify` before closing a download's data
+  connection; some servers answered the abrupt close with
+  `426 Transfer failed` after every byte had arrived.
+
 ### Security
 
 - **The recursive remote delete is bounded on both transports.**
@@ -98,8 +116,15 @@ the git history for those.
   `internal-russh-num-bigint` fork for upstream `num-bigint` 0.5, taking the
   graph from 408 to 407 crates.
 
-  Still deliberately out of scope, because each needs code changes:
-  `russh-sftp` 2.4 -> 3.0, `suppaftp` 10.0 -> 12.0, `icy_sixel` 0.6 -> 0.7.
+  The three majors held back from this sweep are taken separately; see
+  Dependencies.
+
+### Dependencies
+
+- `russh-sftp` 2.4 -> 3.0, `suppaftp` 10 -> 12, `icy_sixel` 0.6 -> 0.7.
+  Only suppaftp needed code, two lines. The sixel encoder is now checked by
+  a round-trip test rather than by eye, so this bump did not end in a
+  manual check.
 
 ## [0.7.1] — 2026-08-29
 
