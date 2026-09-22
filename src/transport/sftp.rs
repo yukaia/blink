@@ -726,11 +726,6 @@ fn entry_kind(attrs: &FileAttributes) -> EntryKind {
     }
 }
 
-/// Read the byte range `[offset, offset + len)` fully into a `Vec`, looping to
-/// absorb short reads (SFTP servers may return fewer bytes than requested).
-/// A reply shorter than `len` that isn't itself short — or an `Eof` status —
-/// marks end-of-file, so the returned `Vec` may be shorter than `len` only at
-/// the end of the file.
 /// Bytes of a read reply that may be accepted, given how many are still
 /// wanted.
 ///
@@ -748,6 +743,12 @@ fn reply_within_request(reply_len: usize, requested: u32, label: &str) -> Result
     Ok(reply_len as u32)
 }
 
+/// Read the byte range `[offset, offset + len)` fully into a `Vec`, looping to
+/// absorb short reads (SFTP servers may return fewer bytes than requested).
+/// A short reply is followed by a request for the rest; only an empty reply
+/// or an `Eof` status marks end-of-file, so the returned `Vec` may be shorter
+/// than `len` only at the end of the file. A reply longer than what was asked
+/// for is refused — see [`reply_within_request`].
 async fn read_full(
     raw: &RawSftpSession,
     handle: &str,
