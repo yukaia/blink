@@ -8,6 +8,8 @@ the git history for those.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-09-22
+
 ### Added
 
 - **Plain FTP now says that it is unencrypted.** Every other protocol tells
