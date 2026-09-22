@@ -1902,6 +1902,11 @@ mod integration {
     /// `retr` callback also skipped finalisation, so on suppaftp 10 the
     /// connection refused every later data command. The preview runs on the
     /// browsing connection, so the next listing has to work.
+    ///
+    /// The body overshoots the cap by far more than loopback socket buffering
+    /// holds, so the server's writes fail once the client stops reading and it
+    /// answers `426`, not `226` — the case where checking `retr`'s result
+    /// before the cap flag would report the wrong error.
     #[tokio::test]
     async fn an_oversized_preview_is_a_transport_error_and_the_connection_survives() {
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
@@ -1909,7 +1914,7 @@ mod integration {
             let mut files = store.lock().await;
             files.insert(
                 "/big.bin".to_string(),
-                vec![7u8; super::MAX_PREVIEW_BYTES as usize + 1024],
+                vec![7u8; super::MAX_PREVIEW_BYTES as usize + 16 * 1024 * 1024],
             );
             files.insert("/small.txt".to_string(), b"hello".to_vec());
         }
