@@ -1,7 +1,7 @@
 # Dependency Majors, Round Two
 
 **Date:** 2026-09-22  
-**Status:** Draft — pending review  
+**Status:** Approved  
 
 ## Summary
 
