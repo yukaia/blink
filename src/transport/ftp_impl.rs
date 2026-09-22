@@ -365,12 +365,12 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
         .map_err(|e| BlinkError::transport(format!("sync {}: {e}", part.display())))?;
     drop(local);
 
-    timed_ftp(
-        "finalize retr",
-        remote_path,
-        stream.finalize_retr_stream(reader),
-    )
-    .await?;
+    // Every early `?` above drops `reader` unfinished, and that is safe: a
+    // dropped transfer leaves its completion reply for the next command to
+    // drain, and the dispatcher closes a connection after any failed job
+    // rather than pooling it. The preview path, which runs on the reused
+    // browsing connection, is where an unfinished transfer ever mattered.
+    timed_ftp("finalize retr", remote_path, reader.finish()).await?;
 
     // Only rename once the server confirmed the transfer; otherwise a
     // truncated response could leave a corrupted "complete" file in place.
@@ -425,7 +425,9 @@ pub async fn ftp_upload<T: TokioTlsStream + Send>(
         .flush()
         .await
         .map_err(|e| BlinkError::transport(format!("flush: {e}")))?;
-    timed_ftp("finalize put", &part, stream.finalize_put_stream(writer)).await?;
+    // As in `ftp_download`: early returns above drop `writer` unfinished,
+    // which is safe because a failed job's connection is never reused.
+    timed_ftp("finalize put", &part, writer.finish()).await?;
 
     // Move the fully-stored `.part` onto the final name. Whether RNTO
     // replaces an existing target is server-dependent: try the rename
@@ -1932,6 +1934,38 @@ mod integration {
             .await
             .expect("and a preview under the cap");
         assert_eq!(&small[..], b"hello");
+    }
+
+    /// A preview whose data connection is reset mid-read fails — that part is
+    /// right — but on suppaftp 10 it also left the browsing connection
+    /// refusing every later data command ("Data connection is already open"):
+    /// the `retr` callback returned `Err`, so the transfer was never finalised
+    /// and its reply never read. suppaftp 12's transfer streams leave that
+    /// reply for the next command to drain, so the connection recovers.
+    #[tokio::test]
+    async fn a_preview_cut_by_a_data_reset_leaves_the_connection_usable() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/cut.bin".to_string(), pseudo_random(64 * 1024));
+            files.insert("/small.txt".to_string(), b"hello".to_vec());
+        }
+        let faults = Faults {
+            reset_data_after: Some(8192),
+            ..Faults::default()
+        };
+        let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        with_timeout(transport.read_to_bytes("/cut.bin"), "reset preview")
+            .await
+            .expect_err("a reset data connection must fail the preview");
+
+        let entries = with_timeout(transport.list("/"), "list after the reset")
+            .await
+            .expect("the connection must still serve a listing");
+        assert_eq!(entries.len(), 2);
     }
 
     /// `227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)` -> port.
