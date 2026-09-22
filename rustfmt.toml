@@ -1,0 +1,10 @@
+# rustfmt's defaults, deliberately. The tree was hand-wrapped until this file
+# existed, and no configuration reproduced that wrapping — it was not
+# consistent enough for one to — so the defaults were adopted with a one-time
+# reformat instead. That commit is listed in `.git-blame-ignore-revs`.
+#
+# Pinned so that rustfmt invoked directly (an editor's format-on-save, say)
+# formats the same way `cargo fmt` does, rather than falling back to the 2015
+# style when it cannot see the manifest.
+edition = "2024"
+style_edition = "2024"
