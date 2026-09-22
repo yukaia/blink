@@ -784,7 +784,8 @@ mod integration {
     ///
     /// Every field is read: `bad_pasv_octet` and `unparsable_list_line` by
     /// PASV/LIST below, `abrupt_close` by the abrupt-close branch of LIST,
-    /// RETR and STOR/APPE alike, and `hostile_listing_names` by LIST.
+    /// RETR and STOR/APPE alike, `hostile_listing_names` by LIST, and
+    /// `reset_data_after` by RETR.
     #[derive(Clone, Default)]
     pub(super) struct Faults {
         /// PASV reply carrying an out-of-range octet.
@@ -798,6 +799,11 @@ mod integration {
         /// These cannot be injected through the store, because `listing_for`
         /// derives names from keys and drops any containing a separator.
         pub hostile_listing_names: bool,
+        /// In RETR, send this many bytes, then reset the data connection
+        /// (RST, not FIN), answer `426`, and keep serving control. A reset
+        /// makes the client's read fail, where a clean close would read as a
+        /// short EOF; only a failed read makes a `retr` callback return `Err`.
+        pub reset_data_after: Option<usize>,
     }
 
     /// Bytes per data-connection write. Smaller than the transfer chunk so the
@@ -1005,6 +1011,13 @@ mod integration {
                     let (mut data, _) = data_listener.accept().await?;
                     if faults.abrupt_close {
                         return Ok(());
+                    }
+                    if let Some(n) = faults.reset_data_after {
+                        let _ = data.write_all(&slice[..n.min(slice.len())]).await;
+                        data.set_zero_linger()?;
+                        drop(data);
+                        w.write_all(b"426 connection reset\r\n").await?;
+                        continue;
                     }
                     // A client may close the data connection before the body
                     // is sent — a preview stops reading at its size cap. A
