@@ -650,4 +650,67 @@ mod tests {
             FileViewKind::Unsupported(_),
         ));
     }
+
+    /// The sixel backend is the one preview path whose output only a terminal
+    /// could judge: kitty and iTerm2 carry PNG, which the suite can compare,
+    /// but sixel is a palette-quantised escape stream. Decoding it back and
+    /// bounding the error against what was encoded makes a broken or degraded
+    /// encoder a test failure rather than a manual check after every
+    /// `icy_sixel` bump.
+    ///
+    /// Compared against the *scaled* RGBA, not the source PNG, so this tests
+    /// encoding and not the resize. The source mixes smooth gradients (which
+    /// quantisation has to approximate) with hard edges (which it must not
+    /// smear).
+    #[test]
+    fn sixel_output_decodes_back_to_the_image_it_was_given() {
+        let (w, h) = (240u32, 160u32);
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let edge = ((x / 20) + (y / 20)) % 2 == 0;
+                rgba.extend_from_slice(&[
+                    (x * 255 / w) as u8,
+                    (y * 255 / h) as u8,
+                    if edge { 220 } else { 30 },
+                    255,
+                ]);
+            }
+        }
+        let png = encode_png_rgba(&rgba, w, h).unwrap();
+        let scaled = scale_for_cells(&png, 0, 0, 400, 200).unwrap();
+
+        let sixel = icy_sixel::SixelImage::from_rgba(
+            scaled.rgba.clone(),
+            scaled.width_px as usize,
+            scaled.height_px as usize,
+        )
+        .encode()
+        .unwrap();
+        let decoded = icy_sixel::SixelImage::decode(sixel.as_bytes()).unwrap();
+
+        let (sw, sh) = (scaled.width_px as usize, scaled.height_px as usize);
+        assert_eq!(decoded.width, sw, "decoded width");
+        assert!(
+            decoded.height >= sh && decoded.height < sh + 6,
+            "decoded height {} for a {sh}-row image; sixel pads to a six-row band at most",
+            decoded.height,
+        );
+
+        let mut total = 0u64;
+        for y in 0..sh {
+            for x in 0..sw {
+                let got = &decoded.pixels[(y * decoded.width + x) * 4..][..3];
+                let want = &scaled.rgba[(y * sw + x) * 4..][..3];
+                for c in 0..3 {
+                    total += u64::from(got[c].abs_diff(want[c]));
+                }
+            }
+        }
+        let mean = total as f64 / (sw * sh * 3) as f64;
+        assert!(
+            mean < 10.0,
+            "mean absolute error {mean:.2}/255 after a sixel round trip",
+        );
+    }
 }
