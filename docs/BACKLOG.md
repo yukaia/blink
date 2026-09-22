@@ -6,36 +6,6 @@ spec in `docs/superpowers/specs/` instead.
 
 ---
 
-## `list` and `delete_dir` disagree about both-bits-set entries
-
-`SftpTransport::delete_dir` (`src/transport/sftp.rs:689`) checks `is_symlink()`
-*before* `is_dir()`, with a comment giving the reason: some SFTP servers report
-a symlink-to-directory with both bits set, and recursing into one walks outside
-the subtree the user named — possibly outside the connection's chroot.
-`SftpTransport::list` (`src/transport/sftp.rs:1008`) checks them in the
-opposite order, so the same entry comes back as `EntryKind::Directory`.
-
-`walk_remote` skips on `EntryKind::Symlink` (`src/tui/plan.rs:228`), so it never
-sees a symlink there and recurses into exactly the entry `delete_dir` refuses to
-touch. The download planner is the unsafe side of the disagreement.
-
-There is a third site, `SftpTransport::metadata`
-(`src/transport/sftp.rs:1227`), which orders the checks the same way as `list`
-but is *not* affected: it reads `russh_sftp`'s `metadata()`, which issues
-`SSH_FXP_STAT` and so resolves the link server-side. Its `EntryKind::Symlink`
-arm is close to unreachable. `list` reads `read_dir`, whose attributes are not
-followed, which is why the order matters there and not here.
-
-Not yet established: whether a real server actually sets both bits. The claim
-lives only in `delete_dir`'s comment and no test or server is cited. Settle that
-first — if it is theoretical, the ordering is harmless and this entry closes as
-a comment fix.
-
-Fix, if it is real: flip `list` to test `is_symlink()` first so both paths agree.
-That also changes how a symlinked directory renders in the file pane, which is a
-call worth making deliberately rather than as a side effect. The SFTP test
-harness can list directories as of the delete-cap work, so this is now testable.
-
 ## The next round of major dependency updates
 
 Three direct dependencies have majors that need code changes, and are held back

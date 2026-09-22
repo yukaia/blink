@@ -32,6 +32,16 @@ the git history for those.
   like SFTP, and the warning colour is reserved for protocols where
   `Protocol::is_cleartext()` holds.
 
+- **SFTP no longer lists sockets and block devices as directories.** The
+  entry type was read with `russh_sftp`'s `is_dir()` / `is_symlink()`, which
+  test whether the mode *contains* a type's bits rather than whether the
+  type field equals it — and the POSIX type codes overlap, so a socket
+  (`0o140000`) and a block device (`0o060000`) both passed as directories.
+  They showed as folders in the file pane, and a recursive download or delete
+  tried to open them as one and failed. They are now `Other`: downloaded as
+  files, unlinked as leaves. The directory listing, `metadata`, and the
+  recursive delete now share one classifier rather than three copies of it.
+
 ### Security
 
 - **The recursive remote delete is bounded on both transports.**

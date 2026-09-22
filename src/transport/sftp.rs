@@ -33,7 +33,7 @@ use russh::keys::{load_secret_key, ssh_key};
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::rawsession::Limits;
 use russh_sftp::client::{RawSftpSession, SftpSession};
-use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
+use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
@@ -679,19 +679,12 @@ impl SftpTransport {
                             );
                             continue;
                         };
-                        let attrs = e.metadata();
-                        // is_symlink() before is_dir(): some SFTP servers
-                        // report symlink-to-directory entries with both
-                        // bits set. If we recursed into one, we'd walk
-                        // outside the subtree the user asked to delete
-                        // (and possibly outside the connection's chroot).
-                        // Treat any symlink as a leaf and unlink it.
-                        if attrs.is_symlink() {
-                            self.sftp
-                                .remove_file(&child)
-                                .await
-                                .map_err(|err| map_sftp("remove", &child, err))?;
-                        } else if attrs.is_dir() {
+                        // Only a real directory is recursed into. A symlink
+                        // is a leaf and gets unlinked: recursing through one
+                        // would walk outside the subtree the user asked to
+                        // delete (and possibly outside the connection's
+                        // chroot). Sockets and devices are leaves too.
+                        if entry_kind(&e.metadata()) == EntryKind::Directory {
                             to_recurse.push(Op::Visit(child));
                         } else {
                             self.sftp
@@ -713,6 +706,23 @@ impl SftpTransport {
             }
         }
         Ok(())
+    }
+}
+
+/// Classify an SFTP entry by the whole `S_IFMT` field of its mode.
+///
+/// Not by `is_dir()` / `is_symlink()` / `is_regular()`: those test whether
+/// the type code *contains* a flag's bits, and the codes overlap — a socket
+/// or block device contains the directory bit, a symlink the regular-file bit.
+/// `file_type()` compares the field for equality. Every site that turns
+/// attributes into an [`EntryKind`] goes through here so they cannot drift
+/// apart.
+fn entry_kind(attrs: &FileAttributes) -> EntryKind {
+    match attrs.file_type() {
+        FileType::Dir => EntryKind::Directory,
+        FileType::Symlink => EntryKind::Symlink,
+        FileType::File => EntryKind::File,
+        FileType::Other => EntryKind::Other,
     }
 }
 
@@ -1005,18 +1015,9 @@ impl Transport for SftpTransport {
                 continue;
             }
             let attrs = e.metadata();
-            let kind = if attrs.is_dir() {
-                EntryKind::Directory
-            } else if attrs.is_symlink() {
-                EntryKind::Symlink
-            } else if attrs.is_regular() {
-                EntryKind::File
-            } else {
-                EntryKind::Other
-            };
             out.push(RemoteEntry::new(
                 raw_name,
-                kind,
+                entry_kind(&attrs),
                 attrs.size.unwrap_or(0),
                 attrs
                     .mtime
@@ -1224,15 +1225,7 @@ impl Transport for SftpTransport {
                 err => return Err(err),
             },
         };
-        let kind = if attrs.is_dir() {
-            EntryKind::Directory
-        } else if attrs.is_symlink() {
-            EntryKind::Symlink
-        } else if attrs.is_regular() {
-            EntryKind::File
-        } else {
-            EntryKind::Other
-        };
+        let kind = entry_kind(&attrs);
         let raw_name = remote_path
             .rsplit('/')
             .find(|s| !s.is_empty())
@@ -1388,6 +1381,45 @@ mod tests {
         assert_eq!(read_local_full(&mut src, &mut buf).await.unwrap(), 400);
         assert_eq!(read_local_full(&mut src, &mut buf).await.unwrap(), 200);
         assert_eq!(read_local_full(&mut src, &mut buf).await.unwrap(), 0);
+    }
+
+    // `FileAttributes::is_dir()` and friends are bitwise subset tests, and the
+    // `S_IFMT` type codes are not disjoint bit patterns: a socket (0o140000)
+    // and a block device (0o060000) both contain the directory bit (0o040000),
+    // and a symlink (0o120000) contains the regular-file bit. Classifying with
+    // those predicates made sockets directories. Every type code is pinned
+    // here, with permission bits set so they cannot be what decides it.
+    #[test]
+    fn entry_kind_compares_the_whole_file_type_field() {
+        use super::entry_kind;
+        use crate::transport::EntryKind;
+        use russh_sftp::protocol::FileAttributes;
+
+        let cases = [
+            (0o010000, EntryKind::Other),     // fifo
+            (0o020000, EntryKind::Other),     // character device
+            (0o040000, EntryKind::Directory), // directory
+            (0o060000, EntryKind::Other),     // block device
+            (0o100000, EntryKind::File),      // regular file
+            (0o120000, EntryKind::Symlink),   // symlink
+            (0o140000, EntryKind::Other),     // socket
+        ];
+        for (ty, want) in cases {
+            let attrs = FileAttributes {
+                permissions: Some(ty | 0o7777),
+                ..Default::default()
+            };
+            assert_eq!(entry_kind(&attrs), want, "type code {ty:o}");
+        }
+    }
+
+    #[test]
+    fn entry_kind_without_permissions_is_other() {
+        use super::entry_kind;
+        use crate::transport::EntryKind;
+        use russh_sftp::protocol::FileAttributes;
+
+        assert_eq!(entry_kind(&FileAttributes::default()), EntryKind::Other);
     }
 }
 
