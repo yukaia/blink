@@ -34,7 +34,7 @@ futures = "0.3"
 # compiled instead of two. `flate2` and `rsa` are the rest of russh's defaults,
 # kept as they were. See aws_lc_stays_out_of_the_dependency_graph in ftps.rs.
 russh = { version = "0.63", default-features = false, features = ["ring", "flate2", "rsa"] }
-russh-sftp = "2.0"
+russh-sftp = "3.0"
 
 # FTP / FTPS
 suppaftp = { version = "10.0", features = ["tokio", "rustls-ring", "tokio-rustls-ring"] }
