@@ -125,20 +125,21 @@ impl Config {
             }
         }
         if let Some(s) = ini.section(Some("terminal"))
-            && let Some(v) = s.get("image_preview") {
-                cfg.terminal.image_preview = match v.trim().to_ascii_lowercase().as_str() {
-                    "auto" => ImagePreviewMode::Auto,
-                    "kitty" => ImagePreviewMode::Kitty,
-                    "sixel" => ImagePreviewMode::Sixel,
-                    "iterm2" => ImagePreviewMode::Iterm2,
-                    "none" | "off" | "false" => ImagePreviewMode::None,
-                    _ => {
-                        return Err(BlinkError::config(
-                            "image_preview must be one of: auto, kitty, sixel, iterm2, none",
-                        ))
-                    }
-                };
-            }
+            && let Some(v) = s.get("image_preview")
+        {
+            cfg.terminal.image_preview = match v.trim().to_ascii_lowercase().as_str() {
+                "auto" => ImagePreviewMode::Auto,
+                "kitty" => ImagePreviewMode::Kitty,
+                "sixel" => ImagePreviewMode::Sixel,
+                "iterm2" => ImagePreviewMode::Iterm2,
+                "none" | "off" | "false" => ImagePreviewMode::None,
+                _ => {
+                    return Err(BlinkError::config(
+                        "image_preview must be one of: auto, kitty, sixel, iterm2, none",
+                    ));
+                }
+            };
+        }
         Ok(cfg)
     }
 
@@ -241,9 +242,7 @@ pub(crate) fn validate_theme_name(name: &str) -> Result<()> {
     // Path separators are already rejected above, so split-based checks
     // are unnecessary; `contains` is sufficient.
     if name.contains("..") {
-        return Err(BlinkError::config(
-            "theme name must not contain '..'",
-        ));
+        return Err(BlinkError::config("theme name must not contain '..'"));
     }
     Ok(())
 }
@@ -270,12 +269,11 @@ mod tests {
     // from starting.
 
     fn parallel_from(tag: &str, value: &str) -> Result<u8> {
-        let dir = std::env::temp_dir()
-            .join(format!("blink-cfg-clamp-{tag}-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("blink-cfg-clamp-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.ini");
-        std::fs::write(&path, format!("[general]\nparallel_downloads = {value}\n"))
-            .unwrap();
+        std::fs::write(&path, format!("[general]\nparallel_downloads = {value}\n")).unwrap();
         let loaded = Config::load_from(&path).map(|c| c.general.parallel_downloads);
         let _ = std::fs::remove_dir_all(&dir);
         loaded
@@ -283,7 +281,10 @@ mod tests {
 
     #[test]
     fn a_value_above_the_maximum_is_clamped_to_it() {
-        assert_eq!(parallel_from("high", "50").expect("must load"), MAX_PARALLEL);
+        assert_eq!(
+            parallel_from("high", "50").expect("must load"),
+            MAX_PARALLEL
+        );
     }
 
     #[test]
@@ -291,7 +292,10 @@ mod tests {
         // 300 used to fail the `u8` parse and take the whole config down
         // with it, even though the README promises an out-of-range value is
         // clamped so a stale file cannot stop blink from starting.
-        assert_eq!(parallel_from("huge", "300").expect("must load"), MAX_PARALLEL);
+        assert_eq!(
+            parallel_from("huge", "300").expect("must load"),
+            MAX_PARALLEL
+        );
     }
 
     #[test]
@@ -313,8 +317,7 @@ mod tests {
     // two different ideas of how big it may be.
 
     fn tmp(tag: &str, bytes: usize) -> std::path::PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("blink-cfg-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("blink-cfg-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.ini");
         std::fs::write(&path, "x".repeat(bytes)).unwrap();
@@ -346,8 +349,7 @@ mod tests {
 
     #[test]
     fn a_missing_file_reports_not_found() {
-        let err = read_capped(std::path::Path::new("/nonexistent/blink.ini"), 64)
-            .unwrap_err();
+        let err = read_capped(std::path::Path::new("/nonexistent/blink.ini"), 64).unwrap_err();
         assert!(
             matches!(err, BlinkError::Io(ref e) if e.kind() == std::io::ErrorKind::NotFound),
             "callers distinguish first-run from a real failure: {err:?}",

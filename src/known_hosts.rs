@@ -444,10 +444,22 @@ mod trust_tests {
     fn trust_is_scoped_to_the_exact_key() {
         let t = SessionTrust::new();
         t.trust("h", 22, "ssh-ed25519", KEY);
-        assert!(!t.is_trusted("h", 22, "ssh-ed25519", "OTHERKEY"), "different key");
-        assert!(!t.is_trusted("h", 22, "ssh-rsa", KEY), "different algorithm");
-        assert!(!t.is_trusted("h", 2222, "ssh-ed25519", KEY), "different port");
-        assert!(!t.is_trusted("other", 22, "ssh-ed25519", KEY), "different host");
+        assert!(
+            !t.is_trusted("h", 22, "ssh-ed25519", "OTHERKEY"),
+            "different key"
+        );
+        assert!(
+            !t.is_trusted("h", 22, "ssh-rsa", KEY),
+            "different algorithm"
+        );
+        assert!(
+            !t.is_trusted("h", 2222, "ssh-ed25519", KEY),
+            "different port"
+        );
+        assert!(
+            !t.is_trusted("other", 22, "ssh-ed25519", KEY),
+            "different host"
+        );
     }
 
     #[test]
@@ -534,7 +546,9 @@ mod tests {
         let raw = format!("prod.example.com ssh-ed25519 {ED_KEY}\n");
         let r = check_in_str(&raw, "prod.example.com", 22, "ssh-ed25519", ED_KEY_2);
         match r {
-            KeyStatus::Changed { stored_key_type, .. } => {
+            KeyStatus::Changed {
+                stored_key_type, ..
+            } => {
                 assert_eq!(stored_key_type, "ssh-ed25519");
             }
             other => panic!("expected Changed, got {other:?}"),
@@ -694,8 +708,14 @@ mod tests {
         );
         let (out, n) = filter_out_host(&raw, "prod.example.com", 22);
         assert_eq!(n, 1);
-        assert!(out.contains("other.example.com"), "neighbour was dropped: {out:?}");
-        assert!(out.contains("# blink known hosts"), "comment was dropped: {out:?}");
+        assert!(
+            out.contains("other.example.com"),
+            "neighbour was dropped: {out:?}"
+        );
+        assert!(
+            out.contains("# blink known hosts"),
+            "comment was dropped: {out:?}"
+        );
         assert!(!out.contains("prod.example.com"));
     }
 

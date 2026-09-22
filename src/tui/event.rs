@@ -12,7 +12,7 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
-use tokio::time::{interval, Interval};
+use tokio::time::{Interval, interval};
 
 use crate::error::Result;
 use crate::preview::FileViewKind;
@@ -49,7 +49,10 @@ pub enum AppEvent {
     ConnectKeyNeedsPassphrase,
 
     /// A directory listing completed successfully.
-    Listed { path: String, entries: Vec<RemoteEntry> },
+    Listed {
+        path: String,
+        entries: Vec<RemoteEntry>,
+    },
 
     /// A directory listing failed.
     ListFailed { path: String, error: String },
@@ -71,7 +74,12 @@ pub enum AppEvent {
     Renamed { from: String, to: String },
 
     /// A rename failed.
-    RenameFailed { from: String, #[allow(dead_code)] to: String, error: String },
+    RenameFailed {
+        from: String,
+        #[allow(dead_code)]
+        to: String,
+        error: String,
+    },
 
     /// A remote mkdir completed successfully.
     MkdirDone { path: String },
@@ -102,10 +110,7 @@ pub enum AppEvent {
     },
 
     /// A recursive walk failed.
-    WalkFailed {
-        error: String,
-        kind: Direction,
-    },
+    WalkFailed { error: String, kind: Direction },
 
     /// File contents fetched for the viewer.
     ViewLoaded {
@@ -280,7 +285,10 @@ mod tests {
         }
         // ...and draining stops there, leaving what followed it in order.
         assert!(
-            matches!(rx.try_recv(), Ok(AppEvent::Transfer(TransferEvent::Progress))),
+            matches!(
+                rx.try_recv(),
+                Ok(AppEvent::Transfer(TransferEvent::Progress))
+            ),
             "events queued after the deferred one must survive",
         );
     }
@@ -290,7 +298,10 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         tx.send(AppEvent::ConnectKeyNeedsPassphrase).unwrap();
         assert!(
-            matches!(drain_progress(&mut rx), Some(AppEvent::ConnectKeyNeedsPassphrase)),
+            matches!(
+                drain_progress(&mut rx),
+                Some(AppEvent::ConnectKeyNeedsPassphrase)
+            ),
             "a non-progress head must not be dropped",
         );
     }

@@ -39,8 +39,7 @@ pub struct PaneEntry {
 impl PaneEntry {
     pub fn new(raw_name: String, is_dir: bool, size: u64) -> Self {
         let display_name = crate::error::sanitize(raw_name.clone());
-        let previewable_image =
-            !is_dir && crate::preview::is_previewable_image(&raw_name);
+        let previewable_image = !is_dir && crate::preview::is_previewable_image(&raw_name);
         Self {
             raw_name,
             display_name,
@@ -202,9 +201,7 @@ impl PaneState {
             let lower = query.to_ascii_lowercase();
             let filtered: Vec<PaneEntry> = entries
                 .iter()
-                .filter(|e| {
-                    e.is_parent() || e.display_name.to_ascii_lowercase().contains(&lower)
-                })
+                .filter(|e| e.is_parent() || e.display_name.to_ascii_lowercase().contains(&lower))
                 .cloned()
                 .collect();
             self.all_entries = Some(entries);
@@ -229,9 +226,7 @@ impl PaneState {
         let all = self.all_entries.as_ref().unwrap();
         self.entries = all
             .iter()
-            .filter(|e| {
-                e.is_parent() || e.display_name.to_ascii_lowercase().contains(&lower)
-            })
+            .filter(|e| e.is_parent() || e.display_name.to_ascii_lowercase().contains(&lower))
             .cloned()
             .collect();
         self.filter = Some(query);

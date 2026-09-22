@@ -50,9 +50,8 @@ pub fn lang_for_name(name: &str) -> Lang {
     let lower = name.to_ascii_lowercase();
     // Bare filenames first (no extension).
     match lower.as_str() {
-        "makefile" | "gnumakefile" | "dockerfile" | "justfile"
-        | ".bashrc" | ".zshrc" | ".profile" | ".bash_profile" | ".bash_aliases"
-        | ".env" => return Lang::Shell,
+        "makefile" | "gnumakefile" | "dockerfile" | "justfile" | ".bashrc" | ".zshrc"
+        | ".profile" | ".bash_profile" | ".bash_aliases" | ".env" => return Lang::Shell,
         _ => {}
     }
     let ext = match lower.rsplit_once('.') {
@@ -75,48 +74,98 @@ pub fn lang_for_name(name: &str) -> Lang {
 // ─── Keyword tables ───────────────────────────────────────────────────────────
 
 const RUST_KW: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn",
-    "else", "enum", "extern", "false", "fn", "for", "if", "impl", "in",
-    "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
-    "self", "static", "struct", "super", "trait", "true", "type", "union",
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "static", "struct", "super", "trait", "true", "type", "union",
     "unsafe", "use", "where", "while", "yield",
 ];
 
 const RUST_TYPES: &[&str] = &[
-    "bool", "char", "f32", "f64", "i8", "i16", "i32", "i64", "i128",
-    "isize", "u8", "u16", "u32", "u64", "u128", "usize", "str",
-    "String", "Vec", "Option", "Result", "Box", "Arc", "Rc",
-    "Cell", "RefCell", "Mutex", "RwLock", "Self",
+    "bool", "char", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32",
+    "u64", "u128", "usize", "str", "String", "Vec", "Option", "Result", "Box", "Arc", "Rc", "Cell",
+    "RefCell", "Mutex", "RwLock", "Self",
 ];
 
 const PYTHON_KW: &[&str] = &[
-    "and", "as", "assert", "async", "await", "break", "class", "continue",
-    "def", "del", "elif", "else", "except", "False", "finally", "for",
-    "from", "global", "if", "import", "in", "is", "lambda", "None",
-    "nonlocal", "not", "or", "pass", "raise", "return", "True", "try",
-    "while", "with", "yield",
+    "and", "as", "assert", "async", "await", "break", "class", "continue", "def", "del", "elif",
+    "else", "except", "False", "finally", "for", "from", "global", "if", "import", "in", "is",
+    "lambda", "None", "nonlocal", "not", "or", "pass", "raise", "return", "True", "try", "while",
+    "with", "yield",
 ];
 
 const JS_KW: &[&str] = &[
-    "async", "await", "break", "case", "catch", "class", "const", "continue",
-    "debugger", "default", "delete", "do", "else", "export", "extends",
-    "false", "finally", "for", "from", "function", "if", "import", "in",
-    "instanceof", "let", "new", "null", "of", "return", "static", "super",
-    "switch", "this", "throw", "true", "try", "typeof", "undefined", "var",
-    "void", "while", "with", "yield",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "debugger",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "from",
+    "function",
+    "if",
+    "import",
+    "in",
+    "instanceof",
+    "let",
+    "new",
+    "null",
+    "of",
+    "return",
+    "static",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "undefined",
+    "var",
+    "void",
+    "while",
+    "with",
+    "yield",
 ];
 
 const TS_EXTRA_KW: &[&str] = &[
-    "abstract", "any", "as", "boolean", "declare", "enum", "implements",
-    "interface", "is", "keyof", "module", "namespace", "never", "number",
-    "object", "override", "readonly", "string", "type", "unknown",
+    "abstract",
+    "any",
+    "as",
+    "boolean",
+    "declare",
+    "enum",
+    "implements",
+    "interface",
+    "is",
+    "keyof",
+    "module",
+    "namespace",
+    "never",
+    "number",
+    "object",
+    "override",
+    "readonly",
+    "string",
+    "type",
+    "unknown",
 ];
 
 const SHELL_KW: &[&str] = &[
-    "if", "then", "else", "elif", "fi", "for", "while", "do", "done",
-    "case", "esac", "in", "function", "return", "local", "export",
-    "readonly", "break", "continue", "exit", "echo", "source",
-    "alias", "unset", "shift", "trap", "declare",
+    "if", "then", "else", "elif", "fi", "for", "while", "do", "done", "case", "esac", "in",
+    "function", "return", "local", "export", "readonly", "break", "continue", "exit", "echo",
+    "source", "alias", "unset", "shift", "trap", "declare",
 ];
 
 const JSON_KW: &[&str] = &["true", "false", "null"];
@@ -126,7 +175,11 @@ const JSON_KW: &[&str] = &["true", "false", "null"];
 /// Tokenize one line, threading `state` in and out.
 ///
 /// Returns a list of `(kind, text)` pairs whose concatenation equals `line`.
-pub fn tokenize(lang: Lang, line: &str, mut state: LineState) -> (Vec<(TokenKind, String)>, LineState) {
+pub fn tokenize(
+    lang: Lang,
+    line: &str,
+    mut state: LineState,
+) -> (Vec<(TokenKind, String)>, LineState) {
     let chars: Vec<char> = line.chars().collect();
     let n = chars.len();
     let mut spans: Vec<(TokenKind, String)> = Vec::new();
@@ -208,7 +261,8 @@ pub fn tokenize(lang: Lang, line: &str, mut state: LineState) -> (Vec<(TokenKind
         }
 
         // Python triple-quoted strings: """ or '''
-        if lang == Lang::Python && (ch == '"' || ch == '\'')
+        if lang == Lang::Python
+            && (ch == '"' || ch == '\'')
             && chars.get(pos + 1) == Some(&ch)
             && chars.get(pos + 2) == Some(&ch)
         {
@@ -264,12 +318,17 @@ pub fn tokenize(lang: Lang, line: &str, mut state: LineState) -> (Vec<(TokenKind
                 emit(&mut spans, TokenKind::Macro, &chars[pos..close]);
                 pos = close;
             } else {
-                let id_end = pos + 1
+                let id_end = pos
+                    + 1
                     + chars[pos + 1..]
                         .iter()
                         .take_while(|&&c| c.is_alphanumeric() || c == '_')
                         .count();
-                emit(&mut spans, TokenKind::Macro, &chars[pos..id_end.max(pos + 1)]);
+                emit(
+                    &mut spans,
+                    TokenKind::Macro,
+                    &chars[pos..id_end.max(pos + 1)],
+                );
                 pos = id_end.max(pos + 1);
             }
             continue;
@@ -277,8 +336,7 @@ pub fn tokenize(lang: Lang, line: &str, mut state: LineState) -> (Vec<(TokenKind
 
         // Number: digits, 0x hex, float with optional exponent.
         if ch.is_ascii_digit()
-            || (ch == '.'
-                && chars.get(pos + 1).is_some_and(|c| c.is_ascii_digit()))
+            || (ch == '.' && chars.get(pos + 1).is_some_and(|c| c.is_ascii_digit()))
         {
             let end = scan_number(&chars, pos);
             emit(&mut spans, TokenKind::Number, &chars[pos..end]);
@@ -379,10 +437,7 @@ fn scan_number(chars: &[char], from: usize) -> usize {
     while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '_') {
         i += 1;
     }
-    if i < chars.len()
-        && chars[i] == '.'
-        && chars.get(i + 1).is_some_and(|c| c.is_ascii_digit())
-    {
+    if i < chars.len() && chars[i] == '.' && chars.get(i + 1).is_some_and(|c| c.is_ascii_digit()) {
         i += 1;
         while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '_') {
             i += 1;
@@ -400,7 +455,10 @@ fn scan_number(chars: &[char], from: usize) -> usize {
     }
     // Rust numeric suffix: u8, i32, f64, usize, …
     if i < chars.len() && matches!(chars[i], 'u' | 'i' | 'f') {
-        let end = i + chars[i..].iter().take_while(|&&c| c.is_alphanumeric()).count();
+        let end = i + chars[i..]
+            .iter()
+            .take_while(|&&c| c.is_alphanumeric())
+            .count();
         i = end;
     }
     i
@@ -502,10 +560,11 @@ fn emit(spans: &mut Vec<(TokenKind, String)>, kind: TokenKind, chars: &[char]) {
     }
     let text: String = chars.iter().collect();
     if let Some(last) = spans.last_mut()
-        && last.0 == kind {
-            last.1.push_str(&text);
-            return;
-        }
+        && last.0 == kind
+    {
+        last.1.push_str(&text);
+        return;
+    }
     spans.push((kind, text));
 }
 
@@ -516,12 +575,20 @@ mod tests {
     use super::*;
 
     fn kinds(lang: Lang, line: &str) -> Vec<TokenKind> {
-        tokenize(lang, line, LineState::default()).0.into_iter().map(|(k, _)| k).collect()
+        tokenize(lang, line, LineState::default())
+            .0
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect()
     }
 
     #[allow(dead_code)]
     fn texts(lang: Lang, line: &str) -> Vec<String> {
-        tokenize(lang, line, LineState::default()).0.into_iter().map(|(_, t)| t).collect()
+        tokenize(lang, line, LineState::default())
+            .0
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect()
     }
 
     fn roundtrip(lang: Lang, line: &str) {
@@ -534,7 +601,10 @@ mod tests {
 
     #[test]
     fn roundtrip_rust() {
-        roundtrip(Lang::Rust, r#"    let x: Vec<u8> = vec![1, 2, 3]; // comment"#);
+        roundtrip(
+            Lang::Rust,
+            r#"    let x: Vec<u8> = vec![1, 2, 3]; // comment"#,
+        );
     }
 
     #[test]
@@ -697,7 +767,11 @@ mod tests {
     #[test]
     fn integer_number() {
         let (spans, _) = tokenize(Lang::Rust, "let x = 42;", LineState::default());
-        assert!(spans.iter().any(|(k, t)| *k == TokenKind::Number && t == "42"));
+        assert!(
+            spans
+                .iter()
+                .any(|(k, t)| *k == TokenKind::Number && t == "42")
+        );
     }
 
     #[test]
@@ -709,7 +783,11 @@ mod tests {
     #[test]
     fn float_number() {
         let (spans, _) = tokenize(Lang::Python, "x = 3.14", LineState::default());
-        assert!(spans.iter().any(|(k, t)| *k == TokenKind::Number && t.contains('.')));
+        assert!(
+            spans
+                .iter()
+                .any(|(k, t)| *k == TokenKind::Number && t.contains('.'))
+        );
     }
 
     // ── Rust macros ──────────────────────────────────────────────────────────
@@ -717,7 +795,11 @@ mod tests {
     #[test]
     fn rust_macro_call() {
         let (spans, _) = tokenize(Lang::Rust, "println!(\"hi\");", LineState::default());
-        assert!(spans.iter().any(|(k, t)| *k == TokenKind::Macro && t == "println!"));
+        assert!(
+            spans
+                .iter()
+                .any(|(k, t)| *k == TokenKind::Macro && t == "println!")
+        );
     }
 
     // ── Shell variables ───────────────────────────────────────────────────────
@@ -725,13 +807,21 @@ mod tests {
     #[test]
     fn shell_dollar_var() {
         let (spans, _) = tokenize(Lang::Shell, "echo $HOME", LineState::default());
-        assert!(spans.iter().any(|(k, t)| *k == TokenKind::Macro && t == "$HOME"));
+        assert!(
+            spans
+                .iter()
+                .any(|(k, t)| *k == TokenKind::Macro && t == "$HOME")
+        );
     }
 
     #[test]
     fn shell_brace_var() {
         let (spans, _) = tokenize(Lang::Shell, "echo ${MY_VAR}", LineState::default());
-        assert!(spans.iter().any(|(k, t)| *k == TokenKind::Macro && t == "${MY_VAR}"));
+        assert!(
+            spans
+                .iter()
+                .any(|(k, t)| *k == TokenKind::Macro && t == "${MY_VAR}")
+        );
     }
 
     // ── TOML ─────────────────────────────────────────────────────────────────
@@ -850,7 +940,11 @@ mod tests {
         let line = r#"let s = "";"#;
         roundtrip(Lang::Rust, line);
         let (spans, _) = tokenize(Lang::Rust, line, LineState::default());
-        assert!(spans.iter().any(|(k, t)| *k == TokenKind::String && t == "\"\""));
+        assert!(
+            spans
+                .iter()
+                .any(|(k, t)| *k == TokenKind::String && t == "\"\"")
+        );
     }
 
     #[test]

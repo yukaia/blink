@@ -1,10 +1,10 @@
 //! Custom render widgets used by the views.
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 
 use crate::tui::app::{App, Pane};
 
@@ -60,7 +60,9 @@ pub mod file_pane {
             .border_style(Style::default().fg(border_color))
             .title(Span::styled(
                 title,
-                Style::default().fg(border_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(border_color)
+                    .add_modifier(Modifier::BOLD),
             ));
         let inner = block.inner(area);
         f.render_widget(block, area);
@@ -220,12 +222,20 @@ pub mod bottom_pane {
             Span::raw(" "),
             Span::styled(
                 " TRANSFERS ",
-                if on_transfers { active_style } else { inactive_style },
+                if on_transfers {
+                    active_style
+                } else {
+                    inactive_style
+                },
             ),
             Span::styled("·", inactive_style),
             Span::styled(
                 " LOG ",
-                if !on_transfers { active_style } else { inactive_style },
+                if !on_transfers {
+                    active_style
+                } else {
+                    inactive_style
+                },
             ),
             Span::raw(" "),
         ])
@@ -236,12 +246,10 @@ pub mod bottom_pane {
     fn render_transfers(f: &mut Frame, app: &App, area: Rect) {
         let jobs = app.active_jobs();
         if jobs.is_empty() {
-            let p = Paragraph::new(
-                Line::from(Span::styled(
-                    " no active transfers",
-                    Style::default().fg(app.theme.dim),
-                )),
-            );
+            let p = Paragraph::new(Line::from(Span::styled(
+                " no active transfers",
+                Style::default().fg(app.theme.dim),
+            )));
             f.render_widget(p, area);
             return;
         }
@@ -293,7 +301,10 @@ pub mod bottom_pane {
             let speed = crate::transfer::format_bytes_per_sec(job.bytes_per_sec);
             let remaining = job.bytes_total.saturating_sub(job.bytes_done);
             if remaining > 0 {
-                format!("{speed} ETA {}", crate::transfer::format_eta(remaining, job.bytes_per_sec))
+                format!(
+                    "{speed} ETA {}",
+                    crate::transfer::format_eta(remaining, job.bytes_per_sec)
+                )
             } else {
                 speed
             }
@@ -384,8 +395,8 @@ pub mod bottom_pane {
 
     #[cfg(test)]
     mod tests {
-        use crate::tui::app::name_for_job as display_name_for;
         use crate::transfer::{Direction, TransferJob, TransferState};
+        use crate::tui::app::name_for_job as display_name_for;
 
         fn job(remote: &str) -> TransferJob {
             TransferJob {
@@ -406,7 +417,10 @@ pub mod bottom_pane {
             // Remote paths carry the server's own bytes now, and this row is
             // rendered straight into the terminal.
             let name = display_name_for(&job("/srv/re\u{202E}port.txt"));
-            assert!(!name.contains('\u{202E}'), "bidi override reached the pane: {name:?}");
+            assert!(
+                !name.contains('\u{202E}'),
+                "bidi override reached the pane: {name:?}"
+            );
             assert_eq!(name, "re port.txt");
         }
 
@@ -451,7 +465,6 @@ pub mod bottom_pane {
             use crate::tui::views::conflict_row_name;
             assert_eq!(conflict_row_name("/srv/data/report.pdf"), "report.pdf");
         }
-
     }
 }
 
@@ -535,10 +548,7 @@ pub mod status_bar {
             Span::raw(" quit"),
         ];
 
-        let left_w: usize = left_spans
-            .iter()
-            .map(|s| s.content.chars().count())
-            .sum();
+        let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
         let theme_w = theme_label.chars().count();
         let ver_w = version_label.chars().count();
         let total_w = area.width as usize;

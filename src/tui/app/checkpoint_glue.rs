@@ -149,12 +149,18 @@ impl App {
                     remote_path: remote_path.clone(),
                     status: JobStatus::Pending,
                 },
-                PlannedJob::Download { remote_path, local_path } => CheckpointJob::Download {
+                PlannedJob::Download {
+                    remote_path,
+                    local_path,
+                } => CheckpointJob::Download {
                     remote_path: remote_path.clone(),
                     local_path: local_path.clone(),
                     status: JobStatus::Pending,
                 },
-                PlannedJob::Upload { local_path, remote_path } => CheckpointJob::Upload {
+                PlannedJob::Upload {
+                    local_path,
+                    remote_path,
+                } => CheckpointJob::Upload {
                     local_path: local_path.clone(),
                     remote_path: remote_path.clone(),
                     status: JobStatus::Pending,
@@ -198,9 +204,7 @@ impl App {
                 (PlannedJob::Mkdir { remote_path }, Some(b)) => {
                     manager.enqueue_mkdir_batched(remote_path, b)
                 }
-                (PlannedJob::Mkdir { remote_path }, None) => {
-                    manager.enqueue_mkdir(remote_path)
-                }
+                (PlannedJob::Mkdir { remote_path }, None) => manager.enqueue_mkdir(remote_path),
                 (
                     PlannedJob::Download {
                         remote_path,
@@ -342,11 +346,19 @@ impl App {
                 CheckpointJob::Mkdir { remote_path, .. } => PlannedJob::Mkdir {
                     remote_path: remote_path.clone(),
                 },
-                CheckpointJob::Download { remote_path, local_path, .. } => PlannedJob::Download {
+                CheckpointJob::Download {
+                    remote_path,
+                    local_path,
+                    ..
+                } => PlannedJob::Download {
                     remote_path: remote_path.clone(),
                     local_path: local_path.clone(),
                 },
-                CheckpointJob::Upload { local_path, remote_path, .. } => PlannedJob::Upload {
+                CheckpointJob::Upload {
+                    local_path,
+                    remote_path,
+                    ..
+                } => PlannedJob::Upload {
                     local_path: local_path.clone(),
                     remote_path: remote_path.clone(),
                 },

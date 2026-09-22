@@ -69,10 +69,7 @@ impl App {
         match self.active_pane {
             Pane::Local => {
                 self.refresh_local_pane();
-                self.push_log(
-                    LogLevel::Info,
-                    format!("refreshed: {}", self.local.path),
-                );
+                self.push_log(LogLevel::Info, format!("refreshed: {}", self.local.path));
             }
             Pane::Remote => {
                 if self.transport.is_some() {

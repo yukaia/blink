@@ -149,20 +149,20 @@ impl Theme {
     /// the filenames. This avoids O(n) file I/O on every theme cycle.
     pub fn list_all_names() -> Vec<String> {
         use std::collections::BTreeSet;
-        let mut set: BTreeSet<String> =
-            BUILTIN_NAMES.iter().map(|s| s.to_string()).collect();
+        let mut set: BTreeSet<String> = BUILTIN_NAMES.iter().map(|s| s.to_string()).collect();
         if let Ok(dir) = paths::themes_dir()
-            && let Ok(read) = std::fs::read_dir(&dir) {
-                for entry in read.flatten() {
-                    let path = entry.path();
-                    if path.extension().and_then(|s| s.to_str()) != Some("ini") {
-                        continue;
-                    }
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        set.insert(stem.to_string());
-                    }
+            && let Ok(read) = std::fs::read_dir(&dir)
+        {
+            for entry in read.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) != Some("ini") {
+                    continue;
+                }
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    set.insert(stem.to_string());
                 }
             }
+        }
         set.into_iter().collect()
     }
 }
@@ -359,8 +359,8 @@ mod tests {
         // the name list must come back from `load`, because that value is
         // what gets written to config.ini and re-loaded on the next launch.
         for name in Theme::list_builtin_names() {
-            let theme = Theme::load(name)
-                .unwrap_or_else(|e| panic!("built-in {name} must load: {e}"));
+            let theme =
+                Theme::load(name).unwrap_or_else(|e| panic!("built-in {name} must load: {e}"));
             assert_eq!(
                 &theme.name, name,
                 "a built-in's display name doubles as its key",
@@ -373,8 +373,7 @@ mod tests {
         // Demonstrates the divergence the fix accounts for: the loaded theme
         // reports "My Cool Theme" while the only string that can load it
         // again is the filename stem.
-        let dir = std::env::temp_dir()
-            .join(format!("blink-theme-key-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("blink-theme-key-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("custom.ini");
         std::fs::write(
@@ -388,7 +387,10 @@ mod tests {
         .unwrap();
 
         let theme = Theme::load_from(&path).expect("theme must parse");
-        assert_eq!(theme.name, "My Cool Theme", "display name comes from [theme]");
+        assert_eq!(
+            theme.name, "My Cool Theme",
+            "display name comes from [theme]"
+        );
         assert_ne!(
             theme.name, "custom",
             "display name is not the key — persisting it would not resolve",

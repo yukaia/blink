@@ -115,9 +115,7 @@ mod test_home {
     /// `Session::save()` without thinking about isolation lands here, not in
     /// the user's config.
     pub fn current() -> PathBuf {
-        OVERRIDE
-            .with(|o| o.borrow().clone())
-            .unwrap_or_else(shared)
+        OVERRIDE.with(|o| o.borrow().clone()).unwrap_or_else(shared)
     }
 
     /// Create `dir`, refusing to adopt anything already at that path.
@@ -161,8 +159,7 @@ mod test_home {
         static SHARED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         SHARED
             .get_or_init(|| {
-                let dir = std::env::temp_dir()
-                    .join(format!("blink-test-{}", std::process::id()));
+                let dir = std::env::temp_dir().join(format!("blink-test-{}", std::process::id()));
                 claim_dir(&dir).unwrap_or_else(|e| {
                     panic!(
                         "refusing to run: cannot claim a private config home at {} — \
@@ -201,8 +198,7 @@ mod test_home {
 
     pub fn acquire() -> TestHome {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir()
-            .join(format!("blink-test-{}-{n}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("blink-test-{}-{n}", std::process::id()));
         // Claim the directory eagerly. Leaving it to the first `root_dir()`
         // call would mean `create_app_dir` creating it, and its
         // `AlreadyExists` tolerance would adopt anything planted in the
@@ -301,8 +297,7 @@ fn real_base_dir() -> Result<PathBuf> {
 
 #[cfg(target_os = "windows")]
 fn base_dir_from(user_profile: Option<&str>) -> Result<PathBuf> {
-    let profile =
-        user_profile.ok_or_else(|| BlinkError::config("%USERPROFILE% is not set"))?;
+    let profile = user_profile.ok_or_else(|| BlinkError::config("%USERPROFILE% is not set"))?;
     Ok(require_absolute(profile, "%USERPROFILE%")?
         .join("Documents")
         .join(APP_DIR_NAME))
@@ -457,7 +452,9 @@ mod tests {
             release_rx.recv().expect("wait for the main thread");
         });
 
-        let theirs = acquired_rx.recv().expect("the other thread must report its home");
+        let theirs = acquired_rx
+            .recv()
+            .expect("the other thread must report its home");
 
         // The load-bearing read: another thread's guard is alive right now.
         // With a process-global override this returns `theirs`; only a
@@ -608,8 +605,7 @@ mod tests {
     fn plant_symlink(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
         use std::os::unix::fs::symlink;
 
-        let base = std::env::temp_dir()
-            .join(format!("blink-claim-{tag}-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("blink-claim-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("scratch base");
 
@@ -653,8 +649,14 @@ mod tests {
         test_home::claim_dir(&planted).expect("the sweep must clear the way");
 
         let meta = std::fs::symlink_metadata(&planted).expect("claimed path");
-        assert!(meta.file_type().is_dir(), "the claimed path is a real directory");
-        assert!(!meta.file_type().is_symlink(), "and no longer the planted link");
+        assert!(
+            meta.file_type().is_dir(),
+            "the claimed path is a real directory"
+        );
+        assert!(
+            !meta.file_type().is_symlink(),
+            "and no longer the planted link"
+        );
         assert_eq!(
             meta.permissions().mode() & 0o777,
             0o700,

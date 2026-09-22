@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use zeroize::Zeroize;
 
 use crate::checkpoint::{Checkpoint, CheckpointKind};
@@ -25,7 +25,7 @@ use crate::tui::state::{
     EditSessionForm, HostKeyChangedInfo, OverwritePending, PaneEntry, PaneState, PendingCancel,
     PendingDelete, PendingHostKey, PostConnectOffer, Viewer,
 };
-use crate::tui::{TuiTerminal, TICK_INTERVAL};
+use crate::tui::{TICK_INTERVAL, TuiTerminal};
 
 use crate::transport::CONNECT_TIMEOUT;
 
@@ -426,12 +426,7 @@ impl App {
     ///
     /// `unsaved` marks a session built from a URL (`blink connect`), which
     /// has no file behind it — the connect flow offers to persist those.
-    pub fn with_session(
-        config: Config,
-        theme: Theme,
-        session: Session,
-        unsaved: bool,
-    ) -> Self {
+    pub fn with_session(config: Config, theme: Theme, session: Session, unsaved: bool) -> Self {
         let mut app = Self::new(config, theme);
         app.autoconnect = Some(session);
         app.autoconnect_unsaved = unsaved;
@@ -454,10 +449,7 @@ impl App {
             preview::GraphicsProtocol::Iterm2 => "iterm2",
             preview::GraphicsProtocol::None => "none",
         };
-        self.push_log(
-            LogLevel::Info,
-            format!("graphics protocol: {proto_label}"),
-        );
+        self.push_log(LogLevel::Info, format!("graphics protocol: {proto_label}"));
         // Session files that wouldn't parse. Reported here rather than left
         // to `tracing`, which goes to a sink unless BLINK_LOG_FILE is set —
         // so the session just disappeared from the selector with no clue why.
@@ -677,10 +669,7 @@ impl App {
                 // dismisses` lets a fast typist hammer past the MITM warning
                 // before they've read it. Make them stop and acknowledge.
                 match key.code {
-                    KeyCode::Enter
-                    | KeyCode::Esc
-                    | KeyCode::Char('q')
-                    | KeyCode::Char('Q') => {
+                    KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                         self.host_key_changed_info = None;
                         // Every connection a session opens runs the host-key
                         // check, so a transfer worker can raise this while the
@@ -729,7 +718,6 @@ impl App {
             Screen::Viewer => self.handle_viewer(key),
         }
     }
-
 
     // -------------------------------------------------------------------
     // Disconnect (return to the session selector)
@@ -826,11 +814,7 @@ impl App {
     /// Spawn a connect task. The result lands as `AppEvent::Connected` /
     /// `AppEvent::ConnectFailed` / `AppEvent::ConnectKeyNeedsPassphrase` and
     /// is processed by [`handle_app_event`].
-    fn start_connect(
-        &mut self,
-        session: Session,
-        password: Option<zeroize::Zeroizing<String>>,
-    ) {
+    fn start_connect(&mut self, session: Session, password: Option<zeroize::Zeroizing<String>>) {
         self.push_log(
             LogLevel::Info,
             format!(
@@ -1070,8 +1054,7 @@ mod tests {
         // pop this entry, or the next `show_next_offer` sees it again and
         // the modal never lets go — a real-shaped queue is what makes that
         // regression visible; an empty one lets `pop_front` be a no-op.
-        a.pending_offers =
-            std::collections::VecDeque::from(vec![PostConnectOffer::SaveSession]);
+        a.pending_offers = std::collections::VecDeque::from(vec![PostConnectOffer::SaveSession]);
         a.screen = Screen::OfferSaveSession;
 
         a.handle_offer_save_session(press(KeyCode::Char('n')));
@@ -1092,8 +1075,7 @@ mod tests {
     fn accepting_the_offer_opens_the_save_modal() {
         let mut a = app();
         a.current_session = Some(Session::from_url("sftp://me@host.example.com").unwrap());
-        a.pending_offers =
-            std::collections::VecDeque::from(vec![PostConnectOffer::SaveSession]);
+        a.pending_offers = std::collections::VecDeque::from(vec![PostConnectOffer::SaveSession]);
         a.screen = Screen::OfferSaveSession;
 
         a.handle_offer_save_session(press(KeyCode::Char('y')));
@@ -1116,13 +1098,16 @@ mod tests {
         // offer by accident.
         let mut a = app();
         a.current_session = Some(Session::from_url("sftp://me@host").unwrap());
-        a.pending_offers =
-            std::collections::VecDeque::from(vec![PostConnectOffer::SaveSession]);
+        a.pending_offers = std::collections::VecDeque::from(vec![PostConnectOffer::SaveSession]);
         a.screen = Screen::OfferSaveSession;
 
         for code in [KeyCode::Enter, KeyCode::Char('x'), KeyCode::Tab] {
             a.handle_offer_save_session(press(code));
-            assert_eq!(a.screen, Screen::OfferSaveSession, "{code:?} must not dismiss");
+            assert_eq!(
+                a.screen,
+                Screen::OfferSaveSession,
+                "{code:?} must not dismiss"
+            );
         }
         assert_eq!(
             a.pending_offers.len(),
@@ -1298,7 +1283,11 @@ mod tests {
             .enqueue_download("/r/f.bin".into(), "/l/f.bin".into())
             .unwrap();
         a.handle_transfer_event(TransferEvent::Started(id));
-        assert!(last_log(&a).starts_with("downloading: "), "{}", last_log(&a));
+        assert!(
+            last_log(&a).starts_with("downloading: "),
+            "{}",
+            last_log(&a)
+        );
     }
 
     #[test]
@@ -1352,7 +1341,9 @@ mod tests {
     fn a_completed_download_still_reports_its_size() {
         let mut a = app_with_manager();
         let m = a.transfer_manager.as_ref().unwrap().clone();
-        let id = m.enqueue_download("/r/f.bin".into(), "/l/f.bin".into()).unwrap();
+        let id = m
+            .enqueue_download("/r/f.bin".into(), "/l/f.bin".into())
+            .unwrap();
         m.update_progress(id, 2048, 2048, 0);
         a.handle_transfer_event(TransferEvent::Complete(id));
         let msg = last_log(&a);
@@ -1429,7 +1420,11 @@ mod tests {
 
         a.pending_offers.pop_front();
         a.show_next_offer();
-        assert_eq!(a.screen, Screen::Main, "an empty queue lands on the main view");
+        assert_eq!(
+            a.screen,
+            Screen::Main,
+            "an empty queue lands on the main view"
+        );
     }
 
     #[test]
@@ -1443,9 +1438,7 @@ mod tests {
 
     /// An app with one download checkpoint on disk and its offer queued,
     /// plus the cleanup guard the caller must hold for the test's lifetime.
-    fn app_with_queued_offer(
-        tag: &str,
-    ) -> (App, crate::paths::TestHome) {
+    fn app_with_queued_offer(tag: &str) -> (App, crate::paths::TestHome) {
         let (mut a, cleanup) = checkpoint_app(tag);
         let name = a.current_session.as_ref().unwrap().name.clone();
         let mut cp = crate::checkpoint::Checkpoint::new(
@@ -1458,9 +1451,10 @@ mod tests {
             }],
         );
         cp.flush().expect("write the checkpoint");
-        a.pending_offers = std::collections::VecDeque::from(vec![
-            PostConnectOffer::ResumeCheckpoint(cp.to_offer(None)),
-        ]);
+        a.pending_offers =
+            std::collections::VecDeque::from(vec![PostConnectOffer::ResumeCheckpoint(
+                cp.to_offer(None),
+            )]);
         a.show_next_offer();
         (a, cleanup)
     }
@@ -1472,8 +1466,15 @@ mod tests {
         a.handle_offer_resume_checkpoint(press(KeyCode::Char('r')));
 
         let queued = a.transfer_manager.as_ref().unwrap().queue_counts();
-        assert!(queued.1 > 0 || queued.0 > 0, "the outstanding job must be queued");
-        assert_eq!(a.screen, Screen::Main, "the queue is empty, so we land on Main");
+        assert!(
+            queued.1 > 0 || queued.0 > 0,
+            "the outstanding job must be queued"
+        );
+        assert_eq!(
+            a.screen,
+            Screen::Main,
+            "the queue is empty, so we land on Main"
+        );
     }
 
     #[tokio::test]
@@ -1569,7 +1570,10 @@ mod tests {
         let (mut a, _cleanup) = checkpoint_app("disconnect");
         a.dispatch_plan(vec![download(0), download(1)], Direction::Download);
         a.pending_offers = std::collections::VecDeque::from(vec![offer(CheckpointKind::Download)]);
-        assert!(!a.active_checkpoints.is_empty(), "fixture must set up state");
+        assert!(
+            !a.active_checkpoints.is_empty(),
+            "fixture must set up state"
+        );
         assert!(!a.checkpoint_job_map.is_empty());
 
         a.disconnect();
@@ -1578,7 +1582,10 @@ mod tests {
             a.active_checkpoints.is_empty(),
             "a checkpoint from the previous connection must not survive it",
         );
-        assert!(a.checkpoint_job_map.is_empty(), "stale job ids must not survive");
+        assert!(
+            a.checkpoint_job_map.is_empty(),
+            "stale job ids must not survive"
+        );
         assert!(
             a.pending_offers.is_empty(),
             "a queued offer from the previous connection must not survive it",
@@ -1713,7 +1720,8 @@ mod tests {
             Box::new(crate::transport::mock::MockTransport::new()) as Box<dyn Transport>,
         )));
         a.remote.path = "/srv".into();
-        a.remote.set_entries(vec![PaneEntry::new("a.txt".into(), false, 1)]);
+        a.remote
+            .set_entries(vec![PaneEntry::new("a.txt".into(), false, 1)]);
 
         a.refresh_remote_pane("/srv".to_string());
 
@@ -1733,7 +1741,8 @@ mod tests {
             Box::new(crate::transport::mock::MockTransport::new()) as Box<dyn Transport>,
         )));
         a.remote.path = "/srv".into();
-        a.remote.set_entries(vec![PaneEntry::new("a.txt".into(), false, 1)]);
+        a.remote
+            .set_entries(vec![PaneEntry::new("a.txt".into(), false, 1)]);
 
         a.refresh_remote_pane("/srv/sub".to_string());
 
@@ -1801,7 +1810,9 @@ mod tests {
         assert_eq!(a.screen, Screen::SessionSelect);
         assert!(a.pending_session.is_none());
         assert!(
-            !a.log.iter().any(|l| l.message.contains("disconnected from")),
+            !a.log
+                .iter()
+                .any(|l| l.message.contains("disconnected from")),
             "nothing was connected, so nothing was disconnected",
         );
     }

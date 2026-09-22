@@ -1,10 +1,10 @@
 //! View rendering: one inline submodule per screen.
 
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
 
 use crate::session::Protocol;
 use crate::tui::app::{App, Pane};
@@ -337,9 +337,21 @@ pub mod help {
             Line::from(Span::styled("  FILES", acc_s)),
             kv("  space     ", "select / deselect", key_s),
             kv("  ctrl+d    ", "download selected items", key_s),
-            kv("  ctrl+u    ", "upload selected items (local → remote)", key_s),
-            kv("  v         ", "view image (kitty/sixel/iterm2) or text", key_s),
-            kv("  /         ", "filter current directory by substring", key_s),
+            kv(
+                "  ctrl+u    ",
+                "upload selected items (local → remote)",
+                key_s,
+            ),
+            kv(
+                "  v         ",
+                "view image (kitty/sixel/iterm2) or text",
+                key_s,
+            ),
+            kv(
+                "  /         ",
+                "filter current directory by substring",
+                key_s,
+            ),
             kv("  F5        ", "refresh active pane", key_s),
             kv("  F2        ", "rename file or folder (remote pane)", key_s),
             kv("  F7        ", "create new remote directory", key_s),
@@ -347,18 +359,25 @@ pub mod help {
             Line::from(""),
             Line::from(Span::styled("  SESSION", acc_s)),
             kv("  ctrl+s    ", "save current session", key_s),
-            kv("  ctrl+x    ", "disconnect (return to session selector)", key_s),
+            kv(
+                "  ctrl+x    ",
+                "disconnect (return to session selector)",
+                key_s,
+            ),
             kv("  p         ", "pause / resume active downloads", key_s),
             kv("  t         ", "cycle to the next theme", key_s),
-            kv("  c         ", "cancel selected transfer (Transfers pane)", key_s),
+            kv(
+                "  c         ",
+                "cancel selected transfer (Transfers pane)",
+                key_s,
+            ),
             kv("  C         ", "cancel whole batch (Transfers pane)", key_s),
             Line::from(""),
             Line::from(Span::styled("  APP", acc_s)),
             kv("  ?         ", "toggle this help", key_s),
             kv("  q · esc   ", "quit (with confirmation)", key_s),
             Line::from(""),
-            Line::from(Span::styled("  esc / ?  to close", dim_s))
-                .alignment(Alignment::Center),
+            Line::from(Span::styled("  esc / ?  to close", dim_s)).alignment(Alignment::Center),
         ];
 
         f.render_widget(Paragraph::new(lines), inner);
@@ -415,9 +434,9 @@ pub(crate) fn protocol_style(protocol: &Protocol, theme: &crate::theme::Theme) -
 #[cfg(test)]
 mod protocol_style_tests {
     use super::protocol_style;
-    use ratatui::style::Style;
     use crate::session::Protocol;
     use crate::theme::Theme;
+    use ratatui::style::Style;
 
     /// FTP and FTPS shared one arm, so the selector told the user the
     /// encrypted protocol was exactly as risky as the cleartext one — and
@@ -527,11 +546,8 @@ pub mod confirm_quit {
         let mut lines = vec![Line::from("")];
         if let Some(warning) = super::cancellation_warning(active, pending) {
             lines.push(
-                Line::from(Span::styled(
-                    warning,
-                    Style::default().fg(app.theme.error),
-                ))
-                .alignment(Alignment::Center),
+                Line::from(Span::styled(warning, Style::default().fg(app.theme.error)))
+                    .alignment(Alignment::Center),
             );
             lines.push(Line::from(""));
         }
@@ -598,9 +614,7 @@ pub mod confirm_cancel {
         let mut lines: Vec<Line> = vec![Line::from("")];
         match app.pending_cancel.as_ref() {
             Some(PendingCancel::Single { name, .. }) => {
-                lines.push(
-                    Line::from("  cancel this transfer:").alignment(Alignment::Center),
-                );
+                lines.push(Line::from("  cancel this transfer:").alignment(Alignment::Center));
                 lines.push(
                     Line::from(Span::styled(
                         name.clone(),
@@ -628,10 +642,8 @@ pub mod confirm_cancel {
                 let total = active + pending;
                 let plural = if total == 1 { "" } else { "s" };
                 lines.push(
-                    Line::from(format!(
-                        "  cancel {total} transfer{plural} in this batch?"
-                    ))
-                    .alignment(Alignment::Center),
+                    Line::from(format!("  cancel {total} transfer{plural} in this batch?"))
+                        .alignment(Alignment::Center),
                 );
                 lines.push(Line::from(""));
                 lines.push(
@@ -739,10 +751,7 @@ pub mod password_prompt {
             Line::from(vec![
                 Span::raw("  password: "),
                 Span::styled(masked, Style::default().fg(app.theme.fg)),
-                Span::styled(
-                    "█",
-                    Style::default().fg(app.theme.border_active),
-                ),
+                Span::styled("█", Style::default().fg(app.theme.border_active)),
             ]),
             Line::from(""),
             Line::from(Span::styled(
@@ -863,11 +872,8 @@ pub mod viewer {
         match &viewer.kind {
             ViewerKind::Loading => {
                 let p = Paragraph::new(
-                    Line::from(Span::styled(
-                        "loading…",
-                        Style::default().fg(app.theme.dim),
-                    ))
-                    .alignment(Alignment::Center),
+                    Line::from(Span::styled("loading…", Style::default().fg(app.theme.dim)))
+                        .alignment(Alignment::Center),
                 );
                 f.render_widget(p, body);
             }
@@ -902,10 +908,7 @@ pub mod viewer {
             _ => "  [q/esc] close".to_string(),
         };
         let hint_style = Style::default().fg(app.theme.dim);
-        f.render_widget(
-            Paragraph::new(Span::styled(hint_text, hint_style)),
-            hint,
-        );
+        f.render_widget(Paragraph::new(Span::styled(hint_text, hint_style)), hint);
     }
 
     fn render_text(
@@ -1012,10 +1015,7 @@ pub mod new_session {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(
-                    format!("✗ {err}"),
-                    Style::default().fg(app.theme.error),
-                ),
+                Span::styled(format!("✗ {err}"), Style::default().fg(app.theme.error)),
             ]));
         }
         lines.push(Line::from(""));
@@ -1027,8 +1027,6 @@ pub mod new_session {
         f.render_widget(Paragraph::new(lines), inner);
     }
 }
-
-
 
 // ---------------------------------------------------------------------------
 // Save current session (overlay over Main)
@@ -1069,11 +1067,8 @@ pub mod offer_save_session {
 
         let lines = vec![
             Line::from(""),
-            Line::from(Span::styled(
-                "connected — but this one isn't saved yet",
-                fg,
-            ))
-            .alignment(Alignment::Center),
+            Line::from(Span::styled("connected — but this one isn't saved yet", fg))
+                .alignment(Alignment::Center),
             Line::from(""),
             Line::from(Span::styled(
                 crate::error::sanitize_display(&target).into_owned(),
@@ -1086,11 +1081,8 @@ pub mod offer_save_session {
                 dim,
             ))
             .alignment(Alignment::Center),
-            Line::from(Span::styled(
-                "you can always save later with ctrl+s.",
-                dim,
-            ))
-            .alignment(Alignment::Center),
+            Line::from(Span::styled("you can always save later with ctrl+s.", dim))
+                .alignment(Alignment::Center),
             Line::from(""),
             Line::from(vec![
                 Span::styled(
@@ -1245,7 +1237,10 @@ pub mod offer_resume_checkpoint {
 
         #[test]
         fn hours_and_days_round_down() {
-            assert_eq!(human_age(Duration::from_secs(3 * 3600 + 59 * 60)), "3 hours ago");
+            assert_eq!(
+                human_age(Duration::from_secs(3 * 3600 + 59 * 60)),
+                "3 hours ago"
+            );
             assert_eq!(human_age(Duration::from_secs(50 * 3600)), "2 days ago");
         }
 
@@ -1329,10 +1324,7 @@ pub mod save_session {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(
-                    format!("✗ {err}"),
-                    Style::default().fg(app.theme.error),
-                ),
+                Span::styled(format!("✗ {err}"), Style::default().fg(app.theme.error)),
             ]));
         }
         lines.push(Line::from(""));
@@ -1381,10 +1373,7 @@ pub mod rename {
             Line::from(vec![
                 Span::raw("  "),
                 Span::styled("  to: ", dim),
-                Span::styled(
-                    app.rename_input.as_str(),
-                    Style::default().fg(app.theme.fg),
-                ),
+                Span::styled(app.rename_input.as_str(), Style::default().fg(app.theme.fg)),
                 Span::styled("█", Style::default().fg(app.theme.border_active)),
             ]),
         ];
@@ -1392,10 +1381,7 @@ pub mod rename {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(
-                    format!("✗ {err}"),
-                    Style::default().fg(app.theme.error),
-                ),
+                Span::styled(format!("✗ {err}"), Style::default().fg(app.theme.error)),
             ]));
         }
         lines.push(Line::from(""));
@@ -1451,10 +1437,7 @@ pub mod mkdir {
             Line::from(vec![
                 Span::raw("  "),
                 Span::styled("name: ", dim),
-                Span::styled(
-                    app.mkdir_input.as_str(),
-                    Style::default().fg(app.theme.fg),
-                ),
+                Span::styled(app.mkdir_input.as_str(), Style::default().fg(app.theme.fg)),
                 Span::styled("█", Style::default().fg(app.theme.border_active)),
             ]),
         ];
@@ -1462,10 +1445,7 @@ pub mod mkdir {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(
-                    format!("✗ {err}"),
-                    Style::default().fg(app.theme.error),
-                ),
+                Span::styled(format!("✗ {err}"), Style::default().fg(app.theme.error)),
             ]));
         }
         lines.push(Line::from(""));
@@ -1581,8 +1561,7 @@ pub mod confirm_overwrite {
         let mut lines = vec![Line::from("")];
         let is_plan = matches!(
             app.pending_overwrite.as_ref(),
-            Some(OverwritePending::DownloadPlan { .. })
-                | Some(OverwritePending::UploadPlan { .. })
+            Some(OverwritePending::DownloadPlan { .. }) | Some(OverwritePending::UploadPlan { .. })
         );
         match app.pending_overwrite.as_ref() {
             Some(OverwritePending::Rename { target_name, .. }) => {
@@ -1612,36 +1591,20 @@ pub mod confirm_overwrite {
                 plan,
                 conflict_indices,
             }) => {
-                render_plan_body(
-                    &mut lines,
-                    app,
-                    plan,
-                    conflict_indices,
-                    PlanKind::Download,
-                );
+                render_plan_body(&mut lines, app, plan, conflict_indices, PlanKind::Download);
             }
             Some(OverwritePending::UploadPlan {
                 plan,
                 conflict_indices,
             }) => {
-                render_plan_body(
-                    &mut lines,
-                    app,
-                    plan,
-                    conflict_indices,
-                    PlanKind::Upload,
-                );
+                render_plan_body(&mut lines, app, plan, conflict_indices, PlanKind::Upload);
             }
             None => {}
         }
 
         lines.push(Line::from(""));
         // Hint strip: rename modal has no skip option, plan modals do.
-        let key_style = |c| {
-            Style::default()
-                .fg(c)
-                .add_modifier(Modifier::BOLD)
-        };
+        let key_style = |c| Style::default().fg(c).add_modifier(Modifier::BOLD);
         let mut hint_spans = vec![
             Span::raw("   "),
             Span::styled("[y]", key_style(app.theme.warning)),
@@ -1729,9 +1692,7 @@ pub mod confirm_overwrite {
             .alignment(Alignment::Center),
         );
     }
-
 }
-
 
 /// The name shown for one conflicting file in the overwrite-confirmation
 /// modal.
@@ -1868,10 +1829,7 @@ pub mod edit_session {
             aic_spans.push(Span::raw(" "));
             aic_spans.push(Span::styled("◀", cursor));
         }
-        aic_spans.push(Span::styled(
-            "  accept invalid certs (FTPS only)",
-            dim,
-        ));
+        aic_spans.push(Span::styled("  accept invalid certs (FTPS only)", dim));
         lines.push(Line::from(aic_spans));
         if form.accept_invalid_certs {
             lines.push(Line::from(vec![
@@ -1907,10 +1865,7 @@ pub mod edit_session {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(
-                    format!("✗ {err}"),
-                    Style::default().fg(app.theme.error),
-                ),
+                Span::styled(format!("✗ {err}"), Style::default().fg(app.theme.error)),
             ]));
         }
 
@@ -1953,8 +1908,7 @@ pub mod confirm_delete_session {
         let mut lines = vec![Line::from("")];
         if let Some(s) = app.pending_session_delete.as_ref() {
             lines.push(
-                Line::from("  permanently delete this session:")
-                    .alignment(Alignment::Center),
+                Line::from("  permanently delete this session:").alignment(Alignment::Center),
             );
             lines.push(Line::from(""));
             lines.push(
@@ -1979,18 +1933,12 @@ pub mod confirm_delete_session {
             );
             lines.push(Line::from(""));
             lines.push(
-                Line::from(Span::styled(
-                    "this only removes the saved session.",
-                    dim,
-                ))
-                .alignment(Alignment::Center),
+                Line::from(Span::styled("this only removes the saved session.", dim))
+                    .alignment(Alignment::Center),
             );
             lines.push(
-                Line::from(Span::styled(
-                    "no remote files are touched.",
-                    dim,
-                ))
-                .alignment(Alignment::Center),
+                Line::from(Span::styled("no remote files are touched.", dim))
+                    .alignment(Alignment::Center),
             );
         }
         lines.push(Line::from(""));
@@ -2060,28 +2008,19 @@ pub mod key_passphrase_prompt {
 
         let mut lines = vec![
             Line::from(""),
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled(key_label, dim),
-            ]),
+            Line::from(vec![Span::raw("  "), Span::styled(key_label, dim)]),
             Line::from(""),
             Line::from(vec![
                 Span::raw("  passphrase: "),
                 Span::styled(masked, Style::default().fg(app.theme.fg)),
-                Span::styled(
-                    "█",
-                    Style::default().fg(app.theme.border_active),
-                ),
+                Span::styled("█", Style::default().fg(app.theme.border_active)),
             ]),
         ];
         if let Some(err) = &app.passphrase_error {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(
-                    format!("✗ {err}"),
-                    Style::default().fg(app.theme.error),
-                ),
+                Span::styled(format!("✗ {err}"), Style::default().fg(app.theme.error)),
             ]));
         }
         lines.push(Line::from(""));
@@ -2119,18 +2058,8 @@ pub mod search {
         };
         // Subtract one for the always-retained ".." entry where applicable.
         let match_count = match app.search_target {
-            Pane::Local => app
-                .local
-                .entries
-                .iter()
-                .filter(|e| !e.is_parent())
-                .count(),
-            Pane::Remote => app
-                .remote
-                .entries
-                .iter()
-                .filter(|e| !e.is_parent())
-                .count(),
+            Pane::Local => app.local.entries.iter().filter(|e| !e.is_parent()).count(),
+            Pane::Remote => app.remote.entries.iter().filter(|e| !e.is_parent()).count(),
             _ => visible_count,
         };
 
@@ -2151,10 +2080,7 @@ pub mod search {
 
         let line = Line::from(vec![
             Span::styled(format!(" /{target_label}: "), label_style),
-            Span::styled(
-                app.search_input.clone(),
-                Style::default().fg(app.theme.fg),
-            ),
+            Span::styled(app.search_input.clone(), Style::default().fg(app.theme.fg)),
             Span::styled("█", Style::default().fg(app.theme.border_active)),
             Span::raw("  "),
             Span::styled(count_label, dim),
@@ -2213,8 +2139,7 @@ pub mod confirm_disconnect {
 
         let mut lines = vec![
             Line::from(""),
-            Line::from("  return to the session selector?")
-                .alignment(Alignment::Center),
+            Line::from("  return to the session selector?").alignment(Alignment::Center),
             Line::from(""),
             Line::from(Span::styled(target, fg.add_modifier(Modifier::BOLD)))
                 .alignment(Alignment::Center),
@@ -2222,11 +2147,8 @@ pub mod confirm_disconnect {
         ];
         if let Some(warning) = super::cancellation_warning(active, pending) {
             lines.push(
-                Line::from(Span::styled(
-                    warning,
-                    Style::default().fg(app.theme.error),
-                ))
-                .alignment(Alignment::Center),
+                Line::from(Span::styled(warning, Style::default().fg(app.theme.error)))
+                    .alignment(Alignment::Center),
             );
         } else {
             lines.push(
@@ -2294,16 +2216,20 @@ pub mod confirm_host_key {
 
         let lines = vec![
             Line::from(""),
-            Line::from(
-                Span::styled(
-                    "The server's host key is not in your known-hosts file.",
-                    Style::default().fg(app.theme.fg),
-                )
-            ).alignment(Alignment::Center),
+            Line::from(Span::styled(
+                "The server's host key is not in your known-hosts file.",
+                Style::default().fg(app.theme.fg),
+            ))
+            .alignment(Alignment::Center),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Host:        ", Style::default().fg(app.theme.dim)),
-                Span::styled(host, Style::default().fg(app.theme.fg).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    host,
+                    Style::default()
+                        .fg(app.theme.fg)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("  Key type:    ", Style::default().fg(app.theme.dim)),
@@ -2314,22 +2240,37 @@ pub mod confirm_host_key {
                 Span::styled(fingerprint, Style::default().fg(app.theme.accent)),
             ]),
             Line::from(""),
-            Line::from(
-                Span::styled(
-                    "Verify this fingerprint out-of-band before accepting.",
-                    Style::default().fg(app.theme.warning),
-                )
-            ).alignment(Alignment::Center),
+            Line::from(Span::styled(
+                "Verify this fingerprint out-of-band before accepting.",
+                Style::default().fg(app.theme.warning),
+            ))
+            .alignment(Alignment::Center),
             Line::from(""),
             Line::from(vec![
                 Span::raw("  "),
-                Span::styled("[y]", Style::default().fg(app.theme.success).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "[y]",
+                    Style::default()
+                        .fg(app.theme.success)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" accept & save    "),
-                Span::styled("[t]", Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "[t]",
+                    Style::default()
+                        .fg(app.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" trust once    "),
-                Span::styled("[n/esc]", Style::default().fg(app.theme.error).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "[n/esc]",
+                    Style::default()
+                        .fg(app.theme.error)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw(" reject"),
-            ]).alignment(Alignment::Center),
+            ])
+            .alignment(Alignment::Center),
         ];
 
         f.render_widget(Paragraph::new(lines), inner);
@@ -2381,38 +2322,40 @@ pub mod host_key_changed {
 
         let lines = vec![
             Line::from(""),
-            Line::from(
-                Span::styled(
-                    "⚠  WARNING: HOST KEY MISMATCH",
-                    Style::default()
-                        .fg(app.theme.error)
-                        .add_modifier(Modifier::BOLD),
-                )
-            ).alignment(Alignment::Center),
+            Line::from(Span::styled(
+                "⚠  WARNING: HOST KEY MISMATCH",
+                Style::default()
+                    .fg(app.theme.error)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Center),
             Line::from(""),
-            Line::from(
-                Span::styled(
-                    "The server presented a different key than expected.",
-                    Style::default().fg(app.theme.fg),
-                )
-            ).alignment(Alignment::Center),
-            Line::from(
-                Span::styled(
-                    "This may indicate a man-in-the-middle attack.",
-                    Style::default().fg(app.theme.warning),
-                )
-            ).alignment(Alignment::Center),
+            Line::from(Span::styled(
+                "The server presented a different key than expected.",
+                Style::default().fg(app.theme.fg),
+            ))
+            .alignment(Alignment::Center),
+            Line::from(Span::styled(
+                "This may indicate a man-in-the-middle attack.",
+                Style::default().fg(app.theme.warning),
+            ))
+            .alignment(Alignment::Center),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Host:          ", Style::default().fg(app.theme.dim)),
                 Span::styled(
                     info.host.clone(),
-                    Style::default().fg(app.theme.fg).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(app.theme.fg)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]),
             Line::from(vec![
                 Span::styled("  Expected type: ", Style::default().fg(app.theme.dim)),
-                Span::styled(info.stored_key_type.clone(), Style::default().fg(app.theme.fg)),
+                Span::styled(
+                    info.stored_key_type.clone(),
+                    Style::default().fg(app.theme.fg),
+                ),
             ]),
             Line::from(vec![
                 Span::styled("  Got type:      ", Style::default().fg(app.theme.dim)),
@@ -2423,35 +2366,36 @@ pub mod host_key_changed {
             ]),
             Line::from(vec![
                 Span::styled("  Fingerprint:   ", Style::default().fg(app.theme.dim)),
-                Span::styled(info.fingerprint.clone(), Style::default().fg(app.theme.accent)),
+                Span::styled(
+                    info.fingerprint.clone(),
+                    Style::default().fg(app.theme.accent),
+                ),
             ]),
             Line::from(""),
-            Line::from(
-                Span::styled(
-                    "Only if you know the key was legitimately replaced, and",
-                    Style::default().fg(app.theme.dim),
-                )
-            ).alignment(Alignment::Center),
-            Line::from(
-                Span::styled(
-                    "have confirmed the new fingerprint out of band, run:",
-                    Style::default().fg(app.theme.dim),
-                )
-            ).alignment(Alignment::Center),
+            Line::from(Span::styled(
+                "Only if you know the key was legitimately replaced, and",
+                Style::default().fg(app.theme.dim),
+            ))
+            .alignment(Alignment::Center),
+            Line::from(Span::styled(
+                "have confirmed the new fingerprint out of band, run:",
+                Style::default().fg(app.theme.dim),
+            ))
+            .alignment(Alignment::Center),
             Line::from(""),
-            Line::from(
-                Span::styled(
-                    remove_cmd,
-                    Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
-                )
-            ).alignment(Alignment::Center),
+            Line::from(Span::styled(
+                remove_cmd,
+                Style::default()
+                    .fg(app.theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .alignment(Alignment::Center),
             Line::from(""),
-            Line::from(
-                Span::styled(
-                    "[enter/esc/q] dismiss",
-                    Style::default().fg(app.theme.dim),
-                )
-            ).alignment(Alignment::Center),
+            Line::from(Span::styled(
+                "[enter/esc/q] dismiss",
+                Style::default().fg(app.theme.dim),
+            ))
+            .alignment(Alignment::Center),
         ];
 
         f.render_widget(Paragraph::new(lines), inner);

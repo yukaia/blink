@@ -8,8 +8,8 @@ use std::env;
 use std::fmt;
 use std::io::{Cursor, Write};
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use image::{ImageError, ImageFormat, ImageReader, Limits};
 
 use crate::config::ImagePreviewMode;
@@ -152,12 +152,16 @@ const MAX_IMAGE_ALLOC: u64 = 128 * 1024 * 1024;
 /// Windows console host) we fall back to a reasonable default.
 pub fn cell_pixels() -> (u32, u32) {
     if let Ok(ws) = crossterm::terminal::window_size()
-        && ws.columns > 0 && ws.rows > 0 && ws.width > 0 && ws.height > 0 {
-            return (
-                (ws.width as u32 / ws.columns as u32).max(1),
-                (ws.height as u32 / ws.rows as u32).max(1),
-            );
-        }
+        && ws.columns > 0
+        && ws.rows > 0
+        && ws.width > 0
+        && ws.height > 0
+    {
+        return (
+            (ws.width as u32 / ws.columns as u32).max(1),
+            (ws.height as u32 / ws.rows as u32).max(1),
+        );
+    }
     (FALLBACK_PX_PER_COL, FALLBACK_PX_PER_ROW)
 }
 
@@ -253,10 +257,11 @@ fn scale_for_cells(
 /// Encode an RGBA buffer as PNG. Used by the kitty and iTerm2 backends after
 /// scaling.
 fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, image::ImageError> {
-    let img = image::RgbaImage::from_raw(width, height, rgba.to_vec())
-        .ok_or_else(|| image::ImageError::Parameter(image::error::ParameterError::from_kind(
+    let img = image::RgbaImage::from_raw(width, height, rgba.to_vec()).ok_or_else(|| {
+        image::ImageError::Parameter(image::error::ParameterError::from_kind(
             image::error::ParameterErrorKind::DimensionMismatch,
-        )))?;
+        ))
+    })?;
     let mut out = Vec::new();
     image::DynamicImage::ImageRgba8(img).write_to(&mut Cursor::new(&mut out), ImageFormat::Png)?;
     Ok(out)
@@ -493,16 +498,64 @@ pub fn is_viewable_text(name: &str) -> bool {
     };
     matches!(
         ext,
-        "txt" | "md" | "rst" | "log" | "ini" | "conf" | "cfg" | "config" | "env"
-            | "json" | "yaml" | "yml" | "toml" | "xml" | "html" | "htm" | "css"
-            | "scss" | "sass" | "less"
-            | "js" | "mjs" | "cjs" | "ts" | "jsx" | "tsx"
-            | "rs" | "py" | "rb" | "go" | "c" | "h" | "cpp" | "cxx" | "cc" | "hpp"
-            | "cs" | "java" | "kt" | "swift" | "php" | "lua" | "pl" | "r"
-            | "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat"
-            | "sql" | "csv" | "tsv"
-            | "gitignore" | "gitattributes" | "editorconfig"
-            | "diff" | "patch"
+        "txt"
+            | "md"
+            | "rst"
+            | "log"
+            | "ini"
+            | "conf"
+            | "cfg"
+            | "config"
+            | "env"
+            | "json"
+            | "yaml"
+            | "yml"
+            | "toml"
+            | "xml"
+            | "html"
+            | "htm"
+            | "css"
+            | "scss"
+            | "sass"
+            | "less"
+            | "js"
+            | "mjs"
+            | "cjs"
+            | "ts"
+            | "jsx"
+            | "tsx"
+            | "rs"
+            | "py"
+            | "rb"
+            | "go"
+            | "c"
+            | "h"
+            | "cpp"
+            | "cxx"
+            | "cc"
+            | "hpp"
+            | "cs"
+            | "java"
+            | "kt"
+            | "swift"
+            | "php"
+            | "lua"
+            | "pl"
+            | "r"
+            | "sh"
+            | "bash"
+            | "zsh"
+            | "fish"
+            | "ps1"
+            | "bat"
+            | "sql"
+            | "csv"
+            | "tsv"
+            | "gitignore"
+            | "gitattributes"
+            | "editorconfig"
+            | "diff"
+            | "patch"
             | "nfo"
     )
 }
@@ -539,7 +592,13 @@ pub fn decode_cp437(bytes: &[u8]) -> String {
     ];
     bytes
         .iter()
-        .map(|&b| if b < 0x80 { b as char } else { MAP[(b - 0x80) as usize] })
+        .map(|&b| {
+            if b < 0x80 {
+                b as char
+            } else {
+                MAP[(b - 0x80) as usize]
+            }
+        })
         .collect()
 }
 

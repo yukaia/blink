@@ -162,7 +162,9 @@ impl Handler for KnownHostsHandler {
 
         match known_hosts::check(&self.host, self.port, &key_type, &key_b64) {
             Ok(KeyStatus::Trusted) => return Ok(true),
-            Ok(KeyStatus::Changed { stored_key_type, .. }) => {
+            Ok(KeyStatus::Changed {
+                stored_key_type, ..
+            }) => {
                 tracing::warn!(
                     host = %display_host,
                     stored = %stored_key_type,
@@ -200,7 +202,10 @@ impl Handler for KnownHostsHandler {
         // Not in the file, but the user may already have accepted it for this
         // session. Every worker connection lands here, and re-asking would
         // pop a modal mid-transfer for each one.
-        if self.trust.is_trusted(&self.host, self.port, &key_type, &key_b64) {
+        if self
+            .trust
+            .is_trusted(&self.host, self.port, &key_type, &key_b64)
+        {
             return Ok(true);
         }
 
@@ -224,21 +229,17 @@ impl Handler for KnownHostsHandler {
 
         // The TUI must respond within 60 seconds, otherwise reject
         // to avoid hanging the connection indefinitely.
-        let decision = match tokio::time::timeout(
-            std::time::Duration::from_secs(60),
-            decision_rx,
-        )
-        .await
-        {
-            Ok(d) => d.unwrap_or(HostKeyDecision::Reject),
-            Err(_) => {
-                tracing::warn!(
-                    host = %self.host,
-                    "host-key decision timed out — rejecting"
-                );
-                HostKeyDecision::Reject
-            }
-        };
+        let decision =
+            match tokio::time::timeout(std::time::Duration::from_secs(60), decision_rx).await {
+                Ok(d) => d.unwrap_or(HostKeyDecision::Reject),
+                Err(_) => {
+                    tracing::warn!(
+                        host = %self.host,
+                        "host-key decision timed out — rejecting"
+                    );
+                    HostKeyDecision::Reject
+                }
+            };
 
         match decision {
             HostKeyDecision::AcceptAndSave => {
@@ -250,8 +251,7 @@ impl Handler for KnownHostsHandler {
             HostKeyDecision::AcceptOnce => {
                 // Scope the decision to this session so the connections that
                 // follow — one per transfer worker — don't ask again.
-                self.trust
-                    .trust(&self.host, self.port, &key_type, &key_b64);
+                self.trust.trust(&self.host, self.port, &key_type, &key_b64);
                 Ok(true)
             }
             HostKeyDecision::Reject => Ok(false),
@@ -432,12 +432,9 @@ impl SftpTransport {
             AuthMethod::Agent => {
                 #[cfg(unix)]
                 {
-                    let mut agent =
-                        russh::keys::agent::client::AgentClient::connect_env()
-                            .await
-                            .map_err(|e| {
-                                BlinkError::auth(format!("ssh-agent connect: {e}"))
-                            })?;
+                    let mut agent = russh::keys::agent::client::AgentClient::connect_env()
+                        .await
+                        .map_err(|e| BlinkError::auth(format!("ssh-agent connect: {e}")))?;
 
                     let identities = agent.request_identities().await.map_err(|e| {
                         BlinkError::auth(format!("ssh-agent request_identities: {e}"))
@@ -456,9 +453,7 @@ impl SftpTransport {
                         let pubkey = identity.public_key().into_owned();
                         let hash_alg = rsa_hash_alg(&pubkey.algorithm());
                         let auth_result = handle
-                            .authenticate_publickey_with(
-                                username, pubkey, hash_alg, &mut agent,
-                            )
+                            .authenticate_publickey_with(username, pubkey, hash_alg, &mut agent)
                             .await;
                         match auth_result {
                             Ok(r) if r.success() => {
@@ -485,39 +480,33 @@ impl SftpTransport {
 
                     const OPENSSH_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
 
-                    let succeeded =
-                        match AgentClient::connect_named_pipe(OPENSSH_PIPE).await {
-                            Ok(mut agent) => {
-                                try_agent_identities(&mut handle, username, &mut agent)
-                                    .await?
-                            }
-                            Err(pipe_err) => {
-                                // russh 0.60 made connect_pageant fallible;
-                                // it previously returned the client directly.
-                                let mut agent = AgentClient::connect_pageant()
-                                    .await
-                                    .map_err(|e| {
-                                        BlinkError::auth(format!(
-                                            "ssh-agent: no agent found (OpenSSH \
+                    let succeeded = match AgentClient::connect_named_pipe(OPENSSH_PIPE).await {
+                        Ok(mut agent) => {
+                            try_agent_identities(&mut handle, username, &mut agent).await?
+                        }
+                        Err(pipe_err) => {
+                            // russh 0.60 made connect_pageant fallible;
+                            // it previously returned the client directly.
+                            let mut agent = AgentClient::connect_pageant().await.map_err(|e| {
+                                BlinkError::auth(format!(
+                                    "ssh-agent: no agent found (OpenSSH \
                                              pipe error: {pipe_err}; Pageant \
                                              error: {e})"
-                                        ))
-                                    })?;
-                                try_agent_identities(&mut handle, username, &mut agent)
-                                    .await
-                                    .map_err(|e| {
-                                        BlinkError::auth(format!(
-                                            "ssh-agent: no agent found \
+                                ))
+                            })?;
+                            try_agent_identities(&mut handle, username, &mut agent)
+                                .await
+                                .map_err(|e| {
+                                    BlinkError::auth(format!(
+                                        "ssh-agent: no agent found \
                                              (OpenSSH pipe error: {pipe_err}; {e})"
-                                        ))
-                                    })?
-                            }
-                        };
+                                    ))
+                                })?
+                        }
+                    };
 
                     if !succeeded {
-                        return Err(BlinkError::auth(
-                            "ssh-agent: no identity accepted",
-                        ));
+                        return Err(BlinkError::auth("ssh-agent: no identity accepted"));
                     }
                     true
                 }
@@ -862,12 +851,13 @@ async fn pipelined_download(
     // final path as if the download had succeeded; the stale `.part` is
     // detected and discarded on the next attempt.
     if let Some(end) = size
-        && done < end {
-            return Err(BlinkError::transport(format!(
-                "{label}: remote file truncated during transfer \
+        && done < end
+    {
+        return Err(BlinkError::transport(format!(
+            "{label}: remote file truncated during transfer \
                  (expected {end} bytes, got {done})"
-            )));
-        }
+        )));
+    }
     Ok(())
 }
 
@@ -913,9 +903,7 @@ async fn finalize_remote_rename(
         use russh_sftp::protocol::Packet;
         return match raw.extended("posix-rename@openssh.com", data).await {
             Ok(Packet::Status(s)) if s.status_code == StatusCode::Ok => Ok(()),
-            Ok(Packet::Status(s)) => {
-                Err(map_sftp("posix-rename", dest, SftpError::Status(s)))
-            }
+            Ok(Packet::Status(s)) => Err(map_sftp("posix-rename", dest, SftpError::Status(s))),
             Ok(_) => Err(BlinkError::transport(format!(
                 "posix-rename {dest}: unexpected reply packet"
             ))),
@@ -1250,7 +1238,10 @@ impl Transport for SftpTransport {
             .await
             .map_err(|e| map_sftp("open", remote_path, e))?;
         let mut buf = Vec::new();
-        remote.take(MAX_PREVIEW_BYTES + 1).read_to_end(&mut buf).await?;
+        remote
+            .take(MAX_PREVIEW_BYTES + 1)
+            .read_to_end(&mut buf)
+            .await?;
         if buf.len() as u64 > MAX_PREVIEW_BYTES {
             return Err(BlinkError::transport("file exceeds preview size limit"));
         }
@@ -1603,7 +1594,10 @@ mod integration {
             } else if !store.contains_key(&filename) {
                 return Err(StatusCode::NoSuchFile);
             }
-            Ok(SftpHandle { id, handle: filename })
+            Ok(SftpHandle {
+                id,
+                handle: filename,
+            })
         }
 
         async fn close(&mut self, id: u32, _handle: String) -> Result<Status, Self::Error> {
@@ -2090,15 +2084,22 @@ mod integration {
     #[tokio::test]
     async fn a_server_host_key_is_verified_for_every_algorithm() {
         for (label, pem, expected_type) in [
-            ("ed25519", super::super::sftp_test_keys::ED25519_KEY, "ssh-ed25519"),
-            ("ecdsa", super::super::sftp_test_keys::ECDSA_KEY, "ecdsa-sha2-nistp256"),
+            (
+                "ed25519",
+                super::super::sftp_test_keys::ED25519_KEY,
+                "ssh-ed25519",
+            ),
+            (
+                "ecdsa",
+                super::super::sftp_test_keys::ECDSA_KEY,
+                "ecdsa-sha2-nistp256",
+            ),
             ("rsa", super::super::sftp_test_keys::RSA_KEY, "ssh-rsa"),
         ] {
             let store: Store = Arc::new(Mutex::new(HashMap::new()));
             let (port, _c) = start_server_with_host_key(store, pem).await;
 
-            let (mut transport, key_type) =
-                connect_with(port, AuthMethod::Password).await;
+            let (mut transport, key_type) = connect_with(port, AuthMethod::Password).await;
 
             assert_eq!(
                 key_type, expected_type,
@@ -2227,8 +2228,14 @@ mod integration {
             .into_iter()
             .map(|b| b ^ 0xA5) // make B unmistakably different from A
             .collect::<Vec<u8>>();
-        store.lock().await.insert("/a.bin".to_string(), a_bytes.clone());
-        store.lock().await.insert("/b.bin".to_string(), b_bytes.clone());
+        store
+            .lock()
+            .await
+            .insert("/a.bin".to_string(), a_bytes.clone());
+        store
+            .lock()
+            .await
+            .insert("/b.bin".to_string(), b_bytes.clone());
 
         let (port, _c) = start_server(store).await;
         let mut transport = connect(port).await;
@@ -2275,7 +2282,10 @@ mod integration {
     async fn a_partial_of_this_file_is_resumed_and_completes_correctly() {
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
         let bytes = pseudo_random(40_000);
-        store.lock().await.insert("/c.bin".to_string(), bytes.clone());
+        store
+            .lock()
+            .await
+            .insert("/c.bin".to_string(), bytes.clone());
 
         let (port, _c) = start_server(store).await;
         let mut transport = connect(port).await;
@@ -2428,16 +2438,11 @@ mod integration {
     fn host_certificate() -> russh::keys::ssh_key::Certificate {
         use russh::keys::ssh_key::certificate::{Builder, CertType};
 
-        let ca = russh::keys::PrivateKey::random(
-            &mut rand::rng(),
-            russh::keys::Algorithm::Ed25519,
-        )
-        .unwrap();
-        let subject = russh::keys::PrivateKey::random(
-            &mut rand::rng(),
-            russh::keys::Algorithm::Ed25519,
-        )
-        .unwrap();
+        let ca = russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+            .unwrap();
+        let subject =
+            russh::keys::PrivateKey::random(&mut rand::rng(), russh::keys::Algorithm::Ed25519)
+                .unwrap();
 
         let mut builder = Builder::new(
             [0u8; 16],

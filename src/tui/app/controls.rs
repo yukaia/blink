@@ -16,7 +16,7 @@ use crate::theme::Theme;
 use crate::transfer::TransferJob;
 use crate::tui::state::PendingCancel;
 
-use super::{name_for_job, App, LogLevel, Screen};
+use super::{App, LogLevel, Screen, name_for_job};
 
 impl App {
     pub(super) fn request_cancel_selected_transfer(&mut self) {
@@ -129,10 +129,7 @@ impl App {
                 self.theme = theme;
                 self.push_log(
                     LogLevel::Info,
-                    format!("theme: {} ({}/{})",
-                        next_name,
-                        next_idx + 1,
-                        names.len()),
+                    format!("theme: {} ({}/{})", next_name, next_idx + 1, names.len()),
                 );
                 // Persist as a best-effort. A save failure here shouldn't
                 // refuse the in-memory swap (the user can see the new theme

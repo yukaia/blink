@@ -97,9 +97,7 @@ impl App {
         };
         // Renaming to a name another session already uses would silently
         // clobber the other one — block that explicitly.
-        if name != form.original_name
-            && self.sessions.iter().any(|s| s.name == name)
-        {
+        if name != form.original_name && self.sessions.iter().any(|s| s.name == name) {
             form.error = Some(format!("a session named `{name}` already exists"));
             self.edit_session_form = Some(form);
             return;
@@ -133,9 +131,7 @@ impl App {
             None
         } else {
             match parallel_str.parse::<u16>() {
-                Ok(n) if n >= 1 && n <= u16::from(crate::config::MAX_PARALLEL) => {
-                    Some(n as u8)
-                }
+                Ok(n) if n >= 1 && n <= u16::from(crate::config::MAX_PARALLEL) => Some(n as u8),
                 _ => {
                     form.error = Some(format!(
                         "parallel must be a number 1–{} (or empty for default)",
@@ -152,14 +148,12 @@ impl App {
         // previous pin is no longer meaningful (different target or the
         // user is switching to normal CA verification), so we clear it and
         // let the next connect TOFU.
-        let cert_sha256 = if form.accept_invalid_certs
-            && original.host == host
-            && original.port == port
-        {
-            original.cert_sha256.clone()
-        } else {
-            None
-        };
+        let cert_sha256 =
+            if form.accept_invalid_certs && original.host == host && original.port == port {
+                original.cert_sha256.clone()
+            } else {
+                None
+            };
 
         let updated = Session {
             name: name.clone(),
@@ -185,17 +179,16 @@ impl App {
                 // If the rename succeeded, drop the old `.ini` file. We do
                 // this AFTER save so a save failure doesn't lose the original.
                 if name != form.original_name
-                    && let Err(e) = Session::delete(&form.original_name) {
-                        // Soft-failure: the new session is saved, but the old
-                        // file stayed behind. Surface as a warn rather than
-                        // failing the whole edit.
-                        self.push_log(
-                            LogLevel::Warn,
-                            format!(
-                                "renamed session saved, but failed to remove old file: {e}"
-                            ),
-                        );
-                    }
+                    && let Err(e) = Session::delete(&form.original_name)
+                {
+                    // Soft-failure: the new session is saved, but the old
+                    // file stayed behind. Surface as a warn rather than
+                    // failing the whole edit.
+                    self.push_log(
+                        LogLevel::Warn,
+                        format!("renamed session saved, but failed to remove old file: {e}"),
+                    );
+                }
                 self.reload_sessions();
                 // Keep the cursor pointed at the freshly-edited session if
                 // we can find it, otherwise clamp.
@@ -203,7 +196,10 @@ impl App {
                     .sessions
                     .iter()
                     .position(|s| s.name == name)
-                    .unwrap_or_else(|| self.session_cursor.min(self.sessions.len().saturating_sub(1)));
+                    .unwrap_or_else(|| {
+                        self.session_cursor
+                            .min(self.sessions.len().saturating_sub(1))
+                    });
                 self.edit_session_form = None;
                 self.screen = Screen::SessionSelect;
                 self.push_log(LogLevel::Success, format!("session updated: {name}"));
@@ -406,8 +402,7 @@ impl App {
         // Delete addresses the real name; the modal shows the readable one.
         // Conflating them is how a confirmation for one file ends up
         // unlinking another whose name merely renders the same.
-        let Some(remote_path) = transport::join_remote(&self.remote.path, &entry.raw_name)
-        else {
+        let Some(remote_path) = transport::join_remote(&self.remote.path, &entry.raw_name) else {
             self.push_log(
                 LogLevel::Warn,
                 format!("cannot delete `{}`: unusable name", entry.display_name),
@@ -427,7 +422,11 @@ impl App {
             return;
         };
         let tx = self.app_event_tx.clone();
-        let label = if is_dir { "deleting folder" } else { "deleting" };
+        let label = if is_dir {
+            "deleting folder"
+        } else {
+            "deleting"
+        };
         self.push_log(LogLevel::Info, format!("{label}: {name}"));
         tokio::spawn(async move {
             let mut transport = t.lock().await;

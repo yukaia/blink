@@ -64,17 +64,16 @@ impl FtpsTransport {
                 .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth()
         } else {
-            let root_store = RootCertStore::from_iter(
-                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
-            );
+            let root_store =
+                RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             ClientConfig::builder()
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         };
 
-        let connector = AsyncRustlsConnector::from(
-            suppaftp::tokio_rustls::TlsConnector::from(Arc::new(config)),
-        );
+        let connector = AsyncRustlsConnector::from(suppaftp::tokio_rustls::TlsConnector::from(
+            Arc::new(config),
+        ));
         let mut stream = plain
             .into_secure(connector, &session.host)
             .await
@@ -147,10 +146,7 @@ mod pinning {
     }
 
     impl PinningVerifier {
-        pub fn new(
-            expected_pin: Option<String>,
-            captured_pin: Arc<Mutex<Option<String>>>,
-        ) -> Self {
+        pub fn new(expected_pin: Option<String>, captured_pin: Arc<Mutex<Option<String>>>) -> Self {
             let sig_algs = crypto::ring::default_provider().signature_verification_algorithms;
             Self {
                 expected_pin,
@@ -277,11 +273,8 @@ mod pinning {
         /// on Linux rather than waiting for someone to cross-compile.
         #[test]
         fn aws_lc_stays_out_of_the_dependency_graph() {
-            let lock = std::fs::read_to_string(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/Cargo.lock"
-            ))
-            .expect("Cargo.lock should be readable from the manifest dir");
+            let lock = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.lock"))
+                .expect("Cargo.lock should be readable from the manifest dir");
 
             for crate_name in ["aws-lc-sys", "aws-lc-rs"] {
                 assert!(

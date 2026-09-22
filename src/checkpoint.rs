@@ -143,7 +143,6 @@ pub enum JobStatus {
     Cancelled,
 }
 
-
 /// One entry in the persisted plan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -231,7 +230,6 @@ pub struct Checkpoint {
     pub jobs: Vec<CheckpointJob>,
 
     // ---- Runtime-only debouncing state (not serialised) -----------------
-
     /// True if there are unflushed mutations.
     #[serde(default, skip)]
     dirty: bool,
@@ -281,8 +279,7 @@ impl Checkpoint {
             use std::fmt::Write as _;
             let _ = write!(&mut suffix, "{b:02x}");
         }
-        Ok(paths::checkpoints_dir()?
-            .join(format!("{safe_name}-{suffix}-{}.json", kind.as_str())))
+        Ok(paths::checkpoints_dir()?.join(format!("{safe_name}-{suffix}-{}.json", kind.as_str())))
     }
 
     /// Atomically and durably write `content` to `path` via a `.tmp` sibling
@@ -517,10 +514,7 @@ impl Checkpoint {
         // Rewrite each job entry.
         if let Some(jobs) = doc.get_mut("jobs").and_then(|j| j.as_array_mut()) {
             for job in jobs.iter_mut() {
-                let done = job
-                    .get("done")
-                    .and_then(|d| d.as_bool())
-                    .unwrap_or(false);
+                let done = job.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
                 let status = if done { "done" } else { "pending" };
                 if let Value::Object(map) = job {
                     map.remove("done");
@@ -721,12 +715,7 @@ pub fn discard(session: &str, kind: CheckpointKind) -> Result<DiscardOutcome> {
 ///
 /// The first write is always owed — nothing has been persisted yet, and the
 /// plan has to reach disk before any transfer starts.
-fn write_due(
-    dirty: bool,
-    last_save: Option<Instant>,
-    now: Instant,
-    interval: Duration,
-) -> bool {
+fn write_due(dirty: bool, last_save: Option<Instant>, now: Instant, interval: Duration) -> bool {
     if !dirty {
         return false;
     }
@@ -776,7 +765,10 @@ pub struct DiscardOutcome {
 fn remove_orphan_parts(cp: &Checkpoint) -> DiscardOutcome {
     let mut outcome = DiscardOutcome::default();
     for job in &cp.jobs {
-        let CheckpointJob::Download { local_path, status, .. } = job else {
+        let CheckpointJob::Download {
+            local_path, status, ..
+        } = job
+        else {
             continue;
         };
         if *status == JobStatus::Done {
@@ -1088,7 +1080,10 @@ mod policy_tests {
             skipped: vec!["broken.ini: bad protocol".to_string()],
         }));
         assert!(!known.complete);
-        assert!(known.names.contains("prod"), "what did parse is still usable");
+        assert!(
+            known.names.contains("prod"),
+            "what did parse is still usable"
+        );
     }
 
     #[test]
@@ -1138,7 +1133,12 @@ mod debounce_tests {
     fn a_change_inside_the_interval_is_held_back() {
         let now = Instant::now();
         let just_wrote = now - Duration::from_millis(10);
-        assert!(!write_due(true, Some(just_wrote), now, CHECKPOINT_FLUSH_INTERVAL));
+        assert!(!write_due(
+            true,
+            Some(just_wrote),
+            now,
+            CHECKPOINT_FLUSH_INTERVAL
+        ));
     }
 
     #[test]
@@ -1152,7 +1152,12 @@ mod debounce_tests {
     fn the_interval_boundary_counts_as_due() {
         let now = Instant::now();
         let exactly = now - CHECKPOINT_FLUSH_INTERVAL;
-        assert!(write_due(true, Some(exactly), now, CHECKPOINT_FLUSH_INTERVAL));
+        assert!(write_due(
+            true,
+            Some(exactly),
+            now,
+            CHECKPOINT_FLUSH_INTERVAL
+        ));
     }
 
     /// The property the policy exists for, stated as a rate: a burst of
@@ -1188,8 +1193,7 @@ mod sweep_tests {
 
     /// A scratch directory holding real `.part` files for the sweep to find.
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("blink-sweep-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("blink-sweep-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -1212,7 +1216,9 @@ mod sweep_tests {
         // All three have a partial on disk; only the unfinished ones (pending
         // and in-progress) are orphaned.
         for j in [&unfinished, &in_progress, &finished] {
-            let CheckpointJob::Download { local_path, .. } = j else { unreachable!() };
+            let CheckpointJob::Download { local_path, .. } = j else {
+                unreachable!()
+            };
             std::fs::write(crate::transport::part_path(local_path), b"x").unwrap();
         }
         let cp = Checkpoint::new(
@@ -1263,7 +1269,9 @@ mod sweep_tests {
         let name = format!("blink-test-discard-{}", std::process::id());
         let _home = paths::test_home();
         let unfinished = job(&dir, "a.bin", JobStatus::Pending);
-        let CheckpointJob::Download { local_path, .. } = &unfinished else { unreachable!() };
+        let CheckpointJob::Download { local_path, .. } = &unfinished else {
+            unreachable!()
+        };
         std::fs::write(crate::transport::part_path(local_path), b"x").unwrap();
 
         let mut cp = Checkpoint::new(&name, CheckpointKind::Download, vec![unfinished]);
@@ -1310,10 +1318,10 @@ mod sweep_tests {
         // drop anyway; doing it now keeps the cleanup next to its reason.
         let _ = std::fs::remove_dir_all(&path);
 
-        let outcome =
-            result.expect("discard must return Ok, not propagate the removal failure");
+        let outcome = result.expect("discard must return Ok, not propagate the removal failure");
         assert_eq!(
-            outcome.failures.len(), 1,
+            outcome.failures.len(),
+            1,
             "the failed unlink must be recorded rather than silently dropped",
         );
     }
@@ -1367,15 +1375,15 @@ mod sweep_tests {
         // directory in /tmp on exactly the run where this test earns its keep.
         std::fs::set_permissions(&cp_dir, original).unwrap();
 
-        let outcome =
-            result.expect("discard must return Ok, not propagate the removal failure");
+        let outcome = result.expect("discard must return Ok, not propagate the removal failure");
 
         assert_eq!(
             outcome.parts_removed, 1,
             "the partial was already deleted — that count must survive the failed unlink",
         );
         assert_eq!(
-            outcome.failures.len(), 1,
+            outcome.failures.len(),
+            1,
             "and the failed unlink must still be reported",
         );
 
@@ -1489,7 +1497,10 @@ mod offer_tests {
 
         let offer = cp.to_offer(None);
 
-        assert_eq!(offer.sample_paths, vec!["/home/me/photos/a.cr2".to_string()]);
+        assert_eq!(
+            offer.sample_paths,
+            vec!["/home/me/photos/a.cr2".to_string()]
+        );
     }
 
     #[test]
@@ -1602,7 +1613,10 @@ mod offer_tests {
 
         let offer = cp.to_offer(None);
 
-        assert_eq!(offer.remaining, 2, "the pending mkdir plus the pending upload");
+        assert_eq!(
+            offer.remaining, 2,
+            "the pending mkdir plus the pending upload"
+        );
         assert_eq!(offer.total, 3, "all three jobs, the done mkdir included");
 
         // `source_path` reads the remote side for a `Mkdir`, so an upload
@@ -1688,7 +1702,10 @@ mod merge_tests {
         let mut cp = Checkpoint::new("s", CheckpointKind::Download, vec![dl(0), dl(1)]);
         cp.mark_cancelled(0);
 
-        assert!(!cp.jobs[0].needs_resume(), "a cancelled job must not resume");
+        assert!(
+            !cp.jobs[0].needs_resume(),
+            "a cancelled job must not resume"
+        );
         assert!(!cp.jobs[0].is_done(), "and must not count as completed");
         assert_eq!(cp.pending_count(), 1, "only the untouched job remains");
         assert_eq!(cp.done_count(), 0);
@@ -1707,8 +1724,7 @@ mod merge_tests {
         // v3 only adds a status value, so v2 files are valid v3 documents and
         // must keep loading — a checkpoint written by the previous release is
         // exactly what someone resumes after upgrading.
-        let dir = std::env::temp_dir()
-            .join(format!("blink-cp-v2-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("blink-cp-v2-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("v2.json");
         std::fs::write(

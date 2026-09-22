@@ -67,10 +67,7 @@ macro_rules! delegate_ftp_transport {
                 .await
             }
 
-            async fn delete_file(
-                &mut self,
-                remote_path: &str,
-            ) -> $crate::error::Result<()> {
+            async fn delete_file(&mut self, remote_path: &str) -> $crate::error::Result<()> {
                 $crate::transport::ftp_impl::check_ftp_path("dele", remote_path)?;
                 $crate::transport::ftp_impl::timed_ftp(
                     "dele",
@@ -108,11 +105,7 @@ macro_rules! delegate_ftp_transport {
                 &mut self,
                 remote_path: &str,
             ) -> $crate::error::Result<bytes::Bytes> {
-                $crate::transport::ftp_impl::ftp_read_to_bytes(
-                    &mut self.stream,
-                    remote_path,
-                )
-                .await
+                $crate::transport::ftp_impl::ftp_read_to_bytes(&mut self.stream, remote_path).await
             }
 
             async fn close(&mut self) -> $crate::error::Result<()> {
@@ -133,9 +126,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use bytes::Bytes;
+use suppaftp::FtpError;
 use suppaftp::list::ListParser;
 use suppaftp::tokio::{ImplAsyncFtpStream, TokioTlsStream};
-use suppaftp::FtpError;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -370,7 +363,12 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
         .map_err(|e| BlinkError::transport(format!("sync {}: {e}", part.display())))?;
     drop(local);
 
-    timed_ftp("finalize retr", remote_path, stream.finalize_retr_stream(reader)).await?;
+    timed_ftp(
+        "finalize retr",
+        remote_path,
+        stream.finalize_retr_stream(reader),
+    )
+    .await?;
 
     // Only rename once the server confirmed the transfer; otherwise a
     // truncated response could leave a corrupted "complete" file in place.
@@ -430,7 +428,13 @@ pub async fn ftp_upload<T: TokioTlsStream + Send>(
     // Move the fully-stored `.part` onto the final name. Whether RNTO
     // replaces an existing target is server-dependent: try the rename
     // first, and when it's refused, delete the target and retry once.
-    if let Err(first_err) = timed_ftp("rename", remote_path, stream.rename(part.as_str(), remote_path)).await {
+    if let Err(first_err) = timed_ftp(
+        "rename",
+        remote_path,
+        stream.rename(part.as_str(), remote_path),
+    )
+    .await
+    {
         // A dead control channel won't recover by retrying.
         if matches!(first_err, BlinkError::Disconnected(_)) {
             return Err(first_err);
@@ -440,7 +444,12 @@ pub async fn ftp_upload<T: TokioTlsStream + Send>(
             Err(BlinkError::NotFound(_)) => {}
             Err(e) => return Err(e),
         }
-        timed_ftp("rename", remote_path, stream.rename(part.as_str(), remote_path)).await?;
+        timed_ftp(
+            "rename",
+            remote_path,
+            stream.rename(part.as_str(), remote_path),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -648,9 +657,9 @@ pub async fn ftp_read_to_bytes<T: TokioTlsStream + Send + 'static>(
                     .map_err(suppaftp::FtpError::ConnectionError)?;
                 let reader = limited.into_inner();
                 if buf.len() as u64 > MAX_PREVIEW_BYTES {
-                    return Err(suppaftp::FtpError::ConnectionError(
-                        std::io::Error::other("file exceeds preview size limit"),
-                    ));
+                    return Err(suppaftp::FtpError::ConnectionError(std::io::Error::other(
+                        "file exceeds preview size limit",
+                    )));
                 }
                 Ok((buf, reader))
             })
@@ -1001,7 +1010,10 @@ mod integration {
                     {
                         let mut files = store.lock().await;
                         if cmd == "APPE" {
-                            files.entry(arg.clone()).or_default().extend_from_slice(&buf);
+                            files
+                                .entry(arg.clone())
+                                .or_default()
+                                .extend_from_slice(&buf);
                         } else {
                             files.insert(arg.clone(), buf);
                         }
@@ -1074,7 +1086,10 @@ mod integration {
         assert_eq!(transport.protocol(), Protocol::Ftp);
         assert_eq!(connects.load(Ordering::SeqCst), 1);
 
-        transport.close().await.expect("close should report success");
+        transport
+            .close()
+            .await
+            .expect("close should report success");
 
         // `close` discards `quit`'s result and returns `Ok(())`, so the call
         // above asserts nothing on its own — only the log shows QUIT went out.
@@ -1201,7 +1216,9 @@ mod integration {
         // how many arrived: the chunking that decides the count is not what
         // is under test, and would make this brittle for no gain.
         assert!(
-            updates.iter().all(|u| u.bytes_total == payload.len() as u64),
+            updates
+                .iter()
+                .all(|u| u.bytes_total == payload.len() as u64),
             "every update must carry SIZE's answer as the total; got {:?}",
             updates.iter().map(|u| u.bytes_total).collect::<Vec<_>>(),
         );
@@ -1247,7 +1264,11 @@ mod integration {
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
-        let meta = transport.metadata("/a.txt").await.unwrap().expect("present");
+        let meta = transport
+            .metadata("/a.txt")
+            .await
+            .unwrap()
+            .expect("present");
         assert_eq!(meta.size, 12);
     }
 
@@ -1271,19 +1292,17 @@ mod integration {
         // this test would silently exercise a fresh download instead, and
         // still pass: restarting from zero also lands the correct bytes.
         // That is why the REST assertion below is the real assertion.
-        std::fs::write(
-            crate::transport::part_path(&local),
-            &payload[..30_000],
-        )
-        .unwrap();
-        crate::transport::write_part_meta(&local, "/resume.bin", Some(payload.len() as u64))
-            .await;
+        std::fs::write(crate::transport::part_path(&local), &payload[..30_000]).unwrap();
+        crate::transport::write_part_meta(&local, "/resume.bin", Some(payload.len() as u64)).await;
 
         let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
-        transport.download("/resume.bin", &local, None).await.unwrap();
+        transport
+            .download("/resume.bin", &local, None)
+            .await
+            .unwrap();
 
         let got = std::fs::read(&local).unwrap();
         assert_eq!(got.len(), payload.len(), "resumed file must be whole");
@@ -1324,7 +1343,10 @@ mod integration {
         assert!(files.contains_key("/new.txt"), "rename should move the key");
         assert!(!files.contains_key("/old.txt"), "old name should be gone");
         assert_eq!(files.get("/new.txt").unwrap().as_slice(), b"body");
-        assert!(files.contains_key("/fresh/"), "mkdir should create a dir key");
+        assert!(
+            files.contains_key("/fresh/"),
+            "mkdir should create a dir key"
+        );
         assert!(!files.contains_key("/doomed.txt"), "delete should remove");
         assert!(!files.contains_key("/emptydir/"), "rmdir should remove");
         drop(files);
@@ -1620,7 +1642,9 @@ mod integration {
         let data_port = parse_pasv_port(&pasv_line);
 
         w.write_all(b"APPE /app.bin\r\n").await.unwrap();
-        with_timeout(lines.next_line(), "150 for APPE").await.unwrap(); // 150
+        with_timeout(lines.next_line(), "150 for APPE")
+            .await
+            .unwrap(); // 150
         let mut data = with_timeout(TcpStream::connect(("127.0.0.1", data_port)), "data connect")
             .await
             .unwrap();
@@ -1716,7 +1740,10 @@ mod integration {
     #[tokio::test]
     async fn a_malformed_pasv_reply_is_an_error_not_a_panic() {
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
-        store.lock().await.insert("/a.txt".to_string(), b"x".to_vec());
+        store
+            .lock()
+            .await
+            .insert("/a.txt".to_string(), b"x".to_vec());
 
         let faults = Faults {
             bad_pasv_octet: true,
@@ -1746,7 +1773,10 @@ mod integration {
     #[tokio::test]
     async fn an_unparsable_listing_line_becomes_no_entry_at_all() {
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
-        store.lock().await.insert("/a.txt".to_string(), b"x".to_vec());
+        store
+            .lock()
+            .await
+            .insert("/a.txt".to_string(), b"x".to_vec());
 
         let faults = Faults {
             unparsable_list_line: true,
@@ -1826,7 +1856,10 @@ mod integration {
             .and_then(|(_, rest)| rest.split_once(')'))
             .map(|(inner, _)| inner)
             .expect("PASV reply should carry a tuple");
-        let parts: Vec<u16> = inner.split(',').map(|p| p.trim().parse().unwrap()).collect();
+        let parts: Vec<u16> = inner
+            .split(',')
+            .map(|p| p.trim().parse().unwrap())
+            .collect();
         parts[4] * 256 + parts[5]
     }
 }

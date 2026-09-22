@@ -23,8 +23,8 @@ use crate::transfer::Direction;
 use crate::transport;
 use crate::tui::event::AppEvent;
 use crate::tui::plan::{
-    drop_conflicting, find_download_conflicts, find_upload_conflicts, safe_local_name, walk_local,
-    walk_remote, PlannedJob,
+    PlannedJob, drop_conflicting, find_download_conflicts, find_upload_conflicts, safe_local_name,
+    walk_local, walk_remote,
 };
 use crate::tui::state::OverwritePending;
 
@@ -124,17 +124,16 @@ impl App {
             // Phase 2: collect every destination directory mentioned by the
             // plan (the parent of each Upload job), then list each one once
             // and check for conflicts in O(dirs) round-trips.
-            let conflict_indices =
-                match find_upload_conflicts(&t, &plan).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = tx.send(AppEvent::WalkFailed {
-                            error: e.to_string(),
-                            kind: Direction::Upload,
-                        });
-                        return;
-                    }
-                };
+            let conflict_indices = match find_upload_conflicts(&t, &plan).await {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(AppEvent::WalkFailed {
+                        error: e.to_string(),
+                        kind: Direction::Upload,
+                    });
+                    return;
+                }
+            };
 
             let _ = tx.send(AppEvent::WalkComplete {
                 plan,

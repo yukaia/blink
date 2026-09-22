@@ -32,9 +32,17 @@ use crate::tui::app::SharedTransport;
 /// site rather than discovered at dispatch time.
 #[derive(Debug, Clone)]
 pub enum PlannedJob {
-    Mkdir { remote_path: String },
-    Download { remote_path: String, local_path: PathBuf },
-    Upload { local_path: PathBuf, remote_path: String },
+    Mkdir {
+        remote_path: String,
+    },
+    Download {
+        remote_path: String,
+        local_path: PathBuf,
+    },
+    Upload {
+        local_path: PathBuf,
+        remote_path: String,
+    },
 }
 
 /// Output of a recursive walk: the flat job plan plus a count of symlinks
@@ -212,8 +220,7 @@ pub async fn walk_remote(
                 );
                 continue;
             };
-            let Some(remote_child) = transport::join_remote(&remote_dir, &entry.raw_name)
-            else {
+            let Some(remote_child) = transport::join_remote(&remote_dir, &entry.raw_name) else {
                 tracing::warn!(
                     "skipping remote entry whose name cannot be joined: {:?}",
                     entry.display_name
@@ -287,9 +294,9 @@ pub async fn walk_local(local_root: &Path, remote_root: &str) -> Result<WalkResu
             remote_path: remote_dir.clone(),
         });
 
-        let mut read = tokio::fs::read_dir(&local_dir).await.map_err(|e| {
-            BlinkError::transport(format!("readdir {}: {e}", local_dir.display()))
-        })?;
+        let mut read = tokio::fs::read_dir(&local_dir)
+            .await
+            .map_err(|e| BlinkError::transport(format!("readdir {}: {e}", local_dir.display())))?;
 
         let mut subdirs: Vec<(PathBuf, String)> = Vec::new();
 
@@ -363,9 +370,10 @@ pub async fn find_download_conflicts(plan: &[PlannedJob]) -> Vec<usize> {
     let mut conflicts = Vec::new();
     for (i, job) in plan.iter().enumerate() {
         if let PlannedJob::Download { local_path, .. } = job
-            && tokio::fs::metadata(local_path).await.is_ok() {
-                conflicts.push(i);
-            }
+            && tokio::fs::metadata(local_path).await.is_ok()
+        {
+            conflicts.push(i);
+        }
     }
     conflicts
 }
@@ -526,8 +534,7 @@ mod tests {
 
     /// Unique scratch directory, removed by the caller.
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir()
-            .join(format!("blink-plan-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("blink-plan-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         dir
     }
@@ -554,7 +561,11 @@ mod tests {
             }
             // Only the root fans out; children are leaves, so the walk makes
             // exactly `fan_out + 1` gated listings.
-            let n = if remote_path == "/gated" { self.fan_out } else { 0 };
+            let n = if remote_path == "/gated" {
+                self.fan_out
+            } else {
+                0
+            };
             Ok((0..n)
                 .map(|i| {
                     transport::RemoteEntry::new(
@@ -625,13 +636,12 @@ mod tests {
     async fn a_walk_releases_the_connection_between_directories() {
         let root = scratch("gated");
         let (gate_tx, mut gate_rx) = tokio::sync::mpsc::unbounded_channel();
-        let shared: SharedTransport = std::sync::Arc::new(tokio::sync::Mutex::new(Box::new(
-            GatedTree {
+        let shared: SharedTransport =
+            std::sync::Arc::new(tokio::sync::Mutex::new(Box::new(GatedTree {
                 gates: gate_tx,
                 fan_out: 3,
-            },
-        )
-            as Box<dyn Transport>));
+            })
+                as Box<dyn Transport>));
 
         let walk_handle = {
             let shared = shared.clone();
@@ -693,7 +703,9 @@ mod tests {
         let root = scratch("small");
         let t = EmptyDirTree { fan_out: 0 };
 
-        let result = walk_remote(&shared(t), "/", &root).await.expect("must succeed");
+        let result = walk_remote(&shared(t), "/", &root)
+            .await
+            .expect("must succeed");
         assert!(result.plan.is_empty(), "no files means no jobs");
         assert_eq!(result.symlinks_skipped, 0);
 
@@ -719,15 +731,7 @@ mod tests {
             Ok(self
                 .names
                 .iter()
-                .map(|n| {
-                    transport::RemoteEntry::new(
-                        n.clone(),
-                        EntryKind::File,
-                        3,
-                        None,
-                        None,
-                    )
-                })
+                .map(|n| transport::RemoteEntry::new(n.clone(), EntryKind::File, 3, None, None))
                 .collect())
         }
 
@@ -894,7 +898,16 @@ mod tests {
 
     #[test]
     fn windows_rejects_reserved_device_names() {
-        for name in ["NUL", "nul", "CON", "aux", "COM1", "lpt9", "NUL.txt", "con.tar.gz"] {
+        for name in [
+            "NUL",
+            "nul",
+            "CON",
+            "aux",
+            "COM1",
+            "lpt9",
+            "NUL.txt",
+            "con.tar.gz",
+        ] {
             assert!(
                 safe_local_name_for(name, true).is_none(),
                 "expected {name:?} to be rejected on Windows"
@@ -1060,7 +1073,9 @@ mod tests {
     #[test]
     fn drop_conflicting_removes_only_listed_indices() {
         let plan = vec![
-            PlannedJob::Mkdir { remote_path: "/a".into() },
+            PlannedJob::Mkdir {
+                remote_path: "/a".into(),
+            },
             PlannedJob::Upload {
                 local_path: PathBuf::from("/local/a.txt"),
                 remote_path: "/a/a.txt".into(),
@@ -1073,7 +1088,9 @@ mod tests {
         let out = drop_conflicting(plan, &[1]);
         assert_eq!(out.len(), 2);
         assert!(matches!(&out[0], PlannedJob::Mkdir { remote_path } if remote_path == "/a"));
-        assert!(matches!(&out[1], PlannedJob::Upload { remote_path, .. } if remote_path == "/a/b.txt"));
+        assert!(
+            matches!(&out[1], PlannedJob::Upload { remote_path, .. } if remote_path == "/a/b.txt")
+        );
     }
 
     #[test]
@@ -1083,7 +1100,9 @@ mod tests {
         // is idempotent, and recalculating which mkdirs are still needed
         // would require another graph walk.
         let plan = vec![
-            PlannedJob::Mkdir { remote_path: "/a".into() },
+            PlannedJob::Mkdir {
+                remote_path: "/a".into(),
+            },
             PlannedJob::Upload {
                 local_path: PathBuf::from("/local/x"),
                 remote_path: "/a/x".into(),

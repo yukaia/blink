@@ -16,7 +16,7 @@ mod transport;
 mod tui;
 
 use crate::config::Config;
-use crate::error::{sanitize_display, Result};
+use crate::error::{Result, sanitize_display};
 use crate::theme::Theme;
 
 #[derive(Parser, Debug)]
@@ -112,9 +112,7 @@ async fn main() -> Result<()> {
             let session = session::Session::list_all()?
                 .into_iter()
                 .find(|s| s.name == name)
-                .ok_or_else(|| {
-                    crate::error::BlinkError::session_not_found(name.clone())
-                })?;
+                .ok_or_else(|| crate::error::BlinkError::session_not_found(name.clone()))?;
             // Loaded from disk — already saved.
             tui::run_with_session(config, theme, session, false).await
         }
@@ -154,10 +152,9 @@ fn remove_known_host(host: &str, port: u16) -> Result<()> {
 
 fn init_tracing() {
     use std::fs::OpenOptions;
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt};
 
-    let filter =
-        EnvFilter::try_from_env("BLINK_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
+    let filter = EnvFilter::try_from_env("BLINK_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
 
     // If BLINK_LOG_FILE is set, write logs there; otherwise discard them so
     // they don't smear the TUI. Example: BLINK_LOG_FILE=/tmp/blink.log BLINK_LOG=debug blink

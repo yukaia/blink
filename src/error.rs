@@ -206,7 +206,13 @@ pub(crate) fn sanitize(s: String) -> String {
 /// says.
 pub(crate) fn sanitize_line(s: &str) -> String {
     s.chars()
-        .map(|ch| if ch == '\t' || !is_unsafe_for_display(ch) { ch } else { ' ' })
+        .map(|ch| {
+            if ch == '\t' || !is_unsafe_for_display(ch) {
+                ch
+            } else {
+                ' '
+            }
+        })
         .collect()
 }
 
@@ -256,7 +262,10 @@ mod tests {
     fn sanitize_truncates_long_string() {
         let long = "a".repeat(MAX_ERR_CHARS + 100);
         let out = sanitize(long);
-        assert!(out.ends_with('…'), "truncated string must end with ellipsis");
+        assert!(
+            out.ends_with('…'),
+            "truncated string must end with ellipsis"
+        );
         assert!(out.chars().count() <= MAX_ERR_CHARS + 1);
     }
 
@@ -321,8 +330,8 @@ mod tests {
     #[test]
     fn sanitize_strips_every_bidi_formatter() {
         for ch in [
-            '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}',
-            '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+            '\u{061C}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}',
+            '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
         ] {
             let out = sanitize(format!("a{ch}b"));
             assert_eq!(out, "a b", "U+{:04X} must be neutralised", ch as u32);

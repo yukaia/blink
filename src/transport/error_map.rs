@@ -35,9 +35,7 @@ pub fn map_sftp(op: &str, path: &str, err: SftpError) -> BlinkError {
     match &err {
         SftpError::Status(s) => match s.status_code {
             StatusCode::NoSuchFile => BlinkError::not_found(format!("{op} {path}")),
-            StatusCode::PermissionDenied => {
-                BlinkError::permission(format!("{op} {path}"))
-            }
+            StatusCode::PermissionDenied => BlinkError::permission(format!("{op} {path}")),
             StatusCode::NoConnection | StatusCode::ConnectionLost => {
                 BlinkError::disconnected(format!("{op} {path}: {err}"))
             }
@@ -68,9 +66,7 @@ pub fn map_ftp(op: &str, path: &str, err: FtpError) -> BlinkError {
         }
         FtpError::UnexpectedResponse(r) => match r.status {
             FtpStatus::FileUnavailable => BlinkError::not_found(format!("{op} {path}")),
-            FtpStatus::NotLoggedIn => {
-                BlinkError::auth(format!("{op} {path}: {err}"))
-            }
+            FtpStatus::NotLoggedIn => BlinkError::auth(format!("{op} {path}: {err}")),
             _ => BlinkError::transport(format!("{op} {path}: {err}")),
         },
         _ => BlinkError::transport(format!("{op} {path}: {err}")),
@@ -193,7 +189,11 @@ mod tests {
 
     #[test]
     fn sftp_op_and_path_appear_in_message() {
-        let e = map_sftp("open", "/etc/secret", sftp_status(StatusCode::PermissionDenied));
+        let e = map_sftp(
+            "open",
+            "/etc/secret",
+            sftp_status(StatusCode::PermissionDenied),
+        );
         let msg = format!("{e}");
         assert!(msg.contains("open"), "{msg}");
         assert!(msg.contains("/etc/secret"), "{msg}");

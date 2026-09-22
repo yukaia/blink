@@ -53,14 +53,12 @@ fn apply_text_edit(buf: &mut String, key: &KeyEvent) -> bool {
 impl App {
     pub(super) fn handle_session_select(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Up
-                if self.session_cursor > 0 => {
-                    self.session_cursor -= 1;
-                }
-            KeyCode::Down
-                if self.session_cursor + 1 < self.sessions.len() => {
-                    self.session_cursor += 1;
-                }
+            KeyCode::Up if self.session_cursor > 0 => {
+                self.session_cursor -= 1;
+            }
+            KeyCode::Down if self.session_cursor + 1 < self.sessions.len() => {
+                self.session_cursor += 1;
+            }
             KeyCode::Enter => {
                 let Some(s) = self.sessions.get(self.session_cursor).cloned() else {
                     return;
@@ -178,9 +176,10 @@ impl App {
             _ => {
                 if let Some(f) = self.edit_session_form.as_mut()
                     && let Some(v) = f.current_value_mut()
-                        && apply_text_edit(v, &key) {
-                            f.error = None;
-                        }
+                    && apply_text_edit(v, &key)
+                {
+                    f.error = None;
+                }
             }
         }
     }
@@ -241,8 +240,7 @@ impl App {
                 // every keystroke, scattering fragments of the partial
                 // secret across the heap that no later zeroize can reach.
                 // `zeroize` clears the bytes and keeps the capacity.
-                let password =
-                    zeroize::Zeroizing::new(self.password_input.as_str().to_owned());
+                let password = zeroize::Zeroizing::new(self.password_input.as_str().to_owned());
                 self.password_input.zeroize();
                 self.pending_password = Some(password.clone());
                 self.start_connect(session, Some(password));
@@ -269,8 +267,7 @@ impl App {
                 if self.passphrase_input.is_empty() {
                     // Empty submit would just bounce off the same KeyNeedsPassphrase.
                     // Show a hint instead of round-tripping.
-                    self.passphrase_error =
-                        Some("enter the passphrase or [esc] to cancel".into());
+                    self.passphrase_error = Some("enter the passphrase or [esc] to cancel".into());
                     return;
                 }
                 let Some(session) = self.pending_session.clone() else {
@@ -278,8 +275,7 @@ impl App {
                     return;
                 };
                 // See the password prompt: copy out, wipe in place.
-                let passphrase =
-                    zeroize::Zeroizing::new(self.passphrase_input.as_str().to_owned());
+                let passphrase = zeroize::Zeroizing::new(self.passphrase_input.as_str().to_owned());
                 self.passphrase_input.zeroize();
                 self.passphrase_attempted = true;
                 self.passphrase_error = None;
@@ -301,30 +297,22 @@ impl App {
             KeyCode::Tab => self.cycle_pane(true),
             KeyCode::BackTab => self.cycle_pane(false),
             KeyCode::Up => match self.active_pane {
-                Pane::Local | Pane::Remote => {
-                    self.active_pane_mut().unwrap().move_cursor(-1)
-                }
+                Pane::Local | Pane::Remote => self.active_pane_mut().unwrap().move_cursor(-1),
                 Pane::Transfers => self.move_transfer_cursor(-1),
                 Pane::Log => {}
             },
             KeyCode::Down => match self.active_pane {
-                Pane::Local | Pane::Remote => {
-                    self.active_pane_mut().unwrap().move_cursor(1)
-                }
+                Pane::Local | Pane::Remote => self.active_pane_mut().unwrap().move_cursor(1),
                 Pane::Transfers => self.move_transfer_cursor(1),
                 Pane::Log => {}
             },
             KeyCode::PageUp => match self.active_pane {
-                Pane::Local | Pane::Remote => {
-                    self.active_pane_mut().unwrap().move_cursor(-10)
-                }
+                Pane::Local | Pane::Remote => self.active_pane_mut().unwrap().move_cursor(-10),
                 Pane::Transfers => self.move_transfer_cursor(-10),
                 Pane::Log => {}
             },
             KeyCode::PageDown => match self.active_pane {
-                Pane::Local | Pane::Remote => {
-                    self.active_pane_mut().unwrap().move_cursor(10)
-                }
+                Pane::Local | Pane::Remote => self.active_pane_mut().unwrap().move_cursor(10),
                 Pane::Transfers => self.move_transfer_cursor(10),
                 Pane::Log => {}
             },
@@ -379,24 +367,23 @@ impl App {
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.start_selected_uploads();
             }
-            KeyCode::F(2)
-                if self.active_pane == Pane::Remote => {
-                    self.open_rename();
-                }
-            KeyCode::F(7)
-                if self.active_pane == Pane::Remote => {
-                    self.open_mkdir();
-                }
-            KeyCode::Delete if key.modifiers.contains(KeyModifiers::SHIFT)
-                && self.active_pane == Pane::Remote => {
-                    self.open_delete();
-                }
+            KeyCode::F(2) if self.active_pane == Pane::Remote => {
+                self.open_rename();
+            }
+            KeyCode::F(7) if self.active_pane == Pane::Remote => {
+                self.open_mkdir();
+            }
+            KeyCode::Delete
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    && self.active_pane == Pane::Remote =>
+            {
+                self.open_delete();
+            }
             // 'D' (uppercase) as an alternative to Shift+Delete for terminals
             // that don't pass that combo cleanly.
-            KeyCode::Char('D')
-                if self.active_pane == Pane::Remote => {
-                    self.open_delete();
-                }
+            KeyCode::Char('D') if self.active_pane == Pane::Remote => {
+                self.open_delete();
+            }
             KeyCode::Char('p') => {
                 self.toggle_pause();
             }
@@ -414,10 +401,11 @@ impl App {
             KeyCode::F(5) => {
                 self.refresh_active_pane();
             }
-            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL)
-                && self.transport.is_some() => {
-                    self.screen = Screen::ConfirmDisconnect;
-                }
+            KeyCode::Char('x')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && self.transport.is_some() =>
+            {
+                self.screen = Screen::ConfirmDisconnect;
+            }
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.request_quit(Screen::Main);
             }
@@ -444,10 +432,7 @@ impl App {
                         match pc {
                             PendingCancel::Single { id, name } => {
                                 manager.cancel(id);
-                                self.push_log(
-                                    LogLevel::Warn,
-                                    format!("cancelled: {name}"),
-                                );
+                                self.push_log(LogLevel::Warn, format!("cancelled: {name}"));
                                 // Remove this job from the checkpoint map so a
                                 // subsequent resume re-queues it (it was never
                                 // completed, so it must not be skipped). The
@@ -459,8 +444,7 @@ impl App {
                                 // Collect before cancelling: the ids are what
                                 // tie the batch to its checkpoint entries.
                                 let batch_ids = manager.job_ids_in_batch(batch_id);
-                                let (active_n, pending_n) =
-                                    manager.cancel_batch(batch_id);
+                                let (active_n, pending_n) = manager.cancel_batch(batch_id);
                                 self.push_log(
                                     LogLevel::Warn,
                                     format!(
@@ -505,17 +489,16 @@ impl App {
             // t / T — trust once, don't save
             KeyCode::Char('t') | KeyCode::Char('T') => Some(HostKeyDecision::AcceptOnce),
             // n / N / Esc — reject
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                Some(HostKeyDecision::Reject)
-            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(HostKeyDecision::Reject),
             _ => None,
         };
 
         if let Some(decision) = decision {
             if let Some(mut phk) = self.pending_host_key.take()
-                && let Some(tx) = phk.decision_tx.take() {
-                    let _ = tx.send(decision);
-                }
+                && let Some(tx) = phk.decision_tx.take()
+            {
+                let _ = tx.send(decision);
+            }
             // Return to whatever the prompt interrupted, whichever way the
             // user answered.
             //
@@ -673,10 +656,7 @@ impl App {
                         self.reload_sessions();
                         self.save_session_error = None;
                         self.screen = Screen::Main;
-                        self.push_log(
-                            LogLevel::Success,
-                            format!("session saved: {name}"),
-                        );
+                        self.push_log(LogLevel::Success, format!("session saved: {name}"));
                     }
                     Err(e) => {
                         self.save_session_error = Some(e.to_string());
@@ -752,8 +732,7 @@ impl App {
     /// sweeps the batch's orphaned partials because the checkpoint is the
     /// only record of where they are.
     pub(super) fn handle_offer_resume_checkpoint(&mut self, key: KeyEvent) {
-        let Some(PostConnectOffer::ResumeCheckpoint(offer)) =
-            self.pending_offers.front().cloned()
+        let Some(PostConnectOffer::ResumeCheckpoint(offer)) = self.pending_offers.front().cloned()
         else {
             // Nothing queued — shouldn't happen, but don't strand the user.
             self.show_next_offer();

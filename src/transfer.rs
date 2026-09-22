@@ -128,13 +128,7 @@ impl TransferManager {
             paused: false,
             active: HashMap::new(),
         }));
-        (
-            Self {
-                inner,
-                events: tx,
-            },
-            rx,
-        )
+        (Self { inner, events: tx }, rx)
     }
 
     /// Adjust concurrency at runtime. New jobs honour the new limit; running
@@ -474,8 +468,7 @@ impl TransferManager {
                 .jobs
                 .iter()
                 .filter(|j| {
-                    j.batch_id == Some(batch_id)
-                        && matches!(j.state, TransferState::Active)
+                    j.batch_id == Some(batch_id) && matches!(j.state, TransferState::Active)
                 })
                 .map(|j| j.id)
                 .collect();
@@ -483,8 +476,7 @@ impl TransferManager {
                 .jobs
                 .iter()
                 .filter(|j| {
-                    j.batch_id == Some(batch_id)
-                        && matches!(j.state, TransferState::Pending)
+                    j.batch_id == Some(batch_id) && matches!(j.state, TransferState::Pending)
                 })
                 .map(|j| j.id)
                 .collect();
@@ -625,7 +617,9 @@ mod tests {
                 .unwrap();
             m.mark(id, TransferState::Complete);
         }
-        let running = m.enqueue_download("/live".into(), "/tmp/live".into()).unwrap();
+        let running = m
+            .enqueue_download("/live".into(), "/tmp/live".into())
+            .unwrap();
         m.mark(running, TransferState::Active);
 
         assert_eq!(m.active_jobs().len(), 1);
@@ -636,9 +630,14 @@ mod tests {
     fn batch_counts_splits_active_and_pending() {
         let m = manager();
         let batch = m.allocate_batch_id();
-        let a = m.enqueue_download_batched("/a".into(), "/tmp/a".into(), batch).unwrap();
-        let b = m.enqueue_download_batched("/b".into(), "/tmp/b".into(), batch).unwrap();
-        m.enqueue_download_batched("/c".into(), "/tmp/c".into(), batch).unwrap();
+        let a = m
+            .enqueue_download_batched("/a".into(), "/tmp/a".into(), batch)
+            .unwrap();
+        let b = m
+            .enqueue_download_batched("/b".into(), "/tmp/b".into(), batch)
+            .unwrap();
+        m.enqueue_download_batched("/c".into(), "/tmp/c".into(), batch)
+            .unwrap();
 
         m.mark(a, TransferState::Active);
         m.mark(b, TransferState::Complete);
@@ -652,9 +651,12 @@ mod tests {
         let m = manager();
         let mine = m.allocate_batch_id();
         let theirs = m.allocate_batch_id();
-        m.enqueue_download_batched("/a".into(), "/tmp/a".into(), mine).unwrap();
-        m.enqueue_download_batched("/b".into(), "/tmp/b".into(), theirs).unwrap();
-        m.enqueue_download("/loose".into(), "/tmp/loose".into()).unwrap();
+        m.enqueue_download_batched("/a".into(), "/tmp/a".into(), mine)
+            .unwrap();
+        m.enqueue_download_batched("/b".into(), "/tmp/b".into(), theirs)
+            .unwrap();
+        m.enqueue_download("/loose".into(), "/tmp/loose".into())
+            .unwrap();
 
         assert_eq!(m.batch_counts(mine), (0, 1));
         assert_eq!(m.batch_counts(theirs), (0, 1));

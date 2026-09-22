@@ -19,8 +19,8 @@
 //!
 //! Pause / resume gates new dispatches; in-flight workers complete naturally.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;

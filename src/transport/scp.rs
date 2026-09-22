@@ -111,10 +111,7 @@ macro_rules! delegate_inner_transport {
                 self.inner.rename(from, to).await
             }
 
-            async fn delete_file(
-                &mut self,
-                remote_path: &str,
-            ) -> $crate::error::Result<()> {
+            async fn delete_file(&mut self, remote_path: &str) -> $crate::error::Result<()> {
                 self.inner.delete_file(remote_path).await
             }
 

@@ -16,9 +16,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use zeroize::Zeroize;
 
-
 use crate::preview::{self, FileViewKind};
-use crate::transfer::{format_bytes, Direction, Dispatcher, TransferEvent, TransferManager};
+use crate::transfer::{Direction, Dispatcher, TransferEvent, TransferManager, format_bytes};
 use crate::tui::event::AppEvent;
 use crate::tui::state::{
     HostKeyChangedInfo, OverwritePending, PendingHostKey, PostConnectOffer, ViewerKind,
@@ -107,16 +106,15 @@ impl App {
                     .parallel_downloads
                     .unwrap_or(self.config.general.parallel_downloads);
                 let (manager, mut events_rx) = TransferManager::new(parallelism);
-                let dispatcher =
-                    Dispatcher::spawn(
-                        manager.clone(),
-                        session.clone(),
-                        password,
-                        self.app_event_tx.clone(),
-                        // Same store the initial connect used, so a
-                        // "trust once" is not re-asked per worker.
-                        self.pending_trust.clone(),
-                    );
+                let dispatcher = Dispatcher::spawn(
+                    manager.clone(),
+                    session.clone(),
+                    password,
+                    self.app_event_tx.clone(),
+                    // Same store the initial connect used, so a
+                    // "trust once" is not re-asked per worker.
+                    self.pending_trust.clone(),
+                );
 
                 // Forwarder: drain the dispatcher's event stream into the App
                 // event channel as `AppEvent::Transfer(...)`.
@@ -161,7 +159,8 @@ impl App {
                     self.push_log(
                         LogLevel::Warn,
                         "scp:// is routed through SFTP internally; \
-                         full file-manager operations are available".into(),
+                         full file-manager operations are available"
+                            .into(),
                     );
                 }
                 // Every other protocol tells the user something about how it
@@ -176,7 +175,8 @@ impl App {
                         LogLevel::Warn,
                         "ftp:// is unencrypted — credentials, file names and \
                          file contents are all sent in the clear. Use ftps:// \
-                         or sftp:// if the server offers it".into(),
+                         or sftp:// if the server offers it"
+                            .into(),
                     );
                 }
                 self.refresh_remote_pane(remote_dir);
@@ -218,10 +218,7 @@ impl App {
                     .set_entries(super::build_remote_pane_entries(&entries, &path));
             }
             AppEvent::ListFailed { path, error } => {
-                self.push_log(
-                    LogLevel::Error,
-                    format!("list {path} failed: {error}"),
-                );
+                self.push_log(LogLevel::Error, format!("list {path} failed: {error}"));
             }
             AppEvent::LocalListed { path, entries } => {
                 // Stale guard: user may have navigated again before the
@@ -261,10 +258,7 @@ impl App {
                 self.refresh_remote_pane(path);
             }
             AppEvent::RenameFailed { from, to: _, error } => {
-                self.push_log(
-                    LogLevel::Error,
-                    format!("rename {from} failed: {error}"),
-                );
+                self.push_log(LogLevel::Error, format!("rename {from} failed: {error}"));
             }
             AppEvent::MkdirDone { path } => {
                 let name = path
@@ -290,10 +284,7 @@ impl App {
                 self.refresh_remote_pane(path);
             }
             AppEvent::DeleteFailed { name, error } => {
-                self.push_log(
-                    LogLevel::Error,
-                    format!("delete {name} failed: {error}"),
-                );
+                self.push_log(LogLevel::Error, format!("delete {name} failed: {error}"));
             }
             AppEvent::WalkComplete {
                 plan,
@@ -303,7 +294,11 @@ impl App {
                 kind,
             } => {
                 if unencodable_skipped > 0 {
-                    let noun = if unencodable_skipped == 1 { "file" } else { "files" };
+                    let noun = if unencodable_skipped == 1 {
+                        "file"
+                    } else {
+                        "files"
+                    };
                     self.push_log(
                         LogLevel::Warn,
                         format!(
@@ -313,7 +308,11 @@ impl App {
                     );
                 }
                 if symlinks_skipped > 0 {
-                    let noun = if symlinks_skipped == 1 { "symlink" } else { "symlinks" };
+                    let noun = if symlinks_skipped == 1 {
+                        "symlink"
+                    } else {
+                        "symlinks"
+                    };
                     self.push_log(
                         LogLevel::Info,
                         format!("skipped {symlinks_skipped} {noun} during walk"),
@@ -351,58 +350,55 @@ impl App {
             AppEvent::ViewLoaded { name, kind, bytes } => {
                 let mut needs_redraw = false;
                 if let Some(viewer) = self.viewer.as_mut()
-                    && viewer.name == name {
-                        viewer.kind = match kind {
-                            FileViewKind::Text => {
-                                let text = if preview::is_nfo_file(&name) {
-                                    preview::decode_cp437(&bytes)
-                                } else {
-                                    String::from_utf8_lossy(&bytes).into_owned()
-                                };
-                                let lines: Vec<String> =
-                                    text.lines().map(crate::error::sanitize_line).collect();
-                                let tokens = super::viewer::tokenize_lines(&name, &lines);
-                                // `lines` is dropped here: the tokens carry
-                                // the same text, one Vec per line.
-                                ViewerKind::Text { tokens, scroll: 0 }
-                            }
-                            FileViewKind::Image => {
-                                // Only enter Image state if a graphics backend
-                                // is available; otherwise show a useful
-                                // explanation in the viewer.
-                                let proto = preview::detect(
-                                    self.config.terminal.image_preview,
-                                );
-                                if matches!(proto, preview::GraphicsProtocol::None)
-                                    || preview::backend_for(proto).is_none()
-                                {
-                                    let term = std::env::var("TERM")
-                                        .unwrap_or_else(|_| "<unset>".into());
-                                    ViewerKind::Unsupported(format!(
-                                        "no supported graphics protocol \
+                    && viewer.name == name
+                {
+                    viewer.kind = match kind {
+                        FileViewKind::Text => {
+                            let text = if preview::is_nfo_file(&name) {
+                                preview::decode_cp437(&bytes)
+                            } else {
+                                String::from_utf8_lossy(&bytes).into_owned()
+                            };
+                            let lines: Vec<String> =
+                                text.lines().map(crate::error::sanitize_line).collect();
+                            let tokens = super::viewer::tokenize_lines(&name, &lines);
+                            // `lines` is dropped here: the tokens carry
+                            // the same text, one Vec per line.
+                            ViewerKind::Text { tokens, scroll: 0 }
+                        }
+                        FileViewKind::Image => {
+                            // Only enter Image state if a graphics backend
+                            // is available; otherwise show a useful
+                            // explanation in the viewer.
+                            let proto = preview::detect(self.config.terminal.image_preview);
+                            if matches!(proto, preview::GraphicsProtocol::None)
+                                || preview::backend_for(proto).is_none()
+                            {
+                                let term =
+                                    std::env::var("TERM").unwrap_or_else(|_| "<unset>".into());
+                                ViewerKind::Unsupported(format!(
+                                    "no supported graphics protocol \
                                          (TERM={term}). \
                                          supported: kitty, ghostty, wezterm, iterm2"
-                                    ))
-                                } else {
-                                    needs_redraw = true;
-                                    ViewerKind::Image { bytes }
-                                }
+                                ))
+                            } else {
+                                needs_redraw = true;
+                                ViewerKind::Image { bytes }
                             }
-                            FileViewKind::Unsupported(reason) => {
-                                ViewerKind::Unsupported(reason)
-                            }
-                        };
-                    }
+                        }
+                        FileViewKind::Unsupported(reason) => ViewerKind::Unsupported(reason),
+                    };
+                }
                 if needs_redraw {
                     self.image_needs_redraw = true;
                 }
             }
             AppEvent::ViewFailed { name, error } => {
                 if let Some(viewer) = self.viewer.as_mut()
-                    && viewer.name == name {
-                        viewer.kind =
-                            ViewerKind::Unsupported(format!("read failed: {error}"));
-                    }
+                    && viewer.name == name
+                {
+                    viewer.kind = ViewerKind::Unsupported(format!("read failed: {error}"));
+                }
                 self.push_log(LogLevel::Error, format!("view {name} failed: {error}"));
             }
             AppEvent::Transfer(ev) => self.handle_transfer_event(ev),
@@ -488,12 +484,13 @@ impl App {
                 // says `pending`) — which is the same safe outcome as a
                 // crash mid-transfer, just at a different moment.
                 if let Some((kind, cp_idx)) = self.checkpoint_job_map.get(&id).copied()
-                    && let Some(cp) = self.active_checkpoints.get_mut(&kind) {
-                        cp.mark_in_progress(cp_idx);
-                        if let Err(e) = cp.flush_if_due() {
-                            tracing::warn!(id, cp_idx, "checkpoint in_progress flush failed: {e}");
-                        }
+                    && let Some(cp) = self.active_checkpoints.get_mut(&kind)
+                {
+                    cp.mark_in_progress(cp_idx);
+                    if let Err(e) = cp.flush_if_due() {
+                        tracing::warn!(id, cp_idx, "checkpoint in_progress flush failed: {e}");
                     }
+                }
                 if let Some(j) = self.job_lookup(id) {
                     // Say what the job actually is: every started job used to
                     // announce itself as a download, including uploads and

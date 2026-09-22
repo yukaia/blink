@@ -259,9 +259,7 @@ impl Session {
         if let AuthMethod::Key { path } = &self.auth
             && !path.is_absolute()
         {
-            return Err(BlinkError::config(
-                "auth.key_path must be an absolute path",
-            ));
+            return Err(BlinkError::config("auth.key_path must be an absolute path"));
         }
 
         // Out of range here would reach `TransferManager::new` as the
@@ -457,9 +455,7 @@ impl Session {
                     })?;
                     let p = PathBuf::from(key_path);
                     if !p.is_absolute() {
-                        return Err(BlinkError::config(
-                            "auth.key_path must be an absolute path",
-                        ));
+                        return Err(BlinkError::config("auth.key_path must be an absolute path"));
                     }
                     AuthMethod::Key { path: p }
                 }
@@ -467,7 +463,7 @@ impl Session {
                 _ => {
                     return Err(BlinkError::config(
                         "auth.method must be one of: password, key, agent",
-                    ))
+                    ));
                 }
             },
             None => AuthMethod::Password,
@@ -500,10 +496,7 @@ impl Session {
                 clamped
             });
 
-        let theme = match ini
-            .section(Some("appearance"))
-            .and_then(|s| s.get("theme"))
-        {
+        let theme = match ini.section(Some("appearance")).and_then(|s| s.get("theme")) {
             Some(v) => {
                 config::validate_theme_name(v)?;
                 Some(v.to_string())
@@ -606,10 +599,11 @@ impl Session {
         // common case where the name maps uniquely to its sanitized filename.
         let candidate = dir.join(Self::name_to_filename(name));
         if let Ok(s) = Self::load_from(&candidate)
-            && s.name == name {
-                fs::remove_file(&candidate)?;
-                return Ok(());
-            }
+            && s.name == name
+        {
+            fs::remove_file(&candidate)?;
+            return Ok(());
+        }
 
         // Fallback scan: needed when two distinct names produce the same
         // sanitized filename (e.g. "my session" and "my_session").
@@ -623,10 +617,11 @@ impl Session {
                 continue;
             }
             if let Ok(s) = Self::load_from(&path)
-                && s.name == name {
-                    fs::remove_file(&path)?;
-                    return Ok(());
-                }
+                && s.name == name
+            {
+                fs::remove_file(&path)?;
+                return Ok(());
+            }
         }
         Err(BlinkError::session_not_found(name))
     }
@@ -681,9 +676,11 @@ impl Session {
 
         let (host, port) = if hostport.starts_with('[') {
             // Bracketed IPv6 literal: [::1] or [::1]:22
-            let close = hostport
-                .find(']')
-                .ok_or_else(|| BlinkError::config("unclosed '[' in host — IPv6 addresses must use [::1]:port notation"))?;
+            let close = hostport.find(']').ok_or_else(|| {
+                BlinkError::config(
+                    "unclosed '[' in host — IPv6 addresses must use [::1]:port notation",
+                )
+            })?;
             let ip = &hostport[1..close];
             let after = &hostport[close + 1..];
             let port = if after.is_empty() {
@@ -774,17 +771,17 @@ fn percent_decode(s: &str, field: &str) -> Result<String> {
                 "incomplete percent-escape in {field}"
             )));
         }
-        let hi = hex_digit(bytes[i + 1]).ok_or_else(|| {
-            BlinkError::config(format!("invalid percent-escape in {field}"))
-        })?;
-        let lo = hex_digit(bytes[i + 2]).ok_or_else(|| {
-            BlinkError::config(format!("invalid percent-escape in {field}"))
-        })?;
+        let hi = hex_digit(bytes[i + 1])
+            .ok_or_else(|| BlinkError::config(format!("invalid percent-escape in {field}")))?;
+        let lo = hex_digit(bytes[i + 2])
+            .ok_or_else(|| BlinkError::config(format!("invalid percent-escape in {field}")))?;
         out.push((hi << 4) | lo);
         i += 3;
     }
     String::from_utf8(out).map_err(|_| {
-        BlinkError::config(format!("percent-escape decodes to invalid UTF-8 in {field}"))
+        BlinkError::config(format!(
+            "percent-escape decodes to invalid UTF-8 in {field}"
+        ))
     })
 }
 
@@ -1000,7 +997,10 @@ mod tests {
         // Anything `from_url` accepts must survive `validate()`, or the same
         // gap reopens the next time a field is added.
         let s = Session::from_url("sftp://bob@example.com:2222/var/www").unwrap();
-        assert!(s.validate().is_ok(), "from_url built a session validate() rejects");
+        assert!(
+            s.validate().is_ok(),
+            "from_url built a session validate() rejects"
+        );
     }
 
     #[test]
@@ -1091,7 +1091,9 @@ mod tests {
     #[test]
     fn validate_rejects_relative_key_path() {
         let mut s = valid();
-        s.auth = AuthMethod::Key { path: PathBuf::from("id_ed25519") };
+        s.auth = AuthMethod::Key {
+            path: PathBuf::from("id_ed25519"),
+        };
         assert!(s.validate().is_err());
     }
 
@@ -1153,8 +1155,7 @@ mod tests {
 
     /// Write `body` as a session file and load it back.
     fn load_written(tag: &str, body: &str) -> Result<Session> {
-        let dir = std::env::temp_dir()
-            .join(format!("blink-session-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("blink-session-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s.ini");
         std::fs::write(&path, body).unwrap();
@@ -1286,17 +1287,21 @@ mod tests {
             .set("port", s.port.to_string())
             .set("username", &s.username)
             .set("remote_dir", &s.remote_dir)
-            .set("local_dir", s.local_dir.as_ref().unwrap().display().to_string());
+            .set(
+                "local_dir",
+                s.local_dir.as_ref().unwrap().display().to_string(),
+            );
         ini.with_section(Some("auth")).set("method", "password");
-        ini.with_section(Some("transfer")).set("parallel_downloads", "4");
-        ini.with_section(Some("appearance")).set("theme", "tokyo-night");
+        ini.with_section(Some("transfer"))
+            .set("parallel_downloads", "4");
+        ini.with_section(Some("appearance"))
+            .set("theme", "tokyo-night");
 
         let mut buf: Vec<u8> = Vec::new();
         ini.write_to(&mut buf).unwrap();
         let raw = String::from_utf8(buf).unwrap();
 
-        let dir = std::env::temp_dir()
-            .join(format!("blink-session-rt-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("blink-session-rt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("rt.ini");
         std::fs::write(&path, raw).unwrap();

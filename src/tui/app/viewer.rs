@@ -15,9 +15,9 @@ use ratatui::layout::Rect;
 
 use crate::preview::{self, FileViewKind};
 use crate::transport;
+use crate::tui::TuiTerminal;
 use crate::tui::event::AppEvent;
 use crate::tui::state::{ViewSource, Viewer, ViewerKind};
-use crate::tui::TuiTerminal;
 
 use super::{App, LogLevel, Pane, Screen};
 
@@ -61,10 +61,7 @@ impl App {
         // image, and it has to be the extension the file actually has.
         let kind = preview::detect_view_kind(&raw_name, size);
         if let FileViewKind::Unsupported(reason) = &kind {
-            self.push_log(
-                LogLevel::Warn,
-                format!("can't view {name}: {reason}"),
-            );
+            self.push_log(LogLevel::Warn, format!("can't view {name}: {reason}"));
             return;
         }
 
@@ -102,9 +99,7 @@ impl App {
                     self.screen = self.previous_screen.clone();
                     return;
                 };
-                let Some(remote_path) =
-                    transport::join_remote(&self.remote.path, &raw_name)
-                else {
+                let Some(remote_path) = transport::join_remote(&self.remote.path, &raw_name) else {
                     self.viewer = None;
                     self.screen = self.previous_screen.clone();
                     self.push_log(
@@ -130,19 +125,21 @@ impl App {
 
     pub(super) fn viewer_scroll(&mut self, delta: isize) {
         if let Some(viewer) = self.viewer.as_mut()
-            && let ViewerKind::Text { tokens, scroll } = &mut viewer.kind {
-                let max = tokens.len().saturating_sub(1);
-                let next = (*scroll as isize + delta).max(0) as usize;
-                *scroll = next.min(max);
-            }
+            && let ViewerKind::Text { tokens, scroll } = &mut viewer.kind
+        {
+            let max = tokens.len().saturating_sub(1);
+            let next = (*scroll as isize + delta).max(0) as usize;
+            *scroll = next.min(max);
+        }
     }
 
     pub(super) fn viewer_scroll_to(&mut self, target: usize) {
         if let Some(viewer) = self.viewer.as_mut()
-            && let ViewerKind::Text { tokens, scroll } = &mut viewer.kind {
-                let max = tokens.len().saturating_sub(1);
-                *scroll = target.min(max);
-            }
+            && let ViewerKind::Text { tokens, scroll } = &mut viewer.kind
+        {
+            let max = tokens.len().saturating_sub(1);
+            *scroll = target.min(max);
+        }
     }
 
     /// Called after each `terminal.draw` to emit graphics escape sequences

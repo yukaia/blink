@@ -465,7 +465,10 @@ pub(crate) mod mock {
                 parent = "/";
             }
             self.dirs.lock().unwrap().push(parent.to_string());
-            self.files.lock().unwrap().insert(path.to_string(), contents.to_vec());
+            self.files
+                .lock()
+                .unwrap()
+                .insert(path.to_string(), contents.to_vec());
             self
         }
     }
@@ -495,16 +498,18 @@ pub(crate) mod mock {
             for path in files.keys() {
                 if let Some(rest) = path.strip_prefix(&p)
                     && let Some(name) = rest.split('/').next()
-                    && !name.is_empty() {
-                        entries.insert(name.to_string());
-                    }
+                    && !name.is_empty()
+                {
+                    entries.insert(name.to_string());
+                }
             }
             for dir in dirs.iter() {
                 if let Some(rest) = dir.strip_prefix(&p)
                     && let Some(name) = rest.split('/').next()
-                    && !name.is_empty() {
-                        entries.insert(name.to_string());
-                    }
+                    && !name.is_empty()
+                {
+                    entries.insert(name.to_string());
+                }
             }
 
             let mut out = Vec::new();
@@ -542,14 +547,9 @@ pub(crate) mod mock {
         ) -> Result<()> {
             let data = {
                 let files = self.files.lock().unwrap();
-                files
-                    .get(remote_path)
-                    .cloned()
-                    .ok_or_else(|| {
-                        crate::error::BlinkError::transport(format!(
-                            "file not found: {remote_path}"
-                        ))
-                    })?
+                files.get(remote_path).cloned().ok_or_else(|| {
+                    crate::error::BlinkError::transport(format!("file not found: {remote_path}"))
+                })?
             };
             if let Some(parent) = local_path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
@@ -599,9 +599,10 @@ pub(crate) mod mock {
             let mut dirs = self.dirs.lock().unwrap();
             if recursive {
                 dirs.retain(|d| !d.starts_with(remote_path));
-                self.files.lock().unwrap().retain(|k, _| {
-                    !k.starts_with(remote_path)
-                });
+                self.files
+                    .lock()
+                    .unwrap()
+                    .retain(|k, _| !k.starts_with(remote_path));
             } else {
                 dirs.retain(|d| d != remote_path);
             }
@@ -609,10 +610,7 @@ pub(crate) mod mock {
         }
 
         async fn mkdir(&mut self, remote_path: &str) -> Result<()> {
-            self.dirs
-                .lock()
-                .unwrap()
-                .push(remote_path.to_string());
+            self.dirs.lock().unwrap().push(remote_path.to_string());
             Ok(())
         }
 
@@ -657,9 +655,7 @@ pub(crate) mod mock {
                 .cloned()
                 .map(Bytes::from)
                 .ok_or_else(|| {
-                    crate::error::BlinkError::transport(format!(
-                        "file not found: {remote_path}"
-                    ))
+                    crate::error::BlinkError::transport(format!("file not found: {remote_path}"))
                 })
         }
 
@@ -690,7 +686,12 @@ mod tests {
 
     #[test]
     fn resumes_a_partial_of_the_same_remote_file() {
-        let d = decide_resume(Some(4_000), Some(&meta("/a/report.pdf", Some(9_000))), "/a/report.pdf", Some(9_000));
+        let d = decide_resume(
+            Some(4_000),
+            Some(&meta("/a/report.pdf", Some(9_000))),
+            "/a/report.pdf",
+            Some(9_000),
+        );
         assert_eq!(d, ResumeDecision::Resume(4_000));
     }
 
@@ -699,8 +700,17 @@ mod tests {
         // The bug this exists for: same local name, different source. The
         // old code appended file B onto file A's bytes and renamed the
         // result into place as a completed download.
-        let d = decide_resume(Some(4_000), Some(&meta("/a/report.pdf", Some(9_000))), "/b/report.pdf", Some(9_000));
-        assert_eq!(d, ResumeDecision::Fresh, "a partial of another file must not be resumed");
+        let d = decide_resume(
+            Some(4_000),
+            Some(&meta("/a/report.pdf", Some(9_000))),
+            "/b/report.pdf",
+            Some(9_000),
+        );
+        assert_eq!(
+            d,
+            ResumeDecision::Fresh,
+            "a partial of another file must not be resumed"
+        );
     }
 
     #[test]
@@ -714,13 +724,23 @@ mod tests {
     #[test]
     fn restarts_when_the_remote_file_changed_size_since_the_partial() {
         // Same path, but the file was replaced between attempts.
-        let d = decide_resume(Some(4_000), Some(&meta("/a/report.pdf", Some(9_000))), "/a/report.pdf", Some(12_000));
+        let d = decide_resume(
+            Some(4_000),
+            Some(&meta("/a/report.pdf", Some(9_000))),
+            "/a/report.pdf",
+            Some(12_000),
+        );
         assert_eq!(d, ResumeDecision::Fresh);
     }
 
     #[test]
     fn restarts_when_the_partial_is_longer_than_the_remote_file() {
-        let d = decide_resume(Some(20_000), Some(&meta("/a/report.pdf", Some(9_000))), "/a/report.pdf", Some(9_000));
+        let d = decide_resume(
+            Some(20_000),
+            Some(&meta("/a/report.pdf", Some(9_000))),
+            "/a/report.pdf",
+            Some(9_000),
+        );
         assert_eq!(d, ResumeDecision::Fresh);
     }
 
@@ -739,19 +759,34 @@ mod tests {
         // staleness check entirely and resumed unconditionally. Identity is
         // checked independently of size, so this is now safe — and a
         // mismatched path is still refused (next test).
-        let d = decide_resume(Some(4_000), Some(&meta("/a/report.pdf", None)), "/a/report.pdf", None);
+        let d = decide_resume(
+            Some(4_000),
+            Some(&meta("/a/report.pdf", None)),
+            "/a/report.pdf",
+            None,
+        );
         assert_eq!(d, ResumeDecision::Resume(4_000));
     }
 
     #[test]
     fn restarts_with_an_unknown_remote_size_when_provenance_differs() {
-        let d = decide_resume(Some(4_000), Some(&meta("/a/report.pdf", None)), "/b/report.pdf", None);
+        let d = decide_resume(
+            Some(4_000),
+            Some(&meta("/a/report.pdf", None)),
+            "/b/report.pdf",
+            None,
+        );
         assert_eq!(d, ResumeDecision::Fresh);
     }
 
     #[test]
     fn empty_partial_starts_fresh() {
-        let d = decide_resume(Some(0), Some(&meta("/a/report.pdf", Some(9_000))), "/a/report.pdf", Some(9_000));
+        let d = decide_resume(
+            Some(0),
+            Some(&meta("/a/report.pdf", Some(9_000))),
+            "/a/report.pdf",
+            Some(9_000),
+        );
         assert_eq!(d, ResumeDecision::Fresh, "nothing to resume from");
     }
 
@@ -792,17 +827,26 @@ mod tests {
     // join_remote
     #[test]
     fn join_appends_name() {
-        assert_eq!(join_remote("/home/user", "file.txt").as_deref(), Some("/home/user/file.txt"));
+        assert_eq!(
+            join_remote("/home/user", "file.txt").as_deref(),
+            Some("/home/user/file.txt")
+        );
     }
 
     #[test]
     fn join_trailing_slash_base() {
-        assert_eq!(join_remote("/home/user/", "file.txt").as_deref(), Some("/home/user/file.txt"));
+        assert_eq!(
+            join_remote("/home/user/", "file.txt").as_deref(),
+            Some("/home/user/file.txt")
+        );
     }
 
     #[test]
     fn join_strips_leading_slash_from_name() {
-        assert_eq!(join_remote("/srv", "/etc/shadow").as_deref(), Some("/srv/etc/shadow"));
+        assert_eq!(
+            join_remote("/srv", "/etc/shadow").as_deref(),
+            Some("/srv/etc/shadow")
+        );
     }
 
     // Returning the base unchanged made "rejected" indistinguishable from a
@@ -966,4 +1010,3 @@ mod tests {
         assert!(m.metadata("/nope").await.unwrap().is_none());
     }
 }
-
