@@ -490,6 +490,10 @@ The full list lives in the in-app help overlay (`?`). Highlights:
 
 In the session selector: `n` new, `e` edit, `d` delete, `t` cycle theme.
 
+In the viewer: `↑` / `↓` or `k` / `j` scroll a line, `PgUp` / `PgDn` (or
+`space`) scroll a page, `Home` / `g` and `End` / `G` jump to the top and
+bottom, and `q` / `esc` close it.
+
 ## Supported viewer formats
 
 `v` opens the in-app viewer for the cursor item. Whether a file is recognised
@@ -555,6 +559,7 @@ src/
 ├── transport/           connection layer
 │   ├── mod.rs           Transport trait + factory + Connected struct + part_path / part_meta_path + resume provenance (decide_resume)
 │   ├── sftp.rs          SFTP via russh + russh-sftp (SSH keepalive, rsa-sha2-512)
+│   ├── sftp_test_keys.rs  test-only: published throwaway host/client keys for the in-process SFTP server — not secrets
 │   ├── scp.rs           transparent SFTP wrapper (matches OpenSSH 9.0+); delegates via the delegate_inner_transport! macro
 │   ├── ftp.rs           FTP via suppaftp tokio backend
 │   ├── ftps.rs          FTPS via suppaftp + rustls; pinning verifier (hostname + signature + cert pin)
@@ -704,9 +709,13 @@ Applied to:
   very wide tree of *empty* directories would otherwise expand the walk
   (and create local directories) without ever tripping the job cap.
 - **SFTP recursive delete unlinks symlinks rather than following them.**
-  Some SFTP servers report symlink-to-directory entries with both
-  `is_dir` and `is_symlink` set; a recursive `delete_dir(true)` that
-  followed those could delete files outside the chosen subtree.
+  A recursive `delete_dir(true)` that recursed through a symlink to a
+  directory would delete files outside the chosen subtree — possibly
+  outside the connection's chroot. Only a real directory is recursed into;
+  symlinks, sockets and devices are unlinked as leaves. Entries are
+  classified by comparing the whole file-type field of their mode, not by
+  testing individual bits: the POSIX type codes overlap, so a bit test
+  reads a socket or block device as a directory.
 - **Password-in-URL is rejected.** `sftp://alice:hunter2@host/` errors
   with a pointer at the interactive prompt rather than smuggling the
   password into the username field and into shell history.
@@ -896,8 +905,6 @@ and do not affect blink's MIT license except where noted.
 | [tracing-subscriber](https://github.com/tokio-rs/tracing) | Tokio contributors | Log sink / filter |
 | [bytes](https://github.com/tokio-rs/bytes) | Tokio contributors | Byte buffer utilities |
 | [rust-ini](https://github.com/zonyitoo/rust-ini) | Y. T. | INI config parser |
-| [icy_sixel](https://github.com/nickel-lang/icy_sixel) | Mike Krüger | Sixel image encoding |
-| [parking_lot](https://github.com/Amanieu/parking_lot) | Amanieu d'Antras | Faster synchronisation primitives |
 
 ### MIT OR Apache-2.0
 
@@ -917,15 +924,17 @@ and do not affect blink's MIT license except where noted.
 | [chrono](https://github.com/chronotope/chrono) | chronotope contributors | Date / time formatting |
 | [sha2](https://github.com/RustCrypto/hashes) | RustCrypto contributors | SHA-256 for known-hosts disambiguation and FTPS cert pins |
 | [zeroize](https://github.com/RustCrypto/utils/tree/master/zeroize) | RustCrypto contributors | Wipe in-memory passwords on drop |
+| [icy_sixel](https://github.com/mkrueger/icy_sixel) | Mike Krüger | Sixel image encoding |
+| [parking_lot](https://github.com/Amanieu/parking_lot) | Amanieu d'Antras | Faster synchronisation primitives |
 
 ### Apache-2.0
 
 | Crate | Author(s) | Use in blink |
 | ----- | --------- | ------------ |
-| [russh](https://github.com/Eugeny/russh) | Eugeny, Pierre-Étienne Meunier | SSH transport (SFTP / SCP) |
-| [russh-sftp](https://github.com/Eugeny/russh) | Eugeny | SFTP protocol layer |
+| [russh](https://github.com/warp-tech/russh) | Eugeny, Pierre-Étienne Meunier | SSH transport (SFTP / SCP) |
+| [russh-sftp](https://github.com/AspectUnk/russh-sftp) | AspectUnk | SFTP protocol layer |
 
-### Mozilla Public License 2.0 (MPL-2.0)
+### Community Data License Agreement – Permissive 2.0 (CDLA-Permissive-2.0)
 
 | Crate | Author(s) | Use in blink |
 | ----- | --------- | ------------ |

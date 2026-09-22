@@ -108,6 +108,32 @@ the git history for those.
   entries, so the walk's bottom-up order is enforced by the server rather than
   merely asserted. 430 tests -> 439.
 
+- **RSA and ECDSA are covered, for host keys and client key auth.** The SFTP
+  harness authenticated with a password only, so `AuthMethod::Key` had never
+  run against a server, and the `rsa-sha2-512` negotiation the README lists
+  as enforced was unreachable from any test. The harness now serves RSA and
+  ECDSA host keys and verifies public-key auth; the keys are published test
+  fixtures in `src/transport/sftp_test_keys.rs`, not secrets.
+
+- **The sixel encoder is tested by a round trip.** Its output is decoded back
+  and bounded against what was encoded (mean RGB error under 10/255), so an
+  `icy_sixel` bump no longer ends in a manual look at a terminal.
+
+- **The FTP harness answers like a daemon when a transfer is cut short.** An
+  early-closed data connection now gets `426` with the control connection
+  kept open, instead of ending the whole session; and a new fault resets the
+  data connection mid-transfer, which is what exercises the preview fix
+  above.
+
+- **Formatting is rustfmt's defaults.** The tree was hand-wrapped and no
+  configuration reproduced that wrapping, so it was reformatted once with a
+  `rustfmt.toml` pinning the 2024 style. That commit is listed in
+  `.git-blame-ignore-revs`; GitHub applies it automatically, and a local clone
+  opts in with `git config blame.ignoreRevsFile .git-blame-ignore-revs`.
+  Nothing enforces formatting, so run `cargo fmt` before committing.
+
+- The suite stands at 447 tests.
+
 ### Changed
 
 - **Semver-compatible sweep across the rest of the graph** (`cargo update`,
@@ -125,6 +151,33 @@ the git history for those.
   Only suppaftp needed code, two lines. The sixel encoder is now checked by
   a round-trip test rather than by eye, so this bump did not end in a
   manual check.
+
+### Documentation
+
+- The README said some SFTP servers report a symlink with both the symlink
+  and directory bits set. None can: the POSIX type codes make that
+  combination impossible for a well-formed symlink. The Path-safety section
+  now gives the real reason symlinks are leaves, and names sockets and
+  devices alongside them.
+- Third-party attributions corrected against each crate's own manifest.
+  `webpki-roots` 1.x is CDLA-Permissive-2.0, not MPL-2.0; `icy_sixel` and
+  `parking_lot` are MIT OR Apache-2.0, not MIT alone; `russh-sftp` is its
+  own project (`AspectUnk/russh-sftp`), not part of `russh`; and `russh` and
+  `icy_sixel` link to their current repositories.
+- The viewer's scroll keys are documented, and the architecture tree lists
+  `sftp_test_keys.rs`, so the private keys in the repository are explained
+  where someone would find them.
+
+### Known gaps
+
+- FTPS still has no end-to-end test; the `close_notify` fix above rests on
+  suppaftp's own tests.
+- A preview cancelled while suppaftp is still opening its data connection can
+  leave that connection refusing data commands until reconnect. It needs a
+  control channel that stalls for a minute mid-open, and it is upstream
+  behaviour; tracked in `docs/BACKLOG.md`.
+- SFTP previews (`SftpTransport::read_to_bytes`) have no test; also in the
+  backlog.
 
 ## [0.7.1] — 2026-08-29
 
