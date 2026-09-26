@@ -30,7 +30,7 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   hard-rejected with a clear warning. Keys are stored in
   `~/.config/blink/known_hosts` in standard OpenSSH format. A server
   presenting an SSH *host certificate* is refused rather than pinned.
-- One-key disconnect, return to selector
+- Disconnect back to the session selector without quitting
 
 ### Browsing & file operations
 
@@ -43,7 +43,7 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   entries the filter is currently hiding
 - **Refresh** active pane (F5) — refreshing in place no longer blanks the
   pane while the new listing is fetched
-- **Disconnect** and return to the session selector (`Ctrl-X`)
+- **Disconnect** and return to the session selector (`Ctrl-X`, then confirm)
 - **View** text files inline (scrollable, line-numbered, syntax-highlighted) —
   control and ANSI escape characters are stripped before display to prevent
   terminal injection; see [Supported viewer formats](#supported-viewer-formats)
@@ -96,7 +96,7 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   in the summary if that is a possibility.
 - **Checkpoint file format** is versioned (currently version 3, which adds
   a `cancelled` job status); checkpoints written by older blink versions
-  (version 2) still load and resume normally.
+  (versions 1 and 2) still load and resume normally.
 - **Download resume is provenance-checked.** A `.part` file records bytes,
   not which remote file they came from, so blink writes a `<dest>.part.meta`
   sidecar alongside it naming the remote path and the size the server
@@ -241,9 +241,13 @@ Output: `target/x86_64-pc-windows-gnu/release/blink.exe`.
 
 #### Notes on cross-compiled binaries
 
-- The Windows binary is a real PE32+ executable; it runs natively on
-  Windows 10 / 11 with no runtime dependencies beyond the standard
-  Microsoft Visual C++ Runtime (already present on every modern Windows).
+- The Windows binary is a real PE32+ executable and runs natively on
+  Windows 10 / 11. The MinGW build imports only DLLs that ship with Windows
+  (`msvcrt.dll` among them). The `cargo-xwin` (MSVC) build links the Visual
+  C++ runtime (`vcruntime140.dll`) dynamically, as Rust does by default;
+  Windows itself does not ship it, so a machine without the Visual C++
+  Redistributable needs it installed, or build with
+  `RUSTFLAGS="-C target-feature=+crt-static"` to link it statically.
 - For ARM64 Windows, swap `x86_64` for `aarch64` in either route.
 
 ## Run
@@ -466,7 +470,7 @@ The full list lives in the in-app help overlay (`?`). Highlights:
 | -------------- | -------------------------------------------- |
 | `tab` / `S-tab`| cycle active pane (Local → Remote → Transfers → Log) |
 | `↑` / `↓`      | move cursor                                  |
-| `↵`            | open file or enter directory                 |
+| `↵`            | enter directory                              |
 | `backspace`    | go up to parent directory                    |
 | `space`        | select / deselect                            |
 | `^d`           | download selected items                      |
@@ -478,7 +482,7 @@ The full list lives in the in-app help overlay (`?`). Highlights:
 | `F7`           | create new remote directory                  |
 | `S-del` / `D`  | delete file or folder (remote pane)          |
 | `^s`           | save current session                         |
-| `^x`           | disconnect (return to selector)              |
+| `^x`           | disconnect (return to selector, with confirmation) |
 | `t`            | cycle theme                                  |
 | `c`            | cancel selected transfer (Transfers pane)    |
 | `C`            | cancel whole batch (Transfers pane)          |
@@ -486,7 +490,7 @@ The full list lives in the in-app help overlay (`?`). Highlights:
 | `R`            | resume interrupted upload batch (Transfers pane)   |
 | `p`            | pause / resume all transfers                 |
 | `?`            | toggle help                                  |
-| `q` / `esc`    | quit (with confirmation)                     |
+| `q` / `esc`    | quit (confirms unless `confirm_quit = false`) |
 
 In the session selector: `n` new, `e` edit, `d` delete, `t` cycle theme.
 
@@ -563,7 +567,7 @@ src/
 │   ├── scp.rs           transparent SFTP wrapper (matches OpenSSH 9.0+); delegates via the delegate_inner_transport! macro
 │   ├── ftp.rs           FTP via suppaftp tokio backend
 │   ├── ftps.rs          FTPS via suppaftp + rustls; pinning verifier (hostname + signature + cert pin)
-│   ├── ftp_impl.rs      shared macro that generates the Transport impl for FTP and FTPS
+│   ├── ftp_impl.rs      shared macro that generates the Transport impl for FTP and FTPS; per-call deadline, reconnect after a broken call
 │   └── error_map.rs     maps russh-sftp / suppaftp errors to typed BlinkError variants (NotFound / Permission / Disconnected)
 ├── transfer.rs          TransferManager: queue, state, progress events; MAX_QUEUED_JOBS cap
 ├── transfer/
@@ -700,7 +704,7 @@ Applied to:
 - **Remote path injection** — `join_remote()` strips leading `/` from
   server-supplied names and rejects any `..` component, preventing a server
   from escaping the working directory via path construction.
-- **Recursive walks skip symlinks by default.** A server-side symlink
+- **Recursive walks skip symlinks.** A server-side symlink
   named `passwd` pointing at `/etc/passwd` won't get fetched into the
   user's destination tree, and an A→B→A symlink cycle can't loop the
   walker. Single-file `View` of a symlink still works — that's an
@@ -763,9 +767,9 @@ RGBA buffer is already allocated.
   clearing it, stranding fragments that no later wipe can reach. Abandoning
   a prompt zeroizes the buffer rather than calling `clear()`, which would
   only reset the length and leave the bytes in place.
-- Each parallel worker slot opens its own authenticated connection and
-  receives the cached credentials; no shared state crosses task
-  boundaries.
+- Each parallel worker slot opens its own authenticated connection. The
+  workers share one zeroized copy of the credential by reference rather
+  than each holding a copy of their own.
 
 ### Config and session file safety
 
@@ -839,8 +843,10 @@ A few things worth knowing before you use this in anger:
 - **FTP directory listings are parsed as POSIX (`ls -l`) or DOS, nothing
   else.** blink issues `LIST` and never `MLSD`/`MLST`, so it parses with
   those two parsers only. A server whose listing format is neither shows an
-  empty directory and logs one `skipped N of M unparsable lines` warning per
-  listing. The alternative — the library's fallback parser, which accepts
+  empty directory. Each such listing writes one `skipped unparsable listing
+  lines` warning, with the skipped and total line counts, to the debug log —
+  which is discarded unless `BLINK_LOG_FILE` is set, so the TUI itself says
+  nothing. The alternative — the library's fallback parser, which accepts
   *any* line and names the file after it — put entries in the pane that
   addressed nothing, which was worse. Real-world dialect coverage is
   untested: the FTP test suite runs against an in-process server, not
