@@ -47,3 +47,21 @@ stays correct, but the `map_ftp` doc comment in `error_map.rs` that says
 suppaftp reports a closed connection as `BadResponse` needs rewording, and
 `a_dropped_control_connection_is_followed_by_a_reconnect` then passes
 through `ConnectionError` instead.
+
+## An unparsable FTP listing says nothing in the TUI
+
+A server whose `LIST` lines neither the POSIX nor the DOS parser accepts
+shows an empty directory. `ftp_list` (and `ftp_metadata`) in
+`ftp_impl.rs` report the skipped lines only through `tracing::warn!`,
+which is discarded unless `BLINK_LOG_FILE` is set, so the user sees an
+empty pane and no reason. The comment above the warning says silence was
+the problem it fixed; it only fixed it for someone reading the debug log.
+
+The FTP transports have no channel to the TUI log: the SFTP transport
+gets an `AppEvent` sender for host-key prompts, FTP gets nothing, and
+the plain-FTP warning is pushed by the app on connect, not by the
+transport. Either give the FTP transports a sender, or have `list`
+report the skip count to its caller (a `Transport` interface change,
+so SFTP would return zero). One log line per listing, as now, not one
+per skipped line. `an_unparsable_listing_line_becomes_no_entry_at_all`
+in the FTP harness is the place to assert it.
