@@ -657,6 +657,12 @@ terminal. The following properties are enforced in the current codebase.
 - **30-second connect timeout** — applied to both the primary connection
   and every parallel worker connection. A server that accepts the TCP
   socket but stalls the handshake cannot pin connections indefinitely.
+- **An FTP/FTPS connection that breaks is replaced, not reused.** Each
+  control-channel call has a 60-second deadline. A call that passes it,
+  is cut short, or loses the connection leaves the client possibly out
+  of step with the server, so the next call reconnects and logs in
+  afresh before it runs. An FTPS reconnect must present the certificate
+  the first connect accepted.
 
 ### Terminal injection prevention
 
@@ -859,7 +865,8 @@ A few things worth knowing before you use this in anger:
 - **Passwords are held in memory** for the duration of the connected
   session, but the allocation is zeroised on drop. Each parallel
   transfer slot opens its own connection, so the dispatcher needs
-  credentials to handshake each one. If that's not acceptable for your
+  credentials to handshake each one, and an FTP/FTPS connection keeps a
+  copy to reconnect with after it breaks. If that's not acceptable for your
   threat model, use SSH key auth or ssh-agent instead — the key file
   (or the agent's identity store) stays put and no in-memory copy of
   the secret is needed.

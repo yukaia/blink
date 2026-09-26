@@ -21,15 +21,3 @@ whether russh has moved its pin to that release.
 
 Last checked 2026-09-26: russh 0.63.3, and its `main`, still pin rc.18;
 #626, #680 and #702 all open, untouched since June.
-
-## A preview cancelled while its data connection opens can still wedge
-
-suppaftp 12 recovers a transfer that is dropped once its `TransferStream`
-exists. There is a window before that: if `timed_ftp`'s 60 s deadline
-cancels `retr` or `list` inside suppaftp's `open_transfer`, the data socket
-can already be open, with the client marked `data_connection_open`, but no
-`TransferStream` has been made to leave a pending reply. The connection
-then refuses data commands until reconnect. On the browsing connection
-this needs a control channel that stalls for a minute mid-open, so it is
-rare; it is upstream behaviour, not blink's. Worth a harness fault (stall
-the `150` reply past the deadline) and an upstream report if it reproduces.

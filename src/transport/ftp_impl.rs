@@ -4,10 +4,39 @@
 //! different `T` parameters (`AsyncNoTlsStream` vs `AsyncRustlsStream`).
 //! Since the generic struct provides identical methods regardless of `T`,
 //! this module provides a macro that generates a full [`Transport`] impl
-//! for any wrapper type that has a `stream: ImplAsyncFtpStream<T>` field.
+//! for any wrapper type that has a `stream: ImplAsyncFtpStream<T>` field,
+//! a `broken: bool` field, and an `async fn reopen(&mut self)` that
+//! replaces `stream` with a fresh connection and login.
 
 macro_rules! delegate_ftp_transport {
     ($ty:ty, $proto_variant:ident) => {
+        /// Reconnection. suppaftp's calls are not cancellation-safe: one cut
+        /// short by `timed_ftp`'s deadline, or dropped by its caller, can
+        /// leave the client out of step with the server — at worst still
+        /// believing a data connection is open, so every later data command
+        /// fails. And a call that ends in `Disconnected` has lost the
+        /// connection outright. Either way the connection is not reused:
+        /// the next call opens a fresh one, with the session and password
+        /// the transport kept, before it runs. The call that broke it is not
+        /// retried; it may have just waited out a minute-long deadline.
+        impl $ty {
+            /// Reconnect if the last call left the connection broken, then
+            /// count it broken until the call about to run settles, so a
+            /// call that never finishes leaves it broken too.
+            async fn begin_call(&mut self) -> $crate::error::Result<()> {
+                if self.broken {
+                    self.reopen().await?;
+                }
+                self.broken = true;
+                Ok(())
+            }
+
+            fn settle<T>(&mut self, result: $crate::error::Result<T>) -> $crate::error::Result<T> {
+                self.broken = matches!(result, Err($crate::error::BlinkError::Disconnected(_)));
+                result
+            }
+        }
+
         #[async_trait::async_trait]
         impl $crate::transport::Transport for $ty {
             fn protocol(&self) -> $crate::session::Protocol {
@@ -18,7 +47,10 @@ macro_rules! delegate_ftp_transport {
                 &mut self,
                 remote_path: &str,
             ) -> $crate::error::Result<Vec<$crate::transport::RemoteEntry>> {
-                $crate::transport::ftp_impl::ftp_list(&mut self.stream, remote_path).await
+                self.begin_call().await?;
+                let result =
+                    $crate::transport::ftp_impl::ftp_list(&mut self.stream, remote_path).await;
+                self.settle(result)
             }
 
             async fn download(
@@ -29,13 +61,15 @@ macro_rules! delegate_ftp_transport {
                     tokio::sync::mpsc::UnboundedSender<$crate::transport::ProgressUpdate>,
                 >,
             ) -> $crate::error::Result<()> {
-                $crate::transport::ftp_impl::ftp_download(
+                self.begin_call().await?;
+                let result = $crate::transport::ftp_impl::ftp_download(
                     &mut self.stream,
                     remote_path,
                     local_path,
                     progress,
                 )
-                .await
+                .await;
+                self.settle(result)
             }
 
             async fn upload(
@@ -46,35 +80,41 @@ macro_rules! delegate_ftp_transport {
                     tokio::sync::mpsc::UnboundedSender<$crate::transport::ProgressUpdate>,
                 >,
             ) -> $crate::error::Result<()> {
-                $crate::transport::ftp_impl::ftp_upload(
+                self.begin_call().await?;
+                let result = $crate::transport::ftp_impl::ftp_upload(
                     &mut self.stream,
                     local_path,
                     remote_path,
                     progress,
                 )
-                .await
+                .await;
+                self.settle(result)
             }
 
             async fn rename(&mut self, from: &str, to: &str) -> $crate::error::Result<()> {
                 $crate::transport::ftp_impl::check_ftp_path("rnfr", from)?;
                 $crate::transport::ftp_impl::check_ftp_path("rnto", to)?;
                 let label = format!("{from} -> {to}");
-                $crate::transport::ftp_impl::timed_ftp(
+                self.begin_call().await?;
+                let result = $crate::transport::ftp_impl::timed_ftp(
                     "rename",
                     &label,
                     self.stream.rename(from, to),
                 )
-                .await
+                .await;
+                self.settle(result)
             }
 
             async fn delete_file(&mut self, remote_path: &str) -> $crate::error::Result<()> {
                 $crate::transport::ftp_impl::check_ftp_path("dele", remote_path)?;
-                $crate::transport::ftp_impl::timed_ftp(
+                self.begin_call().await?;
+                let result = $crate::transport::ftp_impl::timed_ftp(
                     "dele",
                     remote_path,
                     self.stream.rm(remote_path),
                 )
-                .await
+                .await;
+                self.settle(result)
             }
 
             async fn delete_dir(
@@ -82,34 +122,51 @@ macro_rules! delegate_ftp_transport {
                 remote_path: &str,
                 recursive: bool,
             ) -> $crate::error::Result<()> {
-                $crate::transport::ftp_impl::ftp_delete_dir(
+                self.begin_call().await?;
+                let result = $crate::transport::ftp_impl::ftp_delete_dir(
                     &mut self.stream,
                     remote_path,
                     recursive,
                 )
-                .await
+                .await;
+                self.settle(result)
             }
 
             async fn mkdir(&mut self, remote_path: &str) -> $crate::error::Result<()> {
-                $crate::transport::ftp_impl::ftp_mkdir(&mut self.stream, remote_path).await
+                self.begin_call().await?;
+                let result =
+                    $crate::transport::ftp_impl::ftp_mkdir(&mut self.stream, remote_path).await;
+                self.settle(result)
             }
 
             async fn metadata(
                 &mut self,
                 remote_path: &str,
             ) -> $crate::error::Result<Option<$crate::transport::RemoteEntry>> {
-                $crate::transport::ftp_impl::ftp_metadata(&mut self.stream, remote_path).await
+                self.begin_call().await?;
+                let result =
+                    $crate::transport::ftp_impl::ftp_metadata(&mut self.stream, remote_path).await;
+                self.settle(result)
             }
 
             async fn read_to_bytes(
                 &mut self,
                 remote_path: &str,
             ) -> $crate::error::Result<bytes::Bytes> {
-                $crate::transport::ftp_impl::ftp_read_to_bytes(&mut self.stream, remote_path).await
+                self.begin_call().await?;
+                let result =
+                    $crate::transport::ftp_impl::ftp_read_to_bytes(&mut self.stream, remote_path)
+                        .await;
+                self.settle(result)
             }
 
             async fn close(&mut self) -> $crate::error::Result<()> {
-                let _ = self.stream.quit().await;
+                // `quit` has no deadline, and a server that stalled a call
+                // may never answer it: the dispatcher closes a failed job's
+                // connection, and would wait on that server forever.
+                if !self.broken {
+                    let _ = self.stream.quit().await;
+                }
                 Ok(())
             }
         }
@@ -159,6 +216,26 @@ pub(crate) const MAX_PREVIEW_BYTES: u64 = crate::preview::IMAGE_VIEW_LIMIT;
 /// data channel shows up as 0 MB/s. The user can cancel via `c`.
 pub(crate) const FTP_OP_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// [`FTP_OP_TIMEOUT`], except where a test has shortened it for its own
+/// thread. A test that needs the deadline to pass cannot wait a minute,
+/// and a paused tokio clock would advance while real loopback I/O is in
+/// flight, firing deadlines that should not.
+#[cfg(not(test))]
+fn op_timeout() -> Duration {
+    FTP_OP_TIMEOUT
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static OP_TIMEOUT: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(FTP_OP_TIMEOUT) };
+}
+
+#[cfg(test)]
+fn op_timeout() -> Duration {
+    OP_TIMEOUT.get()
+}
+
 /// Refuse a remote path that would break out of one FTP command into another.
 ///
 /// FTP commands are newline-terminated text — suppaftp builds them as
@@ -206,12 +283,13 @@ pub(crate) async fn timed_ftp<T, F>(op: &str, path: &str, fut: F) -> Result<T>
 where
     F: std::future::Future<Output = std::result::Result<T, FtpError>>,
 {
-    match tokio::time::timeout(FTP_OP_TIMEOUT, fut).await {
+    let deadline = op_timeout();
+    match tokio::time::timeout(deadline, fut).await {
         Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(map_ftp(op, path, e)),
         Err(_) => Err(BlinkError::disconnected(format!(
             "{op} {path}: no response in {}s",
-            FTP_OP_TIMEOUT.as_secs(),
+            deadline.as_secs(),
         ))),
     }
 }
@@ -301,7 +379,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     // Wrap size() in a timeout too — a server that hangs on SIZE would
     // pin the whole download here. On timeout / error the size is simply
     // unknown; the progress bar just can't show a percentage.
-    let reported_size = tokio::time::timeout(FTP_OP_TIMEOUT, stream.size(remote_path))
+    let reported_size = tokio::time::timeout(op_timeout(), stream.size(remote_path))
         .await
         .ok()
         .and_then(|r| r.ok())
@@ -787,8 +865,9 @@ mod integration {
     /// Every field is read: `bad_pasv_octet` and `unparsable_list_line` by
     /// PASV/LIST below, `abrupt_close` by the abrupt-close branch of LIST,
     /// RETR and STOR/APPE alike, `hostile_listing_names` by LIST,
-    /// `reset_data_after` by RETR, and `oversized_greeting` before any
-    /// command.
+    /// `reset_data_after`, `stall_next_retr` and `drop_on_next_retr` by
+    /// RETR, and
+    /// `oversized_greeting` before any command.
     #[derive(Clone, Default)]
     pub(super) struct Faults {
         /// PASV reply carrying an out-of-range octet.
@@ -812,6 +891,17 @@ mod integration {
         /// than endless so that a client with no cap on reply size buffers
         /// it and hangs, instead of exhausting the test machine's memory.
         pub oversized_greeting: bool,
+        /// While set, the next RETR is never answered: the data connection
+        /// can be opened (its listener stays bound) but no `150` follows.
+        /// The flag clears as the fault fires, and the control connection
+        /// goes on serving later commands, so a test can see what the
+        /// client does after its deadline. Shared across connections, so
+        /// only one RETR on the whole server stalls.
+        pub stall_next_retr: Arc<std::sync::atomic::AtomicBool>,
+        /// While set, the next RETR closes the control connection without a
+        /// reply. Clears as it fires and is shared across connections, like
+        /// `stall_next_retr`, so a reconnect finds a working server.
+        pub drop_on_next_retr: Arc<std::sync::atomic::AtomicBool>,
     }
 
     /// Length of the `oversized_greeting` fault's greeting: 32 times the
@@ -925,6 +1015,9 @@ mod integration {
         let mut rest: u64 = 0;
         // Set by RNFR, consumed by the next RNTO.
         let mut rename_from = String::new();
+        // Data listeners of stalled commands, kept bound so the client's
+        // data connection opens and then waits.
+        let mut stalled: Vec<TcpListener> = Vec::new();
 
         while let Some(line) = lines.next_line().await? {
             let line = line.trim_end();
@@ -1026,6 +1119,13 @@ mod integration {
                     };
                     let slice = body.get(start..).unwrap_or(&[]).to_vec();
 
+                    if faults.drop_on_next_retr.swap(false, Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    if faults.stall_next_retr.swap(false, Ordering::SeqCst) {
+                        stalled.push(data_listener);
+                        continue;
+                    }
                     w.write_all(b"150 opening data connection\r\n").await?;
                     let (mut data, _) = data_listener.accept().await?;
                     if faults.abrupt_close {
@@ -2023,6 +2123,115 @@ mod integration {
             .await
             .expect("the connection must still serve a listing");
         assert_eq!(entries.len(), 2);
+    }
+
+    /// Store for the reconnect tests: a file the faulted RETR asks for, and
+    /// one the connection serves once it has recovered.
+    async fn reconnect_store() -> Store {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/stall.bin".to_string(), b"never sent".to_vec());
+            files.insert("/small.txt".to_string(), b"hello".to_vec());
+        }
+        store
+    }
+
+    /// After a broken call, the connection must serve the next one, on a
+    /// fresh login: the browsing connection is the only one the TUI has.
+    async fn assert_recovers_on_a_fresh_login(
+        transport: &mut FtpTransport,
+        connects: &AtomicUsize,
+        log: &Log,
+    ) {
+        let entries = with_timeout(transport.list("/"), "list after the break")
+            .await
+            .expect("the connection must serve the next listing");
+        assert_eq!(entries.len(), 2);
+        let small = with_timeout(transport.read_to_bytes("/small.txt"), "next preview")
+            .await
+            .expect("and the next preview");
+        assert_eq!(&small[..], b"hello");
+        assert_eq!(connects.load(Ordering::SeqCst), 2, "one reconnect");
+        let logins = log
+            .lock()
+            .await
+            .iter()
+            .filter(|c| *c == "USER tester")
+            .count();
+        assert_eq!(logins, 2, "the reconnect logs in again");
+    }
+
+    /// A preview whose deadline passes while suppaftp is opening its data
+    /// connection. The data socket is open and the client marked as having
+    /// one, but no `TransferStream` exists yet to leave a pending reply, so
+    /// nothing clears the mark when the deadline cancels `retr`; on the same
+    /// connection the next listing failed with "Data connection is already
+    /// open". The transport now reconnects before its next call instead.
+    #[tokio::test]
+    async fn a_preview_past_its_deadline_is_followed_by_a_reconnect() {
+        super::OP_TIMEOUT.set(std::time::Duration::from_millis(500));
+        let faults = Faults::default();
+        faults.stall_next_retr.store(true, Ordering::SeqCst);
+        let (port, connects, log) = start_server(reconnect_store().await, faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let err = with_timeout(transport.read_to_bytes("/stall.bin"), "stalled preview")
+            .await
+            .expect_err("a preview past its deadline must fail");
+        assert!(
+            matches!(err, crate::error::BlinkError::Disconnected(_)),
+            "a deadline reads as a disconnect: {err:?}",
+        );
+
+        assert_recovers_on_a_fresh_login(&mut transport, &connects, &log).await;
+    }
+
+    /// A control connection the server closed is gone for good; the next
+    /// call reconnects rather than failing on the dead socket.
+    #[tokio::test]
+    async fn a_dropped_control_connection_is_followed_by_a_reconnect() {
+        let faults = Faults::default();
+        faults.drop_on_next_retr.store(true, Ordering::SeqCst);
+        let (port, connects, log) = start_server(reconnect_store().await, faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let err = with_timeout(transport.read_to_bytes("/stall.bin"), "dropped preview")
+            .await
+            .expect_err("a preview on a closed connection must fail");
+        assert!(
+            matches!(err, crate::error::BlinkError::Disconnected(_)),
+            "a closed control connection is a disconnect: {err:?}",
+        );
+
+        assert_recovers_on_a_fresh_login(&mut transport, &connects, &log).await;
+    }
+
+    /// A call whose future is dropped before it finishes returns nothing,
+    /// so no error can mark the connection; suppaftp's calls are not
+    /// cancellation-safe, so it must be treated as broken all the same.
+    /// The deadline here is the caller's, well inside blink's own.
+    #[tokio::test]
+    async fn a_preview_dropped_mid_call_is_followed_by_a_reconnect() {
+        let faults = Faults::default();
+        faults.stall_next_retr.store(true, Ordering::SeqCst);
+        let (port, connects, log) = start_server(reconnect_store().await, faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            transport.read_to_bytes("/stall.bin"),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the stalled preview must still be pending"
+        );
+
+        assert_recovers_on_a_fresh_login(&mut transport, &connects, &log).await;
     }
 
     /// `227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)` -> port.

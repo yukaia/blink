@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use suppaftp::rustls::{ClientConfig, RootCertStore};
 use suppaftp::tokio::{AsyncRustlsConnector, AsyncRustlsFtpStream};
 use suppaftp::types::FileType;
+use zeroize::Zeroizing;
 
 use crate::error::{BlinkError, Result};
 use crate::session::{AuthMethod, Session};
@@ -25,6 +26,26 @@ use super::ftp_impl;
 
 pub struct FtpsTransport {
     stream: AsyncRustlsFtpStream,
+    /// What [`Self::reopen`] connects with, carrying the pin the first
+    /// connect saw — see [`pinned_session`]. See `delegate_ftp_transport!`.
+    session: Session,
+    password: Option<Zeroizing<String>>,
+    /// Set while a call is in flight and after one ends in `Disconnected`;
+    /// the next call reconnects first. See `delegate_ftp_transport!`.
+    broken: bool,
+}
+
+/// The session a reconnect uses: `session` with the certificate pin the
+/// first connect captured, if it captured one. A reconnect must meet the
+/// certificate that connect accepted, never trust a new one on first use:
+/// the caller persists a new pin only from `connect`'s return value, so a
+/// certificate first seen on a reconnect would be trusted without that.
+fn pinned_session(session: &Session, new_pin: Option<&str>) -> Session {
+    let mut pinned = session.clone();
+    if let Some(pin) = new_pin {
+        pinned.cert_sha256 = Some(pin.to_string());
+    }
+    pinned
 }
 
 impl FtpsTransport {
@@ -37,6 +58,30 @@ impl FtpsTransport {
         session: &Session,
         password: Option<&str>,
     ) -> Result<(Self, Option<String>)> {
+        let (stream, new_pin) = Self::open(session, password).await?;
+        let transport = Self {
+            stream,
+            session: pinned_session(session, new_pin.as_deref()),
+            password: password.map(|p| Zeroizing::new(p.to_string())),
+            broken: false,
+        };
+        Ok((transport, new_pin))
+    }
+
+    /// Replace the stream with a fresh connection and login. The stored
+    /// session carries a pin whenever pinning is in use, so the verifier
+    /// checks against it and captures nothing new.
+    async fn reopen(&mut self) -> Result<()> {
+        let password = self.password.as_ref().map(|p| p.as_str());
+        let (stream, _) = Self::open(&self.session, password).await?;
+        self.stream = stream;
+        Ok(())
+    }
+
+    async fn open(
+        session: &Session,
+        password: Option<&str>,
+    ) -> Result<(AsyncRustlsFtpStream, Option<String>)> {
         if !matches!(session.auth, AuthMethod::Password) {
             return Err(BlinkError::auth(
                 "FTPS only supports password (or anonymous) auth",
@@ -98,7 +143,7 @@ impl FtpsTransport {
             .await
             .map_err(|e| BlinkError::transport(format!("set binary: {e}")))?;
 
-        Ok((Self { stream }, new_pin))
+        Ok((stream, new_pin))
     }
 }
 
@@ -285,5 +330,52 @@ mod pinning {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pinned_session;
+    use crate::session::{AuthMethod, Protocol, Session};
+
+    fn session(cert_sha256: Option<&str>) -> Session {
+        Session {
+            name: "it".to_string(),
+            protocol: Protocol::Ftps,
+            host: "127.0.0.1".to_string(),
+            port: 990,
+            username: "tester".to_string(),
+            remote_dir: "/".to_string(),
+            local_dir: None,
+            auth: AuthMethod::Password,
+            parallel_downloads: None,
+            theme: None,
+            accept_invalid_certs: true,
+            cert_sha256: cert_sha256.map(str::to_string),
+        }
+    }
+
+    /// Trust on first use: the pin the first connect captured is the one
+    /// every reconnect must meet, so a reconnect never pins afresh.
+    #[test]
+    fn a_reconnect_requires_the_pin_the_first_connect_captured() {
+        let pinned = pinned_session(&session(None), Some("ab12"));
+        assert_eq!(pinned.cert_sha256.as_deref(), Some("ab12"));
+    }
+
+    /// A pin match captures nothing, and the stored pin carries over.
+    #[test]
+    fn a_reconnect_keeps_the_stored_pin() {
+        let pinned = pinned_session(&session(Some("ab12")), None);
+        assert_eq!(pinned.cert_sha256.as_deref(), Some("ab12"));
+    }
+
+    /// With CA verification there is no pin to carry, and none appears.
+    #[test]
+    fn without_pinning_a_reconnect_has_no_pin() {
+        let mut ca_verified = session(None);
+        ca_verified.accept_invalid_certs = false;
+        let pinned = pinned_session(&ca_verified, None);
+        assert_eq!(pinned.cert_sha256, None);
     }
 }

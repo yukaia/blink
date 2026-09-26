@@ -22,13 +22,26 @@ the git history for those.
 
 ### Fixed
 
+- **A timed-out FTP preview no longer leaves browsing broken.** A preview
+  whose 60-second deadline passed while its data connection was opening
+  left suppaftp believing a data connection was still open, and every
+  later listing or preview on that connection failed with "Data
+  connection is already open" until the user reconnected by hand. suppaftp
+  calls are not safe to cut short, so this was one case of a wider one:
+  after any deadline, dropped call or lost connection, blink went on using
+  a connection that could be out of step with the server. An FTP or FTPS
+  connection now replaces itself instead: the call that broke it still
+  fails, and the next call reconnects and logs in again before running.
+  An FTPS reconnect must present the certificate the first connect
+  accepted; it never pins a new one.
+
 - **An FTP server hanging up now counts as a disconnect.** A control
   connection the server closed before replying surfaced as "Response
   contains an invalid syntax", and a `421` (the server closing the
   connection, often for idle time) as a plain error. Both are now
-  reported as a lost connection. That makes the transfer queue retry a
-  job whose pooled connection the server had reaped while idle, as it
-  already did for SFTP.
+  reported as a lost connection. Besides the reconnect above, that makes
+  the transfer queue retry a job whose pooled connection the server had
+  reaped while idle, as it already did for SFTP.
 
 ## [0.8.0] — 2026-09-22
 
