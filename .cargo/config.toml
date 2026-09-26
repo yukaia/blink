@@ -3,7 +3,7 @@
 #
 #   cargo build --release --target x86_64-unknown-linux-musl
 #
-# The musl C compiler is required because crypto deps (aws-lc-rs, ring) build C.
+# The musl C compiler is required because the crypto backend, ring, builds C.
 [target.x86_64-unknown-linux-musl]
 linker = "musl-gcc"
 

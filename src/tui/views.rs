@@ -329,7 +329,7 @@ pub mod help {
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled("  NAVIGATION", acc_s)),
-            kv("  ↵         ", "open file or enter directory", key_s),
+            kv("  ↵         ", "enter directory", key_s),
             kv("  bksp      ", "go up to parent directory", key_s),
             kv("  tab       ", "switch active pane", key_s),
             kv("  ↑ ↓       ", "move cursor (pgup/pgdn for page)", key_s),

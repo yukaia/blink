@@ -1,6 +1,8 @@
 //! Platform-specific paths for config, sessions, and themes.
 //!
-//! - Linux / macOS: `~/.config/blink/` (or `$XDG_CONFIG_HOME/blink/` if set)
+//! - Linux: `~/.config/blink/` (or `$XDG_CONFIG_HOME/blink/` if set)
+//! - macOS: `~/Library/Application Support/blink/` (or
+//!   `$XDG_CONFIG_HOME/blink/` if set)
 //! - Windows: `%USERPROFILE%\Documents\blink\`
 
 use std::path::{Path, PathBuf};
