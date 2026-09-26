@@ -20,6 +20,16 @@ the git history for those.
   12.1 also checks where an active-mode data connection comes from; blink
   only uses passive mode, so that part changes nothing here.
 
+### Fixed
+
+- **An FTP server hanging up now counts as a disconnect.** A control
+  connection the server closed before replying surfaced as "Response
+  contains an invalid syntax", and a `421` (the server closing the
+  connection, often for idle time) as a plain error. Both are now
+  reported as a lost connection. That makes the transfer queue retry a
+  job whose pooled connection the server had reaped while idle, as it
+  already did for SFTP.
+
 ## [0.8.0] — 2026-09-22
 
 ### Added

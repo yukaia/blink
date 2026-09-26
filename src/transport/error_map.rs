@@ -51,6 +51,12 @@ pub fn map_sftp(op: &str, path: &str, err: SftpError) -> BlinkError {
 /// Classify a `suppaftp` error against `(op, path)` context.
 ///
 /// - `ConnectionError(_)` / `SecureError(_)` → [`BlinkError::Disconnected`]
+/// - `BadResponse` and `UnexpectedResponse(421 NotAvailable)` →
+///   [`BlinkError::Disconnected`]. suppaftp reports a control connection
+///   the server closed before replying as `BadResponse`, not as a
+///   `ConnectionError`; and 421 is how a server says it is about to close
+///   it, often for idle time. Either way the connection is gone, and a
+///   reply that cannot be parsed leaves it out of step all the same.
 /// - `UnexpectedResponse(550 FileUnavailable)` → [`BlinkError::NotFound`].
 ///   FTP overloads 550 for "file not found" and "no access" — the
 ///   former is the dominant interpretation across server
@@ -61,10 +67,11 @@ pub fn map_sftp(op: &str, path: &str, err: SftpError) -> BlinkError {
 /// - Everything else → [`BlinkError::Transport`].
 pub fn map_ftp(op: &str, path: &str, err: FtpError) -> BlinkError {
     match &err {
-        FtpError::ConnectionError(_) | FtpError::SecureError(_) => {
+        FtpError::ConnectionError(_) | FtpError::SecureError(_) | FtpError::BadResponse => {
             BlinkError::disconnected(format!("{op} {path}: {err}"))
         }
         FtpError::UnexpectedResponse(r) => match r.status {
+            FtpStatus::NotAvailable => BlinkError::disconnected(format!("{op} {path}: {err}")),
             FtpStatus::FileUnavailable => BlinkError::not_found(format!("{op} {path}")),
             FtpStatus::NotLoggedIn => BlinkError::auth(format!("{op} {path}: {err}")),
             _ => BlinkError::transport(format!("{op} {path}: {err}")),
@@ -172,9 +179,15 @@ mod tests {
     }
 
     #[test]
-    fn ftp_bad_response_falls_back_to_transport() {
+    fn ftp_bad_response_is_disconnected() {
         let e = map_ftp("list", "/x", FtpError::BadResponse);
-        assert!(matches!(e, BlinkError::Transport(_)), "{e:?}");
+        assert!(matches!(e, BlinkError::Disconnected(_)), "{e:?}");
+    }
+
+    #[test]
+    fn ftp_not_available_is_disconnected() {
+        let e = map_ftp("list", "/x", ftp_response(FtpStatus::NotAvailable));
+        assert!(matches!(e, BlinkError::Disconnected(_)), "{e:?}");
     }
 
     #[test]
