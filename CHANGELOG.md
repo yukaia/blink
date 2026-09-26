@@ -8,6 +8,8 @@ the git history for those.
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-09-26
+
 ### Security
 
 - **An FTP server can no longer make blink buffer an endless reply.**
