@@ -21,3 +21,29 @@ whether russh has moved its pin to that release.
 
 Last checked 2026-09-26: russh 0.63.3, and its `main`, still pin rc.18;
 #626, #680 and #702 all open, untouched since June.
+
+## suppaftp: one issue to file, one fix to pick up
+
+blink no longer depends on either: an FTP connection now reconnects after
+any call that breaks it, and `map_ftp` maps `BadResponse` to
+`Disconnected`. These are about the upstream side.
+
+**To file.** Cancelling a data command after its data connection opens
+leaves `data_connection_open` set, so every later data command fails with
+`DataConnectionAlreadyOpen`. suppaftp#156 fixed the same flag for a data
+command that *fails*, not one that is *cancelled*. Not reported upstream as
+of 2026-09-26. The harness fault `stall_next_retr` in `ftp_impl.rs`
+reproduces it. What to file: `data_command` sets the flag once the data
+socket connects, and only a failed `150` clears it, so a future dropped
+while awaiting the `150` leaves it set with no `TransferStream` to reset it.
+Ask for a guard that clears it on drop, or a docs note that data commands
+need a reconnect after cancelling. Link #155 and #156.
+
+**To pick up.** suppaftp#184 (issue #183) makes a control connection that
+closes before its reply a `ConnectionError(UnexpectedEof)` instead of
+`BadResponse`. It was merged on 2026-09-25, after 12.1.0, and is
+unreleased. At the release that carries it, bump suppaftp. The mapping
+stays correct, but the `map_ftp` doc comment in `error_map.rs` that says
+suppaftp reports a closed connection as `BadResponse` needs rewording, and
+`a_dropped_control_connection_is_followed_by_a_reconnect` then passes
+through `ConnectionError` instead.
