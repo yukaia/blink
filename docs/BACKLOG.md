@@ -24,12 +24,3 @@ then refuses data commands until reconnect. On the browsing connection
 this needs a control channel that stalls for a minute mid-open, so it is
 rare; it is upstream behaviour, not blink's. Worth a harness fault (stall
 the `150` reply past the deadline) and an upstream report if it reproduces.
-
-## Nothing tests the SFTP preview path
-
-`SftpTransport::read_to_bytes` has no test: the SFTP harness covers
-transfers, listing and deletes, not previews. russh-sftp 3.0 changed how
-`File` reads (pipelined, 16 in flight), and the evidence that previews are
-unaffected is a source reading alone. A test against the SFTP harness —
-preview a file, preview one over the cap, list afterwards — would close
-it, mirroring the FTP tests in `ftp_impl.rs`.

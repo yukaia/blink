@@ -2216,6 +2216,99 @@ mod integration {
         let _ = transport.close().await;
     }
 
+    /// Bound a harness call, so a regression hangs for seconds rather than
+    /// forever. Mirrors the FTP harness's helper of the same name.
+    async fn with_timeout<F: std::future::Future>(fut: F, what: &str) -> F::Output {
+        tokio::time::timeout(std::time::Duration::from_secs(10), fut)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+    }
+
+    /// Previews read through russh-sftp's `File`, which since 3.0 probes the
+    /// server's read size with one request and then keeps 16 in flight. The
+    /// server caps every reply at `SHORT_READ`, so the probe comes back short
+    /// and sets the size the pipeline uses; the file spans more than a full
+    /// window of those and ends mid-chunk, so the last read is short too.
+    /// SCP previews go through the same code, via `ScpTransport`.
+    #[tokio::test]
+    async fn a_preview_returns_every_byte() {
+        let payload = pseudo_random(17 * SHORT_READ + 137);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/file.bin".to_string(), payload.clone());
+        let (port, _connects) = start_server(store).await;
+        let mut transport = connect(port).await;
+
+        let got = with_timeout(transport.read_to_bytes("/file.bin"), "preview")
+            .await
+            .expect("a file under the cap should preview");
+        assert_eq!(got.len(), payload.len(), "preview size mismatch");
+        assert!(got[..] == payload[..], "preview bytes mismatch");
+    }
+
+    /// The cap is inclusive: `read_to_bytes` reads one byte past it to tell a
+    /// file that exactly fits from one that does not.
+    #[tokio::test]
+    async fn a_preview_of_exactly_the_cap_succeeds() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store.lock().await.insert(
+            "/full.bin".to_string(),
+            vec![7u8; super::MAX_PREVIEW_BYTES as usize],
+        );
+        let (port, _connects) = start_server(store).await;
+        let mut transport = connect(port).await;
+
+        let got = with_timeout(transport.read_to_bytes("/full.bin"), "preview at the cap")
+            .await
+            .expect("a file of exactly the cap should preview");
+        assert_eq!(got.len() as u64, super::MAX_PREVIEW_BYTES);
+    }
+
+    /// Hitting the cap is not a dropped connection, and it leaves the
+    /// connection usable. The read stops at the cap with up to 16 requests
+    /// still in flight and drops the `File`; their replies still arrive, so
+    /// the listing and preview afterwards show nothing mistakes one for its
+    /// own. The preview runs on the browsing connection, so both must work.
+    /// Mirrors the FTP test of the same name.
+    #[tokio::test]
+    async fn an_oversized_preview_is_a_transport_error_and_the_connection_survives() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            // The harness only lists a directory that has its own key.
+            files.insert("/".to_string(), Vec::new());
+            files.insert(
+                "/big.bin".to_string(),
+                vec![7u8; super::MAX_PREVIEW_BYTES as usize + 1],
+            );
+            files.insert("/small.txt".to_string(), b"hello".to_vec());
+        }
+        let (port, _connects) = start_server(store).await;
+        let mut transport = connect(port).await;
+
+        let err = with_timeout(transport.read_to_bytes("/big.bin"), "oversized preview")
+            .await
+            .expect_err("a file one byte over the cap must not preview");
+        assert!(
+            matches!(err, crate::error::BlinkError::Transport(_)),
+            "the cap is not a disconnect: {err:?}",
+        );
+        assert!(err.to_string().contains("preview size limit"), "{err}");
+
+        let entries = with_timeout(transport.list("/"), "list after the preview")
+            .await
+            .expect("the connection must still serve a listing");
+        let mut names: Vec<_> = entries.iter().map(|e| e.display_name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["big.bin", "small.txt"]);
+        let small = with_timeout(transport.read_to_bytes("/small.txt"), "second preview")
+            .await
+            .expect("and a preview under the cap");
+        assert_eq!(&small[..], b"hello");
+    }
+
     /// A `.part` left behind by a download of a *different* remote file must
     /// never be resumed into the current one. Before the provenance check,
     /// this appended B's tail to A's head and renamed the result into place
