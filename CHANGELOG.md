@@ -8,6 +8,18 @@ the git history for those.
 
 ## [Unreleased]
 
+### Security
+
+- **An FTP server can no longer make blink buffer an endless reply.**
+  suppaftp before 12.1 read each control-connection reply with no bound, so
+  a server answering with a line that never ended — the greeting included,
+  before any login — grew blink's memory until the connect deadline gave
+  up. suppaftp 12.1 refuses a reply over 256 KiB, and the connection fails
+  as soon as the cap is passed. Applies to FTP and FTPS alike.
+
+  12.1 also checks where an active-mode data connection comes from; blink
+  only uses passive mode, so that part changes nothing here.
+
 ## [0.8.0] — 2026-09-22
 
 ### Added

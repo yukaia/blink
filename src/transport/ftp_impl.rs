@@ -786,8 +786,9 @@ mod integration {
     ///
     /// Every field is read: `bad_pasv_octet` and `unparsable_list_line` by
     /// PASV/LIST below, `abrupt_close` by the abrupt-close branch of LIST,
-    /// RETR and STOR/APPE alike, `hostile_listing_names` by LIST, and
-    /// `reset_data_after` by RETR.
+    /// RETR and STOR/APPE alike, `hostile_listing_names` by LIST,
+    /// `reset_data_after` by RETR, and `oversized_greeting` before any
+    /// command.
     #[derive(Clone, Default)]
     pub(super) struct Faults {
         /// PASV reply carrying an out-of-range octet.
@@ -806,7 +807,16 @@ mod integration {
         /// makes the client's read fail, where a clean close would read as a
         /// short EOF; only a failed read makes a `retr` callback return `Err`.
         pub reset_data_after: Option<usize>,
+        /// Open with a greeting line of [`OVERSIZED_GREETING`] bytes and no
+        /// line end, then wait for the client to hang up. Bounded rather
+        /// than endless so that a client with no cap on reply size buffers
+        /// it and hangs, instead of exhausting the test machine's memory.
+        pub oversized_greeting: bool,
     }
+
+    /// Length of the `oversized_greeting` fault's greeting: 32 times the
+    /// 256 KiB cap suppaftp 12.1 puts on a control-connection reply.
+    const OVERSIZED_GREETING: usize = 8 * 1024 * 1024;
 
     /// Bytes per data-connection write. Smaller than the transfer chunk so the
     /// client's read loop genuinely reassembles across reads.
@@ -900,6 +910,13 @@ mod integration {
         let (read_half, mut w) = sock.split();
         let mut lines = BufReader::new(read_half).lines();
 
+        if faults.oversized_greeting {
+            let mut greeting = b"220 ".to_vec();
+            greeting.resize(OVERSIZED_GREETING, b'a');
+            w.write_all(&greeting).await?;
+            while lines.next_line().await?.is_some() {}
+            return Ok(());
+        }
         w.write_all(b"220 blink test server\r\n").await?;
 
         // Bound by PASV, consumed by the next data command.
@@ -1784,6 +1801,41 @@ mod integration {
     /// An out-of-range PASV octet must surface as an error, not a panic and
     /// not a hang. suppaftp 10.0 changed this from a panic; these tests pin
     /// the behaviour on both sides of that bump.
+    /// A server can answer with a reply that never ends, before any login.
+    /// suppaftp before 12.1 read a reply line with no bound, buffering it for
+    /// as long as the server kept sending; the caller's connect deadline was
+    /// the only limit, and memory grew for all of it. 12.1 refuses a reply
+    /// over 256 KiB, so connecting fails once the cap is passed.
+    #[tokio::test]
+    async fn an_oversized_greeting_is_refused_not_buffered() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let faults = Faults {
+            oversized_greeting: true,
+            ..Faults::default()
+        };
+        let (port, _c, log) = start_server(Arc::clone(&store), faults).await;
+        let session = test_session(port);
+
+        let result = with_timeout(
+            FtpTransport::connect(&session, Some("pw")),
+            "connect to refuse the oversized greeting",
+        )
+        .await;
+
+        let Err(err) = result else {
+            panic!("an oversized greeting must fail the connect");
+        };
+        assert!(
+            matches!(&err, crate::error::BlinkError::Connect(m) if m.contains("larger than")),
+            "expected the reply-size error at connect, got {err:?}",
+        );
+        let issued = log.lock().await.clone();
+        assert!(
+            issued.is_empty(),
+            "nothing should be sent after the greeting; commands issued: {issued:?}",
+        );
+    }
+
     #[tokio::test]
     async fn a_malformed_pasv_reply_is_an_error_not_a_panic() {
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
