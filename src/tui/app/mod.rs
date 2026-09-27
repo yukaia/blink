@@ -1562,6 +1562,72 @@ mod tests {
         assert_eq!(idx.len(), 3, "checkpoint indices must be distinct");
     }
 
+    fn logged(a: &App, needle: &str) -> bool {
+        a.log.iter().any(|l| l.message.contains(needle))
+    }
+
+    /// Downloading a file again while its first download is still queued or
+    /// running used to start a second job on the same `.part`, and the two
+    /// corrupted it between them. The second must not be queued at all, and
+    /// must not reach the checkpoint either: an entry nothing will run stays
+    /// pending forever and blocks `r`.
+    #[tokio::test]
+    async fn a_file_already_queued_is_not_queued_again() {
+        let (mut a, _cleanup) = checkpoint_app("dedupe");
+
+        a.dispatch_plan(vec![download(0), download(1)], Direction::Download);
+        a.dispatch_plan(vec![download(1), download(2)], Direction::Download);
+
+        let (_, pending) = a.transfer_manager.as_ref().unwrap().queue_counts();
+        assert_eq!(pending, 3, "download(1) must be queued once");
+        let cp = a
+            .active_checkpoints
+            .get(&CheckpointKind::Download)
+            .expect("the download checkpoint is tracked");
+        assert_eq!(cp.jobs.len(), 3, "and recorded once");
+        assert_eq!(a.checkpoint_job_map.len(), 3);
+        assert!(
+            logged(&a, "skipped 1 file(s) already queued or running"),
+            "the user must be told why fewer jobs were queued",
+        );
+    }
+
+    /// Two entries of one plan with the same destination — on a
+    /// case-insensitive filesystem, `README` and `readme` from one server
+    /// directory — are the same collision inside a single batch. The first
+    /// wins; the second is named in the log, since it will not be fetched.
+    #[tokio::test]
+    async fn a_destination_repeated_within_one_batch_is_queued_once() {
+        let (mut a, _cleanup) = checkpoint_app("dedupe-batch");
+
+        a.dispatch_plan(
+            vec![download(0), download(0), download(1)],
+            Direction::Download,
+        );
+
+        let (_, pending) = a.transfer_manager.as_ref().unwrap().queue_counts();
+        assert_eq!(pending, 2);
+        let cp = a.active_checkpoints.get(&CheckpointKind::Download).unwrap();
+        assert_eq!(cp.jobs.len(), 2);
+        assert!(
+            logged(&a, "not downloading /r/0"),
+            "a file that will not be fetched must be named",
+        );
+    }
+
+    /// Uploads collide on the remote path, not the local one.
+    #[tokio::test]
+    async fn an_upload_already_queued_is_not_queued_again() {
+        let (mut a, _cleanup) = checkpoint_app("dedupe-up");
+
+        a.dispatch_plan(vec![upload(0)], Direction::Upload);
+        a.dispatch_plan(vec![upload(0), upload(1)], Direction::Upload);
+
+        let (_, pending) = a.transfer_manager.as_ref().unwrap().queue_counts();
+        assert_eq!(pending, 2);
+        assert!(logged(&a, "skipped 1 file(s) already queued or running"));
+    }
+
     #[tokio::test]
     async fn disconnecting_clears_checkpoint_state() {
         // A new connection gets a fresh TransferManager whose job ids restart

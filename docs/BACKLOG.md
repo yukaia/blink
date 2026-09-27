@@ -66,33 +66,9 @@ so SFTP would return zero). One log line per listing, as now, not one
 per skipped line. `an_unparsable_listing_line_becomes_no_entry_at_all`
 in the FTP harness is the place to assert it.
 
-## Two downloads to one local file corrupt it
-
-Found in the 2026-09-26 codebase audit, like every entry below. The most
-serious of them.
-
-Nothing stops two jobs targeting the same local path from running at
-once. `enqueue_selected_downloads` (`tui/app/transfers.rs`) does no
-dedupe, and `find_download_conflicts` only looks for the *final* file,
-which does not exist while the first download is still writing its
-`.part`. The second job's `resume_offset` (`transport/mod.rs`) then
-either deletes the first job's `.part` and starts its own, or takes it
-for its own partial and resumes into it. Both write into one file; the
-first renames it into place and reports success.
-
-Probed against the SFTP harness with an 8 MiB file, cancelling the second
-job once the first finished: the final file came out 294 KB short or
-522 KB too long depending on timing, with the first job reporting
-complete both times. Triggers: Ctrl-D twice on the same file or folder,
-overlapping folder downloads, and on a case-insensitive filesystem
-(Windows, default macOS) a directory holding both `README` and `readme`.
-
-Likely fix: refuse or skip a job whose local path matches one already
-pending or active in `TransferManager`, comparing case-insensitively on
-Windows and macOS, and log it. A regression test can reuse the probe's
-shape: two concurrent `download` calls to one destination.
-
 ## The host-key prompt counts against the 30 s connect timeout
+
+Found in the 2026-09-26 codebase audit, like every entry below.
 
 `tui/app/mod.rs` wraps the whole `transport::open` in `CONNECT_TIMEOUT`
 (30 s), and that includes the time the SFTP handler waits on the user's

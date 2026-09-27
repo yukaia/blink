@@ -71,6 +71,12 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   directory can't be listed for any reason other than "doesn't exist yet" —
   a server that refuses `LIST` on a writable directory is surfaced as an
   error rather than silently treated as conflict-free
+- **One job per destination.** A download is not queued while another
+  queued or running download writes the same local file (compared ignoring
+  case on Windows and macOS), and an upload likewise for its remote path —
+  two jobs on one destination would corrupt it. The log counts what was
+  skipped, and names any file skipped because another in the same batch
+  lands on the same path
 - **Recursive walks share the connection.** A walk locks the transport only
   for the directory it's currently listing, not for the whole tree, so an
   F5 refresh or a navigation elsewhere doesn't wait for a large recursive

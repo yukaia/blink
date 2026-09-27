@@ -4,8 +4,8 @@
 //! render. The [`dispatcher`] submodule pulls pending jobs and runs them
 //! against the [`crate::transport`] layer.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -15,7 +15,7 @@ use tokio::task::AbortHandle;
 pub mod dispatcher;
 pub use dispatcher::Dispatcher;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
     Download,
     Upload,
@@ -76,6 +76,56 @@ pub enum TransferEvent {
 /// after.
 pub(crate) const MAX_QUEUED_JOBS: usize = 100_000;
 
+/// Why [`TransferManager`] refused to queue a job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnqueueError {
+    /// [`MAX_QUEUED_JOBS`] jobs are already pending.
+    QueueFull,
+    /// A pending or running job already writes this job's destination. See
+    /// [`destination_key`].
+    Duplicate,
+}
+
+/// The destination a job writes, as the key two jobs must not share.
+///
+/// Two jobs writing one destination at once corrupt it. Both stream into
+/// the same `.part` — the second either deletes the first's or takes it for
+/// its own partial and appends to it — and the first to finish renames the
+/// file into place while the other is still writing, then reports success.
+/// A download's destination is its local path; an upload's is its remote
+/// path. A mkdir has none: creating a directory twice is harmless.
+///
+/// Local paths fold case where the filesystem does (Windows, and macOS by
+/// default), so `README` and `readme` from one server directory count as
+/// one destination there. Remote paths never fold: whether the server's
+/// filesystem does is unknowable from here.
+pub(crate) fn destination_key(
+    direction: Direction,
+    remote_path: &str,
+    local_path: &Path,
+) -> Option<(Direction, String)> {
+    match direction {
+        Direction::Download => Some((
+            direction,
+            local_destination_key(local_path, cfg!(any(windows, target_os = "macos"))),
+        )),
+        Direction::Upload => Some((direction, remote_path.to_string())),
+        Direction::CreateDir => None,
+    }
+}
+
+/// The local half of [`destination_key`], with the case policy passed in so
+/// both branches are tested on any host. Lossy conversion is fine for a
+/// key: a path with undecodable bytes still maps to one string every time.
+fn local_destination_key(path: &Path, fold_case: bool) -> String {
+    let s = path.to_string_lossy();
+    if fold_case {
+        s.to_lowercase()
+    } else {
+        s.into_owned()
+    }
+}
+
 /// Manages a queue of jobs and a configurable concurrency cap.
 ///
 /// We don't use Tokio's Semaphore directly because we want to expose the queue
@@ -96,6 +146,11 @@ struct Inner {
     /// `update_progress`. Jobs are never removed from `jobs`, so indices are
     /// stable for the lifetime of the manager.
     job_index: HashMap<u64, usize>,
+    /// Destinations of every Pending or Active job — see [`destination_key`].
+    /// Kept in step with job states so an enqueue checks in O(1): a batch
+    /// can be [`MAX_QUEUED_JOBS`] long, and scanning `jobs` per enqueue
+    /// would make queuing it quadratic.
+    in_flight: HashSet<(Direction, String)>,
     parallelism: u8,
     paused: bool,
     /// Abort handles for currently-running worker tasks, keyed by job id.
@@ -124,6 +179,7 @@ impl TransferManager {
             jobs: Vec::new(),
             pending_count: 0,
             job_index: HashMap::new(),
+            in_flight: HashSet::new(),
             parallelism,
             paused: false,
             active: HashMap::new(),
@@ -173,21 +229,29 @@ impl TransferManager {
         self.inner.lock().paused
     }
 
-    /// Queue a new download. Returns the assigned job id, or `None` if the
-    /// pending-job cap ([`MAX_QUEUED_JOBS`]) has been reached.
-    pub fn enqueue_download(&self, remote_path: String, local_path: PathBuf) -> Option<u64> {
+    /// Queue a new download. Returns the assigned job id, or why it was
+    /// refused: the pending-job cap ([`MAX_QUEUED_JOBS`]) was reached, or a
+    /// job already writes this destination ([`destination_key`]).
+    pub fn enqueue_download(
+        &self,
+        remote_path: String,
+        local_path: PathBuf,
+    ) -> Result<u64, EnqueueError> {
         self.enqueue(Direction::Download, remote_path, local_path, None)
     }
 
-    /// Queue a new upload. Returns the assigned job id, or `None` if the cap
-    /// has been reached.
-    pub fn enqueue_upload(&self, local_path: PathBuf, remote_path: String) -> Option<u64> {
+    /// Queue a new upload. Refused as [`Self::enqueue_download`] is.
+    pub fn enqueue_upload(
+        &self,
+        local_path: PathBuf,
+        remote_path: String,
+    ) -> Result<u64, EnqueueError> {
         self.enqueue(Direction::Upload, remote_path, local_path, None)
     }
 
     /// Queue a remote-side `mkdir`. The `local_path` field is unused for this
     /// direction; we pass an empty PathBuf to satisfy the shared shape.
-    pub fn enqueue_mkdir(&self, remote_path: String) -> Option<u64> {
+    pub fn enqueue_mkdir(&self, remote_path: String) -> Result<u64, EnqueueError> {
         self.enqueue(Direction::CreateDir, remote_path, PathBuf::new(), None)
     }
 
@@ -207,7 +271,7 @@ impl TransferManager {
         remote_path: String,
         local_path: PathBuf,
         batch_id: u64,
-    ) -> Option<u64> {
+    ) -> Result<u64, EnqueueError> {
         self.enqueue(Direction::Download, remote_path, local_path, Some(batch_id))
     }
 
@@ -217,12 +281,16 @@ impl TransferManager {
         local_path: PathBuf,
         remote_path: String,
         batch_id: u64,
-    ) -> Option<u64> {
+    ) -> Result<u64, EnqueueError> {
         self.enqueue(Direction::Upload, remote_path, local_path, Some(batch_id))
     }
 
     /// Queue an mkdir as part of a batch. See [`allocate_batch_id`].
-    pub fn enqueue_mkdir_batched(&self, remote_path: String, batch_id: u64) -> Option<u64> {
+    pub fn enqueue_mkdir_batched(
+        &self,
+        remote_path: String,
+        batch_id: u64,
+    ) -> Result<u64, EnqueueError> {
         self.enqueue(
             Direction::CreateDir,
             remote_path,
@@ -237,12 +305,21 @@ impl TransferManager {
         remote_path: String,
         local_path: PathBuf,
         batch_id: Option<u64>,
-    ) -> Option<u64> {
+    ) -> Result<u64, EnqueueError> {
         let mut inner = self.inner.lock();
         // Cap the number of pending jobs so a large server directory listing
         // cannot grow the queue without bound and exhaust memory.
         if inner.pending_count >= MAX_QUEUED_JOBS {
-            return None;
+            return Err(EnqueueError::QueueFull);
+        }
+        let key = destination_key(direction, &remote_path, &local_path);
+        if let Some(key) = &key
+            && inner.in_flight.contains(key)
+        {
+            return Err(EnqueueError::Duplicate);
+        }
+        if let Some(key) = key {
+            inner.in_flight.insert(key);
         }
         let id = inner.next_id;
         inner.next_id += 1;
@@ -262,7 +339,13 @@ impl TransferManager {
         inner.job_index.insert(id, idx);
         inner.pending_count += 1;
         let _ = self.events.send(TransferEvent::Queued(job));
-        Some(id)
+        Ok(id)
+    }
+
+    /// Whether a Pending or Active job writes this destination. Lets a
+    /// caller drop duplicates from a plan before recording it anywhere.
+    pub(crate) fn is_in_flight(&self, key: &(Direction, String)) -> bool {
+        self.inner.lock().in_flight.contains(key)
     }
 
     /// Mark a job's state. Used by the dispatcher (once it lands).
@@ -272,9 +355,19 @@ impl TransferManager {
             if let Some(&idx) = inner.job_index.get(&id) {
                 let j = &mut inner.jobs[idx];
                 let was_pending = j.state == TransferState::Pending;
+                let was_live = matches!(j.state, TransferState::Pending | TransferState::Active);
+                let ends = matches!(state, TransferState::Complete | TransferState::Failed(_));
                 j.state = state.clone();
+                let key = destination_key(j.direction, &j.remote_path, &j.local_path);
                 if was_pending {
                     inner.pending_count = inner.pending_count.saturating_sub(1);
+                }
+                // The job has stopped writing its destination; another may.
+                if was_live
+                    && ends
+                    && let Some(key) = key
+                {
+                    inner.in_flight.remove(&key);
                 }
             }
         }
@@ -582,6 +675,122 @@ mod tests {
     fn new_leaves_in_range_parallelism_alone() {
         let (m, _rx) = TransferManager::new(4);
         assert_eq!(m.parallelism(), 4);
+    }
+
+    // -- duplicate destinations ------------------------------------------------
+    //
+    // Two jobs writing one destination at once corrupt it: both stream into
+    // the same `.part`, and the first to finish renames it into place while
+    // the other is still writing. So a destination is held from enqueue until
+    // its job completes or fails, and a second job for it is refused.
+
+    #[test]
+    fn a_second_download_to_a_queued_destination_is_refused() {
+        let m = manager();
+        m.enqueue_download("/a".into(), "/tmp/x".into()).unwrap();
+        assert_eq!(
+            m.enqueue_download("/b".into(), "/tmp/x".into()),
+            Err(EnqueueError::Duplicate),
+        );
+    }
+
+    #[test]
+    fn a_second_download_to_a_running_destination_is_refused() {
+        let m = manager();
+        m.enqueue_download("/a".into(), "/tmp/x".into()).unwrap();
+        m.take_next_pending().expect("the first job starts");
+        assert_eq!(
+            m.enqueue_download("/a".into(), "/tmp/x".into()),
+            Err(EnqueueError::Duplicate),
+        );
+    }
+
+    #[test]
+    fn a_destination_is_free_again_once_its_job_ends() {
+        let m = manager();
+        let done = m.enqueue_download("/a".into(), "/tmp/x".into()).unwrap();
+        m.mark(done, TransferState::Complete);
+        let failed = m
+            .enqueue_download("/a".into(), "/tmp/x".into())
+            .expect("a completed job no longer holds its destination");
+        m.mark(failed, TransferState::Failed("boom".into()));
+        m.enqueue_download("/a".into(), "/tmp/x".into())
+            .expect("nor does a failed one");
+    }
+
+    #[test]
+    fn a_cancelled_job_frees_its_destination() {
+        let m = manager();
+        let batch = m.allocate_batch_id();
+        m.enqueue_download_batched("/a".into(), "/tmp/x".into(), batch)
+            .unwrap();
+        m.cancel_batch(batch);
+        m.enqueue_download("/a".into(), "/tmp/x".into())
+            .expect("a cancelled job no longer holds its destination");
+    }
+
+    #[test]
+    fn uploads_are_held_by_their_remote_path() {
+        let m = manager();
+        m.enqueue_upload("/tmp/x".into(), "/r/x".into()).unwrap();
+        assert_eq!(
+            m.enqueue_upload("/tmp/y".into(), "/r/x".into()),
+            Err(EnqueueError::Duplicate),
+            "two uploads to one remote path write one `.part` there",
+        );
+        m.enqueue_upload("/tmp/x".into(), "/r/other".into())
+            .expect("one local source may go to two remote paths");
+    }
+
+    #[test]
+    fn a_download_and_an_upload_do_not_hold_each_other() {
+        let m = manager();
+        m.enqueue_download("/r/x".into(), "/tmp/x".into()).unwrap();
+        m.enqueue_upload("/tmp/x".into(), "/r/x".into())
+            .expect("an upload's destination is remote, not local");
+    }
+
+    #[test]
+    fn mkdirs_are_never_refused() {
+        let m = manager();
+        m.enqueue_mkdir("/r/d".into()).unwrap();
+        m.enqueue_mkdir("/r/d".into())
+            .expect("creating a directory twice is harmless");
+    }
+
+    #[test]
+    fn is_in_flight_tracks_the_destination() {
+        let m = manager();
+        let key = destination_key(Direction::Download, "/a", Path::new("/tmp/x")).unwrap();
+        assert!(!m.is_in_flight(&key));
+        let id = m.enqueue_download("/a".into(), "/tmp/x".into()).unwrap();
+        assert!(m.is_in_flight(&key));
+        m.mark(id, TransferState::Complete);
+        assert!(!m.is_in_flight(&key));
+    }
+
+    #[test]
+    fn local_destinations_fold_case_only_where_the_filesystem_does() {
+        let upper = Path::new("/tmp/README");
+        let lower = Path::new("/tmp/readme");
+        assert_ne!(
+            local_destination_key(upper, false),
+            local_destination_key(lower, false),
+            "a case-sensitive filesystem holds both",
+        );
+        assert_eq!(
+            local_destination_key(upper, true),
+            local_destination_key(lower, true),
+            "a case-insensitive one holds one file under both names",
+        );
+    }
+
+    #[test]
+    fn remote_destinations_never_fold_case() {
+        assert_ne!(
+            destination_key(Direction::Upload, "/r/README", Path::new("/l")),
+            destination_key(Direction::Upload, "/r/readme", Path::new("/l")),
+        );
     }
 
     #[test]

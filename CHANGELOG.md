@@ -8,6 +8,24 @@ the git history for those.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Downloading a file that is already downloading no longer corrupts it.**
+  Nothing stopped two jobs with one destination from running at once — a
+  second Ctrl-D on the same file or folder, overlapping folder downloads,
+  or on Windows and macOS a server directory holding both `README` and
+  `readme`. Both wrote the same `.part`, and the first to finish renamed
+  it into place and reported success while the other was still writing:
+  the file came out short or with duplicated data. Reproduced against the
+  test SFTP server with an 8 MiB file: 294 KB short or 522 KB too long,
+  depending on timing. Uploads had the same flaw on the server side.
+
+  A job is now not queued while another pending or running job writes the
+  same destination — a download's local path, compared ignoring case on
+  Windows and macOS, or an upload's remote path. The log says how many
+  were skipped; two files in one batch that would land on the same path
+  are each named, since one of them will not be transferred.
+
 ## [0.8.1] — 2026-09-26
 
 ### Security

@@ -23,7 +23,7 @@
 //! batch.
 
 use crate::checkpoint::{Checkpoint, CheckpointJob, CheckpointKind, JobStatus};
-use crate::transfer::Direction;
+use crate::transfer::{Direction, EnqueueError, TransferManager, destination_key};
 use crate::tui::plan::PlannedJob;
 
 use super::{App, LogLevel};
@@ -111,6 +111,16 @@ impl App {
         let Some(manager) = self.transfer_manager.clone() else {
             return;
         };
+
+        // Drop jobs whose destination is already being written, before the
+        // plan is recorded anywhere. The manager would refuse them at
+        // enqueue, but by then they would be in the checkpoint as `pending`
+        // with nothing to run them — and a checkpoint with pending entries
+        // blocks `r` for the rest of the session.
+        let plan = self.drop_duplicate_destinations(&manager, plan);
+        if plan.is_empty() {
+            return;
+        }
 
         // Allocate a batch id for any plan with more than one job, so `C`
         // can cancel the whole thing as a unit — including the mkdir that
@@ -235,7 +245,7 @@ impl App {
                 ) => manager.enqueue_upload(local_path, remote_path),
             };
             match job_id {
-                Some(id) => {
+                Ok(id) => {
                     self.checkpoint_job_map.insert(id, (ck_kind, base + cp_idx));
                     if is_mkdir {
                         dirs += 1;
@@ -246,7 +256,16 @@ impl App {
                 // Queue cap reached. The job stays `pending` in the
                 // checkpoint, so a later resume picks it up — but the user
                 // must be told the batch was only partially enqueued.
-                None => dropped += 1,
+                Err(EnqueueError::QueueFull) => dropped += 1,
+                // Filtered out above, and nothing else enqueues between the
+                // filter and here: both run on the UI thread. Should it ever
+                // happen, the entry must not stay `pending` with nothing to
+                // run it, which would block `r` for the session.
+                Err(EnqueueError::Duplicate) => {
+                    if let Some(cp) = self.active_checkpoints.get_mut(&ck_kind) {
+                        cp.mark_cancelled(base + cp_idx);
+                    }
+                }
             }
         }
         let label = match kind {
@@ -271,6 +290,74 @@ impl App {
                 ),
             );
         }
+    }
+
+    /// Remove plan entries whose destination another job already writes —
+    /// one still queued or running, or an earlier entry of this same plan.
+    ///
+    /// Two jobs on one destination corrupt it: see
+    /// [`crate::transfer::destination_key`]. The two cases are reported
+    /// differently. A duplicate of a live job loses nothing, because that
+    /// job writes the same file, so it is counted in one line. A collision
+    /// inside the plan — `README` and `readme` from one server directory on
+    /// a case-insensitive filesystem — means one of the two files will not
+    /// be transferred, so each one is named.
+    fn drop_duplicate_destinations(
+        &mut self,
+        manager: &TransferManager,
+        plan: Vec<PlannedJob>,
+    ) -> Vec<PlannedJob> {
+        let mut seen = std::collections::HashSet::new();
+        let mut already_live = 0usize;
+        let mut kept = Vec::with_capacity(plan.len());
+        for job in plan {
+            let key = match &job {
+                PlannedJob::Mkdir { .. } => None,
+                PlannedJob::Download {
+                    remote_path,
+                    local_path,
+                } => destination_key(Direction::Download, remote_path, local_path),
+                PlannedJob::Upload {
+                    local_path,
+                    remote_path,
+                } => destination_key(Direction::Upload, remote_path, local_path),
+            };
+            let Some(key) = key else {
+                kept.push(job);
+                continue;
+            };
+            if manager.is_in_flight(&key) {
+                already_live += 1;
+                continue;
+            }
+            if !seen.insert(key) {
+                let (verb, source) = match &job {
+                    PlannedJob::Download { remote_path, .. } => {
+                        ("downloading", remote_path.clone())
+                    }
+                    PlannedJob::Upload { local_path, .. } => {
+                        ("uploading", local_path.display().to_string())
+                    }
+                    PlannedJob::Mkdir { .. } => unreachable!("mkdirs have no key"),
+                };
+                self.push_log(
+                    LogLevel::Warn,
+                    format!(
+                        "not {verb} {source}: another file in this batch has \
+                         the same destination"
+                    ),
+                );
+                continue;
+            }
+            kept.push(job);
+        }
+        if already_live > 0 {
+            self.push_log(
+                LogLevel::Info,
+                format!("skipped {already_live} file(s) already queued or running"),
+            );
+        }
+        kept
     }
 
     /// Dispatch a *resumed* plan: load the checkpoint for `kind`, skip jobs
