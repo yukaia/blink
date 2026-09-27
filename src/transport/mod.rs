@@ -267,7 +267,83 @@ pub struct ProgressUpdate {
 /// Maximum time allowed for `transport::open` (TCP connect + SSH handshake +
 /// auth). Shared between the TUI initial-connect path and the dispatcher's
 /// per-job connect path so both enforce the same deadline.
+///
+/// It bounds the network, not the user: time spent with a host-key prompt
+/// open does not count — see [`within_deadline_excluding_waits`].
 pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Tells the connect deadline when a connection is waiting on the user.
+///
+/// The SSH host-key handler holds one and marks the time it spends waiting
+/// for an answer to its prompt; the caller that set the deadline holds the
+/// receiver and stops the clock meanwhile. Without it, a user who took more
+/// than the deadline to check a fingerprint — which the README tells them to
+/// do out of band — got "connection timed out" under the open prompt.
+#[derive(Clone)]
+pub struct UserWait(tokio::sync::watch::Sender<bool>);
+
+impl UserWait {
+    /// A signal and the receiver for [`within_deadline_excluding_waits`].
+    pub fn new() -> (Self, tokio::sync::watch::Receiver<bool>) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        (Self(tx), rx)
+    }
+
+    /// Mark the connection as waiting on the user until the guard drops,
+    /// on every path out: an answer, a timeout, a cancelled connect.
+    pub(crate) fn waiting(&self) -> UserWaitGuard<'_> {
+        self.0.send_replace(true);
+        UserWaitGuard(&self.0)
+    }
+}
+
+/// Ends a [`UserWait::waiting`] period on drop.
+pub(crate) struct UserWaitGuard<'a>(&'a tokio::sync::watch::Sender<bool>);
+
+impl Drop for UserWaitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.send_replace(false);
+    }
+}
+
+/// Run `fut` under a deadline of `limit` that counts only the time no one is
+/// waiting on the user, as signalled through `waiting`. Returns `None` if
+/// the deadline passes first.
+///
+/// The pause suspends the deadline rather than resetting it: time before
+/// and after a prompt adds up. It ends when the signal is cleared, or when
+/// every [`UserWait`] is gone — a pause nothing can end any more must not
+/// last forever, so the remaining time applies from then.
+pub(crate) async fn within_deadline_excluding_waits<F: std::future::Future>(
+    limit: std::time::Duration,
+    mut waiting: tokio::sync::watch::Receiver<bool>,
+    fut: F,
+) -> Option<F::Output> {
+    tokio::pin!(fut);
+    let mut remaining = limit;
+    loop {
+        let paused = *waiting.borrow_and_update();
+        let started = tokio::time::Instant::now();
+        let signal_lost = if paused {
+            tokio::select! {
+                out = &mut fut => return Some(out),
+                changed = waiting.changed() => changed.is_err(),
+            }
+        } else {
+            tokio::select! {
+                out = &mut fut => return Some(out),
+                () = tokio::time::sleep(remaining) => return None,
+                changed = waiting.changed() => {
+                    remaining = remaining.saturating_sub(started.elapsed());
+                    changed.is_err()
+                }
+            }
+        };
+        if signal_lost {
+            return tokio::time::timeout(remaining, fut).await.ok();
+        }
+    }
+}
 
 /// What every protocol implementation must provide.
 #[async_trait]
@@ -344,6 +420,10 @@ pub struct Connected {
 /// `app_event_tx` is forwarded to the SFTP/SCP handler for the host-key
 /// confirmation flow. FTP/FTPS do not use host-key verification.
 ///
+/// `user_wait` is how the SSH handler marks time spent on its host-key
+/// prompt, so the caller's connect deadline can exclude it; see
+/// [`within_deadline_excluding_waits`]. FTP/FTPS never prompt.
+///
 /// `trust` carries the keys the user accepted for this session without
 /// saving them. It must be the *same* store for every connection a connected
 /// session opens — the interactive one and each transfer worker's — or an
@@ -354,14 +434,21 @@ pub async fn open(
     password: Option<&str>,
     app_event_tx: mpsc::UnboundedSender<crate::tui::event::AppEvent>,
     trust: crate::known_hosts::SessionTrust,
+    user_wait: UserWait,
 ) -> Result<Connected> {
     let (transport, new_cert_pin): (Box<dyn Transport>, Option<String>) = match session.protocol {
         Protocol::Sftp => (
-            Box::new(sftp::SftpTransport::connect(session, password, app_event_tx, trust).await?),
+            Box::new(
+                sftp::SftpTransport::connect(session, password, app_event_tx, trust, user_wait)
+                    .await?,
+            ),
             None,
         ),
         Protocol::Scp => (
-            Box::new(scp::ScpTransport::connect(session, password, app_event_tx, trust).await?),
+            Box::new(
+                scp::ScpTransport::connect(session, password, app_event_tx, trust, user_wait)
+                    .await?,
+            ),
             None,
         ),
         Protocol::Ftp => (
@@ -668,6 +755,85 @@ pub(crate) mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- the connect deadline and the host-key prompt ----------------------
+    //
+    // The connect deadline bounds the network: a server that accepts the
+    // socket and then stalls. It must not bound the user, who may be checking
+    // a host-key fingerprint through another channel before answering the
+    // prompt — the README tells them to. Time with the prompt open does not
+    // count. The paused clock is safe here: nothing below does real I/O.
+
+    use std::time::Duration;
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_finishes_in_time_returns_its_result() {
+        let (_wait, waiting) = UserWait::new();
+        let out = within_deadline_excluding_waits(Duration::from_secs(30), waiting, async {
+            tokio::time::sleep(Duration::from_secs(29)).await;
+            7
+        })
+        .await;
+        assert_eq!(out, Some(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn time_outside_a_prompt_counts_toward_the_deadline() {
+        let (_wait, waiting) = UserWait::new();
+        let out = within_deadline_excluding_waits(Duration::from_secs(30), waiting, async {
+            tokio::time::sleep(Duration::from_secs(31)).await;
+        })
+        .await;
+        assert_eq!(out, None, "a stalled server must still time out");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn time_with_a_prompt_open_does_not_count() {
+        let (wait, waiting) = UserWait::new();
+        // 5 s of network, a 30 s prompt, 5 s more: 40 s in all, 10 counted.
+        let out = within_deadline_excluding_waits(Duration::from_secs(30), waiting, async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            {
+                let _open = wait.waiting();
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            "connected"
+        })
+        .await;
+        assert_eq!(out, Some("connected"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn time_before_and_after_a_prompt_adds_up() {
+        let (wait, waiting) = UserWait::new();
+        // 20 s, a prompt, then 11 s: 31 s of network time.
+        let out = within_deadline_excluding_waits(Duration::from_secs(30), waiting, async {
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            {
+                let _open = wait.waiting();
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            tokio::time::sleep(Duration::from_secs(11)).await;
+        })
+        .await;
+        assert_eq!(out, None, "the prompt pauses the deadline, not resets it");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn losing_the_signal_mid_prompt_restores_the_deadline() {
+        let (wait, waiting) = UserWait::new();
+        let out = within_deadline_excluding_waits(Duration::from_secs(30), waiting, async move {
+            let open = wait.waiting();
+            // Leak the guard so the flag is never cleared, then drop every
+            // sender: nothing can end the pause any more.
+            std::mem::forget(open);
+            drop(wait);
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        })
+        .await;
+        assert_eq!(out, None, "a pause nothing can end must not last forever");
+    }
 
     // -- resume provenance -------------------------------------------------
     //

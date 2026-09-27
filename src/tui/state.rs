@@ -520,6 +520,10 @@ pub struct PendingHostKey {
     pub fingerprint: String,
     /// One-shot sender; consumed exactly once when the user decides.
     pub decision_tx: Option<tokio::sync::oneshot::Sender<crate::transport::sftp::HostKeyDecision>>,
+    /// When the prompt appeared. A connect that fails with the prompt still
+    /// open after [`crate::transport::sftp::HOST_KEY_DECISION_TIMEOUT`]
+    /// failed because the prompt expired, and the log says so.
+    pub opened_at: std::time::Instant,
 }
 
 impl Drop for PendingHostKey {

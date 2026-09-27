@@ -264,12 +264,22 @@ async fn connect(
 ) -> crate::error::Result<Box<dyn Transport>> {
     // A stalling server (connects but never completes the handshake) would
     // otherwise pin this worker slot for the lifetime of the TCP session.
-    let connected = tokio::time::timeout(
+    // Workers rarely prompt — the session's trust covers them — but if one
+    // does, the user's time with it open is not the server stalling.
+    let (user_wait, waiting) = transport::UserWait::new();
+    let connected = transport::within_deadline_excluding_waits(
         CONNECT_TIMEOUT,
-        transport::open(session, password, app_event_tx.clone(), trust.clone()),
+        waiting,
+        transport::open(
+            session,
+            password,
+            app_event_tx.clone(),
+            trust.clone(),
+            user_wait,
+        ),
     )
     .await
-    .map_err(|_| BlinkError::connect("connection timed out"))??;
+    .ok_or_else(|| BlinkError::connect("connection timed out"))??;
     Ok(connected.transport)
 }
 

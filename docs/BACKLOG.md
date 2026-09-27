@@ -66,20 +66,9 @@ so SFTP would return zero). One log line per listing, as now, not one
 per skipped line. `an_unparsable_listing_line_becomes_no_entry_at_all`
 in the FTP harness is the place to assert it.
 
-## The host-key prompt counts against the 30 s connect timeout
+## Every completed upload re-lists the remote pane
 
 Found in the 2026-09-26 codebase audit, like every entry below.
-
-`tui/app/mod.rs` wraps the whole `transport::open` in `CONNECT_TIMEOUT`
-(30 s), and that includes the time the SFTP handler waits on the user's
-host-key decision. The handler's own 60 s allowance (`sftp.rs`,
-`check_server_key`) therefore never applies. Someone who takes more than
-about 30 s to check the fingerprint out of band, as the README tells them
-to, gets "connection timed out" under the open modal. Fails closed, so
-not a security hole. Fix: exclude the prompt wait from the deadline, for
-example by timing the handshake and auth phases separately.
-
-## Every completed upload re-lists the remote pane
 
 `handle_transfer_event` (`tui/app/events.rs`) calls `refresh_remote_pane`
 on each completed upload, and `refresh_remote_pane` (`tui/app/panes.rs`)

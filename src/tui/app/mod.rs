@@ -839,14 +839,18 @@ impl App {
             // Zeroizing<String> is moved into this task and zeroes on drop
             // when the future returns.
             let pw_borrow = password.as_ref().map(|p| p.as_str());
-            let result = match tokio::time::timeout(
+            // The deadline bounds the server, not the user: it stops while
+            // the host-key prompt is open. See `within_deadline_excluding_waits`.
+            let (user_wait, waiting) = transport::UserWait::new();
+            let result = match transport::within_deadline_excluding_waits(
                 CONNECT_TIMEOUT,
-                transport::open(&session, pw_borrow, tx_for_transport, trust),
+                waiting,
+                transport::open(&session, pw_borrow, tx_for_transport, trust, user_wait),
             )
             .await
             {
-                Ok(r) => r,
-                Err(_) => Err(crate::error::BlinkError::connect("connection timed out")),
+                Some(r) => r,
+                None => Err(crate::error::BlinkError::connect("connection timed out")),
             };
             let event = match result {
                 Ok(t) => AppEvent::Connected(t),
@@ -1178,7 +1182,54 @@ mod tests {
             key_type: "ssh-ed25519".into(),
             fingerprint: "SHA256:abc".into(),
             decision_tx: Some(tx),
+            opened_at: std::time::Instant::now(),
         }
+    }
+
+    /// A connect that fails with the host-key prompt still open — the prompt
+    /// expired, or the server gave up first — must take the prompt down.
+    /// Leaving it up answered a connection that no longer existed.
+    #[test]
+    fn a_failed_connect_closes_its_host_key_prompt() {
+        let mut a = app();
+        a.pending_session = Some(Session::from_url("sftp://me@host").unwrap());
+        a.screen = Screen::ConfirmHostKey;
+        a.pending_host_key = Some(pending_host_key());
+
+        a.handle_app_event(AppEvent::ConnectFailed("ssh connect: rejected".into()));
+
+        assert!(a.pending_host_key.is_none(), "the prompt must be dropped");
+        assert_eq!(a.screen, Screen::SessionSelect);
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.message.contains("ssh connect: rejected")),
+            "an early failure keeps its own reason",
+        );
+    }
+
+    /// When the prompt itself ran out, "connection refused" would blame the
+    /// server for what was the user's clock: say that the prompt expired.
+    #[test]
+    fn an_expired_host_key_prompt_is_named_as_the_reason() {
+        let mut a = app();
+        a.pending_session = Some(Session::from_url("sftp://me@host").unwrap());
+        a.screen = Screen::ConfirmHostKey;
+        let mut prompt = pending_host_key();
+        prompt.opened_at = std::time::Instant::now()
+            - crate::transport::sftp::HOST_KEY_DECISION_TIMEOUT
+            - std::time::Duration::from_secs(1);
+        a.pending_host_key = Some(prompt);
+
+        a.handle_app_event(AppEvent::ConnectFailed("ssh connect: rejected".into()));
+
+        assert!(a.pending_host_key.is_none());
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.message.contains("host-key prompt timed out")),
+            "the log must say the prompt expired",
+        );
     }
 
     #[test]

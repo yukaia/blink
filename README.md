@@ -667,6 +667,11 @@ terminal. The following properties are enforced in the current codebase.
 - **30-second connect timeout** — applied to both the primary connection
   and every parallel worker connection. A server that accepts the TCP
   socket but stalls the handshake cannot pin connections indefinitely.
+  Time spent with the host-key prompt open does not count against it, so
+  checking a fingerprint out of band cannot time the connection out. The
+  prompt has its own limit of two minutes, OpenSSH's default
+  `LoginGraceTime`, after which the server would drop the connection
+  anyway.
 - **An FTP/FTPS connection that breaks is replaced, not reused.** Each
   control-channel call has a 60-second deadline. A call that passes it,
   is cut short, or loses the connection leaves the client possibly out

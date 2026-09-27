@@ -10,6 +10,17 @@ the git history for those.
 
 ### Fixed
 
+- **Checking a host-key fingerprint no longer times the connection out.**
+  The 30-second connect deadline covered the whole connect, including the
+  time the host-key prompt waited for an answer, so anyone who took longer
+  than about 30 seconds to verify a fingerprint through another channel —
+  as the README advises — got "connection timed out" under the still-open
+  prompt. The deadline now stops while the prompt is open. The prompt has
+  its own limit, raised from 60 seconds to two minutes (OpenSSH's default
+  `LoginGraceTime`); when it runs out, the log says the prompt timed out
+  rather than blaming the server, and a prompt whose connection has failed
+  is taken down instead of being left up.
+
 - **Downloading a file that is already downloading no longer corrupts it.**
   Nothing stopped two jobs with one destination from running at once — a
   second Ctrl-D on the same file or folder, overlapping folder downloads,

@@ -192,7 +192,26 @@ impl App {
                 self.passphrase_error = None;
                 self.passphrase_attempted = false;
                 self.screen = Screen::SessionSelect;
-                self.push_log(LogLevel::Error, format!("connect failed: {err}"));
+                // A prompt still up belongs to the connection that just
+                // failed; answering it now would answer nothing. If it had
+                // been open for its whole allowance, the prompt expiring is
+                // why the connect failed, and the server's refusal that
+                // followed would blame the wrong party.
+                let expired = self.pending_host_key.take().is_some_and(|p| {
+                    p.opened_at.elapsed() >= crate::transport::sftp::HOST_KEY_DECISION_TIMEOUT
+                });
+                if expired {
+                    self.push_log(
+                        LogLevel::Error,
+                        format!(
+                            "connect failed: the host-key prompt timed out after {} s \
+                             with no answer",
+                            crate::transport::sftp::HOST_KEY_DECISION_TIMEOUT.as_secs()
+                        ),
+                    );
+                } else {
+                    self.push_log(LogLevel::Error, format!("connect failed: {err}"));
+                }
             }
             AppEvent::ConnectKeyNeedsPassphrase => {
                 // Stale guard: the user may have escaped out before this
@@ -413,6 +432,7 @@ impl App {
                     key_type,
                     fingerprint,
                     decision_tx: Some(decision_tx),
+                    opened_at: std::time::Instant::now(),
                 });
                 // Don't let a second prompt make this modal its own return
                 // target — that strands the user on it. (The shared

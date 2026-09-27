@@ -90,7 +90,20 @@ struct KnownHostsHandler {
     /// with every other connection the session opens, so an accept-once is
     /// answered once rather than per worker. See [`SessionTrust`].
     trust: SessionTrust,
+    /// Marks the time the prompt waits on the user, so the caller's connect
+    /// deadline does not run meanwhile. See [`crate::transport::UserWait`].
+    user_wait: crate::transport::UserWait,
 }
+
+/// How long the host-key prompt waits for an answer before rejecting.
+///
+/// The connect deadline is paused meanwhile, so this is the user's whole
+/// allowance. Two minutes is OpenSSH's default `LoginGraceTime`: the server
+/// drops an unauthenticated connection after that, so waiting longer would
+/// only trade an honest "prompt timed out" for a confusing failure after the
+/// user finally answers.
+pub(crate) const HOST_KEY_DECISION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(120);
 
 impl KnownHostsHandler {
     /// Human-readable form of the host, used in TUI prompts and log lines.
@@ -227,10 +240,11 @@ impl Handler for KnownHostsHandler {
             return Ok(false);
         }
 
-        // The TUI must respond within 60 seconds, otherwise reject
-        // to avoid hanging the connection indefinitely.
-        let decision =
-            match tokio::time::timeout(std::time::Duration::from_secs(60), decision_rx).await {
+        // Wait for the user, with the connect deadline paused, but not
+        // forever: see `HOST_KEY_DECISION_TIMEOUT`.
+        let decision = {
+            let _waiting = self.user_wait.waiting();
+            match tokio::time::timeout(HOST_KEY_DECISION_TIMEOUT, decision_rx).await {
                 Ok(d) => d.unwrap_or(HostKeyDecision::Reject),
                 Err(_) => {
                     tracing::warn!(
@@ -239,7 +253,8 @@ impl Handler for KnownHostsHandler {
                     );
                     HostKeyDecision::Reject
                 }
-            };
+            }
+        };
 
         match decision {
             HostKeyDecision::AcceptAndSave => {
@@ -371,6 +386,7 @@ impl SftpTransport {
         password: Option<&str>,
         app_event_tx: mpsc::UnboundedSender<crate::tui::event::AppEvent>,
         trust: SessionTrust,
+        user_wait: crate::transport::UserWait,
     ) -> Result<Self> {
         let config = Arc::new(client::Config {
             keepalive_interval: Some(KEEPALIVE_INTERVAL),
@@ -385,6 +401,7 @@ impl SftpTransport {
             port: session.port,
             event_tx: Some(app_event_tx),
             trust,
+            user_wait,
         };
 
         let mut handle = client::connect(config, addr.clone(), handler)
@@ -1815,6 +1832,42 @@ mod integration {
     /// the first. Each dispatcher worker opens its own; before the shared
     /// trust store, every one of them raised a fresh host-key prompt
     /// mid-transfer — and that prompt takes over the whole UI.
+    /// End to end: a prompt answered after the connect deadline would have
+    /// passed still connects, because time with the prompt open does not
+    /// count. The deadline is shortened to half a second and the answer
+    /// comes after a full one.
+    #[tokio::test]
+    async fn a_prompt_answered_after_the_connect_deadline_still_connects() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let (port, _c) = start_server(store).await;
+        let session = test_session(port);
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let (user_wait, waiting) = crate::transport::UserWait::new();
+
+        let connect = crate::transport::within_deadline_excluding_waits(
+            std::time::Duration::from_millis(500),
+            waiting,
+            SftpTransport::connect(
+                &session,
+                Some("pw"),
+                ev_tx,
+                crate::known_hosts::SessionTrust::new(),
+                user_wait,
+            ),
+        );
+        let answer_slowly = async {
+            if let Some(AppEvent::HostKeyUnknown { decision_tx, .. }) = ev_rx.recv().await {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                let _ = decision_tx.send(HostKeyDecision::AcceptOnce);
+            }
+        };
+        let (result, ()) = tokio::join!(connect, answer_slowly);
+        let mut transport = result
+            .expect("the deadline must not run while the prompt is open")
+            .expect("and the connect must succeed");
+        let _ = transport.close().await;
+    }
+
     #[tokio::test]
     async fn accept_once_covers_later_connections_of_the_same_session() {
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
@@ -1829,6 +1882,7 @@ mod integration {
             Some("pw"),
             ev_tx,
             trust.clone(),
+            crate::transport::UserWait::new().0,
         ));
         let mut prompts = 0usize;
         let mut first = loop {
@@ -1847,9 +1901,15 @@ mod integration {
         // Second connection, same session, same trust store — as a worker
         // would. It must not ask again.
         let (ev_tx2, mut ev_rx2) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
-        let mut second = SftpTransport::connect(&session, Some("pw"), ev_tx2, trust)
-            .await
-            .expect("second connect should succeed without a prompt");
+        let mut second = SftpTransport::connect(
+            &session,
+            Some("pw"),
+            ev_tx2,
+            trust,
+            crate::transport::UserWait::new().0,
+        )
+        .await
+        .expect("second connect should succeed without a prompt");
 
         assert!(
             ev_rx2.try_recv().is_err(),
@@ -2008,6 +2068,7 @@ mod integration {
             Some("pw"),
             ev_tx,
             crate::known_hosts::SessionTrust::new(),
+            crate::transport::UserWait::new().0,
         ));
         loop {
             tokio::select! {
@@ -2049,6 +2110,7 @@ mod integration {
             Some("pw"),
             ev_tx,
             crate::known_hosts::SessionTrust::new(),
+            crate::transport::UserWait::new().0,
         ));
         let mut seen_key_type = String::new();
         loop {
@@ -2568,6 +2630,7 @@ mod integration {
             port: 22,
             event_tx: Some(ev_tx),
             trust: crate::known_hosts::SessionTrust::new(),
+            user_wait: crate::transport::UserWait::new().0,
         };
 
         let accepted = handler
@@ -2592,5 +2655,84 @@ mod integration {
             }
             _ => panic!("expected AppEvent::HostCertificateRejected"),
         }
+    }
+
+    /// An unknown key with nobody answering yet: the handler under test,
+    /// the key it was shown, and the channels around it.
+    fn prompting_handler() -> (
+        super::KnownHostsHandler,
+        russh::keys::PublicKeyOrCertificate,
+        tokio::sync::mpsc::UnboundedReceiver<crate::tui::event::AppEvent>,
+        tokio::sync::watch::Receiver<bool>,
+    ) {
+        let (ev_tx, ev_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (user_wait, waiting) = crate::transport::UserWait::new();
+        let handler = super::KnownHostsHandler {
+            host: "example.test".to_string(),
+            port: 22,
+            event_tx: Some(ev_tx),
+            trust: crate::known_hosts::SessionTrust::new(),
+            user_wait,
+        };
+        let key = russh::keys::PrivateKey::from_openssh(super::super::sftp_test_keys::ED25519_KEY)
+            .unwrap()
+            .public_key()
+            .clone();
+        let presented = russh::keys::PublicKeyOrCertificate::PublicKey {
+            key,
+            hash_alg: None,
+        };
+        (handler, presented, ev_rx, waiting)
+    }
+
+    /// The connect deadline must not run while the user reads a fingerprint,
+    /// so the handler says when it is waiting on them — and stops saying so
+    /// once they answer.
+    #[tokio::test]
+    async fn the_handler_signals_while_the_prompt_waits() {
+        use russh::client::Handler as _;
+        let _home = crate::paths::test_home();
+        let (mut handler, presented, mut ev_rx, mut waiting) = prompting_handler();
+
+        let check = tokio::spawn(async move { handler.check_server_key(&presented).await });
+        let Some(crate::tui::event::AppEvent::HostKeyUnknown { decision_tx, .. }) =
+            ev_rx.recv().await
+        else {
+            panic!("an unknown key must raise the prompt");
+        };
+        assert!(
+            *waiting.borrow_and_update(),
+            "the prompt is open, so the deadline must be paused",
+        );
+
+        let _ = decision_tx.send(super::HostKeyDecision::AcceptOnce);
+        assert!(check.await.unwrap().unwrap(), "accepted once");
+        assert!(!*waiting.borrow(), "answered, so the deadline runs again");
+    }
+
+    /// Nobody answering is not an open-ended pause: the prompt expires on
+    /// its own limit, rejects the key, and ends the pause.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_prompt_expires_and_ends_the_pause() {
+        use russh::client::Handler as _;
+        let _home = crate::paths::test_home();
+        let (mut handler, presented, mut ev_rx, waiting) = prompting_handler();
+
+        let started = tokio::time::Instant::now();
+        let check = tokio::spawn(async move { handler.check_server_key(&presented).await });
+        // Hold the decision sender unanswered: dropping it would read as an
+        // immediate reject rather than as a user who never answers.
+        let _unanswered = match ev_rx.recv().await {
+            Some(crate::tui::event::AppEvent::HostKeyUnknown { decision_tx, .. }) => decision_tx,
+            _ => panic!("an unknown key must raise the prompt"),
+        };
+
+        assert!(!check.await.unwrap().unwrap(), "an expired prompt rejects");
+        assert_eq!(
+            started.elapsed(),
+            super::HOST_KEY_DECISION_TIMEOUT,
+            "it waits the prompt's own limit, no less",
+        );
+        assert!(!*waiting.borrow(), "and ends the pause");
     }
 }
