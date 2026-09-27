@@ -10,6 +10,18 @@ the git history for those.
 
 ### Fixed
 
+- **A large upload no longer floods the browsing connection with
+  listings.** Every completed upload asked for a fresh listing of the
+  remote pane, and each one queued behind the last on the connection the
+  pane uses: an upload of a thousand files cost a thousand listings (a
+  thousand data connections on FTP), and navigating or pressing F5 waited
+  behind all of them. Uploads that landed outside the directory on screen
+  triggered them too. Now a refresh asked for while that directory is
+  already being listed folds into a single follow-up, so a batch costs one
+  listing at a time; navigating away drops a follow-up for the directory
+  left behind; and only uploads into the directory shown, or below it,
+  refresh it.
+
 - **Checking a host-key fingerprint no longer times the connection out.**
   The 30-second connect deadline covered the whole connect, including the
   time the host-key prompt waited for an answer, so anyone who took longer

@@ -128,10 +128,27 @@ impl App {
     }
 
     /// Kick off a remote `list` task. The result arrives as `AppEvent::Listed`.
+    ///
+    /// A request for the directory already being listed does not start a
+    /// second listing: it marks the one in flight to run once more when it
+    /// reports back (`finish_remote_listing`). However many requests arrive
+    /// meanwhile, that is at most one listing running and one owed. A
+    /// request for a different directory — navigation — always starts one,
+    /// and drops whatever was owed to the directory being left.
     pub(super) fn refresh_remote_pane(&mut self, path: String) {
         let Some(t) = self.transport.clone() else {
             return;
         };
+        if let Some(listing) = self.remote_listing.as_mut()
+            && listing.path == path
+        {
+            listing.again = true;
+            return;
+        }
+        self.remote_listing = Some(super::RemoteListing {
+            path: path.clone(),
+            again: false,
+        });
         let path_changed = path != self.remote.path;
         // Reflect the new path immediately so the UI shows where we're going,
         // and so the stale-guard in handle_app_event can compare against it.
@@ -160,6 +177,19 @@ impl App {
             };
             let _ = tx.send(event);
         });
+    }
+
+    /// A listing of `path` reported back, successfully or not. If it was the
+    /// one in flight, clear it, and list again if a refresh was asked for
+    /// while it ran. A result for any other path is a listing the user has
+    /// since navigated away from; the one in flight is still running.
+    pub(super) fn finish_remote_listing(&mut self, path: &str) {
+        let Some(listing) = self.remote_listing.take_if(|l| l.path == path) else {
+            return;
+        };
+        if listing.again {
+            self.refresh_remote_pane(listing.path);
+        }
     }
 
     /// Kick off a local `read_dir` task. The result arrives as

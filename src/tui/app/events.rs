@@ -229,6 +229,7 @@ impl App {
                 self.screen = Screen::KeyPassphrasePrompt;
             }
             AppEvent::Listed { path, entries } => {
+                self.finish_remote_listing(&path);
                 // Discard stale responses (user navigated again before this returned).
                 if path != self.remote.path {
                     return;
@@ -237,6 +238,7 @@ impl App {
                     .set_entries(super::build_remote_pane_entries(&entries, &path));
             }
             AppEvent::ListFailed { path, error } => {
+                self.finish_remote_listing(&path);
                 self.push_log(LogLevel::Error, format!("list {path} failed: {error}"));
             }
             AppEvent::LocalListed { path, entries } => {
@@ -563,10 +565,15 @@ impl App {
                     };
                     self.push_log(LogLevel::Success, msg);
                     // Uploads land new files on the remote side; refresh the
-                    // pane so the user sees them. Skip for downloads — the
-                    // local pane doesn't auto-refresh on its own either, and
-                    // a flood of small downloads would thrash the listing.
-                    if j.direction == crate::transfer::Direction::Upload {
+                    // pane so the user sees them — but only when one lands in
+                    // the directory shown or below it, where a new folder may
+                    // have appeared. Requests fold together while a listing
+                    // is in flight, so a batch costs a listing at a time, not
+                    // one per file. Skip for downloads — the local pane
+                    // doesn't auto-refresh on its own either.
+                    if j.direction == crate::transfer::Direction::Upload
+                        && lands_under(&j.remote_path, &self.remote.path)
+                    {
                         let path = self.remote.path.clone();
                         self.refresh_remote_pane(path);
                     }
@@ -614,4 +621,15 @@ impl App {
             }
         }
     }
+}
+
+/// Whether `remote_path` is inside `dir` at any depth. A trailing separator
+/// is added before comparing, so `/srvx/y` is not inside `/srv`.
+fn lands_under(remote_path: &str, dir: &str) -> bool {
+    let prefix = if dir.ends_with('/') {
+        dir.to_string()
+    } else {
+        format!("{dir}/")
+    };
+    remote_path.starts_with(&prefix)
 }

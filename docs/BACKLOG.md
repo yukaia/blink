@@ -66,19 +66,9 @@ so SFTP would return zero). One log line per listing, as now, not one
 per skipped line. `an_unparsable_listing_line_becomes_no_entry_at_all`
 in the FTP harness is the place to assert it.
 
-## Every completed upload re-lists the remote pane
+## A full transfer queue gives advice that cannot be followed
 
 Found in the 2026-09-26 codebase audit, like every entry below.
-
-`handle_transfer_event` (`tui/app/events.rs`) calls `refresh_remote_pane`
-on each completed upload, and `refresh_remote_pane` (`tui/app/panes.rs`)
-spawns a new listing each time with no coalescing. An upload of N files
-queues N listings, FIFO, behind tokio's mutex on the browsing connection;
-on FTP each one opens a data connection. Navigation and F5 wait behind
-the whole queue. Fix: coalesce to one pending refresh, or refresh once
-per batch.
-
-## A full transfer queue gives advice that cannot be followed
 
 When the queue is full, `dispatch_plan` (`tui/app/checkpoint_glue.rs`)
 leaves the dropped jobs `pending` in the active checkpoint and logs

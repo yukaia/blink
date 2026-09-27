@@ -142,6 +142,19 @@ fn credential_buffer() -> zeroize::Zeroizing<String> {
     zeroize::Zeroizing::new(String::with_capacity(CREDENTIAL_CAPACITY))
 }
 
+/// A remote listing that has been started and not yet reported back.
+///
+/// Requests to list the same directory while it is in flight set `again`
+/// instead of starting another: a batch of uploads completing one after
+/// another otherwise queued one listing each behind the browsing
+/// connection's lock. See `App::refresh_remote_pane`.
+struct RemoteListing {
+    path: String,
+    /// A refresh was asked for after this listing started, so its result may
+    /// already be stale: list once more when it reports back.
+    again: bool,
+}
+
 pub struct App {
     pub config: Config,
     pub theme: Theme,
@@ -297,6 +310,8 @@ pub struct App {
     /// re-emitted (initial open, terminal resize). The run loop emits and
     /// clears this flag after each `terminal.draw`.
     image_needs_redraw: bool,
+    /// The remote listing in flight, if any — see `refresh_remote_pane`.
+    remote_listing: Option<RemoteListing>,
     /// Force a full terminal repaint on the next loop iteration. Used when
     /// closing an image viewer: sixel and kitty graphics live outside
     /// ratatui's cell buffer, so ratatui's diffing renderer doesn't know to
@@ -393,6 +408,7 @@ impl App {
             checkpoint_job_map: std::collections::HashMap::new(),
             viewer: None,
             image_needs_redraw: false,
+            remote_listing: None,
             needs_terminal_clear: false,
             status_message: None,
             should_quit: false,
@@ -795,6 +811,7 @@ impl App {
         self.transfer_cursor = 0;
         self.bottom_pane = BottomPane::Log;
         self.remote = PaneState::empty();
+        self.remote_listing = None;
 
         // 4. Reset local pane focus and refresh the sessions list.
         self.active_pane = Pane::Local;
@@ -1847,6 +1864,215 @@ mod tests {
             1,
             "an in-place refresh must not blank the pane while it waits",
         );
+    }
+
+    // -- coalesced remote refreshes -------------------------------------------
+    //
+    // Every completed upload asked for a listing, and each request spawned
+    // its own, queued behind the browsing connection's lock: an upload of N
+    // files cost N listings (N data connections on FTP), with navigation
+    // waiting behind all of them. Requests for the directory already being
+    // listed now fold into one follow-up.
+
+    /// A transport that counts listings and holds each one open until the
+    /// test releases it, so a test can ask for more while one is in flight.
+    struct CountingTransport {
+        lists: Arc<std::sync::atomic::AtomicUsize>,
+        release: Arc<tokio::sync::Semaphore>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for CountingTransport {
+        fn protocol(&self) -> crate::session::Protocol {
+            crate::session::Protocol::Sftp
+        }
+        async fn list(
+            &mut self,
+            _: &str,
+        ) -> crate::error::Result<Vec<crate::transport::RemoteEntry>> {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.release.acquire().await.unwrap().forget();
+            if self.fail {
+                Err(crate::error::BlinkError::transport("listing refused"))
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        async fn download(
+            &mut self,
+            _: &str,
+            _: &std::path::Path,
+            _: Option<tokio::sync::mpsc::UnboundedSender<crate::transport::ProgressUpdate>>,
+        ) -> crate::error::Result<()> {
+            unimplemented!()
+        }
+        async fn upload(
+            &mut self,
+            _: &std::path::Path,
+            _: &str,
+            _: Option<tokio::sync::mpsc::UnboundedSender<crate::transport::ProgressUpdate>>,
+        ) -> crate::error::Result<()> {
+            unimplemented!()
+        }
+        async fn rename(&mut self, _: &str, _: &str) -> crate::error::Result<()> {
+            unimplemented!()
+        }
+        async fn delete_file(&mut self, _: &str) -> crate::error::Result<()> {
+            unimplemented!()
+        }
+        async fn delete_dir(&mut self, _: &str, _: bool) -> crate::error::Result<()> {
+            unimplemented!()
+        }
+        async fn mkdir(&mut self, _: &str) -> crate::error::Result<()> {
+            unimplemented!()
+        }
+        async fn metadata(
+            &mut self,
+            _: &str,
+        ) -> crate::error::Result<Option<crate::transport::RemoteEntry>> {
+            unimplemented!()
+        }
+        async fn read_to_bytes(&mut self, _: &str) -> crate::error::Result<bytes::Bytes> {
+            unimplemented!()
+        }
+        async fn close(&mut self) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Listings {
+        lists: Arc<std::sync::atomic::AtomicUsize>,
+        release: Arc<tokio::sync::Semaphore>,
+        events: tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+    }
+
+    impl Listings {
+        fn started(&self) -> usize {
+            self.lists.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Let the spawned listing tasks run as far as they can.
+        async fn settle() {
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        /// Release one held listing and hand its result to the app.
+        async fn finish_one(&mut self, a: &mut App) {
+            self.release.add_permits(1);
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), self.events.recv())
+                .await
+                .expect("a released listing reports back")
+                .expect("the event channel is open");
+            a.handle_app_event(ev);
+            Self::settle().await;
+        }
+    }
+
+    /// An app browsing `/srv` over a counting transport, with a transfer
+    /// manager for completion events.
+    fn app_listing(fail: bool) -> (App, Listings) {
+        let mut a = app_with_manager();
+        let lists = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        a.transport = Some(Arc::new(Mutex::new(Box::new(CountingTransport {
+            lists: Arc::clone(&lists),
+            release: Arc::clone(&release),
+            fail,
+        }) as Box<dyn Transport>)));
+        a.remote.path = "/srv".into();
+        let events = a.app_event_rx.take().unwrap();
+        (
+            a,
+            Listings {
+                lists,
+                release,
+                events,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn refreshes_asked_for_during_a_listing_fold_into_one() {
+        let (mut a, mut l) = app_listing(false);
+
+        for _ in 0..5 {
+            a.refresh_remote_pane("/srv".into());
+        }
+        Listings::settle().await;
+        assert_eq!(l.started(), 1, "one listing while the first is in flight");
+
+        l.finish_one(&mut a).await;
+        assert_eq!(l.started(), 2, "then exactly one to catch up");
+
+        l.finish_one(&mut a).await;
+        assert_eq!(l.started(), 2, "and nothing after it");
+    }
+
+    #[tokio::test]
+    async fn a_failed_listing_still_runs_the_one_asked_for_meanwhile() {
+        let (mut a, mut l) = app_listing(true);
+
+        a.refresh_remote_pane("/srv".into());
+        a.refresh_remote_pane("/srv".into());
+        Listings::settle().await;
+        l.finish_one(&mut a).await;
+        assert_eq!(l.started(), 2, "a failure must not strand the follow-up");
+    }
+
+    /// Navigation is never folded away, though it still waits for the one
+    /// listing that holds the connection. A follow-up owed to the directory
+    /// the user just left is dropped rather than run in front of theirs.
+    #[tokio::test]
+    async fn navigating_away_drops_the_old_directorys_follow_up() {
+        let (mut a, mut l) = app_listing(false);
+
+        a.refresh_remote_pane("/srv".into());
+        a.refresh_remote_pane("/srv".into());
+        a.refresh_remote_pane("/srv/sub".into());
+        Listings::settle().await;
+        assert_eq!(a.remote.path, "/srv/sub");
+
+        l.finish_one(&mut a).await; // /srv, now stale
+        assert_eq!(l.started(), 2, "/srv/sub runs next");
+        l.finish_one(&mut a).await; // /srv/sub
+        assert_eq!(l.started(), 2, "and /srv is not listed again");
+    }
+
+    fn complete_upload(a: &mut App, remote: &str) {
+        let id = a
+            .transfer_manager
+            .as_ref()
+            .unwrap()
+            .enqueue_upload("/l/x".into(), remote.into())
+            .unwrap();
+        a.handle_transfer_event(TransferEvent::Complete(id));
+    }
+
+    #[tokio::test]
+    async fn an_upload_elsewhere_does_not_refresh_the_pane() {
+        let (mut a, l) = app_listing(false);
+
+        complete_upload(&mut a, "/other/x");
+        complete_upload(&mut a, "/srvx/y");
+        Listings::settle().await;
+        assert_eq!(l.started(), 0, "neither lands in /srv");
+    }
+
+    #[tokio::test]
+    async fn an_upload_into_the_pane_or_below_it_refreshes_it() {
+        let (mut a, mut l) = app_listing(false);
+
+        complete_upload(&mut a, "/srv/x");
+        Listings::settle().await;
+        assert_eq!(l.started(), 1, "a file in /srv");
+        l.finish_one(&mut a).await;
+
+        complete_upload(&mut a, "/srv/new/deep/y");
+        Listings::settle().await;
+        assert_eq!(l.started(), 2, "a file below /srv: its folder may be new");
     }
 
     #[tokio::test]
