@@ -65,3 +65,145 @@ report the skip count to its caller (a `Transport` interface change,
 so SFTP would return zero). One log line per listing, as now, not one
 per skipped line. `an_unparsable_listing_line_becomes_no_entry_at_all`
 in the FTP harness is the place to assert it.
+
+## Two downloads to one local file corrupt it
+
+Found in the 2026-09-26 codebase audit, like every entry below. The most
+serious of them.
+
+Nothing stops two jobs targeting the same local path from running at
+once. `enqueue_selected_downloads` (`tui/app/transfers.rs`) does no
+dedupe, and `find_download_conflicts` only looks for the *final* file,
+which does not exist while the first download is still writing its
+`.part`. The second job's `resume_offset` (`transport/mod.rs`) then
+either deletes the first job's `.part` and starts its own, or takes it
+for its own partial and resumes into it. Both write into one file; the
+first renames it into place and reports success.
+
+Probed against the SFTP harness with an 8 MiB file, cancelling the second
+job once the first finished: the final file came out 294 KB short or
+522 KB too long depending on timing, with the first job reporting
+complete both times. Triggers: Ctrl-D twice on the same file or folder,
+overlapping folder downloads, and on a case-insensitive filesystem
+(Windows, default macOS) a directory holding both `README` and `readme`.
+
+Likely fix: refuse or skip a job whose local path matches one already
+pending or active in `TransferManager`, comparing case-insensitively on
+Windows and macOS, and log it. A regression test can reuse the probe's
+shape: two concurrent `download` calls to one destination.
+
+## The host-key prompt counts against the 30 s connect timeout
+
+`tui/app/mod.rs` wraps the whole `transport::open` in `CONNECT_TIMEOUT`
+(30 s), and that includes the time the SFTP handler waits on the user's
+host-key decision. The handler's own 60 s allowance (`sftp.rs`,
+`check_server_key`) therefore never applies. Someone who takes more than
+about 30 s to check the fingerprint out of band, as the README tells them
+to, gets "connection timed out" under the open modal. Fails closed, so
+not a security hole. Fix: exclude the prompt wait from the deadline, for
+example by timing the handshake and auth phases separately.
+
+## Every completed upload re-lists the remote pane
+
+`handle_transfer_event` (`tui/app/events.rs`) calls `refresh_remote_pane`
+on each completed upload, and `refresh_remote_pane` (`tui/app/panes.rs`)
+spawns a new listing each time with no coalescing. An upload of N files
+queues N listings, FIFO, behind tokio's mutex on the browsing connection;
+on FTP each one opens a data connection. Navigation and F5 wait behind
+the whole queue. Fix: coalesce to one pending refresh, or refresh once
+per batch.
+
+## A full transfer queue gives advice that cannot be followed
+
+When the queue is full, `dispatch_plan` (`tui/app/checkpoint_glue.rs`)
+leaves the dropped jobs `pending` in the active checkpoint and logs
+"resume (r) after the queue drains". Those jobs have no job ids, so
+nothing runs them and the checkpoint's pending count never reaches zero,
+and `resume_walk` refuses while the active checkpoint has pending jobs.
+`r` only works after a reconnect. Fix: track the dropped indices so
+`resume_walk` can re-queue them, or change the message.
+
+## Tabs vanish in the text viewer
+
+`sanitize_line` (`error.rs`) keeps `\t`, and its comment says terminals
+handle tabs, but the tab never reaches the terminal: ratatui drops every
+control grapheme when rendering (`Span::styled_graphemes`,
+`Buffer::set_stringn`). Probed: `"\tindented"` renders as `"indented"`.
+Makefiles and Go files, both listed as viewable, lose their indentation.
+Fix: expand tabs to spaces (tab stops of 4 or 8) before tokenising.
+
+## Images decode on the UI thread
+
+`after_draw` (`tui/app/viewer.rs`) calls the backend's `render`, which
+runs `scale_for_cells` (`preview.rs`): a full decode and a Lanczos3
+resize of up to 4096×4096. It runs synchronously on the UI thread on
+open and on every resize, freezing the TUI (transfer events included)
+meanwhile. Fix: decode and scale on the blocking pool, keyed by panel
+size, and emit the cached escape sequence from `after_draw`.
+
+## Appending to known_hosts can corrupt its last entry
+
+`known_hosts::append` writes the new line without checking the file ends
+in a newline. On a hand-edited file without one, the new entry is glued
+onto the last line; that host's key blob then no longer matches, so it is
+hard-rejected as "key changed". Probed: `a.example` read as `Changed`,
+`b.example` as `Unknown`. Fix: write a newline first when the file is
+non-empty and does not end in one.
+
+## `blink connect` splits user and host at the first `@`
+
+`Session::from_url` (`session.rs`) uses `split_once('@')`, so
+`ftp://user@example.com@files.host.net/` gives user `user` and host
+`example.com@files.host.net` (probed). Email-address usernames are common
+on FTP hosting. curl and most URL parsers split at the last `@`; use
+`rsplit_once`. A `%40`-encoded `@` already works.
+
+## FTP downloads do not check the size they received
+
+`ftp_download` (`ftp_impl.rs`) renames `.part` into place on `226`
+without comparing the bytes received against the size `SIZE` reported.
+SFTP's `pipelined_download` fails a short transfer. A resume the server
+silently restarts, or a short transfer it still confirms, lands as a
+complete file. Fix: when `SIZE` answered, fail if `done` differs.
+
+## FTP previews of large files fail on slow links
+
+`ftp_read_to_bytes` wraps the whole `retr`, data transfer included, in
+the 60 s control-channel deadline, so a 25 MB image never previews below
+about 420 KB/s. Downloads leave the data loop unwrapped for this reason.
+Fix: bound only the control-channel steps, or scale the deadline with
+the size.
+
+## `.part` naming can clobber unrelated files
+
+Downloads use `<name>.part` and `<name>.part.meta`: `resume_offset`
+deletes an unidentifiable `.part` and `File::create` truncates one, so a
+user's own file of that name in the destination is lost. Uploads open
+`<remote>.part` with `TRUNCATE` and remove it on failure (`sftp.rs`,
+`ftp_impl.rs`), the same on the server. Rare, but silent. A more
+specific suffix (`.blink-part`) would make a collision implausible;
+existing partials would need a migration or a one-time restart.
+
+## A resume record does not say which server it came from
+
+`PartMeta` (`transport/mod.rs`) records the remote path and size, not the
+host. Two servers with a file at the same path and size, downloaded to
+one local path, resume into each other's partial. Fix: add host, port
+and protocol to the sidecar; a sidecar without them reads as unidentified
+and restarts, which is already the safe default.
+
+## Comments that say the wrong thing
+
+- `checkpoint.rs` module docs: a new walk *appends* to the checkpoint,
+  not overwrites it; files are `<name>-<hash>-<kind>.json`, not
+  `<session>-<kind>.json`; the format is version 3, not 2.
+- The doc for `remove_orphan_parts` sits above `DiscardOutcome`, so the
+  function that deletes files has none. It also says the CLI is never
+  concurrent with a running batch, but `blink checkpoints --force` in a
+  second terminal can delete `.part` files a running TUI is writing.
+- `from_url`'s comment says `load_from` has always checked `remote_dir`
+  for CR/LF; it checks only `host` and `username`. rust-ini unescapes
+  `\r\n` in values, so a session file can carry one. `check_ftp_path`
+  still blocks it on FTP, but such a session loads and then fails
+  `validate()` on re-save. Fix the comment and validate the same fields
+  in both directions.
