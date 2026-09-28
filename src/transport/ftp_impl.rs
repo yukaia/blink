@@ -450,6 +450,25 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     // browsing connection, is where an unfinished transfer ever mattered.
     timed_ftp("finalize retr", remote_path, reader.finish()).await?;
 
+    // `226` is the server's word that the transfer completed, not proof the
+    // bytes add up. A short transfer it still confirms, or a REST it
+    // acknowledged and then ignored — sending the whole file after the
+    // partial, duplicating its start — both land here with the wrong
+    // length. When SIZE answered, the length must match it exactly. Longer
+    // fails too, though a file growing mid-transfer does the same: the two
+    // cannot be told apart, and a retry of a growing file is harmless. The
+    // partial goes with the failure, or a server that ignores REST would
+    // fail every retry the same way.
+    if let Some(expected) = reported_size
+        && done != expected
+    {
+        let _ = tokio::fs::remove_file(&part).await;
+        super::clear_part_meta(local_path).await;
+        return Err(BlinkError::transport(format!(
+            "retr {remote_path}: received {done} bytes, but the server reported {expected}"
+        )));
+    }
+
     // Only rename once the server confirmed the transfer; otherwise a
     // truncated response could leave a corrupted "complete" file in place.
     tokio::fs::rename(&part, local_path)
@@ -866,7 +885,7 @@ mod integration {
     /// PASV/LIST below, `abrupt_close` by the abrupt-close branch of LIST,
     /// RETR and STOR/APPE alike, `hostile_listing_names` by LIST,
     /// `reset_data_after`, `stall_next_retr` and `drop_on_next_retr` by
-    /// RETR, and
+    /// RETR, `report_size` by SIZE, `ignore_rest` by REST, and
     /// `oversized_greeting` before any command.
     #[derive(Clone, Default)]
     pub(super) struct Faults {
@@ -902,6 +921,11 @@ mod integration {
         /// reply. Clears as it fires and is shared across connections, like
         /// `stall_next_retr`, so a reconnect finds a working server.
         pub drop_on_next_retr: Arc<std::sync::atomic::AtomicBool>,
+        /// Answer SIZE with this instead of the stored file's length.
+        pub report_size: Option<u64>,
+        /// Answer REST with `350` but send RETR from byte 0 regardless: a
+        /// server that acknowledges a restart marker and ignores it.
+        pub ignore_rest: bool,
     }
 
     /// Length of the `oversized_greeting` fault's greeting: 32 times the
@@ -1083,15 +1107,17 @@ mod integration {
                     w.write_all(b"226 transfer complete\r\n").await?;
                 }
                 "REST" => {
-                    rest = arg.trim().parse().unwrap_or(0);
+                    if !faults.ignore_rest {
+                        rest = arg.trim().parse().unwrap_or(0);
+                    }
                     w.write_all(b"350 restart position accepted\r\n").await?;
                 }
                 "SIZE" => {
                     let files = store.lock().await;
                     match files.get(&arg) {
                         Some(bytes) => {
-                            w.write_all(format!("213 {}\r\n", bytes.len()).as_bytes())
-                                .await?
+                            let size = faults.report_size.unwrap_or(bytes.len() as u64);
+                            w.write_all(format!("213 {size}\r\n").as_bytes()).await?
                         }
                         None => w.write_all(b"550 no such file\r\n").await?,
                     }
@@ -1478,6 +1504,85 @@ mod integration {
             "the download must resume from the partial's length, not restart; \
              commands issued: {issued:?}",
         );
+    }
+
+    /// A transfer the server confirms with `226` that is shorter than the
+    /// size SIZE reported must not land as a complete file. Nor may its
+    /// partial stay behind to be resumed from.
+    #[tokio::test]
+    async fn a_download_shorter_than_its_reported_size_fails() {
+        let payload = pseudo_random(40_000);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/short.bin".to_string(), payload.clone());
+        let faults = Faults {
+            report_size: Some(50_000),
+            ..Faults::default()
+        };
+        let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let dir = tempdir_for_test("short-download");
+        let local = dir.join("short.bin");
+        let _ = std::fs::remove_file(&local);
+
+        let err = with_timeout(transport.download("/short.bin", &local, None), "download")
+            .await
+            .expect_err("a short transfer must fail");
+        assert!(
+            err.to_string().contains("40000") && err.to_string().contains("50000"),
+            "the error says what arrived and what was expected: {err}",
+        );
+        assert!(!local.exists(), "no final file");
+        assert!(
+            !crate::transport::part_path(&local).exists(),
+            "and no partial to resume a mismatched transfer from",
+        );
+    }
+
+    /// A server that answers REST with `350` and then sends the whole file
+    /// anyway: blink appended it after the partial, duplicating the start.
+    /// The size check catches it, the partial goes, and the next attempt
+    /// starts from scratch and lands the right bytes.
+    #[tokio::test]
+    async fn a_resume_the_server_ignores_fails_and_the_retry_starts_over() {
+        let payload = pseudo_random(100_000);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/resume.bin".to_string(), payload.clone());
+
+        let dir = tempdir_for_test("ignored-rest");
+        let local = dir.join("resume.bin");
+        let _ = std::fs::remove_file(&local);
+        std::fs::write(crate::transport::part_path(&local), &payload[..30_000]).unwrap();
+        crate::transport::write_part_meta(&local, "/resume.bin", Some(payload.len() as u64)).await;
+
+        let faults = Faults {
+            ignore_rest: true,
+            ..Faults::default()
+        };
+        let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        with_timeout(transport.download("/resume.bin", &local, None), "resume")
+            .await
+            .expect_err("130000 bytes for a 100000-byte file must fail");
+        assert!(!local.exists(), "the duplicated file must not land");
+        assert!(
+            !crate::transport::part_path(&local).exists(),
+            "the partial must go, or every retry resumes into the same fault",
+        );
+
+        with_timeout(transport.download("/resume.bin", &local, None), "retry")
+            .await
+            .expect("with no partial, the retry downloads from scratch");
+        assert_eq!(std::fs::read(&local).unwrap(), payload);
     }
 
     /// The four mutating commands, driven through the transport API. Each

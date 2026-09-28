@@ -10,6 +10,15 @@ the git history for those.
 
 ### Fixed
 
+- **FTP downloads check that they received the whole file.** A download
+  was renamed into place as soon as the server confirmed the transfer,
+  whatever its length. A transfer cut short that the server still
+  confirmed landed truncated; a resume the server acknowledged but ignored
+  — sending the whole file again after the partial one — landed with its
+  start duplicated. When the server reports a size, the download must now
+  match it exactly, or it fails and its partial file is removed so the
+  next attempt starts clean. SFTP already checked.
+
 - **`blink connect` accepts email-address usernames.** The URL was split at
   its first `@`, so `ftp://user@example.com@files.host.net` connected as
   `user` to a host named `example.com@files.host.net`. It is now split at

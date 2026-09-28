@@ -66,17 +66,9 @@ so SFTP would return zero). One log line per listing, as now, not one
 per skipped line. `an_unparsable_listing_line_becomes_no_entry_at_all`
 in the FTP harness is the place to assert it.
 
-## FTP downloads do not check the size they received
+## FTP previews of large files fail on slow links
 
 Found in the 2026-09-26 codebase audit, like every entry below.
-
-`ftp_download` (`ftp_impl.rs`) renames `.part` into place on `226`
-without comparing the bytes received against the size `SIZE` reported.
-SFTP's `pipelined_download` fails a short transfer. A resume the server
-silently restarts, or a short transfer it still confirms, lands as a
-complete file. Fix: when `SIZE` answered, fail if `done` differs.
-
-## FTP previews of large files fail on slow links
 
 `ftp_read_to_bytes` wraps the whole `retr`, data transfer included, in
 the 60 s control-channel deadline, so a 25 MB image never previews below
