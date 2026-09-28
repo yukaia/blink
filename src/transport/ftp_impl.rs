@@ -180,8 +180,6 @@ pub(crate) use delegate_ftp_transport;
 // ---------------------------------------------------------------------------
 
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -744,47 +742,48 @@ pub async fn ftp_read_to_bytes<T: TokioTlsStream + Send + 'static>(
     remote_path: &str,
 ) -> Result<Bytes> {
     check_ftp_path("retr", remote_path)?;
-    let remote_path_owned = remote_path.to_string();
-    // The cap is signalled out of band rather than as the callback's error.
-    // An `Err` from the callback makes `retr` return without finalising the
-    // transfer, which left the connection refusing every later data command
-    // on suppaftp 10; and any `FtpError` it could carry maps to the wrong
-    // thing — `ConnectionError` reads as a disconnect. So the callback always
-    // returns `Ok`, `retr` finalises, and the flag decides the outcome.
-    let over_cap = Arc::new(AtomicBool::new(false));
-    let result = timed_ftp(
-        "retr",
-        remote_path,
-        stream.retr(&remote_path_owned, {
-            let over_cap = Arc::clone(&over_cap);
-            move |reader| {
-                // Cloned per call: `retr` takes an `FnMut`, so the closure
-                // cannot give its own handle away to the future.
-                let over_cap = Arc::clone(&over_cap);
-                Box::pin(async move {
-                    let mut buf = Vec::new();
-                    let mut limited = reader.take(MAX_PREVIEW_BYTES + 1);
-                    limited
-                        .read_to_end(&mut buf)
-                        .await
-                        .map_err(suppaftp::FtpError::ConnectionError)?;
-                    if buf.len() as u64 > MAX_PREVIEW_BYTES {
-                        over_cap.store(true, Ordering::Relaxed);
-                    }
-                    Ok((buf, limited.into_inner()))
-                })
+    // Only the control-channel steps get the op deadline: opening the
+    // transfer here, finishing it below. It used to cover the whole `retr`,
+    // data included, so a 25 MB image could never preview below about
+    // 420 KB/s however steadily it arrived. The data gets an idle deadline
+    // instead: it fails only after that long with nothing arriving, and a
+    // stall reads as a disconnect, since the transfer's state is then
+    // unknown and the connection is reopened before its next use.
+    let mut reader = timed_ftp("retr", remote_path, stream.retr_as_stream(remote_path)).await?;
+    let idle = op_timeout();
+    let mut buf = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    loop {
+        let n = match tokio::time::timeout(idle, reader.read(&mut chunk)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                return Err(BlinkError::transport(format!("read {remote_path}: {e}")));
             }
-        }),
-    )
-    .await;
-    // Checked before `result`: having stopped reading early, the server
-    // usually answers 426, and that is not the error that happened.
-    if over_cap.load(Ordering::Relaxed) {
-        return Err(BlinkError::transport(format!(
-            "retr {remote_path}: file exceeds preview size limit"
-        )));
+            Err(_) => {
+                return Err(BlinkError::disconnected(format!(
+                    "retr {remote_path}: no data for {}s",
+                    idle.as_secs(),
+                )));
+            }
+        };
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.len() as u64 > MAX_PREVIEW_BYTES {
+            // Over the cap: stop reading and drop the transfer unfinished.
+            // suppaftp leaves its completion reply — usually `426`, the
+            // server having seen us stop — for the next command to drain,
+            // so the browsing connection stays usable. The cap is not a
+            // disconnect, so it is reported as a transport error.
+            drop(reader);
+            return Err(BlinkError::transport(format!(
+                "retr {remote_path}: file exceeds preview size limit"
+            )));
+        }
     }
-    Ok(Bytes::from(result?))
+    timed_ftp("finalize retr", remote_path, reader.finish()).await?;
+    Ok(Bytes::from(buf))
 }
 
 // ---------------------------------------------------------------------------
@@ -885,7 +884,8 @@ mod integration {
     /// PASV/LIST below, `abrupt_close` by the abrupt-close branch of LIST,
     /// RETR and STOR/APPE alike, `hostile_listing_names` by LIST,
     /// `reset_data_after`, `stall_next_retr` and `drop_on_next_retr` by
-    /// RETR, `report_size` by SIZE, `ignore_rest` by REST, and
+    /// RETR, as are `trickle` and `stall_next_data_after`, `report_size` by
+    /// SIZE, `ignore_rest` by REST, and
     /// `oversized_greeting` before any command.
     #[derive(Clone, Default)]
     pub(super) struct Faults {
@@ -926,6 +926,13 @@ mod integration {
         /// Answer REST with `350` but send RETR from byte 0 regardless: a
         /// server that acknowledges a restart marker and ignores it.
         pub ignore_rest: bool,
+        /// In RETR, send the body in chunks of this many bytes with this
+        /// pause between them: a slow link that never stalls.
+        pub trickle: Option<(usize, std::time::Duration)>,
+        /// The next RETR sends this many bytes, then holds the data
+        /// connection open and sends nothing more, and no reply. Taken as it
+        /// fires, so a reconnect finds a working server.
+        pub stall_next_data_after: Arc<std::sync::Mutex<Option<usize>>>,
     }
 
     /// Length of the `oversized_greeting` fault's greeting: 32 times the
@@ -1042,6 +1049,8 @@ mod integration {
         // Data listeners of stalled commands, kept bound so the client's
         // data connection opens and then waits.
         let mut stalled: Vec<TcpListener> = Vec::new();
+        // Data connections of stalled transfers, kept open.
+        let mut stalled_data: Vec<TcpStream> = Vec::new();
 
         while let Some(line) = lines.next_line().await? {
             let line = line.trim_end();
@@ -1170,9 +1179,23 @@ mod integration {
                     // write error escape would end the whole control
                     // connection instead, and whether it did would depend on
                     // how much of the body fit in the socket buffer.
+                    let stall_after = faults.stall_next_data_after.lock().unwrap().take();
+                    if let Some(n) = stall_after {
+                        let _ = data.write_all(&slice[..n.min(slice.len())]).await;
+                        // Hold the data connection, and this control
+                        // connection with it, until the client hangs up.
+                        stalled_data.push(data);
+                        while lines.next_line().await?.is_some() {}
+                        return Ok(());
+                    }
                     let sent: std::io::Result<()> = async {
-                        for chunk in slice.chunks(DATA_SLICE) {
+                        let (step, pause) =
+                            faults.trickle.unwrap_or((DATA_SLICE, Default::default()));
+                        for chunk in slice.chunks(step) {
                             data.write_all(chunk).await?;
+                            if !pause.is_zero() {
+                                tokio::time::sleep(pause).await;
+                            }
                         }
                         data.shutdown().await
                     }
@@ -2196,6 +2219,60 @@ mod integration {
             .await
             .expect("and a preview under the cap");
         assert_eq!(&small[..], b"hello");
+    }
+
+    /// The preview's deadline used to cover the whole transfer, data
+    /// included, so a large image never previewed over a slow link however
+    /// steadily it arrived. Now only silence counts: here the transfer takes
+    /// three times the (shortened) deadline, but no gap reaches it.
+    #[tokio::test]
+    async fn a_slow_preview_that_keeps_arriving_succeeds() {
+        super::OP_TIMEOUT.set(std::time::Duration::from_millis(400));
+        let payload = pseudo_random(16 * 1024);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/slow.png".to_string(), payload.clone());
+        let faults = Faults {
+            trickle: Some((2048, std::time::Duration::from_millis(150))),
+            ..Faults::default()
+        };
+        let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let started = std::time::Instant::now();
+        let got = with_timeout(transport.read_to_bytes("/slow.png"), "slow preview")
+            .await
+            .expect("steady data must not time out");
+        assert_eq!(&got[..], &payload[..]);
+        assert!(
+            started.elapsed() > std::time::Duration::from_millis(1000),
+            "the transfer really did outlast the deadline",
+        );
+    }
+
+    /// Data that stops arriving still fails, one deadline after the last
+    /// byte, and the connection reconnects for what comes next.
+    #[tokio::test]
+    async fn a_preview_whose_data_stalls_fails_and_the_connection_recovers() {
+        super::OP_TIMEOUT.set(std::time::Duration::from_millis(400));
+        let faults = Faults::default();
+        *faults.stall_next_data_after.lock().unwrap() = Some(8);
+        let (port, connects, log) = start_server(reconnect_store().await, faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let err = with_timeout(transport.read_to_bytes("/stall.bin"), "stalled data")
+            .await
+            .expect_err("data that stops must fail the preview");
+        assert!(
+            matches!(err, crate::error::BlinkError::Disconnected(_)),
+            "a stall leaves the transfer's state unknown: {err:?}",
+        );
+
+        assert_recovers_on_a_fresh_login(&mut transport, &connects, &log).await;
     }
 
     /// A preview whose data connection is reset mid-read fails — that part is

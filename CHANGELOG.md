@@ -10,6 +10,13 @@ the git history for those.
 
 ### Fixed
 
+- **FTP previews of large files work on slow links.** A preview's
+  60-second deadline covered the whole transfer, so a large image could
+  never preview below about 420 KB/s, however steadily it arrived. Only
+  the FTP commands now carry that deadline; the file's data only has to
+  keep arriving, and fails after 60 seconds with nothing new, after which
+  the connection is reopened for the next command.
+
 - **FTP downloads check that they received the whole file.** A download
   was renamed into place as soon as the server confirmed the transfer,
   whatever its length. A transfer cut short that the server still

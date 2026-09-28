@@ -66,17 +66,9 @@ so SFTP would return zero). One log line per listing, as now, not one
 per skipped line. `an_unparsable_listing_line_becomes_no_entry_at_all`
 in the FTP harness is the place to assert it.
 
-## FTP previews of large files fail on slow links
+## `.part` naming can clobber unrelated files
 
 Found in the 2026-09-26 codebase audit, like every entry below.
-
-`ftp_read_to_bytes` wraps the whole `retr`, data transfer included, in
-the 60 s control-channel deadline, so a 25 MB image never previews below
-about 420 KB/s. Downloads leave the data loop unwrapped for this reason.
-Fix: bound only the control-channel steps, or scale the deadline with
-the size.
-
-## `.part` naming can clobber unrelated files
 
 Downloads use `<name>.part` and `<name>.part.meta`: `resume_offset`
 deletes an unidentifiable `.part` and `File::create` truncates one, so a
