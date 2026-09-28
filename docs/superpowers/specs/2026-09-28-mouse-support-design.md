@@ -1,7 +1,7 @@
 # Mouse Support
 
 **Date:** 2026-09-28  
-**Status:** Draft, for review  
+**Status:** Approved; amended while planning (stable scroll offset, below)  
 
 ## Summary
 
@@ -57,11 +57,26 @@ Rejected: recomputing layouts in the click handler from the terminal size.
 That duplicates every layout, and a duplicated layout is how the image area
 once drifted from what `views::viewer` drew.
 
-A row's entry comes from the same window arithmetic the renderer uses:
-`file_pane::render`'s window calculation moves into one function,
-`visible_window(cursor, len, height) -> Range<usize>`, used by both. The
-transfer and session lists map row `r` of their recorded area to index `r`.
-A click below the last entry hits nothing.
+### A file pane keeps a stable scroll offset
+
+*Amended while planning.* Today's window is a function of the cursor alone:
+once the cursor passes the first screenful it sits on the bottom row, and
+any move shifts the whole list. A click higher up moves the cursor there,
+which shifts the list, so the clicked entry jumps to the bottom row and a
+second click on the same spot lands on a different entry: a double-click
+could never register.
+
+So `PaneState` keeps the first row it showed, `view_offset: Cell<usize>`,
+and the window only scrolls when the cursor leaves it, as ratatui's
+`ListState` does. One function, `scrolled_window(offset, cursor, len,
+height) -> Range<usize>`, computes it; `file_pane::render` calls it and
+stores the result's start back into `view_offset`, so a click maps row `r`
+to entry `view_offset + r`, exactly what was drawn. This changes keyboard
+scrolling slightly: moving up from the bottom row moves the highlight
+within the view instead of shifting the view.
+
+The transfer and session lists have no windowing and map row `r` of their
+recorded area to index `r`. A click below the last entry hits nothing.
 
 ### Events
 
@@ -138,8 +153,9 @@ and the result checked on `App`'s state. No real terminal is involved.
   on a directory it enters it;
 - the wheel over each area moves the right cursor, and the viewer's scroll;
 - with a modal open, clicks on the panes behind it change nothing;
-- `visible_window` gives the renderer's window for cursors at the top, the
-  middle and the end of a list longer than the pane;
+- `scrolled_window` keeps its offset while the cursor stays in view,
+  scrolls just enough when it leaves either end, and clamps when the list
+  shrinks;
 - the `mouse` setting parses, defaults to on, and survives `Config::save`;
 - `EventStream` drops movement events.
 
