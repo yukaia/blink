@@ -10,6 +10,8 @@
 //! mean piggy-backing on side-channel `exec ls -la` and `exec rm` invocations,
 //! which is brittle, locale-dependent, and a security smell.
 //!
+//! [`Transport`]: crate::transport::Transport
+//!
 //! In practice, "scp the protocol" was deprecated in OpenSSH 9.0 (April 2022),
 //! which made `scp(1)` use SFTP internally. Connecting `scp://` to a modern
 //! server is already SFTP under the hood. So we do the same thing: when the
@@ -29,7 +31,7 @@
 //! that out method-for-method invites drift: someone adds a pre-condition
 //! check to `SftpTransport::mkdir` and the SCP wrapper silently misses it,
 //! or the two grow incompatible argument lists during a refactor without
-//! the trait catching it. The [`delegate_inner_transport!`] macro forces
+//! the trait catching it. The `delegate_inner_transport!` macro forces
 //! the body of each method to be exactly `self.inner.METHOD(args).await`
 //! so there is no opportunity for the wrapper to introduce its own logic.
 
@@ -41,7 +43,7 @@ use crate::transport::sftp::SftpTransport;
 
 /// Wraps an [`SftpTransport`] and reports its protocol as
 /// [`crate::session::Protocol::Scp`]. Every other method delegates verbatim
-/// via [`delegate_inner_transport!`].
+/// via `delegate_inner_transport!`.
 pub struct ScpTransport {
     inner: SftpTransport,
 }

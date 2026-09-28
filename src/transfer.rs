@@ -280,7 +280,7 @@ impl TransferManager {
         id
     }
 
-    /// Queue a download as part of a batch. See [`allocate_batch_id`].
+    /// Queue a download as part of a batch. See [`Self::allocate_batch_id`].
     pub fn enqueue_download_batched(
         &self,
         remote_path: String,
@@ -290,7 +290,7 @@ impl TransferManager {
         self.enqueue(Direction::Download, remote_path, local_path, Some(batch_id))
     }
 
-    /// Queue an upload as part of a batch. See [`allocate_batch_id`].
+    /// Queue an upload as part of a batch. See [`Self::allocate_batch_id`].
     pub fn enqueue_upload_batched(
         &self,
         local_path: PathBuf,
@@ -300,7 +300,7 @@ impl TransferManager {
         self.enqueue(Direction::Upload, remote_path, local_path, Some(batch_id))
     }
 
-    /// Queue an mkdir as part of a batch. See [`allocate_batch_id`].
+    /// Queue an mkdir as part of a batch. See [`Self::allocate_batch_id`].
     pub fn enqueue_mkdir_batched(
         &self,
         remote_path: String,
@@ -540,7 +540,7 @@ impl TransferManager {
 
     /// Remove a worker's entry from the active map. Returns `true` if the
     /// entry was present (the natural-completion path), `false` if the entry
-    /// had already been removed by [`cancel`] (cancellation won the race).
+    /// had already been removed by [`Self::cancel`] (cancellation won the race).
     pub fn deregister_active(&self, id: u64) -> bool {
         self.inner.lock().active.remove(&id).is_some()
     }

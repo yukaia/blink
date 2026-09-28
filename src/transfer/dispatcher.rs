@@ -72,7 +72,7 @@ impl Drop for Dispatcher {
 }
 
 impl Dispatcher {
-    /// Spawn a dispatcher that runs in the background until [`shutdown`] is
+    /// Spawn a dispatcher that runs in the background until [`Self::shutdown`] is
     /// called.
     ///
     /// Adjusting concurrency at runtime via

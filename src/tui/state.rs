@@ -64,7 +64,7 @@ impl PaneEntry {
 #[derive(Debug, Clone)]
 pub struct PaneState {
     pub path: String,
-    /// Currently visible entries. When [`filter`] is set, this is the filtered
+    /// Currently visible entries. When [`PaneState::filter`] is set, this is the filtered
     /// subset; otherwise it's the full list.
     pub entries: Vec<PaneEntry>,
     pub cursor: usize,

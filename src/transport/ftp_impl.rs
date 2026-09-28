@@ -7,6 +7,8 @@
 //! for any wrapper type that has a `stream: ImplAsyncFtpStream<T>` field,
 //! a `broken: bool` field, and an `async fn reopen(&mut self)` that
 //! replaces `stream` with a fresh connection and login.
+//!
+//! [`Transport`]: crate::transport::Transport
 
 macro_rules! delegate_ftp_transport {
     ($ty:ty, $proto_variant:ident) => {

@@ -42,7 +42,8 @@ pub enum Screen {
     /// Modal over SessionSelect: user types the password before we connect.
     PasswordPrompt,
     /// Modal over SessionSelect: user types the SSH key passphrase. Reached
-    /// when an initial key-auth connect fails with [`BlinkError::KeyNeedsPassphrase`].
+    /// when an initial key-auth connect fails with
+    /// [`BlinkError::KeyNeedsPassphrase`](crate::error::BlinkError::KeyNeedsPassphrase).
     KeyPassphrasePrompt,
     /// Modal over Main: connect task is in flight.
     Connection,
@@ -850,7 +851,7 @@ impl App {
 
     /// Spawn a connect task. The result lands as `AppEvent::Connected` /
     /// `AppEvent::ConnectFailed` / `AppEvent::ConnectKeyNeedsPassphrase` and
-    /// is processed by [`handle_app_event`].
+    /// is processed by [`Self::handle_app_event`].
     fn start_connect(&mut self, session: Session, password: Option<zeroize::Zeroizing<String>>) {
         self.push_log(
             LogLevel::Info,

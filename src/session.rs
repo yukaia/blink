@@ -152,7 +152,7 @@ pub struct Session {
     ///
     /// When this is enabled, blink still verifies the cert's hostname (SAN /
     /// CN must match `host`) and the handshake signature, and it pins the
-    /// leaf cert SHA-256 in [`cert_sha256`] on the first connect — so future
+    /// leaf cert SHA-256 in [`Session::cert_sha256`] on the first connect — so future
     /// connections to the same host must present the same cert. Disabling
     /// chain trust only removes the CA-authority requirement.
     pub accept_invalid_certs: bool,
@@ -160,11 +160,11 @@ pub struct Session {
     /// Pinned leaf-certificate SHA-256, hex-encoded (lowercase).
     ///
     /// Populated automatically on the first successful FTPS connect with
-    /// [`accept_invalid_certs`] enabled. Subsequent connects to the same
+    /// [`Session::accept_invalid_certs`] enabled. Subsequent connects to the same
     /// session require this exact certificate; if the server's cert hash
     /// differs, the connection is rejected.
     ///
-    /// Has no effect when [`accept_invalid_certs`] is false (normal CA
+    /// Has no effect when [`Session::accept_invalid_certs`] is false (normal CA
     /// verification is used instead).
     pub cert_sha256: Option<String>,
 }
@@ -203,7 +203,7 @@ impl Session {
     }
 
     /// Filename written by older blink versions (sanitized stem only, no
-    /// hash suffix). Kept around so [`save`] can clean up the legacy file
+    /// hash suffix). Kept around so [`Self::save`] can clean up the legacy file
     /// the first time a pre-existing session is re-saved.
     fn legacy_name_to_filename(name: &str) -> String {
         let safe: String = name
@@ -639,7 +639,7 @@ impl Session {
     /// - path is optional (defaults to `/`)
     ///
     /// Auth defaults to [`AuthMethod::Password`] — the password is prompted at
-    /// connect time. The session is not persisted; call [`save`] to do that.
+    /// connect time. The session is not persisted; call [`Self::save`] to do that.
     pub fn from_url(url: &str) -> Result<Self> {
         let s = url.trim();
         if s.is_empty() {

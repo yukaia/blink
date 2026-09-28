@@ -54,7 +54,7 @@ pub fn checkpoints_dir() -> Result<PathBuf> {
 /// Root of the application's data directory.
 ///
 /// Under test this never resolves to the user's real directory — see
-/// [`test_home`]. That guarantee rests on `cfg(test)` being set for every
+/// `test_home`. That guarantee rests on `cfg(test)` being set for every
 /// test that runs, which holds only because this crate has no `[lib]`
 /// target and every test lives inline behind `#[cfg(test)] mod tests`; a
 /// `[lib]` target plus a `tests/` integration-test directory would compile
