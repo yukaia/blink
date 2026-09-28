@@ -113,8 +113,10 @@ impl App {
         }
     }
 
-    /// A double-click on the cursor entry of `pane`: enter a directory
-    /// (or go up, for `..`).
+    /// A double-click on the cursor entry of `pane`: enter a directory (or
+    /// go up, for `..`); transfer a file to the other side — download from
+    /// the remote pane, upload from the local — that file alone, whatever
+    /// else is selected.
     pub(super) fn open_or_transfer(&mut self, pane: Pane) {
         let state = match pane {
             Pane::Local => &self.local,
@@ -128,6 +130,12 @@ impl App {
                 Pane::Local => self.local_enter(),
                 _ => self.remote_enter(),
             }
+            return;
+        }
+        let file = vec![(entry.raw_name.clone(), false)];
+        match pane {
+            Pane::Local => self.start_uploads(file),
+            _ => self.enqueue_downloads(file),
         }
     }
 }
@@ -316,5 +324,104 @@ mod tests {
         a.handle_mouse_at(press(c, r), Instant::now());
         a.handle_mouse_at(wheel(true, c, r), Instant::now());
         assert_eq!(a.local.cursor, 0);
+    }
+
+    use crate::tui::event::AppEvent;
+
+    /// Double-click the local row `r` and return the upload walk's roots,
+    /// read from the WalkComplete it posts.
+    async fn double_click_and_walk(a: &mut App, pane: Pane, r: u16) -> Vec<String> {
+        let mut rx = a.app_event_rx.take().unwrap();
+        let list = match pane {
+            Pane::Local => a.hit.local_list.get().unwrap(),
+            _ => a.hit.remote_list.get().unwrap(),
+        };
+        let t = Instant::now();
+        a.handle_mouse_at(press(list.x + 2, list.y + r), t);
+        a.handle_mouse_at(
+            press(list.x + 2, list.y + r),
+            t + Duration::from_millis(100),
+        );
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the walk reports")
+            .unwrap();
+        match ev {
+            AppEvent::WalkComplete { plan, .. } => plan
+                .iter()
+                .map(|j| match j {
+                    crate::tui::plan::PlannedJob::Upload { remote_path, .. }
+                    | crate::tui::plan::PlannedJob::Download { remote_path, .. } => {
+                        remote_path.clone()
+                    }
+                    crate::tui::plan::PlannedJob::Mkdir { remote_path } => remote_path.clone(),
+                })
+                .collect(),
+            _ => panic!("expected WalkComplete"),
+        }
+    }
+
+    fn connected(a: &mut App) {
+        // A file under /r makes the mock list /r, as the upload's conflict
+        // check does; without it the listing fails and so does the walk.
+        a.transport = Some(std::sync::Arc::new(tokio::sync::Mutex::new(Box::new(
+            crate::transport::mock::MockTransport::new().with_file("/r/.keep", b""),
+        )
+            as Box<dyn crate::transport::Transport>)));
+        a.transfer_manager = Some(crate::transfer::TransferManager::new(1).0);
+        a.remote.path = "/r".into();
+    }
+
+    #[tokio::test]
+    async fn double_clicking_a_local_file_uploads_it_alone() {
+        let mut a = app_on_main(3);
+        connected(&mut a);
+        a.local.toggle_selected(); // file000 selected, cursor on it
+        draw(&a);
+        let roots = double_click_and_walk(&mut a, Pane::Local, 2).await;
+        assert_eq!(
+            roots,
+            vec!["/r/file002".to_string()],
+            "the clicked file alone"
+        );
+        assert_eq!(
+            a.local.selected_count(),
+            1,
+            "the selection is left as it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn double_clicking_a_remote_file_downloads_it_alone() {
+        let mut a = app_on_main(0);
+        connected(&mut a);
+        a.local.path = std::env::temp_dir().display().to_string();
+        a.remote.set_entries(vec![
+            PaneEntry::new("x.bin".into(), false, 1),
+            PaneEntry::new("y.bin".into(), false, 1),
+        ]);
+        a.remote.toggle_selected(); // x.bin selected
+        draw(&a);
+        let roots = double_click_and_walk(&mut a, Pane::Remote, 1).await;
+        assert_eq!(roots, vec!["/r/y.bin".to_string()]);
+        assert_eq!(a.remote.selected_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn double_clicking_the_parent_row_goes_up_and_transfers_nothing() {
+        let mut a = app_on_main(0);
+        connected(&mut a);
+        a.local.path = "/tmp/sub".into();
+        a.local.set_entries(vec![
+            PaneEntry::parent(),
+            PaneEntry::new("f".into(), false, 1),
+        ]);
+        draw(&a);
+        let (c, r) = local_row(&a, 0);
+        let t = Instant::now();
+        a.handle_mouse_at(press(c, r), t);
+        a.handle_mouse_at(press(c, r), t + Duration::from_millis(100));
+        assert_eq!(a.local.path, "/tmp");
+        assert_eq!(a.transfer_manager.as_ref().unwrap().queue_counts(), (0, 0));
     }
 }

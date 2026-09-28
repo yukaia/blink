@@ -57,6 +57,17 @@ impl App {
         // Clear selection upfront — the walk task is async, and we'd rather
         // not surprise the user later if they select more items meanwhile.
         self.local.clear_selection();
+        self.start_uploads(entries);
+    }
+
+    /// Upload `entries` — `(raw_name, is_dir)` in the local pane's directory
+    /// — through the usual conflict check and dispatch. Leaves the selection
+    /// alone: a double-click uploads just the file it landed on.
+    pub(super) fn start_uploads(&mut self, entries: Vec<(String, bool)>) {
+        if self.transfer_manager.is_none() {
+            self.push_log(LogLevel::Warn, "not connected".into());
+            return;
+        }
 
         // Build the upload roots: each selected entry becomes a (local, remote)
         // pair. Files become "trivial walks" of a single Upload job; directories
@@ -166,6 +177,17 @@ impl App {
 
         // Clear selection upfront — see start_selected_uploads for rationale.
         self.remote.clear_selection();
+        self.enqueue_downloads(selections);
+    }
+
+    /// Download `selections` — `(raw_name, is_dir)` in the remote pane's
+    /// directory — through the usual conflict check and dispatch. Leaves the
+    /// selection alone: a double-click downloads just the file it landed on.
+    pub(super) fn enqueue_downloads(&mut self, selections: Vec<(String, bool)>) {
+        if self.transfer_manager.is_none() {
+            self.push_log(LogLevel::Warn, "not connected".into());
+            return;
+        }
 
         let local_base = PathBuf::from(&self.local.path);
         // `safe_local_name` is what makes a server-supplied name safe to join
