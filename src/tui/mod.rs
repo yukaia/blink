@@ -62,14 +62,19 @@ fn install_panic_hook() {
     });
 }
 
-/// Set up the alternate screen, raw mode, and mouse capture. The matching
-/// teardown lives in [`restore`] and MUST run on every exit path.
-pub fn setup() -> Result<TuiTerminal> {
+/// Set up the alternate screen, raw mode, and — when `mouse` is on — mouse
+/// capture. The matching teardown lives in [`restore`] and MUST run on
+/// every exit path; it disables capture either way, which is harmless when
+/// it was never enabled.
+pub fn setup(mouse: bool) -> Result<TuiTerminal> {
     // Before raw mode, so the hook is in place for anything that follows.
     install_panic_hook();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(stdout, EnterAlternateScreen)?;
+    if mouse {
+        execute!(stdout, EnableMouseCapture)?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
@@ -88,7 +93,7 @@ pub fn restore(terminal: &mut TuiTerminal) -> Result<()> {
 
 /// Run the TUI to completion. Always restores the terminal even on error.
 pub async fn run(config: Config, theme: Theme) -> Result<()> {
-    let mut terminal = setup()?;
+    let mut terminal = setup(config.terminal.mouse)?;
     let result = App::new(config, theme).run(&mut terminal).await;
     let _ = restore(&mut terminal);
     result
@@ -105,7 +110,7 @@ pub async fn run_with_session(
     session: crate::session::Session,
     unsaved: bool,
 ) -> Result<()> {
-    let mut terminal = setup()?;
+    let mut terminal = setup(config.terminal.mouse)?;
     let result = App::with_session(config, theme, session, unsaved)
         .run(&mut terminal)
         .await;

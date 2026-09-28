@@ -403,6 +403,8 @@ confirm_quit = true
 
 [terminal]
 image_preview = auto        ; auto | kitty | sixel | iterm2 | none
+mouse = true                ; false: no mouse capture — the terminal's own
+                            ; text selection works, and blink ignores the mouse
 ```
 
 An out-of-range `parallel_downloads` — `0`, or anything above the maximum —

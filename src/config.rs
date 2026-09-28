@@ -8,6 +8,7 @@
 //!
 //! [terminal]
 //! image_preview = auto    ; auto | kitty | sixel | iterm2 | none
+//! mouse = true            ; false: no mouse capture, the terminal's own selection
 //! ```
 
 use std::fs;
@@ -40,6 +41,9 @@ pub struct General {
 #[derive(Debug, Clone)]
 pub struct Terminal {
     pub image_preview: ImagePreviewMode,
+    /// Mouse support. Off leaves mouse capture off, so the terminal's own
+    /// text selection works and blink ignores the mouse.
+    pub mouse: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +65,7 @@ impl Default for Config {
             },
             terminal: Terminal {
                 image_preview: ImagePreviewMode::Auto,
+                mouse: true,
             },
         }
     }
@@ -124,21 +129,24 @@ impl Config {
                 cfg.general.confirm_quit = parse_bool(v)?;
             }
         }
-        if let Some(s) = ini.section(Some("terminal"))
-            && let Some(v) = s.get("image_preview")
-        {
-            cfg.terminal.image_preview = match v.trim().to_ascii_lowercase().as_str() {
-                "auto" => ImagePreviewMode::Auto,
-                "kitty" => ImagePreviewMode::Kitty,
-                "sixel" => ImagePreviewMode::Sixel,
-                "iterm2" => ImagePreviewMode::Iterm2,
-                "none" | "off" | "false" => ImagePreviewMode::None,
-                _ => {
-                    return Err(BlinkError::config(
-                        "image_preview must be one of: auto, kitty, sixel, iterm2, none",
-                    ));
-                }
-            };
+        if let Some(s) = ini.section(Some("terminal")) {
+            if let Some(v) = s.get("image_preview") {
+                cfg.terminal.image_preview = match v.trim().to_ascii_lowercase().as_str() {
+                    "auto" => ImagePreviewMode::Auto,
+                    "kitty" => ImagePreviewMode::Kitty,
+                    "sixel" => ImagePreviewMode::Sixel,
+                    "iterm2" => ImagePreviewMode::Iterm2,
+                    "none" | "off" | "false" => ImagePreviewMode::None,
+                    _ => {
+                        return Err(BlinkError::config(
+                            "image_preview must be one of: auto, kitty, sixel, iterm2, none",
+                        ));
+                    }
+                };
+            }
+            if let Some(v) = s.get("mouse") {
+                cfg.terminal.mouse = parse_bool(v)?;
+            }
         }
         Ok(cfg)
     }
@@ -173,16 +181,18 @@ impl Config {
                 self.general.parallel_downloads.to_string(),
             )
             .set("confirm_quit", self.general.confirm_quit.to_string());
-        ini.with_section(Some("terminal")).set(
-            "image_preview",
-            match self.terminal.image_preview {
-                ImagePreviewMode::Auto => "auto",
-                ImagePreviewMode::Kitty => "kitty",
-                ImagePreviewMode::Sixel => "sixel",
-                ImagePreviewMode::Iterm2 => "iterm2",
-                ImagePreviewMode::None => "none",
-            },
-        );
+        ini.with_section(Some("terminal"))
+            .set(
+                "image_preview",
+                match self.terminal.image_preview {
+                    ImagePreviewMode::Auto => "auto",
+                    ImagePreviewMode::Kitty => "kitty",
+                    ImagePreviewMode::Sixel => "sixel",
+                    ImagePreviewMode::Iterm2 => "iterm2",
+                    ImagePreviewMode::None => "none",
+                },
+            )
+            .set("mouse", self.terminal.mouse.to_string());
 
         // Atomic + durable write — same pattern as session / checkpoint:
         // tempfile → sync_all → rename → fsync parent dir.
@@ -260,6 +270,56 @@ fn parse_bool(s: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- mouse ------------------------------------------------------------------
+
+    fn load_str(tag: &str, body: &str) -> Result<Config> {
+        let dir = std::env::temp_dir().join(format!("blink-config-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.ini");
+        std::fs::write(&path, body).unwrap();
+        let cfg = Config::load_from(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+        cfg
+    }
+
+    #[test]
+    fn mouse_is_on_unless_turned_off() {
+        assert!(Config::default().terminal.mouse);
+        assert!(
+            load_str("mouse-absent", "[terminal]\nimage_preview = auto\n")
+                .unwrap()
+                .terminal
+                .mouse
+        );
+        assert!(
+            !load_str("mouse-off", "[terminal]\nmouse = false\n")
+                .unwrap()
+                .terminal
+                .mouse
+        );
+        assert!(
+            load_str("mouse-on", "[terminal]\nmouse = yes\n")
+                .unwrap()
+                .terminal
+                .mouse
+        );
+    }
+
+    #[test]
+    fn a_mouse_value_that_is_not_a_boolean_is_refused() {
+        assert!(load_str("mouse-bad", "[terminal]\nmouse = sometimes\n").is_err());
+    }
+
+    #[test]
+    fn saving_keeps_the_mouse_setting() {
+        let _home = crate::paths::test_home();
+        let mut cfg = Config::default();
+        cfg.terminal.mouse = false;
+        cfg.save().unwrap();
+        let back = Config::load_from(&paths::config_file().unwrap()).unwrap();
+        assert!(!back.terminal.mouse);
+    }
 
     // -- parallel_downloads clamping ---------------------------------------
     //
