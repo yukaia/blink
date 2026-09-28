@@ -155,6 +155,12 @@ pub mod session_select {
                 lines.push(Line::from(line_spans).style(bg));
             }
         }
+        // Sessions start below the heading and its blank line, one per row.
+        app.hit.session_list.set(Some(Rect {
+            y: area.y + 2,
+            height: area.height.saturating_sub(2),
+            ..area
+        }));
         f.render_widget(Paragraph::new(lines), area);
     }
 
@@ -862,6 +868,7 @@ pub mod viewer {
             inner.width,
             inner.height.saturating_sub(1),
         );
+        app.hit.viewer_body.set(Some(body));
         let hint = Rect::new(
             inner.x,
             inner.y.saturating_add(inner.height.saturating_sub(1)),

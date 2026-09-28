@@ -95,6 +95,12 @@ pub mod file_pane {
 
         // Entry list, windowed around cursor.
         let list_area = inner_layout[1];
+        let (pane_hit, list_hit) = match which {
+            Pane::Local => (&app.hit.local_pane, &app.hit.local_list),
+            _ => (&app.hit.remote_pane, &app.hit.remote_list),
+        };
+        pane_hit.set(Some(area));
+        list_hit.set(Some(list_area));
         let h = list_area.height as usize;
         let len = state.entries.len();
         let cursor = state.cursor.min(len.saturating_sub(1));
@@ -204,11 +210,28 @@ pub mod bottom_pane {
         let inner = block.inner(area);
         f.render_widget(block, area);
 
+        // The tab labels sit in the title row, one cell in from the corner:
+        // " " then " TRANSFERS " then "·" then " LOG ", as `tab_title` draws.
+        let transfers_x = area.x + 2;
+        let log_x = transfers_x + TRANSFERS_TAB.len() as u16 + 1;
+        app.hit.transfers_tab.set(Some(Rect::new(
+            transfers_x,
+            area.y,
+            TRANSFERS_TAB.len() as u16,
+            1,
+        )));
+        app.hit
+            .log_tab
+            .set(Some(Rect::new(log_x, area.y, LOG_TAB.len() as u16, 1)));
+
         match app.bottom_pane {
             BottomPane::Transfers => render_transfers(f, app, inner),
             BottomPane::Log => render_log(f, app, inner),
         }
     }
+
+    const TRANSFERS_TAB: &str = " TRANSFERS ";
+    const LOG_TAB: &str = " LOG ";
 
     /// Title line that doubles as a tab indicator. The currently-displayed
     /// page is rendered in the active border color; the other in dim.
@@ -222,7 +245,7 @@ pub mod bottom_pane {
         Line::from(vec![
             Span::raw(" "),
             Span::styled(
-                " TRANSFERS ",
+                TRANSFERS_TAB,
                 if on_transfers {
                     active_style
                 } else {
@@ -231,7 +254,7 @@ pub mod bottom_pane {
             ),
             Span::styled("·", inactive_style),
             Span::styled(
-                " LOG ",
+                LOG_TAB,
                 if !on_transfers {
                     active_style
                 } else {
@@ -245,6 +268,7 @@ pub mod bottom_pane {
     // ----- Transfers page --------------------------------------------------
 
     fn render_transfers(f: &mut Frame, app: &App, area: Rect) {
+        app.hit.transfer_list.set(Some(area));
         let jobs = app.active_jobs();
         if jobs.is_empty() {
             let p = Paragraph::new(Line::from(Span::styled(

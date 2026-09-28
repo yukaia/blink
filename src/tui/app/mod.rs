@@ -320,6 +320,8 @@ pub struct App {
 
     // Viewer
     pub viewer: Option<Viewer>,
+    /// Where clickable areas were last drawn. See [`crate::tui::hit`].
+    pub(crate) hit: crate::tui::hit::HitMap,
     /// The id the next viewer opened gets. See [`Viewer::id`].
     next_viewer_id: u64,
     /// Set to true when an image viewer needs its graphics escape sequences
@@ -428,6 +430,7 @@ impl App {
             checkpoint_job_map: std::collections::HashMap::new(),
             waiting_jobs: std::collections::HashMap::new(),
             viewer: None,
+            hit: Default::default(),
             next_viewer_id: 1,
             image_needs_redraw: false,
             remote_listing: None,
@@ -550,6 +553,7 @@ impl App {
     }
 
     fn draw(&self, f: &mut Frame) {
+        self.hit.clear();
         match self.screen {
             Screen::SessionSelect => crate::tui::views::session_select::render(f, self),
             Screen::NewSession => {
@@ -1020,6 +1024,33 @@ fn resolve_local_dir(raw: &std::path::Path) -> Option<std::path::PathBuf> {
         Some(expanded)
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+pub(super) mod tests_support {
+    use super::*;
+    use crate::tui::state::PaneEntry;
+
+    /// An app on the main view, local pane `/l` holding `n` files.
+    pub(crate) fn app_on_main(n: usize) -> App {
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        a.screen = Screen::Main;
+        a.local.path = "/l".into();
+        a.local.set_entries(
+            (0..n)
+                .map(|i| PaneEntry::new(format!("file{i:03}"), false, 1))
+                .collect(),
+        );
+        a
+    }
+
+    /// Draw `a` into a 100x30 test terminal, filling its hit map, and hand
+    /// back what was drawn.
+    pub(crate) fn draw(a: &App) -> ratatui::buffer::Buffer {
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        t.draw(|f| a.draw(f)).unwrap();
+        t.backend().buffer().clone()
     }
 }
 
@@ -2082,6 +2113,69 @@ mod tests {
             a.remote.entries.len(),
             1,
             "an in-place refresh must not blank the pane while it waits",
+        );
+    }
+
+    // -- the hit map -----------------------------------------------------------
+    //
+    // Mouse clicks are matched against where things were last drawn. These
+    // draw into a TestBackend and read the recorded areas back, checking
+    // each against the text the renderer actually put there.
+
+    use super::tests_support::{app_on_main, draw};
+
+    fn text_at(buf: &ratatui::buffer::Buffer, r: ratatui::layout::Rect) -> String {
+        (r.x..r.x + r.width)
+            .map(|x| buf[(x, r.y)].symbol().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_file_list_area_is_recorded_where_its_rows_are_drawn() {
+        let a = app_on_main(5);
+        let buf = draw(&a);
+        let list = a.hit.local_list.get().expect("recorded");
+        let first = ratatui::layout::Rect { height: 1, ..list };
+        assert!(
+            text_at(&buf, first).contains("file000"),
+            "{:?}",
+            text_at(&buf, first)
+        );
+        assert!(a.hit.local_pane.get().unwrap().width > list.width);
+    }
+
+    #[test]
+    fn the_bottom_tabs_are_recorded_over_their_labels() {
+        let a = app_on_main(0);
+        let buf = draw(&a);
+        assert_eq!(
+            text_at(&buf, a.hit.transfers_tab.get().unwrap()),
+            " TRANSFERS "
+        );
+        assert_eq!(text_at(&buf, a.hit.log_tab.get().unwrap()), " LOG ");
+    }
+
+    #[test]
+    fn the_session_rows_are_recorded_below_their_heading() {
+        let mut a = app();
+        a.sessions = vec![Session::from_url("sftp://me@alpha.example").unwrap()];
+        let buf = draw(&a);
+        let rows = a.hit.session_list.get().expect("recorded");
+        assert!(
+            text_at(&buf, ratatui::layout::Rect { height: 1, ..rows }).contains("alpha.example")
+        );
+    }
+
+    #[test]
+    fn a_new_draw_forgets_areas_no_longer_drawn() {
+        let mut a = app_on_main(1);
+        draw(&a);
+        assert!(a.hit.local_list.get().is_some());
+        a.screen = Screen::SessionSelect;
+        draw(&a);
+        assert!(
+            a.hit.local_list.get().is_none(),
+            "the session selector draws no panes"
         );
     }
 
