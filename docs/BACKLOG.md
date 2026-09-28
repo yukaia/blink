@@ -66,18 +66,9 @@ so SFTP would return zero). One log line per listing, as now, not one
 per skipped line. `an_unparsable_listing_line_becomes_no_entry_at_all`
 in the FTP harness is the place to assert it.
 
-## Images decode on the UI thread
+## Appending to known_hosts can corrupt its last entry
 
 Found in the 2026-09-26 codebase audit, like every entry below.
-
-`after_draw` (`tui/app/viewer.rs`) calls the backend's `render`, which
-runs `scale_for_cells` (`preview.rs`): a full decode and a Lanczos3
-resize of up to 4096×4096. It runs synchronously on the UI thread on
-open and on every resize, freezing the TUI (transfer events included)
-meanwhile. Fix: decode and scale on the blocking pool, keyed by panel
-size, and emit the cached escape sequence from `after_draw`.
-
-## Appending to known_hosts can corrupt its last entry
 
 `known_hosts::append` writes the new line without checking the file ends
 in a newline. On a hand-edited file without one, the new entry is glued

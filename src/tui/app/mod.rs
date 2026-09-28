@@ -319,6 +319,8 @@ pub struct App {
 
     // Viewer
     pub viewer: Option<Viewer>,
+    /// The id the next viewer opened gets. See [`Viewer::id`].
+    next_viewer_id: u64,
     /// Set to true when an image viewer needs its graphics escape sequences
     /// re-emitted (initial open, terminal resize). The run loop emits and
     /// clears this flag after each `terminal.draw`.
@@ -421,6 +423,7 @@ impl App {
             checkpoint_job_map: std::collections::HashMap::new(),
             waiting_jobs: std::collections::HashMap::new(),
             viewer: None,
+            next_viewer_id: 1,
             image_needs_redraw: false,
             remote_listing: None,
             needs_terminal_clear: false,
@@ -2073,6 +2076,168 @@ mod tests {
             1,
             "an in-place refresh must not blank the pane while it waits",
         );
+    }
+
+    // -- image rendering off the UI thread ------------------------------------
+    //
+    // Decoding, scaling and encoding an image took up to seconds on the UI
+    // thread, inside `after_draw`, on open and again on every resize — the
+    // whole TUI, transfer events included, froze meanwhile. It now runs on
+    // the blocking pool; `after_draw` only writes finished output.
+
+    use crate::tui::state::{ImageArea, ImageRender, Viewer, ViewerKind};
+
+    fn tiny_png() -> bytes::Bytes {
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([200, 30, 30, 255]));
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        bytes::Bytes::from(out)
+    }
+
+    const AREA: ImageArea = ImageArea {
+        x: 1,
+        y: 1,
+        w: 40,
+        h: 20,
+    };
+
+    /// An app showing `bytes` as an image, over the kitty protocol whatever
+    /// the test's own terminal is, with its event receiver in hand.
+    fn image_app(bytes: bytes::Bytes) -> (App, tokio::sync::mpsc::UnboundedReceiver<AppEvent>) {
+        let mut a = app();
+        a.config.terminal.image_preview = crate::config::ImagePreviewMode::Kitty;
+        a.viewer = Some(Viewer {
+            name: "x.png".into(),
+            kind: ViewerKind::Image {
+                bytes,
+                render: ImageRender::default(),
+            },
+            id: 1,
+        });
+        a.image_needs_redraw = true;
+        let rx = a.app_event_rx.take().unwrap();
+        (a, rx)
+    }
+
+    async fn next_render(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) -> AppEvent {
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
+            .await
+            .expect("a render reports back")
+            .unwrap();
+        assert!(matches!(ev, AppEvent::ImageRendered { .. }));
+        ev
+    }
+
+    #[tokio::test]
+    async fn an_image_renders_off_the_ui_thread_and_is_then_written() {
+        let (mut a, mut rx) = image_app(tiny_png());
+
+        assert!(
+            a.image_output_for(AREA).is_none(),
+            "nothing to write until the render comes back",
+        );
+        let ev = next_render(&mut rx).await;
+        a.handle_app_event(ev);
+
+        let out = a
+            .image_output_for(AREA)
+            .expect("the finished render is written");
+        assert!(out.starts_with(b"\x1b["), "cursor move, then the image");
+        assert!(a.image_output_for(AREA).is_none(), "and only once");
+    }
+
+    #[tokio::test]
+    async fn a_redraw_at_the_same_size_reuses_the_render() {
+        let (mut a, mut rx) = image_app(tiny_png());
+        a.image_output_for(AREA);
+        let ev = next_render(&mut rx).await;
+        a.handle_app_event(ev);
+        let first = a.image_output_for(AREA).unwrap();
+
+        a.image_needs_redraw = true;
+        let again = a.image_output_for(AREA).expect("written again at once");
+        assert_eq!(again, first);
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "without rendering again");
+    }
+
+    #[tokio::test]
+    async fn resizing_during_a_render_costs_one_follow_up_at_the_newest_size() {
+        let (mut a, mut rx) = image_app(tiny_png());
+        let bigger = ImageArea {
+            w: 80,
+            h: 40,
+            ..AREA
+        };
+        let biggest = ImageArea {
+            w: 120,
+            h: 50,
+            ..AREA
+        };
+
+        a.image_output_for(AREA);
+        a.image_output_for(bigger);
+        a.image_output_for(biggest);
+        let ev = next_render(&mut rx).await;
+        a.handle_app_event(ev);
+        assert!(rx.try_recv().is_err(), "one render at a time");
+
+        assert!(
+            a.image_output_for(biggest).is_none(),
+            "a render for the old size is not written at the new one",
+        );
+        let ev = next_render(&mut rx).await;
+        match &ev {
+            AppEvent::ImageRendered { area, .. } => assert_eq!(*area, biggest),
+            _ => unreachable!(),
+        }
+        a.handle_app_event(ev);
+        assert!(a.image_output_for(biggest).is_some());
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "and no more than that one");
+    }
+
+    #[tokio::test]
+    async fn a_render_for_a_viewer_since_replaced_is_dropped() {
+        let (mut a, mut rx) = image_app(tiny_png());
+        a.image_output_for(AREA);
+        a.viewer.as_mut().unwrap().id = 2; // another file opened meanwhile
+        let ev = next_render(&mut rx).await;
+        a.handle_app_event(ev);
+
+        let Some(Viewer {
+            kind: ViewerKind::Image { render, .. },
+            ..
+        }) = &a.viewer
+        else {
+            panic!("still an image viewer");
+        };
+        assert!(render.done.is_none(), "another file's pixels must not land");
+    }
+
+    #[tokio::test]
+    async fn a_render_for_a_closed_viewer_is_dropped() {
+        let (mut a, mut rx) = image_app(tiny_png());
+        a.image_output_for(AREA);
+        a.viewer = None;
+        let ev = next_render(&mut rx).await;
+        a.handle_app_event(ev);
+        assert!(a.viewer.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_render_says_why_in_the_viewer() {
+        let (mut a, mut rx) = image_app(bytes::Bytes::from_static(b"not an image"));
+        a.image_output_for(AREA);
+        let ev = next_render(&mut rx).await;
+        a.handle_app_event(ev);
+
+        match &a.viewer.as_ref().unwrap().kind {
+            ViewerKind::Unsupported(reason) => assert!(reason.contains("image"), "{reason}"),
+            other => panic!("expected the failure to be shown, got {other:?}"),
+        }
     }
 
     // -- coalesced remote refreshes -------------------------------------------

@@ -10,6 +10,16 @@ the git history for those.
 
 ### Fixed
 
+- **Opening an image no longer freezes blink.** Decoding, scaling and
+  encoding a previewed image for the terminal ran on the UI thread, when it
+  opened and again on every resize, so the whole interface — transfer
+  progress included — stopped until it finished, which for a large image
+  could take seconds. Rendering now runs in the background: the viewer
+  says "rendering image…" until it is ready, a redraw at the same size
+  reuses the result, and dragging a window's edge costs one render at a
+  time rather than one per step. A render that fails says why in the
+  viewer.
+
 - **Tabs show up in the text viewer.** The viewer kept tab characters for
   the terminal to handle, but they never reached it: the rendering library
   drops control characters, tabs included, so tab-indented files —

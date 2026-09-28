@@ -5,10 +5,12 @@
 //! - **Text path** — bytes get decoded (with NFO/CP437 fallback in
 //!   `events.rs`), tokenised once via [`tokenize_lines`], and rendered
 //!   by `views::viewer::render` straight out of the cached token list.
-//! - **Image path** — bytes stay raw; `after_draw` emits graphics
-//!   escape codes on top of ratatui's diff'd buffer. ratatui won't
-//!   redraw cells it considers unchanged, so the image persists until
-//!   `image_needs_redraw` flips back to true (initial open, resize).
+//! - **Image path** — bytes stay raw. Rendering them for the terminal's
+//!   graphics protocol runs on the blocking pool (`image_output_for`), and
+//!   `after_draw` writes the finished escape codes on top of ratatui's
+//!   diff'd buffer. ratatui won't redraw cells it considers unchanged, so
+//!   the image persists until `image_needs_redraw` flips back to true
+//!   (initial open, resize, a render arriving).
 
 use bytes::Bytes;
 use ratatui::layout::Rect;
@@ -17,7 +19,7 @@ use crate::preview::{self, FileViewKind};
 use crate::transport;
 use crate::tui::TuiTerminal;
 use crate::tui::event::AppEvent;
-use crate::tui::state::{ViewSource, Viewer, ViewerKind};
+use crate::tui::state::{ImageArea, ViewSource, Viewer, ViewerKind};
 
 use super::{App, LogLevel, Pane, Screen};
 
@@ -67,9 +69,12 @@ impl App {
 
         // Open the modal in Loading state. Subsequent ViewLoaded / ViewFailed
         // events populate `kind`.
+        let id = self.next_viewer_id;
+        self.next_viewer_id += 1;
         self.viewer = Some(Viewer {
             name: name.clone(),
             kind: ViewerKind::Loading,
+            id,
         });
         self.previous_screen = self.screen.clone();
         self.screen = Screen::Viewer;
@@ -145,63 +150,125 @@ impl App {
     /// Called after each `terminal.draw` to emit graphics escape sequences
     /// for an active image viewer. Ratatui's diffing renderer leaves cells
     /// alone when their buffer contents don't change, so the image persists
-    /// across ticks; we only need to re-emit on first open and on resize
-    /// (both gated by `image_needs_redraw`).
+    /// across ticks; we only need to re-emit when `image_needs_redraw` says
+    /// so. Writing is all that happens here — see [`Self::image_output_for`].
     pub(super) fn after_draw(&mut self, terminal: &mut TuiTerminal) -> std::io::Result<()> {
         if !self.image_needs_redraw {
             return Ok(());
         }
-        let Some(viewer) = &self.viewer else {
-            self.image_needs_redraw = false;
-            return Ok(());
-        };
-        let ViewerKind::Image { bytes } = &viewer.kind else {
-            self.image_needs_redraw = false;
-            return Ok(());
-        };
-
         let size = terminal.size()?;
-        let full = Rect::new(0, 0, size.width, size.height);
-        let modal = crate::tui::views::centered_rect(85, 85, full);
-
-        // Match the layout in views::viewer::render: borders take 1 cell on
-        // each side, then we reserve the bottom row of the inside for the
-        // hint strip. The image draws into what's left.
-        let body_x = modal.x.saturating_add(1);
-        let body_y = modal.y.saturating_add(1);
-        let body_w = modal.width.saturating_sub(2);
-        let body_h = modal.height.saturating_sub(2).saturating_sub(1);
-        if body_w == 0 || body_h == 0 {
+        let Some(area) = image_area(Rect::new(0, 0, size.width, size.height)) else {
             self.image_needs_redraw = false;
             return Ok(());
+        };
+        if let Some(escape) = self.image_output_for(area) {
+            use std::io::Write;
+            let mut stdout = std::io::stdout();
+            stdout.write_all(&escape)?;
+            stdout.flush()?;
         }
-
-        let proto = preview::detect(self.config.terminal.image_preview);
-        let backend = match preview::backend_for(proto) {
-            Some(b) => b,
-            None => {
-                self.image_needs_redraw = false;
-                return Ok(());
-            }
-        };
-
-        let escape = match backend.render(bytes, body_x, body_y, body_w, body_h) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                self.push_log(LogLevel::Warn, format!("image preview: {e}"));
-                self.image_needs_redraw = false;
-                return Ok(());
-            }
-        };
-
-        use std::io::Write;
-        let mut stdout = std::io::stdout();
-        stdout.write_all(&escape)?;
-        stdout.flush()?;
-        self.image_needs_redraw = false;
-        let _ = terminal; // not needed beyond the size() call
         Ok(())
     }
+
+    /// What to write for the image viewer now, drawn into `area`, if
+    /// anything.
+    ///
+    /// Rendering an image — decode, a Lanczos3 scale of up to 4096×4096, and
+    /// encoding for the graphics protocol — ran right here, on the UI thread,
+    /// on open and again on every resize, freezing the whole TUI (transfer
+    /// events included) for as long as it took. Now a finished render for
+    /// `area` is returned at once and reused on later redraws; otherwise one
+    /// is started on the blocking pool, unless one is already running, and
+    /// `image_rendered` takes the result. While it runs, resizes only change
+    /// the area asked for: when the render lands, a result for an area no
+    /// longer current is kept but not written, and the next call starts one
+    /// render for the current area. However fast a window is dragged, that
+    /// is one render running and at most one after it.
+    pub(super) fn image_output_for(&mut self, area: ImageArea) -> Option<Vec<u8>> {
+        if !self.image_needs_redraw {
+            return None;
+        }
+        let Some(Viewer {
+            kind: ViewerKind::Image { bytes, render },
+            id,
+            ..
+        }) = self.viewer.as_mut()
+        else {
+            self.image_needs_redraw = false;
+            return None;
+        };
+        if let Some((done_area, escape)) = &render.done
+            && *done_area == area
+        {
+            self.image_needs_redraw = false;
+            return Some(escape.clone());
+        }
+        if render.in_flight.is_none() {
+            render.in_flight = Some(area);
+            let proto = preview::detect(self.config.terminal.image_preview);
+            let bytes = bytes.clone();
+            let viewer_id = *id;
+            let tx = self.app_event_tx.clone();
+            tokio::task::spawn_blocking(move || {
+                let result = match preview::backend_for(proto) {
+                    Some(backend) => backend
+                        .render(&bytes, area.x, area.y, area.w, area.h)
+                        .map_err(|e| e.to_string()),
+                    None => Err("no supported graphics protocol".to_string()),
+                };
+                let _ = tx.send(AppEvent::ImageRendered {
+                    viewer_id,
+                    area,
+                    result,
+                });
+            });
+        }
+        // Still owed: the next draw asks again.
+        None
+    }
+
+    /// Take a finished image render. One for a viewer since closed, or since
+    /// showing another file, is dropped. A failure replaces the image with
+    /// the reason, rather than leaving "rendering image…" up for good.
+    pub(super) fn image_rendered(
+        &mut self,
+        viewer_id: u64,
+        area: ImageArea,
+        result: Result<Vec<u8>, String>,
+    ) {
+        let Some(viewer) = self.viewer.as_mut().filter(|v| v.id == viewer_id) else {
+            return;
+        };
+        let ViewerKind::Image { render, .. } = &mut viewer.kind else {
+            return;
+        };
+        render.in_flight = None;
+        match result {
+            Ok(escape) => {
+                render.done = Some((area, escape));
+                self.image_needs_redraw = true;
+            }
+            Err(e) => {
+                viewer.kind = ViewerKind::Unsupported(format!("image preview failed: {e}"));
+                self.image_needs_redraw = false;
+                self.push_log(LogLevel::Warn, format!("image preview: {e}"));
+            }
+        }
+    }
+}
+
+/// The cells an image is drawn into for a terminal of size `full`: the
+/// viewer modal less its border and the hint strip, as `views::viewer`
+/// lays it out. `None` when nothing fits.
+fn image_area(full: Rect) -> Option<ImageArea> {
+    let modal = crate::tui::views::centered_rect(85, 85, full);
+    let area = ImageArea {
+        x: modal.x.saturating_add(1),
+        y: modal.y.saturating_add(1),
+        w: modal.width.saturating_sub(2),
+        h: modal.height.saturating_sub(2).saturating_sub(1),
+    };
+    (area.w > 0 && area.h > 0).then_some(area)
 }
 
 /// Tokenise every line of a file once, at view-load time, so per-frame

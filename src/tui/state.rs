@@ -441,6 +441,32 @@ mod pane_tests {
 pub struct Viewer {
     pub name: String,
     pub kind: ViewerKind,
+    /// Identifies this opening of the viewer. An image render started for
+    /// one file can finish after another has been opened; the id is how its
+    /// result is told apart and dropped.
+    pub id: u64,
+}
+
+/// The terminal cells an image is drawn into. A render is only good for
+/// the area it was made for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageArea {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+/// Where an image's render stands. Rendering (decode, scale, encode for the
+/// terminal's graphics protocol) runs on the blocking pool; see
+/// `App::image_output_for`.
+#[derive(Debug, Default)]
+pub struct ImageRender {
+    /// The last finished render, as the escape sequence to write, and the
+    /// area it was made for.
+    pub done: Option<(ImageArea, Vec<u8>)>,
+    /// The area a render is running for, if one is. At most one runs.
+    pub in_flight: Option<ImageArea>,
 }
 
 #[derive(Debug)]
@@ -462,8 +488,9 @@ pub enum ViewerKind {
         tokens: Vec<Vec<(crate::highlight::TokenKind, String)>>,
         scroll: usize,
     },
-    /// Raw image bytes, ready to be emitted by a [`crate::preview::PreviewBackend`].
-    Image { bytes: Bytes },
+    /// Raw image bytes, rendered off the UI thread by a
+    /// [`crate::preview::PreviewBackend`].
+    Image { bytes: Bytes, render: ImageRender },
     /// Anything we can't render: too big, unknown extension, fetch failed.
     Unsupported(String),
 }

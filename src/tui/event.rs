@@ -122,6 +122,14 @@ pub enum AppEvent {
     /// File-fetch for the viewer failed.
     ViewFailed { name: String, error: String },
 
+    /// An image render for viewer `viewer_id`, made for `area`, finished:
+    /// the escape sequence to write, or why it failed.
+    ImageRendered {
+        viewer_id: u64,
+        area: crate::tui::state::ImageArea,
+        result: std::result::Result<Vec<u8>, String>,
+    },
+
     /// The SFTP/SCP transport encountered an unknown host key and needs the
     /// user to decide whether to trust it. The `decision_tx` sender must be
     /// resolved (by sending a [`crate::transport::sftp::HostKeyDecision`])

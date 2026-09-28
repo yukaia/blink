@@ -404,7 +404,10 @@ impl App {
                                 ))
                             } else {
                                 needs_redraw = true;
-                                ViewerKind::Image { bytes }
+                                ViewerKind::Image {
+                                    bytes,
+                                    render: Default::default(),
+                                }
                             }
                         }
                         FileViewKind::Unsupported(reason) => ViewerKind::Unsupported(reason),
@@ -422,6 +425,11 @@ impl App {
                 }
                 self.push_log(LogLevel::Error, format!("view {name} failed: {error}"));
             }
+            AppEvent::ImageRendered {
+                viewer_id,
+                area,
+                result,
+            } => self.image_rendered(viewer_id, area, result),
             AppEvent::Transfer(ev) => self.handle_transfer_event(ev),
             AppEvent::HostKeyUnknown {
                 host,

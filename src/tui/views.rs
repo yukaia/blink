@@ -880,10 +880,21 @@ pub mod viewer {
             ViewerKind::Text { tokens, scroll } => {
                 render_text(f, body, app, tokens, *scroll);
             }
-            ViewerKind::Image { .. } => {
-                // Body is intentionally left blank — graphics escape codes are
-                // emitted on top of these cells from `App::after_draw`.
-                let p = Paragraph::new(Line::from(""));
+            ViewerKind::Image { render, .. } => {
+                // Once rendered, the body is left blank: graphics escape
+                // codes are emitted on top of these cells from
+                // `App::after_draw`. Until then, say what is happening.
+                let p = if render.done.is_none() {
+                    Paragraph::new(
+                        Line::from(Span::styled(
+                            "rendering image…",
+                            Style::default().fg(app.theme.dim),
+                        ))
+                        .alignment(Alignment::Center),
+                    )
+                } else {
+                    Paragraph::new(Line::from(""))
+                };
                 f.render_widget(p, body);
             }
             ViewerKind::Unsupported(reason) => {
