@@ -1,23 +1,28 @@
 //! Walk checkpointing: persist a transfer plan to disk so an interrupted
 //! batch can be resumed without re-walking the remote / local tree.
 //!
-//! One checkpoint file is written per batch, named by a stable key derived
-//! from the session name and the transfer direction:
+//! One checkpoint file is kept per (session, direction), named by a stable
+//! key derived from the session name and the transfer direction:
 //!
+//! ```text
+//! ~/.config/blink/checkpoints/<name>-<hash>-upload.json
+//! ~/.config/blink/checkpoints/<name>-<hash>-download.json
 //! ```
-//! ~/.config/blink/checkpoints/<session>-upload.json
-//! ~/.config/blink/checkpoints/<session>-download.json
-//! ```
 //!
-//! Only one checkpoint per (session, direction) is kept at a time. Starting a
-//! new walk of the same kind overwrites the previous checkpoint, so stale
-//! files don't accumulate.
+//! `<name>` is the session name with path-unsafe characters replaced by `_`,
+//! and `<hash>` the first eight hex digits of its SHA-256, so two names that
+//! sanitize alike ("my prod", "my_prod") keep separate files.
 //!
-//! ## Format (version 2)
+//! A new walk of the same direction *appends* its jobs to the checkpoint
+//! already tracking that direction rather than replacing it: replacing it
+//! destroyed the plan of a batch still running. The file is removed once
+//! nothing in it still needs to run.
+//!
+//! ## Format (version 3)
 //!
 //! ```json
 //! {
-//!   "version": 2,
+//!   "version": 3,
 //!   "session": "production",
 //!   "kind": "upload",
 //!   "jobs": [
@@ -37,22 +42,26 @@
 //!
 //! ```text
 //! pending  ──(dispatcher picks up job)──►  in_progress  ──(success)──►  done
-//!                                               │
-//!                                               └──(crash / kill)──► stays in_progress
+//!    │                                          │
+//!    │                                          └──(crash / kill)──► stays in_progress
+//!    └──(user cancels the batch)──► cancelled
 //! ```
 //!
 //! On resume:
 //! - `done`        → skipped (already transferred successfully)
+//! - `cancelled`   → skipped (the user abandoned it)
 //! - `in_progress` → re-queued (the transfer was interrupted; partial files
 //!   are safe to overwrite)
 //! - `pending`     → re-queued (never started)
 //!
 //! ## Crash safety
 //!
-//! The status is written to disk *before* the transfer starts (`in_progress`)
-//! and again *after* it completes (`done`). A crash at any point between those
-//! two writes leaves the job as `in_progress`, which causes it to be re-queued
-//! on resume rather than silently skipped as if it had succeeded.
+//! The whole plan is written before any job starts. After that, a job is
+//! marked `in_progress` when it starts and `done` when it completes, and
+//! those marks reach disk debounced, at most every 250 ms: a batch of 100k
+//! jobs would otherwise cost an fsync per transition. A crash can lose the
+//! latest marks, which only means those jobs run again on resume. What it
+//! can never do is record a job as `done` that had not finished.
 //!
 //! Writes are atomic: the JSON is written to a `.tmp` sibling file then
 //! renamed into place, so a crash mid-write never produces a truncated file.
@@ -725,32 +734,6 @@ fn write_due(dirty: bool, last_save: Option<Instant>, now: Instant, interval: Du
     }
 }
 
-/// Delete the `.blink-part` files belonging to `cp`'s unfinished downloads.
-/// Returns how many were removed.
-///
-/// A download streams into `<dest>.blink-part` and renames onto `<dest>` only on
-/// success, so an interrupted batch leaves partials scattered across the
-/// destination tree. The checkpoint is the only record of where they are —
-/// once it is gone, nothing can find them again and they sit there forever.
-///
-/// Only `Done` jobs are skipped: their `.blink-part` was already renamed away, and
-/// a file at that path now would belong to some other transfer.
-///
-/// Called from two places: the `blink checkpoints` CLI (a separate process
-/// invocation, never concurrent with a running batch) and the TUI's
-/// `discard` offer. In the TUI, resume offers are built at connect time,
-/// before any job of that direction has been enqueued for the *new*
-/// session — so pressing `d` never races a worker the current session
-/// itself just started.
-///
-/// It can still race a worker from the session that was just left, though:
-/// `App::disconnect` spawns the dispatcher's `shutdown()` rather than
-/// awaiting it, so a worker from the previous connection can still be
-/// mid-write on a `.blink-part` file when the reconnect completes and its
-/// checkpoint is offered again. Unlinking out from under that worker races
-/// it: on Unix the unlink succeeds, the worker keeps writing to the
-/// now-unlinked inode, and its final rename fails — turning what should be
-/// a clean discard into a spurious transfer failure.
 /// What a checkpoint teardown removed, and what it could not.
 ///
 /// Returned rather than printed: the CLI writes failures to stderr, but the
@@ -762,6 +745,33 @@ pub struct DiscardOutcome {
     pub failures: Vec<String>,
 }
 
+/// Delete the `.blink-part` files belonging to `cp`'s unfinished downloads,
+/// and their sidecars. Reports how many were removed, and what could not be.
+///
+/// A download streams into `<dest>.blink-part` and renames onto `<dest>` only
+/// on success, so an interrupted batch leaves partials scattered across the
+/// destination tree. The checkpoint is the only record of where they are —
+/// once it is gone, nothing can find them again and they sit there forever.
+///
+/// Only `Done` jobs are skipped: their `.blink-part` was already renamed
+/// away, and a file at that path now would belong to some other transfer.
+///
+/// Called from two places: the `blink checkpoints` CLI and the TUI's
+/// `discard` offer. In the TUI, resume offers are built at connect time,
+/// before any job of that direction has been enqueued for the *new*
+/// session — so pressing `d` never races a worker the current session
+/// itself just started.
+///
+/// Both can still race a transfer writing one of these partials. The CLI
+/// runs as a separate process, so `blink checkpoints --clean` or `--force`
+/// in another terminal can sweep partials a running TUI is still writing.
+/// And in the TUI, `App::disconnect` spawns the dispatcher's `shutdown()`
+/// rather than awaiting it, so a worker from the previous connection can
+/// still be mid-write when the reconnect completes and its checkpoint is
+/// offered again. Either way, on Unix the unlink succeeds, the worker keeps
+/// writing to the now-unlinked inode, and its final rename fails — turning a
+/// clean discard into a spurious transfer failure. Nothing here guards
+/// against that.
 fn remove_orphan_parts(cp: &Checkpoint) -> DiscardOutcome {
     let mut outcome = DiscardOutcome::default();
     for job in &cp.jobs {

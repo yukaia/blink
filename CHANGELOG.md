@@ -10,6 +10,13 @@ the git history for those.
 
 ### Changed
 
+- **A session file whose `name` or `remote_dir` holds a newline or NUL no
+  longer loads.** The INI parser turns an escaped `\r\n` or `\0` in a
+  value into the real character, and only `host` and `username` were
+  checked on load, though saving already refused all four. Such a session
+  loaded but could never be saved again; it is now listed as skipped, with
+  the reason, like any other invalid session file.
+
 - **A partial download's resume record now names the server it came
   from.** The `.blink-part.meta` sidecar gains an `origin` field,
   `user@host:port`. A record without one — written before this change —

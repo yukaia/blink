@@ -65,21 +65,3 @@ report the skip count to its caller (a `Transport` interface change,
 so SFTP would return zero). One log line per listing, as now, not one
 per skipped line. `an_unparsable_listing_line_becomes_no_entry_at_all`
 in the FTP harness is the place to assert it.
-
-## Comments that say the wrong thing
-
-Found in the 2026-09-26 codebase audit.
-
-- `checkpoint.rs` module docs: a new walk *appends* to the checkpoint,
-  not overwrites it; files are `<name>-<hash>-<kind>.json`, not
-  `<session>-<kind>.json`; the format is version 3, not 2.
-- The doc for `remove_orphan_parts` sits above `DiscardOutcome`, so the
-  function that deletes files has none. It also says the CLI is never
-  concurrent with a running batch, but `blink checkpoints --force` in a
-  second terminal can delete `.part` files a running TUI is writing.
-- `from_url`'s comment says `load_from` has always checked `remote_dir`
-  for CR/LF; it checks only `host` and `username`. rust-ini unescapes
-  `\r\n` in values, so a session file can carry one. `check_ftp_path`
-  still blocks it on FTP, but such a session loads and then fails
-  `validate()` on re-save. Fix the comment and validate the same fields
-  in both directions.

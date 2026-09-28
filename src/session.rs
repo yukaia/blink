@@ -409,6 +409,10 @@ impl Session {
             .get("name")
             .ok_or_else(|| BlinkError::config("missing session.name"))?
             .to_string();
+        // Every field `save` checks, checked here too: rust-ini unescapes
+        // `\r\n` and `\0` in values, so a file can carry them, and one that
+        // loaded with them could never be saved again.
+        validate_network_field("name", &name)?;
         let protocol: Protocol = s
             .get("protocol")
             .ok_or_else(|| BlinkError::config("missing session.protocol"))?
@@ -429,6 +433,7 @@ impl Session {
         validate_network_field("username", &username)?;
 
         let remote_dir = s.get("remote_dir").unwrap_or("/").to_string();
+        validate_network_field("remote_dir", &remote_dir)?;
 
         let local_dir = match s.get("local_dir") {
             Some(v) => {
@@ -728,8 +733,9 @@ impl Session {
         // straight into a newline-terminated control command, making the tail
         // a second command the server executes — with the user's credentials,
         // from nothing more than a `blink connect ftp://…` line they were
-        // handed. `load_from` has always applied this check to the same field
-        // read from a session file; the URL path simply never did.
+        // handed. `check_ftp_path` also refuses such a path at the FTP
+        // boundary; `load_from` applies this same check to the field read
+        // from a session file.
         validate_network_field("remote_dir", &remote_dir)?;
 
         Ok(Self {
@@ -1191,6 +1197,56 @@ mod tests {
         let loaded = Session::load_from(&path);
         let _ = std::fs::remove_dir_all(&dir);
         loaded
+    }
+
+    // `load_from` checked `host` and `username` for NUL, CR and LF, but not
+    // `name` or `remote_dir`, which `save` refuses too. rust-ini turns an
+    // escaped `\r\n` in a value into the real characters, so a file could
+    // load with one — and then fail to save again.
+
+    fn session_with(field: &str, value: &str) -> String {
+        let mut fields = [
+            ("name", "t".to_string()),
+            ("protocol", "sftp".to_string()),
+            ("host", "h".to_string()),
+            ("username", "u".to_string()),
+            ("remote_dir", "/srv".to_string()),
+        ];
+        for (k, v) in fields.iter_mut() {
+            if *k == field {
+                *v = value.to_string();
+            }
+        }
+        let body: String = fields.iter().map(|(k, v)| format!("{k} = {v}\n")).collect();
+        format!("[session]\n{body}")
+    }
+
+    #[test]
+    fn an_escaped_newline_really_reaches_the_value() {
+        // The premise of the two tests below: without it they would pass
+        // for the wrong reason.
+        let ini = ini::Ini::load_from_str("[s]\nk = a\\r\\nb\n").unwrap();
+        assert_eq!(ini.section(Some("s")).unwrap().get("k"), Some("a\r\nb"));
+    }
+
+    #[test]
+    fn load_rejects_a_newline_in_remote_dir() {
+        let err = load_written("crlf-dir", &session_with("remote_dir", "/x\\r\\nDELE /y"))
+            .expect_err("a remote_dir with CR/LF must not load");
+        assert!(err.to_string().contains("remote_dir"), "{err}");
+    }
+
+    #[test]
+    fn load_rejects_a_newline_in_the_name() {
+        let err = load_written("crlf-name", &session_with("name", "a\\nb"))
+            .expect_err("a name with a newline must not load");
+        assert!(err.to_string().contains("name"), "{err}");
+    }
+
+    #[test]
+    fn load_accepts_an_ordinary_session() {
+        let s = load_written("plain", &session_with("remote_dir", "/srv/www")).unwrap();
+        assert_eq!(s.remote_dir, "/srv/www");
     }
 
     /// A minimal session file carrying one `[transfer] parallel_downloads`
