@@ -318,8 +318,21 @@ impl App {
                 symlinks_skipped,
                 unencodable_skipped,
                 unreadable_skipped,
+                unverifiable_uploads,
                 kind,
             } => {
+                // Said before the overwrite prompt opens, so its count is
+                // not a mystery: these may collide with nothing at all.
+                if unverifiable_uploads > 0 {
+                    self.push_log(
+                        LogLevel::Warn,
+                        format!(
+                            "can't check {unverifiable_uploads} upload(s) for existing \
+                             files: the destination's listing couldn't be fully read, \
+                             so they are treated as possible overwrites"
+                        ),
+                    );
+                }
                 // The walk left these out: the batch is incomplete, and the
                 // user would otherwise believe it whole.
                 if unreadable_skipped > 0 {

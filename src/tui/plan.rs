@@ -394,10 +394,16 @@ pub async fn find_download_conflicts(plan: &[PlannedJob]) -> Vec<usize> {
 ///
 /// If a destination directory doesn't exist yet, it has no conflicts by
 /// definition. We swallow the listing error in that case.
+///
+/// A directory whose listing had lines that could not be read cannot clear
+/// any upload into it: a file of that name may be among them. Every such
+/// upload counts as a possible conflict, so the overwrite prompt appears
+/// and the user decides, and they are counted in
+/// [`UploadConflicts::unverifiable`] so the prompt can be explained.
 pub async fn find_upload_conflicts(
     transport: &SharedTransport,
     plan: &[PlannedJob],
-) -> Result<Vec<usize>> {
+) -> Result<UploadConflicts> {
     use std::collections::HashMap;
 
     // Group upload jobs by destination directory.
@@ -414,6 +420,7 @@ pub async fn find_upload_conflicts(
     }
 
     let mut conflicts = Vec::new();
+    let mut unverifiable = 0usize;
     for (dir, entries) in by_dir {
         // Per-directory lock, same reasoning as `walk_remote`.
         let result = {
@@ -421,7 +428,7 @@ pub async fn find_upload_conflicts(
             t.list(&dir).await
         };
         let listing = match result {
-            Ok(l) => l.entries,
+            Ok(l) => l,
             // "Directory doesn't exist yet" genuinely has no conflicts —
             // that is the normal case when uploading into a new tree.
             Err(BlinkError::NotFound(_)) => continue,
@@ -431,17 +438,35 @@ pub async fn find_upload_conflicts(
             // written over. Surface it and let the user decide.
             Err(e) => return Err(e),
         };
+        if listing.unreadable > 0 {
+            unverifiable += entries.len();
+            conflicts.extend(entries.into_iter().map(|(i, _)| i));
+            continue;
+        }
         for (i, name) in entries {
             // Compare against the server's own bytes: the upload will address
             // `name` verbatim, so the sanitized form could both miss a real
             // collision and invent one that isn't there.
-            if listing.iter().any(|e| e.raw_name == name) {
+            if listing.entries.iter().any(|e| e.raw_name == name) {
                 conflicts.push(i);
             }
         }
     }
     conflicts.sort_unstable();
-    Ok(conflicts)
+    Ok(UploadConflicts {
+        indices: conflicts,
+        unverifiable,
+    })
+}
+
+/// What [`find_upload_conflicts`] found.
+#[derive(Debug)]
+pub struct UploadConflicts {
+    /// Plan indices of uploads that would, or might, overwrite a file.
+    pub indices: Vec<usize>,
+    /// How many of those could not be checked, because their destination's
+    /// listing had lines that could not be read.
+    pub unverifiable: usize,
 }
 
 /// Apply the user's "skip conflicts" choice. Returns the plan with the
@@ -1054,7 +1079,43 @@ mod tests {
         let conflicts = find_upload_conflicts(&t, &upload_plan())
             .await
             .expect("a missing directory is not an error");
-        assert!(conflicts.is_empty());
+        assert!(conflicts.indices.is_empty());
+        assert_eq!(conflicts.unverifiable, 0);
+    }
+
+    fn two_uploads() -> Vec<PlannedJob> {
+        ["a.txt", "b.txt"]
+            .into_iter()
+            .map(|n| PlannedJob::Upload {
+                local_path: PathBuf::from(format!("/l/{n}")),
+                remote_path: format!("/r/{n}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_name_already_listed_is_a_conflict() {
+        let t = shared(FileList {
+            names: vec!["a.txt".into()],
+            unreadable: 0,
+        });
+        let conflicts = find_upload_conflicts(&t, &two_uploads()).await.unwrap();
+        assert_eq!(conflicts.indices, vec![0]);
+        assert_eq!(conflicts.unverifiable, 0);
+    }
+
+    /// A directory whose listing had lines blink could not read may hold a
+    /// file of any upload's name among them. Uploads into it cannot be
+    /// cleared, so they count as possible conflicts and the user decides.
+    #[tokio::test]
+    async fn uploads_into_a_partly_unreadable_directory_are_possible_conflicts() {
+        let t = shared(FileList {
+            names: vec!["other.txt".into()],
+            unreadable: 1,
+        });
+        let conflicts = find_upload_conflicts(&t, &two_uploads()).await.unwrap();
+        assert_eq!(conflicts.indices, vec![0, 1], "neither can be ruled out");
+        assert_eq!(conflicts.unverifiable, 2);
     }
 
     #[tokio::test]

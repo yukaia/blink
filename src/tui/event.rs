@@ -112,6 +112,10 @@ pub enum AppEvent {
         /// Remote entries skipped because their listing lines could not be
         /// read. Always zero for an upload walk.
         unreadable_skipped: usize,
+        /// Uploads counted as possible conflicts only because their
+        /// destination's listing could not be fully read. Always zero for a
+        /// download walk.
+        unverifiable_uploads: usize,
         kind: Direction,
     },
 

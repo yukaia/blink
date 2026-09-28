@@ -124,7 +124,7 @@ impl App {
             // Phase 2: collect every destination directory mentioned by the
             // plan (the parent of each Upload job), then list each one once
             // and check for conflicts in O(dirs) round-trips.
-            let conflict_indices = match find_upload_conflicts(&t, &plan).await {
+            let conflicts = match find_upload_conflicts(&t, &plan).await {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = tx.send(AppEvent::WalkFailed {
@@ -137,10 +137,11 @@ impl App {
 
             let _ = tx.send(AppEvent::WalkComplete {
                 plan,
-                conflict_indices,
+                conflict_indices: conflicts.indices,
                 symlinks_skipped,
                 unencodable_skipped,
                 unreadable_skipped: 0,
+                unverifiable_uploads: conflicts.unverifiable,
                 kind: Direction::Upload,
             });
         });
@@ -244,6 +245,7 @@ impl App {
                 // `safe_local_name`, not through UTF-8 decoding.
                 unencodable_skipped: 0,
                 unreadable_skipped,
+                unverifiable_uploads: 0,
                 kind: Direction::Download,
             });
         });

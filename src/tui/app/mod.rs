@@ -2313,6 +2313,25 @@ mod tests {
     }
 
     #[test]
+    fn uploads_that_could_not_be_checked_are_explained_before_the_prompt() {
+        let mut a = app_with_manager();
+        a.handle_app_event(AppEvent::WalkComplete {
+            plan: vec![upload(0)],
+            conflict_indices: vec![0],
+            symlinks_skipped: 0,
+            unencodable_skipped: 0,
+            unreadable_skipped: 0,
+            unverifiable_uploads: 5,
+            kind: Direction::Upload,
+        });
+        assert!(
+            logged(&a, "can't check 5 upload(s) for existing files"),
+            "the prompt's count must not be a mystery",
+        );
+        assert_eq!(a.screen, Screen::ConfirmOverwrite, "and the user decides");
+    }
+
+    #[test]
     fn a_download_walk_that_skipped_unreadable_entries_says_so() {
         let mut a = app();
         a.handle_app_event(AppEvent::WalkComplete {
@@ -2321,6 +2340,7 @@ mod tests {
             symlinks_skipped: 0,
             unencodable_skipped: 0,
             unreadable_skipped: 12,
+            unverifiable_uploads: 0,
             kind: Direction::Download,
         });
         assert!(logged(

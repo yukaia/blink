@@ -70,7 +70,10 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   recursive. Preparing an upload now fails outright if its destination
   directory can't be listed for any reason other than "doesn't exist yet" —
   a server that refuses `LIST` on a writable directory is surfaced as an
-  error rather than silently treated as conflict-free
+  error rather than silently treated as conflict-free. Likewise, uploads
+  into an FTP directory whose listing couldn't be fully read count as
+  possible conflicts, since a file of that name may be among the unread
+  lines; the log says so before the prompt
 - **One job per destination.** A download is not queued while another
   queued or running download writes the same local file (compared ignoring
   case on Windows and macOS), and an upload likewise for its remote path —

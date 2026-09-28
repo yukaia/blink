@@ -31,6 +31,14 @@ the git history for those.
 
 ### Fixed
 
+- **An upload can't silently overwrite a file hidden in an unreadable FTP
+  listing.** The overwrite check lists each destination directory and
+  looks for the upload's name. When some of that listing's lines couldn't
+  be read, a file of the same name could be among them, unseen, and be
+  overwritten without asking. Uploads into such a directory now count as
+  possible conflicts: the overwrite prompt appears, and the log explains
+  why beforehand.
+
 - **FTP listing lines blink can't read are no longer skipped silently.** A
   server whose directory listing lines match neither the POSIX nor the DOS
   format had them dropped with a warning only in the debug log, discarded
