@@ -8,6 +8,8 @@ the git history for those.
 
 ## [Unreleased]
 
+## [0.8.2] — 2026-09-28
+
 ### Changed
 
 - **A session file whose `name` or `remote_dir` holds a newline or NUL no
