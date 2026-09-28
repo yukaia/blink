@@ -8,7 +8,22 @@ the git history for those.
 
 ## [Unreleased]
 
+### Changed
+
+- **Partial transfers are named `<name>.blink-part`, not `<name>.part`.**
+  Downloads in progress, their `.meta` resume records, and uploads in
+  progress on the server all use the new suffix. Partial downloads left by
+  earlier versions under `.part` are not resumed; download those files
+  again, and delete the old `.part` and `.part.meta` files by hand.
+
 ### Fixed
+
+- **blink no longer deletes or truncates other programs' `.part` files.**
+  Its own partial files used the common `.part` suffix, so a
+  `report.pdf.part` left by a browser beside a download of `report.pdf`
+  was deleted or overwritten — and an upload did the same to a
+  `data.csv.part` on the server. With the new suffix, blink only touches
+  files it wrote.
 
 - **FTP previews of large files work on slow links.** A preview's
   60-second deadline covered the whole transfer, so a large image could

@@ -89,7 +89,7 @@ pub enum EnqueueError {
 /// The destination a job writes, as the key two jobs must not share.
 ///
 /// Two jobs writing one destination at once corrupt it. Both stream into
-/// the same `.part` — the second either deletes the first's or takes it for
+/// the same `.blink-part` — the second either deletes the first's or takes it for
 /// its own partial and appends to it — and the first to finish renames the
 /// file into place while the other is still writing, then reports success.
 /// A download's destination is its local path; an upload's is its remote
@@ -695,7 +695,7 @@ mod tests {
     // -- duplicate destinations ------------------------------------------------
     //
     // Two jobs writing one destination at once corrupt it: both stream into
-    // the same `.part`, and the first to finish renames it into place while
+    // the same `.blink-part`, and the first to finish renames it into place while
     // the other is still writing. So a destination is held from enqueue until
     // its job completes or fails, and a second job for it is refused.
 
@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(
             m.enqueue_upload("/tmp/y".into(), "/r/x".into()),
             Err(EnqueueError::Duplicate),
-            "two uploads to one remote path write one `.part` there",
+            "two uploads to one remote path write one `.blink-part` there",
         );
         m.enqueue_upload("/tmp/x".into(), "/r/other".into())
             .expect("one local source may go to two remote paths");

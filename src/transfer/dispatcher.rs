@@ -362,7 +362,7 @@ async fn run_one(
         // An idle pooled connection may have died while parked (server idle
         // timeout, network drop). That must not fail the job: retry once on
         // a fresh connection. Resume support makes the retry cheap — a
-        // partially written download picks up from its `.part` offset.
+        // partially written download picks up from its `.blink-part` offset.
         if reused && matches!(outcome, Err(BlinkError::Disconnected(_))) {
             drop(transport); // dead; Drop tears down the socket
             transport = connect(&session, pw, &app_event_tx, &trust).await?;

@@ -66,19 +66,9 @@ so SFTP would return zero). One log line per listing, as now, not one
 per skipped line. `an_unparsable_listing_line_becomes_no_entry_at_all`
 in the FTP harness is the place to assert it.
 
-## `.part` naming can clobber unrelated files
+## A resume record does not say which server it came from
 
 Found in the 2026-09-26 codebase audit, like every entry below.
-
-Downloads use `<name>.part` and `<name>.part.meta`: `resume_offset`
-deletes an unidentifiable `.part` and `File::create` truncates one, so a
-user's own file of that name in the destination is lost. Uploads open
-`<remote>.part` with `TRUNCATE` and remove it on failure (`sftp.rs`,
-`ftp_impl.rs`), the same on the server. Rare, but silent. A more
-specific suffix (`.blink-part`) would make a collision implausible;
-existing partials would need a migration or a one-time restart.
-
-## A resume record does not say which server it came from
 
 `PartMeta` (`transport/mod.rs`) records the remote path and size, not the
 host. Two servers with a file at the same path and size, downloaded to

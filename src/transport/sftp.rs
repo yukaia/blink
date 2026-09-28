@@ -865,7 +865,7 @@ async fn pipelined_download(
 
     // The file shrank mid-transfer (a chunk read hit EOF before the size
     // reported at open). Fail rather than rename a short file onto the
-    // final path as if the download had succeeded; the stale `.part` is
+    // final path as if the download had succeeded; the stale `.blink-part` is
     // detected and discarded on the next attempt.
     if let Some(end) = size
         && done < end
@@ -1040,7 +1040,7 @@ impl Transport for SftpTransport {
         local_path: &Path,
         progress: Option<mpsc::UnboundedSender<ProgressUpdate>>,
     ) -> Result<()> {
-        // Stream into `<local>.part` and rename onto the final path only on
+        // Stream into `<local>.blink-part` and rename onto the final path only on
         // success. This keeps the user's existing file (if any) untouched
         // until the download is fully complete and fsynced, and isolates
         // partial bytes from a previous attempt under a recognisable suffix.
@@ -1103,7 +1103,7 @@ impl Transport for SftpTransport {
         let _ = raw.close(&remote_handle).await;
         result?;
 
-        // Flush + fsync the .part so its bytes are durable, then atomically
+        // Flush + fsync the partial so its bytes are durable, then atomically
         // rename onto the final path. Drop the handle first; renaming an
         // open file is fine on Unix but tokio's tempfile/rename pairing is
         // simpler when the source is closed.
@@ -1132,11 +1132,11 @@ impl Transport for SftpTransport {
         let do_fsync = xfer.fsync;
         let posix_rename = xfer.posix_rename;
 
-        // Stream into `<remote>.part` and rename onto the final name only
+        // Stream into `<remote>.blink-part` and rename onto the final name only
         // on success — the remote mirror of the download path. An
         // interrupted or failed upload must never leave a truncated file
         // under the destination name.
-        let part = format!("{remote_path}.part");
+        let part = super::remote_part_path(remote_path);
 
         let remote_handle = raw
             .open(
@@ -2248,8 +2248,11 @@ mod integration {
         assert_eq!(stored.len(), upload_bytes.len(), "uploaded size mismatch");
         assert!(stored == upload_bytes, "uploaded bytes mismatch");
         assert!(
-            !store.lock().await.contains_key("/uploaded.bin.part"),
-            "temporary .part must be renamed away after a successful upload"
+            !store
+                .lock()
+                .await
+                .contains_key(&crate::transport::remote_part_path("/uploaded.bin")),
+            "the upload's partial must be renamed away after a successful upload"
         );
 
         // ---- upload over an existing remote file ----
@@ -2270,8 +2273,11 @@ mod integration {
             .expect("uploaded file should be present");
         assert!(stored == replacement, "overwritten bytes mismatch");
         assert!(
-            !store.lock().await.contains_key("/uploaded.bin.part"),
-            "temporary .part must be renamed away after an overwriting upload"
+            !store
+                .lock()
+                .await
+                .contains_key(&crate::transport::remote_part_path("/uploaded.bin")),
+            "the upload's partial must be renamed away after an overwriting upload"
         );
         let _ = tokio::fs::remove_file(&ul_src).await;
 
@@ -2371,7 +2377,76 @@ mod integration {
         assert_eq!(&small[..], b"hello");
     }
 
-    /// A `.part` left behind by a download of a *different* remote file must
+    /// Somebody else's `x.part` — a browser's, another tool's — sitting
+    /// beside a download of `x` used to be deleted (it could not be
+    /// identified as a partial of `x`) or truncated. blink's partials now
+    /// have a name of their own, and a foreign `.part` is none of its
+    /// business.
+    #[tokio::test]
+    async fn a_download_leaves_another_tools_part_file_alone() {
+        let payload = pseudo_random(3 * SHORT_READ);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/report.pdf".to_string(), payload.clone());
+        let (port, _c) = start_server(store).await;
+        let mut transport = connect(port).await;
+
+        let dir = std::env::temp_dir().join(format!("blink-foreign-part-{port}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let local = dir.join("report.pdf");
+        let theirs = dir.join("report.pdf.part");
+        std::fs::write(&theirs, b"someone else's partial").unwrap();
+
+        transport
+            .download("/report.pdf", &local, None)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&local).unwrap(), payload);
+        assert_eq!(
+            std::fs::read(&theirs).unwrap(),
+            b"someone else's partial",
+            "a file blink did not write must survive",
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = transport.close().await;
+    }
+
+    /// The remote mirror: an upload of `x` opened `x.part` with TRUNCATE and
+    /// removed it on failure, whoever it belonged to.
+    #[tokio::test]
+    async fn an_upload_leaves_a_remote_part_file_alone() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/data.csv.part".to_string(), b"theirs".to_vec());
+        let (port, _c) = start_server(store.clone()).await;
+        let mut transport = connect(port).await;
+
+        let src = std::env::temp_dir().join(format!("blink-upload-src-{port}.csv"));
+        std::fs::write(&src, b"a,b\n1,2\n").unwrap();
+        transport.upload(&src, "/data.csv", None).await.unwrap();
+
+        let files = store.lock().await;
+        assert_eq!(
+            files.get("/data.csv").map(Vec::as_slice),
+            Some(&b"a,b\n1,2\n"[..])
+        );
+        assert_eq!(
+            files.get("/data.csv.part").map(Vec::as_slice),
+            Some(&b"theirs"[..]),
+            "a remote file blink did not write must survive",
+        );
+        drop(files);
+        let _ = std::fs::remove_file(&src);
+        let _ = transport.close().await;
+    }
+
+    /// A `.blink-part` left behind by a download of a *different* remote file must
     /// never be resumed into the current one. Before the provenance check,
     /// this appended B's tail to A's head and renamed the result into place
     /// as a completed download of B.

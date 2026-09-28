@@ -386,7 +386,7 @@ impl Checkpoint {
     ///
     /// Storage is one checkpoint per (session, direction), so a second batch
     /// of the same direction used to overwrite the first — while the first
-    /// was still running, leaving it unresumable and its `.part` files
+    /// was still running, leaving it unresumable and its `.blink-part` files
     /// unfindable. Appending keeps both in one file; the caller offsets its
     /// job-id map by the returned base.
     pub fn append(&mut self, jobs: Vec<CheckpointJob>) -> usize {
@@ -676,7 +676,7 @@ pub fn offers_for(session: &str) -> Vec<CheckpointOffer> {
 
 /// Remove a checkpoint and the partial downloads it is the only record of.
 ///
-/// The checkpoint names where every unfinished download left its `.part`
+/// The checkpoint names where every unfinished download left its `.blink-part`
 /// file; delete it without sweeping and those files are stranded with
 /// nothing left to reference them. `remove_orphan_parts` skips `Done` jobs,
 /// so only partials of transfers that never finished are removed.
@@ -725,15 +725,15 @@ fn write_due(dirty: bool, last_save: Option<Instant>, now: Instant, interval: Du
     }
 }
 
-/// Delete the `.part` files belonging to `cp`'s unfinished downloads.
+/// Delete the `.blink-part` files belonging to `cp`'s unfinished downloads.
 /// Returns how many were removed.
 ///
-/// A download streams into `<dest>.part` and renames onto `<dest>` only on
+/// A download streams into `<dest>.blink-part` and renames onto `<dest>` only on
 /// success, so an interrupted batch leaves partials scattered across the
 /// destination tree. The checkpoint is the only record of where they are —
 /// once it is gone, nothing can find them again and they sit there forever.
 ///
-/// Only `Done` jobs are skipped: their `.part` was already renamed away, and
+/// Only `Done` jobs are skipped: their `.blink-part` was already renamed away, and
 /// a file at that path now would belong to some other transfer.
 ///
 /// Called from two places: the `blink checkpoints` CLI (a separate process
@@ -746,7 +746,7 @@ fn write_due(dirty: bool, last_save: Option<Instant>, now: Instant, interval: Du
 /// It can still race a worker from the session that was just left, though:
 /// `App::disconnect` spawns the dispatcher's `shutdown()` rather than
 /// awaiting it, so a worker from the previous connection can still be
-/// mid-write on a `.part` file when the reconnect completes and its
+/// mid-write on a `.blink-part` file when the reconnect completes and its
 /// checkpoint is offered again. Unlinking out from under that worker races
 /// it: on Unix the unlink succeeds, the worker keeps writing to the
 /// now-unlinked inode, and its final rename fails — turning what should be
@@ -821,7 +821,7 @@ enum Disposition {
 /// Decide what happens to one checkpoint.
 ///
 /// Split out from the directory walk and the printing so the rule can be
-/// tested at all: removing a checkpoint strands the `.part` files of its
+/// tested at all: removing a checkpoint strands the `.blink-part` files of its
 /// unfinished downloads, because nothing else records where they are. A
 /// wrong answer here destroys transfers the user could have resumed.
 fn disposition(pending: usize, orphaned: bool, clean: bool, force: bool) -> Disposition {
@@ -932,7 +932,7 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
         match disposition(pending, orphaned, clean, force) {
             Disposition::Remove(reason) => {
                 // Removing the checkpoint makes the batch unresumable, which
-                // strands the `.part` files its unfinished downloads left
+                // strands the `.blink-part` files its unfinished downloads left
                 // behind — nothing else records where they are. Sweep them
                 // while we still know.
                 let swept = remove_orphan_parts(&cp);
@@ -978,7 +978,7 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
         println!("{removed} removed, {kept} kept");
         if parts_removed > 0 {
             let plural = if parts_removed == 1 { "file" } else { "files" };
-            println!("{parts_removed} orphaned .part {plural} deleted");
+            println!("{parts_removed} orphaned .blink-part {plural} deleted");
         }
     } else if kept > 0 {
         println!();
@@ -1191,7 +1191,7 @@ mod sweep_tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// A scratch directory holding real `.part` files for the sweep to find.
+    /// A scratch directory holding real `.blink-part` files for the sweep to find.
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("blink-sweep-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1205,6 +1205,23 @@ mod sweep_tests {
             local_path: dir.join(name),
             status,
         }
+    }
+
+    /// Discarding a checkpoint sweeps blink's partials, not files that
+    /// merely share the old suffix.
+    #[test]
+    fn the_sweep_leaves_another_tools_part_file_alone() {
+        let dir = scratch("foreign");
+        let unfinished = job(&dir, "a.bin", JobStatus::Pending);
+        std::fs::write(crate::transport::part_path(&dir.join("a.bin")), b"x").unwrap();
+        let theirs = dir.join("a.bin.part");
+        std::fs::write(&theirs, b"theirs").unwrap();
+        let cp = Checkpoint::new("s", CheckpointKind::Download, vec![unfinished]);
+
+        let outcome = remove_orphan_parts(&cp);
+
+        assert_eq!(outcome.parts_removed, 1, "blink's own partial goes");
+        assert_eq!(std::fs::read(&theirs).unwrap(), b"theirs", "theirs stays");
     }
 
     #[test]

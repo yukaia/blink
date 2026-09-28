@@ -370,7 +370,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    // Stream into `<local>.part` and rename on success — see
+    // Stream into `<local>.blink-part` and rename on success — see
     // [`crate::transport::part_path`] for the rationale.
     let part = super::part_path(local_path);
 
@@ -488,12 +488,12 @@ pub async fn ftp_upload<T: TokioTlsStream + Send>(
     let total = tokio::fs::metadata(local_path).await?.len();
     let mut local = tokio::fs::File::open(local_path).await?;
 
-    // Stream into `<remote>.part` and rename onto the final name only on
+    // Stream into `<remote>.blink-part` and rename onto the final name only on
     // success, so an interrupted upload never leaves a truncated file under
-    // the destination name. A failed upload may leave the `.part` behind:
+    // the destination name. A failed upload may leave the `.blink-part` behind:
     // after a data-channel error the control channel's state is uncertain,
     // so we don't risk further commands to clean it up.
-    let part = format!("{remote_path}.part");
+    let part = super::remote_part_path(remote_path);
 
     let mut writer = timed_ftp("stor", &part, stream.put_with_stream(&part)).await?;
 
@@ -524,7 +524,7 @@ pub async fn ftp_upload<T: TokioTlsStream + Send>(
     // which is safe because a failed job's connection is never reused.
     timed_ftp("finalize put", &part, writer.finish()).await?;
 
-    // Move the fully-stored `.part` onto the final name. Whether RNTO
+    // Move the fully-stored `.blink-part` onto the final name. Whether RNTO
     // replaces an existing target is server-dependent: try the rename
     // first, and when it's refused, delete the target and retry once.
     if let Err(first_err) = timed_ftp(
@@ -1485,7 +1485,7 @@ mod integration {
         assert_eq!(meta.size, 12);
     }
 
-    /// A `.part` file from an interrupted download must continue from its
+    /// A `.blink-part` file from an interrupted download must continue from its
     /// length via REST, not restart and not concatenate.
     #[tokio::test]
     async fn a_partial_download_resumes_from_its_offset() {
@@ -1526,6 +1526,62 @@ mod integration {
             issued.iter().any(|c| c == "REST 30000"),
             "the download must resume from the partial's length, not restart; \
              commands issued: {issued:?}",
+        );
+    }
+
+    /// See the SFTP test of the same name: another tool's `x.part` beside a
+    /// download of `x` is not blink's to delete or truncate.
+    #[tokio::test]
+    async fn a_download_leaves_another_tools_part_file_alone() {
+        let payload = pseudo_random(20_000);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/report.pdf".to_string(), payload.clone());
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let dir = tempdir_for_test("foreign-part");
+        let local = dir.join("report.pdf");
+        let _ = std::fs::remove_file(&local);
+        let theirs = dir.join("report.pdf.part");
+        std::fs::write(&theirs, b"someone else's partial").unwrap();
+
+        transport
+            .download("/report.pdf", &local, None)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&local).unwrap(), payload);
+        assert_eq!(std::fs::read(&theirs).unwrap(), b"someone else's partial");
+    }
+
+    #[tokio::test]
+    async fn an_upload_leaves_a_remote_part_file_alone() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/data.csv.part".to_string(), b"theirs".to_vec());
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let dir = tempdir_for_test("remote-part");
+        let src = dir.join("data.csv");
+        std::fs::write(&src, b"a,b\n1,2\n").unwrap();
+        transport.upload(&src, "/data.csv", None).await.unwrap();
+
+        let files = store.lock().await;
+        assert_eq!(
+            files.get("/data.csv").map(Vec::as_slice),
+            Some(&b"a,b\n1,2\n"[..])
+        );
+        assert_eq!(
+            files.get("/data.csv.part").map(Vec::as_slice),
+            Some(&b"theirs"[..]),
         );
     }
 

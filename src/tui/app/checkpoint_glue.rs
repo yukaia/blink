@@ -185,7 +185,7 @@ impl App {
         // Append to the checkpoint already tracking this direction, if there
         // is one. Overwriting it — which is what a fresh `Checkpoint::new`
         // did — destroyed the plan of a batch that was still running, taking
-        // its resumability with it and stranding the `.part` files of its
+        // its resumability with it and stranding the `.blink-part` files of its
         // unfinished downloads, since the checkpoint is the only record of
         // where those are.
         let base = match self.active_checkpoints.get_mut(&ck_kind) {

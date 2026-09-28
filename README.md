@@ -103,13 +103,17 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
 - **Checkpoint file format** is versioned (currently version 3, which adds
   a `cancelled` job status); checkpoints written by older blink versions
   (versions 1 and 2) still load and resume normally.
-- **Download resume is provenance-checked.** A `.part` file records bytes,
-  not which remote file they came from, so blink writes a `<dest>.part.meta`
-  sidecar alongside it naming the remote path and the size the server
-  reported. Resume only happens when the sidecar identifies the same remote
-  file at the same reported size; anything unproven — including a `.part`
-  left by a pre-sidecar version of blink — restarts from byte zero instead
-  of risking a silently corrupt file.
+- **Download resume is provenance-checked.** A partial download,
+  `<dest>.blink-part`, records bytes, not which remote file they came from,
+  so blink writes a `<dest>.blink-part.meta` sidecar alongside it naming the
+  remote path and the size the server reported. Resume only happens when
+  the sidecar identifies the same remote file at the same reported size;
+  anything unproven restarts from byte zero instead of risking a silently
+  corrupt file.
+- **Partial files have a name of their own.** In-flight transfers write
+  `<name>.blink-part`, locally for a download and on the server for an
+  upload, so blink never touches a `<name>.part` that a browser or another
+  tool left beside the file.
 
 ### Sessions
 
@@ -287,7 +291,7 @@ blink checkpoints --clean
 
 # Remove all checkpoint files unconditionally
 blink checkpoints --force
-# (both also delete the .part files, and their .part.meta sidecars, left
+# (both also delete the .blink-part files, and their .meta sidecars, left
 #  by the batches they remove)
 
 # Forget a stored SSH host key (see "known_hosts" below before running this)
@@ -810,25 +814,25 @@ RGBA buffer is already allocated.
   so a 100k-job batch doesn't generate ~200k full plan rewrites. Any
   lost mark on a crash just causes the affected job to be re-queued on
   resume — never silently skipped.
-- Downloads write to a `<local>.part` sibling and rename onto the final
-  name only after `flush` + `sync_all`. The user's existing file (if any)
-  isn't truncated until the new download has fsynced cleanly. A
-  `<local>.part.meta` sidecar is written alongside it, recording the remote
-  path and the size the server reported — the provenance a resume needs to
-  tell "my interrupted download" from "an unrelated file that happens to
-  share this local name" (see "download resume is provenance-checked"
-  under Transfers).
+- Downloads write to a `<local>.blink-part` sibling and rename onto the
+  final name only after `flush` + `sync_all`. The user's existing file (if
+  any) isn't truncated until the new download has fsynced cleanly. A
+  `<local>.blink-part.meta` sidecar is written alongside it, recording the
+  remote path and the size the server reported — the provenance a resume
+  needs to tell "my interrupted download" from "an unrelated file that
+  happens to share this local name" (see "download resume is
+  provenance-checked" under Transfers).
 - Uploads mirror this on the remote side: bytes stream into
-  `<remote>.part` and the final name is only created by rename after the
-  upload completes (and fsyncs, where the server supports
+  `<remote>.blink-part` and the final name is only created by rename after
+  the upload completes (and fsyncs, where the server supports
   `fsync@openssh.com`). SFTP uses `posix-rename@openssh.com` for an
   atomic replace when the server offers it; otherwise (and on FTP/FTPS,
   where overwrite-on-rename is server-dependent) the target is removed
   and the rename retried — that window can expose "old file gone, new
-  file still at `.part`", but never a truncated file under the final
-  name. An upload interrupted by a hard kill or dropped connection can
-  leave a stale `<remote>.part` behind; re-running the upload reuses
-  (truncates) it.
+  file still at `.blink-part`", but never a truncated file under the
+  final name. An upload interrupted by a hard kill or dropped connection
+  can leave a stale `<remote>.blink-part` behind; re-running the upload
+  reuses (truncates) it.
 - Config directories are created with mode 0700 on Unix (not
   world-readable). A `BLINK_LOG_FILE` is created with mode 0600, since at
   debug level it records hostnames and remote paths; if the file already
@@ -900,13 +904,12 @@ A few things worth knowing before you use this in anger:
   that window leaves the affected job in its previous state on resume,
   which is the same safe outcome as a crash mid-transfer (Pending →
   re-queued, InProgress → re-queued, Done → re-run). Partial downloads
-  live at `<name>.part`; the final name is only created via rename
+  live at `<name>.blink-part`; the final name is only created via rename
   after fsync. `mkdir` is idempotent on the remote side, so re-runs are
-  safe across the board. A resumed `.part` is only trusted if its
-  `.part.meta` sidecar names the same remote path at the same reported
-  size — a `.part` from before this check existed, or one whose sidecar
-  didn't survive the crash, restarts instead of risking a silently
-  corrupted file.
+  safe across the board. A resumed partial is only trusted if its
+  `.blink-part.meta` sidecar names the same remote path at the same
+  reported size — one whose sidecar didn't survive the crash restarts
+  instead of risking a silently corrupted file.
 - **Transfers don't auto-refresh the local pane.** Use F5 to refresh after
   downloads complete.
 

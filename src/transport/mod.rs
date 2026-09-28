@@ -16,10 +16,19 @@ use tokio::sync::mpsc;
 use crate::error::Result;
 use crate::session::{Protocol, Session};
 
+/// Suffix of the files a transfer writes while it is in flight: a local
+/// `<name>.blink-part` for a download, a remote one for an upload.
+///
+/// Specific to blink on purpose. It used to be `.part`, which browsers and
+/// other tools use too, and blink deleted or truncated a file of that name
+/// that happened to sit beside a download — or, for an upload, on the
+/// server. No one else writes `.blink-part`.
+const PART_SUFFIX: &str = ".blink-part";
+
 /// The on-disk path a download writes to while it's in flight.
 ///
-/// We always stream into `<final>.part` and rename onto the final name only
-/// once the transfer has completed and been fsynced. That way:
+/// We always stream into `<final>.blink-part` and rename onto the final
+/// name only once the transfer has completed and been fsynced. That way:
 ///
 /// - An interrupted download leaves the partial bytes under a distinguishable
 ///   suffix instead of next to the user's pre-existing real file.
@@ -29,11 +38,17 @@ use crate::session::{Protocol, Session};
 ///   [`crate::paths::sync_parent_dir`] guarantees the rename is durable.
 pub(crate) fn part_path(local: &Path) -> PathBuf {
     let mut s = local.as_os_str().to_owned();
-    s.push(".part");
+    s.push(PART_SUFFIX);
     PathBuf::from(s)
 }
 
-/// Sidecar recording which remote file a `.part` holds bytes of.
+/// The remote path an upload writes to while it's in flight; renamed onto
+/// `remote` once the whole file is stored. See [`PART_SUFFIX`].
+pub(crate) fn remote_part_path(remote: &str) -> String {
+    format!("{remote}{PART_SUFFIX}")
+}
+
+/// Sidecar recording which remote file a `.blink-part` holds bytes of.
 ///
 /// See [`decide_resume`] for why bytes alone are not enough to resume.
 pub(crate) fn part_meta_path(local: &Path) -> PathBuf {
@@ -42,7 +57,7 @@ pub(crate) fn part_meta_path(local: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Provenance of a partial download, stored next to the `.part` file.
+/// Provenance of a partial download, stored next to the `.blink-part` file.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PartMeta {
     /// The remote path these bytes came from.
@@ -52,7 +67,7 @@ pub(crate) struct PartMeta {
     pub size: Option<u64>,
 }
 
-/// What to do with an existing `.part` file.
+/// What to do with an existing `.blink-part` file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResumeDecision {
     /// Discard any partial and download from byte zero.
@@ -63,7 +78,7 @@ pub(crate) enum ResumeDecision {
 
 /// Decide whether an existing partial download can be continued.
 ///
-/// A `.part` file records bytes and nothing else, so length alone cannot
+/// A `.blink-part` file records bytes and nothing else, so length alone cannot
 /// answer "are these the right bytes?". Two downloads that land on the same
 /// local name — `/a/report.pdf` interrupted, then `/b/report.pdf` started —
 /// produce one partial and one resume that appends the second file's tail to
@@ -88,8 +103,8 @@ pub(crate) fn decide_resume(
         return ResumeDecision::Fresh;
     };
 
-    // Unidentified bytes: a partial from an older blink, or one whose
-    // sidecar was lost. We cannot tell what it is, so we don't trust it.
+    // Unidentified bytes: a partial whose sidecar was lost. We cannot tell
+    // what it is, so we don't trust it.
     let Some(meta) = meta else {
         return ResumeDecision::Fresh;
     };
@@ -119,7 +134,7 @@ pub(crate) fn decide_resume(
 /// Resolve the resume offset for a download, cleaning up a stale partial.
 ///
 /// Returns the byte offset to start from. On [`ResumeDecision::Fresh`] the
-/// existing `.part` and its sidecar are removed, so the caller can create
+/// existing `.blink-part` and its sidecar are removed, so the caller can create
 /// the file from scratch.
 pub(crate) async fn resume_offset(
     local_path: &Path,
@@ -152,7 +167,7 @@ pub(crate) async fn resume_offset(
     }
 }
 
-/// Record which remote file the in-flight `.part` belongs to.
+/// Record which remote file the in-flight `.blink-part` belongs to.
 ///
 /// Best-effort: a failure here costs a restart on the next attempt, never
 /// correctness, because a missing sidecar reads as "unidentified" and forces
@@ -837,7 +852,7 @@ mod tests {
 
     // -- resume provenance -------------------------------------------------
     //
-    // A `.part` file records only bytes, not which remote file they came
+    // A `.blink-part` file records only bytes, not which remote file they came
     // from. Resuming on length alone means an interrupted download of one
     // file can be "completed" with the tail of a different file that happens
     // to share a local name — silently, and with a successful-looking rename
@@ -881,8 +896,8 @@ mod tests {
 
     #[test]
     fn restarts_when_the_partial_has_no_provenance() {
-        // A `.part` left by an older blink, or one whose sidecar was lost.
-        // Nothing identifies it, so it cannot be trusted.
+        // A `.blink-part` whose sidecar was lost. Nothing identifies it, so it
+        // cannot be trusted.
         let d = decide_resume(Some(4_000), None, "/a/report.pdf", Some(9_000));
         assert_eq!(d, ResumeDecision::Fresh);
     }
@@ -960,7 +975,7 @@ mod tests {
     fn part_meta_path_sits_beside_the_partial() {
         assert_eq!(
             part_meta_path(Path::new("/tmp/file.iso")),
-            PathBuf::from("/tmp/file.iso.part.meta")
+            PathBuf::from("/tmp/file.iso.blink-part.meta")
         );
     }
 
@@ -969,16 +984,16 @@ mod tests {
     fn part_path_appends_suffix() {
         assert_eq!(
             part_path(Path::new("/tmp/file.iso")),
-            PathBuf::from("/tmp/file.iso.part")
+            PathBuf::from("/tmp/file.iso.blink-part")
         );
     }
 
     #[test]
     fn part_path_preserves_compound_extensions() {
-        // foo.tar.gz -> foo.tar.gz.part (not foo.tar.part)
+        // foo.tar.gz -> foo.tar.gz.blink-part (not foo.tar.blink-part)
         assert_eq!(
             part_path(Path::new("/tmp/archive.tar.gz")),
-            PathBuf::from("/tmp/archive.tar.gz.part")
+            PathBuf::from("/tmp/archive.tar.gz.blink-part")
         );
     }
 
@@ -986,8 +1001,26 @@ mod tests {
     fn part_path_with_no_extension() {
         assert_eq!(
             part_path(Path::new("/tmp/README")),
-            PathBuf::from("/tmp/README.part")
+            PathBuf::from("/tmp/README.blink-part")
         );
+    }
+
+    #[test]
+    fn remote_part_path_uses_the_same_suffix() {
+        assert_eq!(
+            remote_part_path("/srv/data.csv"),
+            "/srv/data.csv.blink-part"
+        );
+    }
+
+    /// blink's partials are named so they cannot be mistaken for anyone
+    /// else's. `.part` is what browsers and other tools use, and blink used
+    /// to delete or truncate a file of that name next to a download.
+    #[test]
+    fn a_partial_is_not_named_like_other_tools_partials() {
+        let local = Path::new("/tmp/report.pdf");
+        assert_ne!(part_path(local), PathBuf::from("/tmp/report.pdf.part"));
+        assert_ne!(remote_part_path("/r/report.pdf"), "/r/report.pdf.part");
     }
 
     // join_remote

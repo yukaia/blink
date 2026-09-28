@@ -1443,7 +1443,7 @@ mod tests {
     // Storage is one checkpoint per (session, direction). Queuing a second
     // batch used to write a fresh one over the top, so a batch that was still
     // running lost its plan — unresumable, and its unfinished downloads'
-    // `.part` files unfindable, since the checkpoint is the only record of
+    // `.blink-part` files unfindable, since the checkpoint is the only record of
     // where they are.
 
     /// An app whose checkpoints go under a name no real session will use,
@@ -1655,7 +1655,7 @@ mod tests {
     }
 
     /// Downloading a file again while its first download is still queued or
-    /// running used to start a second job on the same `.part`, and the two
+    /// running used to start a second job on the same `.blink-part`, and the two
     /// corrupted it between them. The second must not be queued at all, and
     /// must not reach the checkpoint either: an entry nothing will run stays
     /// pending forever and blocks `r`.
