@@ -26,7 +26,7 @@ use crate::checkpoint::{Checkpoint, CheckpointJob, CheckpointKind, JobStatus};
 use crate::transfer::{Direction, EnqueueError, TransferManager, destination_key};
 use crate::tui::plan::PlannedJob;
 
-use super::{App, LogLevel};
+use super::{App, LogLevel, WaitingJob};
 
 /// Whether [`App::settle_checkpoint`] should write immediately or let the
 /// debounce decide.
@@ -121,6 +121,10 @@ impl App {
         if plan.is_empty() {
             return;
         }
+        // Jobs owed from earlier go first; while any are still waiting, this
+        // plan joins the back of the line rather than taking room they are
+        // owed.
+        self.queue_waiting_jobs();
 
         // Allocate a batch id for any plan with more than one job, so `C`
         // can cancel the whole thing as a unit — including the mkdir that
@@ -209,6 +213,15 @@ impl App {
         let mut files = 0usize;
         let mut dropped = 0usize;
         for (cp_idx, job) in plan.into_iter().enumerate() {
+            let waiting = self.waiting_jobs.entry(ck_kind).or_default();
+            if !waiting.is_empty() {
+                waiting.push_back(WaitingJob {
+                    cp_idx: base + cp_idx,
+                    batch_id,
+                });
+                dropped += 1;
+                continue;
+            }
             let is_mkdir = matches!(job, PlannedJob::Mkdir { .. });
             let job_id = match (job, batch_id) {
                 (PlannedJob::Mkdir { remote_path }, Some(b)) => {
@@ -253,10 +266,18 @@ impl App {
                         files += 1;
                     }
                 }
-                // Queue cap reached. The job stays `pending` in the
-                // checkpoint, so a later resume picks it up — but the user
-                // must be told the batch was only partially enqueued.
-                Err(EnqueueError::QueueFull) => dropped += 1,
+                // Queue cap reached. The job waits, still `pending` in the
+                // checkpoint, and is queued as earlier jobs finish.
+                Err(EnqueueError::QueueFull) => {
+                    self.waiting_jobs
+                        .entry(ck_kind)
+                        .or_default()
+                        .push_back(WaitingJob {
+                            cp_idx: base + cp_idx,
+                            batch_id,
+                        });
+                    dropped += 1;
+                }
                 // Filtered out above, and nothing else enqueues between the
                 // filter and here: both run on the UI thread. Should it ever
                 // happen, the entry must not stay `pending` with nothing to
@@ -279,16 +300,90 @@ impl App {
         );
         if dropped > 0 {
             self.push_log(
-                LogLevel::Warn,
+                LogLevel::Info,
                 format!(
-                    "transfer queue is full: {dropped} job(s) not enqueued — \
-                     resume ({}) after the queue drains to pick them up",
-                    match kind {
-                        Direction::Download => "r",
-                        _ => "R",
-                    }
+                    "transfer queue is full: {dropped} job(s) will be queued as \
+                     earlier ones finish"
                 ),
             );
+        }
+    }
+
+    /// Queue as many waiting jobs as the transfer queue has room for, oldest
+    /// first. Called whenever a transfer ends, which is when room appears,
+    /// and before a new plan is queued.
+    ///
+    /// A batch that met a full queue used to leave the rest `pending` in the
+    /// checkpoint with no job ids: nothing ever ran them, the checkpoint
+    /// never settled, and the `r` the log suggested was refused for the rest
+    /// of the session because a batch was still "in flight".
+    pub(super) fn queue_waiting_jobs(&mut self) {
+        let Some(manager) = self.transfer_manager.clone() else {
+            return;
+        };
+        for kind in [CheckpointKind::Download, CheckpointKind::Upload] {
+            let mut cancelled = false;
+            while let Some(next) = self.waiting_jobs.get(&kind).and_then(|q| q.front()) {
+                let (cp_idx, batch_id) = (next.cp_idx, next.batch_id);
+                let Some(job) = self
+                    .active_checkpoints
+                    .get(&kind)
+                    .and_then(|cp| cp.jobs.get(cp_idx))
+                    .cloned()
+                else {
+                    // No checkpoint to take it from: nothing left to queue.
+                    self.waiting_jobs.remove(&kind);
+                    break;
+                };
+                match enqueue_checkpoint_job(&manager, &job, batch_id) {
+                    Ok(id) => {
+                        self.checkpoint_job_map.insert(id, (kind, cp_idx));
+                    }
+                    Err(EnqueueError::QueueFull) => break,
+                    // Another job took this destination while it waited. The
+                    // entry must not stay `pending` with nothing to run it.
+                    Err(EnqueueError::Duplicate) => {
+                        if let Some(cp) = self.active_checkpoints.get_mut(&kind) {
+                            cp.mark_cancelled(cp_idx);
+                        }
+                        cancelled = true;
+                    }
+                }
+                if let Some(q) = self.waiting_jobs.get_mut(&kind) {
+                    q.pop_front();
+                }
+            }
+            if cancelled {
+                self.settle_checkpoint(kind, CheckpointFlush::Debounced);
+            }
+        }
+    }
+
+    /// Drop a cancelled batch's waiting jobs and mark their entries
+    /// cancelled. They have no job ids, so the cancel that goes through the
+    /// transfer manager cannot reach them; left alone, they would be queued
+    /// after the rest of their batch was cancelled.
+    pub(super) fn cancel_waiting_in_batch(&mut self, batch_id: u64) {
+        let mut touched = Vec::new();
+        for (kind, queue) in self.waiting_jobs.iter_mut() {
+            let before = queue.len();
+            let mut kept = std::collections::VecDeque::with_capacity(before);
+            for w in queue.drain(..) {
+                if w.batch_id == Some(batch_id) {
+                    if let Some(cp) = self.active_checkpoints.get_mut(kind) {
+                        cp.mark_cancelled(w.cp_idx);
+                    }
+                } else {
+                    kept.push_back(w);
+                }
+            }
+            if kept.len() != before {
+                touched.push(*kind);
+            }
+            *queue = kept;
+        }
+        for kind in touched {
+            self.settle_checkpoint(kind, CheckpointFlush::Force);
         }
     }
 
@@ -456,5 +551,51 @@ impl App {
         // only the re-queued jobs, all starting as `pending`. They will
         // transition through `in_progress` → `done` as they run.
         self.dispatch_plan(resume_plan, kind);
+    }
+}
+
+/// Queue one checkpoint entry as a transfer job, in `batch_id` if it has one.
+fn enqueue_checkpoint_job(
+    manager: &TransferManager,
+    job: &CheckpointJob,
+    batch_id: Option<u64>,
+) -> Result<u64, EnqueueError> {
+    match (job.clone(), batch_id) {
+        (CheckpointJob::Mkdir { remote_path, .. }, Some(b)) => {
+            manager.enqueue_mkdir_batched(remote_path, b)
+        }
+        (CheckpointJob::Mkdir { remote_path, .. }, None) => manager.enqueue_mkdir(remote_path),
+        (
+            CheckpointJob::Download {
+                remote_path,
+                local_path,
+                ..
+            },
+            Some(b),
+        ) => manager.enqueue_download_batched(remote_path, local_path, b),
+        (
+            CheckpointJob::Download {
+                remote_path,
+                local_path,
+                ..
+            },
+            None,
+        ) => manager.enqueue_download(remote_path, local_path),
+        (
+            CheckpointJob::Upload {
+                local_path,
+                remote_path,
+                ..
+            },
+            Some(b),
+        ) => manager.enqueue_upload_batched(local_path, remote_path, b),
+        (
+            CheckpointJob::Upload {
+                local_path,
+                remote_path,
+                ..
+            },
+            None,
+        ) => manager.enqueue_upload(local_path, remote_path),
     }
 }

@@ -10,6 +10,15 @@ the git history for those.
 
 ### Fixed
 
+- **Jobs that do not fit in a full transfer queue now run.** Past 100,000
+  queued jobs, the rest of a batch was left pending in its checkpoint with
+  nothing to run it, and the log said to press `r` once the queue drained —
+  but `r` refused for the rest of the session, because the unfinished
+  batch still counted as in flight. The overflow now waits in order and is
+  queued automatically as earlier jobs finish; a new batch lines up behind
+  it. Cancelling a batch with `C` cancels its waiting jobs too, and after a
+  disconnect they stay in the checkpoint for the resume offer.
+
 - **A large upload no longer floods the browsing connection with
   listings.** Every completed upload asked for a fresh listing of the
   remote pane, and each one queued behind the last on the connection the

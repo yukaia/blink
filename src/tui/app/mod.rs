@@ -142,6 +142,15 @@ fn credential_buffer() -> zeroize::Zeroizing<String> {
     zeroize::Zeroizing::new(String::with_capacity(CREDENTIAL_CAPACITY))
 }
 
+/// A checkpoint entry that met a full transfer queue and is waiting for
+/// room. See `App::queue_waiting_jobs`.
+struct WaitingJob {
+    /// Index into the direction's active checkpoint.
+    cp_idx: usize,
+    /// The batch it belongs to, so `C` can cancel it with the rest.
+    batch_id: Option<u64>,
+}
+
 /// A remote listing that has been started and not yet reported back.
 ///
 /// Requests to list the same directory while it is in flight set `again`
@@ -303,6 +312,10 @@ pub struct App {
     /// `(kind, index)`, so the transfer-event handler can mark the right
     /// entry without a linear scan of the plan.
     checkpoint_job_map: std::collections::HashMap<u64, (CheckpointKind, usize)>,
+    /// Checkpoint entries that met a full queue, in the order they are owed,
+    /// per direction. Queued as earlier jobs finish — see
+    /// `App::queue_waiting_jobs`.
+    waiting_jobs: std::collections::HashMap<CheckpointKind, std::collections::VecDeque<WaitingJob>>,
 
     // Viewer
     pub viewer: Option<Viewer>,
@@ -406,6 +419,7 @@ impl App {
             host_key_changed_info: None,
             active_checkpoints: std::collections::HashMap::new(),
             checkpoint_job_map: std::collections::HashMap::new(),
+            waiting_jobs: std::collections::HashMap::new(),
             viewer: None,
             image_needs_redraw: false,
             remote_listing: None,
@@ -789,6 +803,9 @@ impl App {
         // assignment always happening.
         self.active_checkpoints.clear();
         self.checkpoint_job_map.clear();
+        // Their entries stay `pending` on disk, so the next connect offers to
+        // resume them with the rest of their batch.
+        self.waiting_jobs.clear();
         self.pending_offers.clear();
         self.transfer_manager = None;
         self.current_session = None;
@@ -1694,6 +1711,198 @@ mod tests {
         let (_, pending) = a.transfer_manager.as_ref().unwrap().queue_counts();
         assert_eq!(pending, 2);
         assert!(logged(&a, "skipped 1 file(s) already queued or running"));
+    }
+
+    // -- jobs that did not fit in the queue ----------------------------------
+    //
+    // A batch that met a full queue left the rest `pending` in the checkpoint
+    // with no job ids, so nothing ever ran them, the checkpoint never settled,
+    // and the "press r" the log suggested was refused for the whole session.
+    // They now wait in order and are queued as earlier jobs finish.
+
+    /// An app whose queue holds two pending jobs.
+    fn capped_app(tag: &str) -> (App, crate::paths::TestHome) {
+        let (mut a, home) = checkpoint_app(tag);
+        a.transfer_manager = Some(TransferManager::with_queue_cap(1, 2));
+        (a, home)
+    }
+
+    /// Start the next queued job and report it finished, as the dispatcher
+    /// would. Returns its id, or `None` when nothing is queued.
+    fn finish_next(a: &mut App, state: crate::transfer::TransferState) -> Option<u64> {
+        let m = a.transfer_manager.clone().unwrap();
+        let job = m.take_next_pending()?;
+        let event = match &state {
+            crate::transfer::TransferState::Failed(e) => TransferEvent::Failed {
+                id: job.id,
+                error: e.clone(),
+            },
+            _ => TransferEvent::Complete(job.id),
+        };
+        m.mark(job.id, state);
+        a.handle_transfer_event(event);
+        Some(job.id)
+    }
+
+    fn pending(a: &App) -> usize {
+        a.transfer_manager.as_ref().unwrap().queue_counts().1
+    }
+
+    #[tokio::test]
+    async fn jobs_that_did_not_fit_are_queued_as_earlier_ones_finish() {
+        let (mut a, _cleanup) = capped_app("overflow");
+
+        a.dispatch_plan(
+            vec![
+                download(0),
+                download(1),
+                download(2),
+                download(3),
+                download(4),
+            ],
+            Direction::Download,
+        );
+        assert_eq!(pending(&a), 2, "the queue takes what fits");
+        assert!(
+            logged(&a, "3 job(s) will be queued as earlier ones finish"),
+            "the log must say the rest are coming, not ask for `r`",
+        );
+
+        let mut finished = 0;
+        while finish_next(&mut a, crate::transfer::TransferState::Complete).is_some() {
+            finished += 1;
+            assert!(pending(&a) <= 2, "never past the cap");
+        }
+        assert_eq!(finished, 5, "every job ran, the overflow included");
+        assert!(
+            !a.active_checkpoints.contains_key(&CheckpointKind::Download),
+            "with everything done the checkpoint settles",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_job_makes_room_too() {
+        let (mut a, _cleanup) = capped_app("overflow-fail");
+
+        a.dispatch_plan(
+            vec![download(0), download(1), download(2)],
+            Direction::Download,
+        );
+        finish_next(
+            &mut a,
+            crate::transfer::TransferState::Failed("boom".into()),
+        );
+        assert_eq!(pending(&a), 2, "the waiting job was queued");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_batch_cancels_its_waiting_jobs() {
+        let (mut a, _cleanup) = capped_app("overflow-cancel");
+
+        a.dispatch_plan(
+            vec![download(0), download(1), download(2), download(3)],
+            Direction::Download,
+        );
+        // Job ids start at 1 in a fresh manager.
+        let batch_id = a
+            .transfer_manager
+            .as_ref()
+            .unwrap()
+            .job(1)
+            .and_then(|j| j.batch_id)
+            .expect("a multi-job plan is a batch");
+
+        a.pending_cancel = Some(crate::tui::state::PendingCancel::Batch {
+            batch_id,
+            active: 0,
+            pending: 2,
+            cursor_name: "x".into(),
+        });
+        a.handle_confirm_cancel(press(KeyCode::Char('y')));
+
+        assert!(
+            finish_next(&mut a, crate::transfer::TransferState::Complete).is_none(),
+            "nothing of the cancelled batch may be queued afterwards",
+        );
+        assert!(
+            !a.active_checkpoints.contains_key(&CheckpointKind::Download),
+            "a fully cancelled batch leaves nothing to resume",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_waiting_job_that_became_a_duplicate_is_cancelled_not_stranded() {
+        let (mut a, _cleanup) = capped_app("overflow-dup");
+
+        a.dispatch_plan(
+            vec![download(0), download(1), download(2)],
+            Direction::Download,
+        );
+        // download(2) waits. Both queued jobs start, which makes room, and a
+        // second Ctrl-D queues download(2) by hand in that room. When the
+        // first finishes, the waiting entry finds its destination taken.
+        let m = a.transfer_manager.clone().unwrap();
+        let first = m.take_next_pending().unwrap();
+        m.take_next_pending().unwrap();
+        m.enqueue_download("/r/2".into(), "/l/2".into()).unwrap();
+        m.mark(first.id, crate::transfer::TransferState::Complete);
+        a.handle_transfer_event(TransferEvent::Complete(first.id));
+        assert!(
+            a.waiting_jobs
+                .get(&CheckpointKind::Download)
+                .is_none_or(|q| q.is_empty()),
+            "the waiting entry was dealt with, not left waiting",
+        );
+
+        let cp = a.active_checkpoints.get(&CheckpointKind::Download).unwrap();
+        assert_eq!(
+            cp.pending_count(),
+            1,
+            "only download(1) is still owed; the duplicate entry must not wait forever",
+        );
+    }
+
+    /// Room can appear before any job finishes — a job starting frees its
+    /// pending slot. A new batch must not take that room ahead of jobs that
+    /// have been waiting for it.
+    #[tokio::test]
+    async fn a_new_batch_waits_behind_jobs_already_waiting() {
+        let (mut a, _cleanup) = capped_app("overflow-order");
+
+        a.dispatch_plan(
+            vec![download(0), download(1), download(2)],
+            Direction::Download,
+        );
+        let m = a.transfer_manager.clone().unwrap();
+        m.take_next_pending().unwrap(); // room for one now
+
+        a.dispatch_plan(vec![download(5)], Direction::Download);
+        let queued: Vec<String> = (1..=10)
+            .filter_map(|id| m.job(id))
+            .filter(|j| j.state == crate::transfer::TransferState::Pending)
+            .map(|j| j.remote_path)
+            .collect();
+        assert!(
+            queued.contains(&"/r/2".to_string()) && !queued.contains(&"/r/5".to_string()),
+            "the waiting job takes the room, the new one waits: {queued:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnecting_forgets_waiting_jobs_but_the_checkpoint_keeps_them() {
+        let (mut a, _cleanup) = capped_app("overflow-disconnect");
+        let name = a.current_session.as_ref().unwrap().name.clone();
+
+        a.dispatch_plan(
+            vec![download(0), download(1), download(2)],
+            Direction::Download,
+        );
+        a.disconnect();
+
+        assert!(a.waiting_jobs.is_empty(), "the next session starts clean");
+        let offers = crate::checkpoint::offers_for(&name);
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].remaining, 3, "the waiting job is still on disk");
     }
 
     #[tokio::test]

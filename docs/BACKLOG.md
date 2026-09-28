@@ -66,19 +66,9 @@ so SFTP would return zero). One log line per listing, as now, not one
 per skipped line. `an_unparsable_listing_line_becomes_no_entry_at_all`
 in the FTP harness is the place to assert it.
 
-## A full transfer queue gives advice that cannot be followed
+## Tabs vanish in the text viewer
 
 Found in the 2026-09-26 codebase audit, like every entry below.
-
-When the queue is full, `dispatch_plan` (`tui/app/checkpoint_glue.rs`)
-leaves the dropped jobs `pending` in the active checkpoint and logs
-"resume (r) after the queue drains". Those jobs have no job ids, so
-nothing runs them and the checkpoint's pending count never reaches zero,
-and `resume_walk` refuses while the active checkpoint has pending jobs.
-`r` only works after a reconnect. Fix: track the dropped indices so
-`resume_walk` can re-queue them, or change the message.
-
-## Tabs vanish in the text viewer
 
 `sanitize_line` (`error.rs`) keeps `\t`, and its comment says terminals
 handle tabs, but the tab never reaches the terminal: ratatui drops every

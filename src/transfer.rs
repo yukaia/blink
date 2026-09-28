@@ -152,6 +152,9 @@ struct Inner {
     /// would make queuing it quadratic.
     in_flight: HashSet<(Direction, String)>,
     parallelism: u8,
+    /// Pending jobs accepted before [`EnqueueError::QueueFull`]:
+    /// [`MAX_QUEUED_JOBS`], except in tests of what happens past it.
+    cap: usize,
     paused: bool,
     /// Abort handles for currently-running worker tasks, keyed by job id.
     /// Populated by [`TransferManager::register_active`] (called from the
@@ -171,6 +174,17 @@ impl TransferManager {
     /// could reintroduce it. Clamping at the single constructor makes the
     /// livelock unrepresentable instead of relying on each caller to check.
     pub fn new(parallelism: u8) -> (Self, mpsc::UnboundedReceiver<TransferEvent>) {
+        Self::with_cap(parallelism, MAX_QUEUED_JOBS)
+    }
+
+    /// A manager whose queue fills at `cap` pending jobs, so tests can reach
+    /// a full queue without queuing [`MAX_QUEUED_JOBS`] of them.
+    #[cfg(test)]
+    pub fn with_queue_cap(parallelism: u8, cap: usize) -> Self {
+        Self::with_cap(parallelism, cap).0
+    }
+
+    fn with_cap(parallelism: u8, cap: usize) -> (Self, mpsc::UnboundedReceiver<TransferEvent>) {
         let parallelism = parallelism.clamp(1, crate::config::MAX_PARALLEL);
         let (tx, rx) = mpsc::unbounded_channel();
         let inner = Arc::new(Mutex::new(Inner {
@@ -181,6 +195,7 @@ impl TransferManager {
             job_index: HashMap::new(),
             in_flight: HashSet::new(),
             parallelism,
+            cap,
             paused: false,
             active: HashMap::new(),
         }));
@@ -309,7 +324,7 @@ impl TransferManager {
         let mut inner = self.inner.lock();
         // Cap the number of pending jobs so a large server directory listing
         // cannot grow the queue without bound and exhaust memory.
-        if inner.pending_count >= MAX_QUEUED_JOBS {
+        if inner.pending_count >= inner.cap {
             return Err(EnqueueError::QueueFull);
         }
         let key = destination_key(direction, &remote_path, &local_path);
@@ -791,6 +806,20 @@ mod tests {
             destination_key(Direction::Upload, "/r/README", Path::new("/l")),
             destination_key(Direction::Upload, "/r/readme", Path::new("/l")),
         );
+    }
+
+    #[test]
+    fn the_queue_cap_refuses_past_its_limit_and_frees_as_jobs_start() {
+        let m = TransferManager::with_queue_cap(1, 2);
+        m.enqueue_download("/a".into(), "/tmp/a".into()).unwrap();
+        m.enqueue_download("/b".into(), "/tmp/b".into()).unwrap();
+        assert_eq!(
+            m.enqueue_download("/c".into(), "/tmp/c".into()),
+            Err(EnqueueError::QueueFull),
+        );
+        m.take_next_pending().unwrap();
+        m.enqueue_download("/c".into(), "/tmp/c".into())
+            .expect("the cap counts pending jobs, and one has started");
     }
 
     #[test]

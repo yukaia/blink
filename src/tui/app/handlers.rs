@@ -459,6 +459,8 @@ impl App {
                                 // (which shares the same checkpoint storage)
                                 // intact and still resumable.
                                 self.cancel_batch_in_checkpoint(&batch_ids);
+                                // And the ones that never got a job id.
+                                self.cancel_waiting_in_batch(batch_id);
                             }
                         }
                     }

@@ -578,6 +578,8 @@ impl App {
                         self.refresh_remote_pane(path);
                     }
                 }
+                // A finished job leaves room in the queue for one waiting.
+                self.queue_waiting_jobs();
             }
             TransferEvent::Failed { id, error } => {
                 // Evict the job from the checkpoint map regardless of the
@@ -612,6 +614,8 @@ impl App {
                     .map(|j| j.remote_path)
                     .unwrap_or_else(|| format!("id={id}"));
                 self.push_log(LogLevel::Error, format!("failed: {label}: {error}"));
+                // A finished job leaves room in the queue for one waiting.
+                self.queue_waiting_jobs();
             }
             TransferEvent::Paused => {
                 self.push_log(LogLevel::Warn, "transfers paused".into());
