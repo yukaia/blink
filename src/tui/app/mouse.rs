@@ -595,4 +595,30 @@ mod tests {
         assert_eq!(a.screen, Screen::PasswordPrompt, "password auth asks first");
         assert_eq!(a.pending_session.as_ref().unwrap().host, "h1.example");
     }
+
+    /// A key press between two clicks breaks the pair. Otherwise a click,
+    /// a key that moves or navigates, and a click on the same row within
+    /// the double-click window acted on whatever that row then held: a
+    /// directory never double-clicked was entered, a file never
+    /// double-clicked was transferred.
+    #[tokio::test]
+    async fn a_key_press_between_two_clicks_breaks_the_double_click() {
+        let mut a = app_on_main(0);
+        a.local.path = "/tmp".into();
+        a.local.set_entries(vec![
+            PaneEntry::new("a".into(), true, 0),
+            PaneEntry::new("b".into(), true, 0),
+        ]);
+        draw(&a);
+        let (c, r) = local_row(&a, 0);
+        let t = Instant::now();
+        a.handle_mouse_at(press(c, r), t);
+        a.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Down,
+            KeyModifiers::NONE,
+        ));
+        a.handle_mouse_at(press(c, r), t + Duration::from_millis(150));
+        assert_eq!(a.local.path, "/tmp", "two single clicks, not a double");
+        assert_eq!(a.local.cursor, 0);
+    }
 }

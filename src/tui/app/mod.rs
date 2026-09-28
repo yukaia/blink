@@ -674,6 +674,9 @@ impl App {
     // -------------------------------------------------------------------
 
     fn handle_key(&mut self, key: KeyEvent) {
+        // A key between two clicks breaks the pair: what the second click
+        // lands on may no longer be what the first one did.
+        self.last_click = None;
         // '?' toggles help from anywhere except inside Help itself or text-
         // entry / viewer screens (where '?' should be treated normally).
         if key.code == KeyCode::Char('?')
