@@ -66,18 +66,9 @@ so SFTP would return zero). One log line per listing, as now, not one
 per skipped line. `an_unparsable_listing_line_becomes_no_entry_at_all`
 in the FTP harness is the place to assert it.
 
-## Tabs vanish in the text viewer
+## Images decode on the UI thread
 
 Found in the 2026-09-26 codebase audit, like every entry below.
-
-`sanitize_line` (`error.rs`) keeps `\t`, and its comment says terminals
-handle tabs, but the tab never reaches the terminal: ratatui drops every
-control grapheme when rendering (`Span::styled_graphemes`,
-`Buffer::set_stringn`). Probed: `"\tindented"` renders as `"indented"`.
-Makefiles and Go files, both listed as viewable, lose their indentation.
-Fix: expand tabs to spaces (tab stops of 4 or 8) before tokenising.
-
-## Images decode on the UI thread
 
 `after_draw` (`tui/app/viewer.rs`) calls the backend's `render`, which
 runs `scale_for_cells` (`preview.rs`): a full decode and a Lanczos3

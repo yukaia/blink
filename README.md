@@ -702,9 +702,10 @@ Applied to:
 - Remote directory-entry names (`list()` in every transport)
 - SSH key-type strings and host-key fingerprints
 - Error messages from transport layers
-- Text file content in the viewer (tabs preserved; no length cap beyond the
-  25 MB transport read limit) — the bidi filter matters as much here, since
-  viewing remote source is exactly the "trojan source" setting
+- Text file content in the viewer (tabs expanded to 8-column stops; no
+  length cap beyond the 25 MB transport read limit) — the bidi filter
+  matters as much here, since viewing remote source is exactly the
+  "trojan source" setting
 - Session and checkpoint names printed by the CLI subcommands
 
 ### Path safety

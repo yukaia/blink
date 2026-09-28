@@ -192,28 +192,43 @@ pub(crate) fn sanitize(s: String) -> String {
     out
 }
 
+/// Tab stops in the text viewer: every 8 columns, as terminals, `less` and
+/// `cat` place them, and as Go source and Makefiles assume.
+const TAB_WIDTH: usize = 8;
+
 /// Strip unsafe characters from a single line of file content for safe
 /// terminal rendering in the text viewer.
 ///
 /// Unlike [`sanitize`], no length cap is applied — line length is bounded by
 /// the caller's `MAX_PREVIEW_BYTES` cap, and Ratatui clips to terminal width.
-/// Tabs are preserved (terminals handle them correctly). Newlines/carriage
-/// returns never appear here because the caller splits on `lines()` first.
+/// Newlines/carriage returns never appear here because the caller splits on
+/// `lines()` first.
+///
+/// Tabs are expanded to spaces up to the next [`TAB_WIDTH`] stop, counted
+/// from the start of the line. Keeping them was not an option: ratatui drops
+/// every control grapheme when it renders, `\t` included, so a kept tab
+/// reached the screen as nothing and tab-indented files lost their
+/// indentation. Columns are counted in characters, so a double-width
+/// character earlier on a line puts that line's later stops one column off.
 ///
 /// The bidi filter matters as much here as it does for filenames: viewing a
 /// remote source file is exactly the "trojan source" setting, where an
 /// override can make a line of code read as something other than what it
 /// says.
 pub(crate) fn sanitize_line(s: &str) -> String {
-    s.chars()
-        .map(|ch| {
-            if ch == '\t' || !is_unsafe_for_display(ch) {
-                ch
-            } else {
-                ' '
-            }
-        })
-        .collect()
+    let mut out = String::with_capacity(s.len());
+    let mut column = 0usize;
+    for ch in s.chars() {
+        if ch == '\t' {
+            let pad = TAB_WIDTH - column % TAB_WIDTH;
+            out.extend(std::iter::repeat_n(' ', pad));
+            column += pad;
+        } else {
+            out.push(if is_unsafe_for_display(ch) { ' ' } else { ch });
+            column += 1;
+        }
+    }
+    out
 }
 
 /// Strip unsafe characters from a user-supplied string before printing it
@@ -277,17 +292,43 @@ mod tests {
         assert!(!out.ends_with('…'));
     }
 
+    // Tabs are expanded, not kept: ratatui drops every control grapheme when
+    // it renders, `\t` included, so a kept tab reached the screen as nothing
+    // and tab-indented files (Makefiles, Go) lost their indentation.
+
     #[test]
-    fn sanitize_line_preserves_tabs() {
-        let s = "col1\tcol2";
-        assert_eq!(sanitize_line(s), "col1\tcol2");
+    fn sanitize_line_expands_a_leading_tab_to_the_first_stop() {
+        assert_eq!(sanitize_line("\tx"), "        x");
     }
 
     #[test]
-    fn sanitize_line_strips_control_not_tab() {
-        let s = "a\x01b\tc";
-        let out = sanitize_line(s);
-        assert_eq!(out, "a b\tc");
+    fn sanitize_line_pads_a_tab_to_the_next_stop() {
+        assert_eq!(sanitize_line("ab\tc"), "ab      c");
+        assert_eq!(sanitize_line("col1\tcol2"), "col1    col2");
+    }
+
+    #[test]
+    fn sanitize_line_tab_at_a_stop_takes_a_whole_stop() {
+        assert_eq!(sanitize_line("12345678\tx"), "12345678        x");
+        assert_eq!(sanitize_line("\t\tx"), format!("{}x", " ".repeat(16)));
+    }
+
+    #[test]
+    fn sanitize_line_strips_control_but_expands_tab() {
+        // The replaced control character is one column, as it renders.
+        assert_eq!(sanitize_line("a\x01b\tc"), "a b     c");
+    }
+
+    #[test]
+    fn an_expanded_line_survives_rendering() {
+        use ratatui::style::Style;
+        use ratatui::text::Span;
+        let line = sanitize_line("\tindented");
+        let rendered: String = Span::raw(line)
+            .styled_graphemes(Style::default())
+            .map(|g| g.symbol)
+            .collect();
+        assert_eq!(rendered, "        indented");
     }
 
     #[test]

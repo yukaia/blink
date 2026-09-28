@@ -10,6 +10,12 @@ the git history for those.
 
 ### Fixed
 
+- **Tabs show up in the text viewer.** The viewer kept tab characters for
+  the terminal to handle, but they never reached it: the rendering library
+  drops control characters, tabs included, so tab-indented files —
+  Makefiles, Go source — lost all their indentation. Tabs are now expanded
+  to spaces at 8-column stops, as a terminal or `less` shows them.
+
 - **Jobs that do not fit in a full transfer queue now run.** Past 100,000
   queued jobs, the rest of a batch was left pending in its checkpoint with
   nothing to run it, and the log said to press `r` once the queue drained —
