@@ -9,6 +9,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use crossterm::event::{
     Event as CrosstermEvent, EventStream as CrosstermEventStream, KeyEvent, KeyEventKind,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -22,6 +23,7 @@ use crate::transport::RemoteEntry;
 /// Top-level event consumed by the App run loop.
 pub enum Event {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Tick,
     #[allow(dead_code)]
     Resize(u16, u16),
@@ -230,6 +232,9 @@ impl EventStream {
                         Some(Ok(CrosstermEvent::Resize(w, h))) => {
                             return Ok(Event::Resize(w, h));
                         }
+                        Some(Ok(CrosstermEvent::Mouse(m))) if wanted_mouse(&m) => {
+                            return Ok(Event::Mouse(m));
+                        }
                         Some(Ok(_)) => continue,
                         Some(Err(e)) => return Err(e.into()),
                         None => return Ok(Event::Tick),
@@ -245,6 +250,18 @@ impl EventStream {
             }
         }
     }
+}
+
+/// The mouse events blink acts on: a left press and the wheel. Capture
+/// reports every movement too; dropping the rest here keeps them from
+/// waking the run loop into a redraw each.
+fn wanted_mouse(m: &MouseEvent) -> bool {
+    matches!(
+        m.kind,
+        MouseEventKind::Down(MouseButton::Left)
+            | MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+    )
 }
 
 /// Drop every immediately-available [`TransferEvent::Progress`] from `app`,
@@ -273,6 +290,29 @@ fn drain_progress(app: &mut mpsc::UnboundedReceiver<AppEvent>) -> Option<AppEven
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_left_presses_and_the_wheel_are_wanted() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let ev = |kind| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(wanted_mouse(&ev(MouseEventKind::Down(MouseButton::Left))));
+        assert!(wanted_mouse(&ev(MouseEventKind::ScrollUp)));
+        assert!(wanted_mouse(&ev(MouseEventKind::ScrollDown)));
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::ScrollLeft,
+        ] {
+            assert!(!wanted_mouse(&ev(kind)), "{kind:?} must not wake the loop");
+        }
+    }
 
     fn progress() -> AppEvent {
         AppEvent::Transfer(TransferEvent::Progress)

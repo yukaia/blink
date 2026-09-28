@@ -322,6 +322,8 @@ pub struct App {
     pub viewer: Option<Viewer>,
     /// Where clickable areas were last drawn. See [`crate::tui::hit`].
     pub(crate) hit: crate::tui::hit::HitMap,
+    /// The last left press, for double-click detection. See `mouse.rs`.
+    last_click: Option<mouse::LastClick>,
     /// The id the next viewer opened gets. See [`Viewer::id`].
     next_viewer_id: u64,
     /// Set to true when an image viewer needs its graphics escape sequences
@@ -361,6 +363,7 @@ mod checkpoint_glue;
 mod controls;
 mod events;
 mod handlers;
+mod mouse;
 mod panes;
 mod transfers;
 mod viewer;
@@ -431,6 +434,7 @@ impl App {
             waiting_jobs: std::collections::HashMap::new(),
             viewer: None,
             hit: Default::default(),
+            last_click: None,
             next_viewer_id: 1,
             image_needs_redraw: false,
             remote_listing: None,
@@ -529,6 +533,7 @@ impl App {
 
             match events.next().await? {
                 Event::Key(k) => self.handle_key(k),
+                Event::Mouse(m) => self.handle_mouse(m),
                 Event::App(e) => self.handle_app_event(e),
                 Event::Tick => {}
                 Event::Resize(_, _) => {

@@ -42,3 +42,11 @@ impl HitMap {
         }
     }
 }
+
+/// The row of `area` that the cell at (`col`, `row`) is on, counted from the
+/// area's top, or `None` when the cell is outside it.
+pub fn row_in(area: Option<Rect>, col: u16, row: u16) -> Option<usize> {
+    let a = area?;
+    let inside = col >= a.x && col < a.x + a.width && row >= a.y && row < a.y + a.height;
+    inside.then(|| usize::from(row - a.y))
+}
