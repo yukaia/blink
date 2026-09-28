@@ -10,6 +10,12 @@ the git history for those.
 
 ### Changed
 
+- **A partial download's resume record now names the server it came
+  from.** The `.blink-part.meta` sidecar gains an `origin` field,
+  `user@host:port`. A record without one — written before this change —
+  is treated as unidentified, so a download interrupted before upgrading
+  restarts from the beginning once instead of resuming.
+
 - **Partial transfers are named `<name>.blink-part`, not `<name>.part`.**
   Downloads in progress, their `.meta` resume records, and uploads in
   progress on the server all use the new suffix. Partial downloads left by
@@ -17,6 +23,12 @@ the git history for those.
   again, and delete the old `.part` and `.part.meta` files by hand.
 
 ### Fixed
+
+- **A download can no longer resume from another server's partial file.**
+  The resume record held only the remote path and size, so two servers —
+  or two accounts on one — with a file at the same path and size,
+  downloaded to the same place, could resume into each other's bytes.
+  Resuming now also requires the same server, account and port.
 
 - **blink no longer deletes or truncates other programs' `.part` files.**
   Its own partial files used the common `.part` suffix, so a

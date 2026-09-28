@@ -66,17 +66,9 @@ so SFTP would return zero). One log line per listing, as now, not one
 per skipped line. `an_unparsable_listing_line_becomes_no_entry_at_all`
 in the FTP harness is the place to assert it.
 
-## A resume record does not say which server it came from
-
-Found in the 2026-09-26 codebase audit, like every entry below.
-
-`PartMeta` (`transport/mod.rs`) records the remote path and size, not the
-host. Two servers with a file at the same path and size, downloaded to
-one local path, resume into each other's partial. Fix: add host, port
-and protocol to the sidecar; a sidecar without them reads as unidentified
-and restarts, which is already the safe default.
-
 ## Comments that say the wrong thing
+
+Found in the 2026-09-26 codebase audit.
 
 - `checkpoint.rs` module docs: a new walk *appends* to the checkpoint,
   not overwrites it; files are `<name>-<hash>-<kind>.json`, not

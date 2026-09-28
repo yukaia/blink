@@ -106,10 +106,11 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
 - **Download resume is provenance-checked.** A partial download,
   `<dest>.blink-part`, records bytes, not which remote file they came from,
   so blink writes a `<dest>.blink-part.meta` sidecar alongside it naming the
-  remote path and the size the server reported. Resume only happens when
-  the sidecar identifies the same remote file at the same reported size;
-  anything unproven restarts from byte zero instead of risking a silently
-  corrupt file.
+  server and account (`user@host:port`), the remote path, and the size the
+  server reported. Resume only happens when the sidecar identifies the same
+  remote file on the same server at the same reported size; anything
+  unproven restarts from byte zero instead of risking a silently corrupt
+  file.
 - **Partial files have a name of their own.** In-flight transfers write
   `<name>.blink-part`, locally for a download and on the server for an
   upload, so blink never touches a `<name>.part` that a browser or another
@@ -907,7 +908,7 @@ A few things worth knowing before you use this in anger:
   live at `<name>.blink-part`; the final name is only created via rename
   after fsync. `mkdir` is idempotent on the remote side, so re-runs are
   safe across the board. A resumed partial is only trusted if its
-  `.blink-part.meta` sidecar names the same remote path at the same
+  `.blink-part.meta` sidecar names the same server, remote path and
   reported size — one whose sidecar didn't survive the crash restarts
   instead of risking a silently corrupted file.
 - **Transfers don't auto-refresh the local pane.** Use F5 to refresh after

@@ -65,6 +65,26 @@ pub(crate) struct PartMeta {
     /// The size the server reported when the partial was started, if it
     /// reported one. A change means the file was replaced between attempts.
     pub size: Option<u64>,
+    /// The server and account the bytes came from, as [`origin_of`] names
+    /// it. `None` in a sidecar written before origins were recorded, which
+    /// is treated as unidentified.
+    #[serde(default)]
+    pub origin: Option<String>,
+}
+
+/// Where a download's bytes come from: `user@host:port`, host folded to
+/// lower case. Two servers, or two accounts on one, can each hold a file at
+/// the same path with the same size; without this, a download from one
+/// could resume into a partial of the other's. The protocol is left out:
+/// SFTP and SCP read the same files, and FTP and SFTP normally differ by
+/// port anyway.
+pub(crate) fn origin_of(session: &Session) -> String {
+    format!(
+        "{}@{}:{}",
+        session.username,
+        session.host.to_ascii_lowercase(),
+        session.port
+    )
 }
 
 /// What to do with an existing `.blink-part` file.
@@ -86,8 +106,8 @@ pub(crate) enum ResumeDecision {
 /// a completed download. The corruption is silent and survives.
 ///
 /// So resume requires positive identification: a sidecar naming the same
-/// remote path, and a server-reported size that hasn't moved since. Anything
-/// unproven restarts. Restarting costs bandwidth; resuming the wrong bytes
+/// origin and remote path, and a server-reported size that hasn't moved
+/// since. Anything unproven restarts. Restarting costs bandwidth; resuming the wrong bytes
 /// costs the user a corrupt file they have no reason to re-check.
 ///
 /// Pure so the policy can be tested without touching a filesystem or a
@@ -97,6 +117,7 @@ pub(crate) fn decide_resume(
     meta: Option<&PartMeta>,
     remote_path: &str,
     reported_size: Option<u64>,
+    origin: &str,
 ) -> ResumeDecision {
     // No partial, or an empty one — nothing to continue.
     let Some(part_len) = part_len.filter(|n| *n > 0) else {
@@ -108,6 +129,11 @@ pub(crate) fn decide_resume(
     let Some(meta) = meta else {
         return ResumeDecision::Fresh;
     };
+
+    // Bytes from another server or account, or a sidecar too old to say.
+    if meta.origin.as_deref() != Some(origin) {
+        return ResumeDecision::Fresh;
+    }
 
     if meta.remote_path != remote_path {
         return ResumeDecision::Fresh;
@@ -140,6 +166,7 @@ pub(crate) async fn resume_offset(
     local_path: &Path,
     remote_path: &str,
     reported_size: Option<u64>,
+    origin: &str,
 ) -> u64 {
     let part = part_path(local_path);
     let meta_path = part_meta_path(local_path);
@@ -150,7 +177,7 @@ pub(crate) async fn resume_offset(
         Err(_) => None,
     };
 
-    match decide_resume(part_len, meta.as_ref(), remote_path, reported_size) {
+    match decide_resume(part_len, meta.as_ref(), remote_path, reported_size, origin) {
         ResumeDecision::Resume(offset) => offset,
         ResumeDecision::Fresh => {
             if part_len.is_some() {
@@ -176,10 +203,12 @@ pub(crate) async fn write_part_meta(
     local_path: &Path,
     remote_path: &str,
     reported_size: Option<u64>,
+    origin: &str,
 ) {
     let meta = PartMeta {
         remote_path: remote_path.to_string(),
         size: reported_size,
+        origin: Some(origin.to_string()),
     };
     if let Ok(raw) = serde_json::to_vec(&meta) {
         let _ = tokio::fs::write(part_meta_path(local_path), raw).await;
@@ -858,16 +887,95 @@ mod tests {
     // to share a local name — silently, and with a successful-looking rename
     // at the end. These pin the identity check that makes resume safe.
 
+    /// The server the tests below download from.
+    const ORIGIN: &str = "me@files.example:22";
+
     fn meta(remote: &str, size: Option<u64>) -> PartMeta {
         PartMeta {
             remote_path: remote.to_string(),
             size,
+            origin: Some(ORIGIN.to_string()),
         }
+    }
+
+    /// `decide_resume` for a download from [`ORIGIN`].
+    fn decide(
+        part_len: Option<u64>,
+        meta: Option<&PartMeta>,
+        remote_path: &str,
+        reported_size: Option<u64>,
+    ) -> ResumeDecision {
+        decide_resume(part_len, meta, remote_path, reported_size, ORIGIN)
+    }
+
+    // Two servers — or two accounts on one — can each hold a file at the
+    // same path with the same size. Path and size alone let a download from
+    // one resume into a partial of the other's; the sidecar also records
+    // where the bytes came from.
+
+    #[test]
+    fn restarts_when_the_partial_came_from_another_server() {
+        let m = PartMeta {
+            origin: Some("me@other.example:22".into()),
+            ..meta("/a/report.pdf", Some(9_000))
+        };
+        assert_eq!(
+            decide(Some(4_000), Some(&m), "/a/report.pdf", Some(9_000)),
+            ResumeDecision::Fresh,
+        );
+    }
+
+    #[test]
+    fn restarts_when_the_partial_came_from_another_account_or_port() {
+        for origin in ["you@files.example:22", "me@files.example:2222"] {
+            let m = PartMeta {
+                origin: Some(origin.into()),
+                ..meta("/a/report.pdf", Some(9_000))
+            };
+            assert_eq!(
+                decide(Some(4_000), Some(&m), "/a/report.pdf", Some(9_000)),
+                ResumeDecision::Fresh,
+                "{origin}",
+            );
+        }
+    }
+
+    /// A sidecar written before origins were recorded cannot say where its
+    /// bytes came from, so it is as unidentified as no sidecar at all.
+    #[test]
+    fn restarts_when_the_sidecar_predates_origins() {
+        let m = PartMeta {
+            origin: None,
+            ..meta("/a/report.pdf", Some(9_000))
+        };
+        assert_eq!(
+            decide(Some(4_000), Some(&m), "/a/report.pdf", Some(9_000)),
+            ResumeDecision::Fresh,
+        );
+    }
+
+    #[test]
+    fn a_sidecar_without_an_origin_still_parses() {
+        let old: PartMeta =
+            serde_json::from_str(r#"{"remote_path":"/a/report.pdf","size":9000}"#).unwrap();
+        assert_eq!(old.origin, None);
+    }
+
+    #[test]
+    fn the_origin_names_user_host_and_port_with_the_host_folded() {
+        let mut s = crate::session::Session::from_url("sftp://me@Files.Example:2222/").unwrap();
+        assert_eq!(origin_of(&s), "me@files.example:2222");
+        s.protocol = crate::session::Protocol::Scp;
+        assert_eq!(
+            origin_of(&s),
+            "me@files.example:2222",
+            "SFTP and SCP read the same files",
+        );
     }
 
     #[test]
     fn resumes_a_partial_of_the_same_remote_file() {
-        let d = decide_resume(
+        let d = decide(
             Some(4_000),
             Some(&meta("/a/report.pdf", Some(9_000))),
             "/a/report.pdf",
@@ -881,7 +989,7 @@ mod tests {
         // The bug this exists for: same local name, different source. The
         // old code appended file B onto file A's bytes and renamed the
         // result into place as a completed download.
-        let d = decide_resume(
+        let d = decide(
             Some(4_000),
             Some(&meta("/a/report.pdf", Some(9_000))),
             "/b/report.pdf",
@@ -898,14 +1006,14 @@ mod tests {
     fn restarts_when_the_partial_has_no_provenance() {
         // A `.blink-part` whose sidecar was lost. Nothing identifies it, so it
         // cannot be trusted.
-        let d = decide_resume(Some(4_000), None, "/a/report.pdf", Some(9_000));
+        let d = decide(Some(4_000), None, "/a/report.pdf", Some(9_000));
         assert_eq!(d, ResumeDecision::Fresh);
     }
 
     #[test]
     fn restarts_when_the_remote_file_changed_size_since_the_partial() {
         // Same path, but the file was replaced between attempts.
-        let d = decide_resume(
+        let d = decide(
             Some(4_000),
             Some(&meta("/a/report.pdf", Some(9_000))),
             "/a/report.pdf",
@@ -916,7 +1024,7 @@ mod tests {
 
     #[test]
     fn restarts_when_the_partial_is_longer_than_the_remote_file() {
-        let d = decide_resume(
+        let d = decide(
             Some(20_000),
             Some(&meta("/a/report.pdf", Some(9_000))),
             "/a/report.pdf",
@@ -928,7 +1036,7 @@ mod tests {
     #[test]
     fn starts_fresh_when_there_is_no_partial() {
         assert_eq!(
-            decide_resume(None, None, "/a/report.pdf", Some(9_000)),
+            decide(None, None, "/a/report.pdf", Some(9_000)),
             ResumeDecision::Fresh
         );
     }
@@ -940,7 +1048,7 @@ mod tests {
         // staleness check entirely and resumed unconditionally. Identity is
         // checked independently of size, so this is now safe — and a
         // mismatched path is still refused (next test).
-        let d = decide_resume(
+        let d = decide(
             Some(4_000),
             Some(&meta("/a/report.pdf", None)),
             "/a/report.pdf",
@@ -951,7 +1059,7 @@ mod tests {
 
     #[test]
     fn restarts_with_an_unknown_remote_size_when_provenance_differs() {
-        let d = decide_resume(
+        let d = decide(
             Some(4_000),
             Some(&meta("/a/report.pdf", None)),
             "/b/report.pdf",
@@ -962,7 +1070,7 @@ mod tests {
 
     #[test]
     fn empty_partial_starts_fresh() {
-        let d = decide_resume(
+        let d = decide(
             Some(0),
             Some(&meta("/a/report.pdf", Some(9_000))),
             "/a/report.pdf",

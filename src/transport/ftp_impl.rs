@@ -62,11 +62,13 @@ macro_rules! delegate_ftp_transport {
                 >,
             ) -> $crate::error::Result<()> {
                 self.begin_call().await?;
+                let origin = $crate::transport::origin_of(&self.session);
                 let result = $crate::transport::ftp_impl::ftp_download(
                     &mut self.stream,
                     remote_path,
                     local_path,
                     progress,
+                    &origin,
                 )
                 .await;
                 self.settle(result)
@@ -364,6 +366,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     remote_path: &str,
     local_path: &Path,
     progress: Option<mpsc::UnboundedSender<ProgressUpdate>>,
+    origin: &str,
 ) -> Result<()> {
     check_ftp_path("retr", remote_path)?;
     if let Some(parent) = local_path.parent() {
@@ -390,7 +393,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     // doesn't answer SIZE skipped the staleness check entirely and resumed
     // whatever happened to be on disk. Identity is checked independently of
     // size, so an unknown size no longer means an unchecked resume.
-    let offset = super::resume_offset(local_path, remote_path, reported_size).await;
+    let offset = super::resume_offset(local_path, remote_path, reported_size, origin).await;
 
     if offset > 0 {
         timed_ftp("rest", remote_path, stream.resume_transfer(offset as usize)).await?;
@@ -407,7 +410,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
         tokio::fs::File::create(&part).await?
     };
     // Identify the partial before writing to it — see the SFTP path.
-    super::write_part_meta(local_path, remote_path, reported_size).await;
+    super::write_part_meta(local_path, remote_path, reported_size, origin).await;
 
     let mut buf = vec![0u8; 64 * 1024];
     let mut done: u64 = offset;
@@ -1505,11 +1508,16 @@ mod integration {
         // this test would silently exercise a fresh download instead, and
         // still pass: restarting from zero also lands the correct bytes.
         // That is why the REST assertion below is the real assertion.
-        std::fs::write(crate::transport::part_path(&local), &payload[..30_000]).unwrap();
-        crate::transport::write_part_meta(&local, "/resume.bin", Some(payload.len() as u64)).await;
-
         let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
         let session = test_session(port);
+        std::fs::write(crate::transport::part_path(&local), &payload[..30_000]).unwrap();
+        crate::transport::write_part_meta(
+            &local,
+            "/resume.bin",
+            Some(payload.len() as u64),
+            &crate::transport::origin_of(&session),
+        )
+        .await;
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
         transport
@@ -1526,6 +1534,45 @@ mod integration {
             issued.iter().any(|c| c == "REST 30000"),
             "the download must resume from the partial's length, not restart; \
              commands issued: {issued:?}",
+        );
+    }
+
+    /// A partial recorded for another server — same path, same size — is not
+    /// this download's to continue: no REST, and the right bytes land.
+    #[tokio::test]
+    async fn a_partial_from_another_server_is_not_resumed() {
+        let payload = pseudo_random(50_000);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/resume.bin".to_string(), payload.clone());
+        let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+
+        let dir = tempdir_for_test("other-origin");
+        let local = dir.join("resume.bin");
+        let _ = std::fs::remove_file(&local);
+        std::fs::write(crate::transport::part_path(&local), vec![0u8; 20_000]).unwrap();
+        crate::transport::write_part_meta(
+            &local,
+            "/resume.bin",
+            Some(payload.len() as u64),
+            "tester@elsewhere.example:21",
+        )
+        .await;
+
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+        transport
+            .download("/resume.bin", &local, None)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&local).unwrap(), payload);
+        let issued = log.lock().await.clone();
+        assert!(
+            !issued.iter().any(|c| c.starts_with("REST")),
+            "another server's partial must not be resumed: {issued:?}",
         );
     }
 
@@ -1638,15 +1685,20 @@ mod integration {
         let dir = tempdir_for_test("ignored-rest");
         let local = dir.join("resume.bin");
         let _ = std::fs::remove_file(&local);
-        std::fs::write(crate::transport::part_path(&local), &payload[..30_000]).unwrap();
-        crate::transport::write_part_meta(&local, "/resume.bin", Some(payload.len() as u64)).await;
-
         let faults = Faults {
             ignore_rest: true,
             ..Faults::default()
         };
         let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
         let session = test_session(port);
+        std::fs::write(crate::transport::part_path(&local), &payload[..30_000]).unwrap();
+        crate::transport::write_part_meta(
+            &local,
+            "/resume.bin",
+            Some(payload.len() as u64),
+            &crate::transport::origin_of(&session),
+        )
+        .await;
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
         with_timeout(transport.download("/resume.bin", &local, None), "resume")

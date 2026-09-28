@@ -337,6 +337,9 @@ pub struct SftpTransport {
     /// transfers; all control ops stay on `sftp`. Opened on the first
     /// download/upload and reused for the connection's lifetime.
     transfer: Option<Transfer>,
+    /// Where downloads' bytes come from, recorded in their resume sidecars.
+    /// See [`super::origin_of`].
+    origin: String,
 }
 
 /// A dedicated SFTP session for bulk transfers, plus the per-direction request
@@ -557,6 +560,7 @@ impl SftpTransport {
             handle,
             sftp,
             transfer: None,
+            origin: super::origin_of(session),
         })
     }
 
@@ -1045,6 +1049,7 @@ impl Transport for SftpTransport {
         // until the download is fully complete and fsynced, and isolates
         // partial bytes from a previous attempt under a recognisable suffix.
         let part = super::part_path(local_path);
+        let origin = self.origin.clone();
 
         let xfer = self.transfer_session().await?;
         let raw = Arc::clone(&xfer.raw);
@@ -1069,7 +1074,7 @@ impl Transport for SftpTransport {
         // different remote file that shares this local name, one from an
         // older blink, or one whose file has since been replaced) is
         // discarded here so the create below starts from a clean state.
-        let offset = super::resume_offset(local_path, remote_path, reported_size).await;
+        let offset = super::resume_offset(local_path, remote_path, reported_size, &origin).await;
 
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -1085,7 +1090,7 @@ impl Transport for SftpTransport {
         // Record what these bytes are before writing any, so an interrupt at
         // any point leaves an identifiable partial rather than an anonymous
         // one that the next attempt has to throw away.
-        super::write_part_meta(local_path, remote_path, reported_size).await;
+        super::write_part_meta(local_path, remote_path, reported_size, &origin).await;
 
         let result = pipelined_download(
             &raw,
@@ -2377,6 +2382,40 @@ mod integration {
         assert_eq!(&small[..], b"hello");
     }
 
+    /// A partial recorded for another server — same path, same size — must
+    /// not be continued. The planted partial holds the wrong bytes, so a
+    /// resume would show in the result.
+    #[tokio::test]
+    async fn a_partial_from_another_server_is_not_resumed() {
+        let bytes = pseudo_random(3 * SHORT_READ);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/c.bin".to_string(), bytes.clone());
+        let (port, _c) = start_server(store).await;
+        let mut transport = connect(port).await;
+
+        let dst = std::env::temp_dir().join(format!("blink-other-origin-{port}.bin"));
+        let _ = std::fs::remove_file(&dst);
+        std::fs::write(crate::transport::part_path(&dst), vec![0u8; 15_000]).unwrap();
+        crate::transport::write_part_meta(
+            &dst,
+            "/c.bin",
+            Some(bytes.len() as u64),
+            "tester@elsewhere.example:22",
+        )
+        .await;
+
+        transport.download("/c.bin", &dst, None).await.unwrap();
+        assert!(
+            std::fs::read(&dst).unwrap() == bytes,
+            "the download must start over, not continue another server's bytes",
+        );
+        let _ = std::fs::remove_file(&dst);
+        let _ = transport.close().await;
+    }
+
     /// Somebody else's `x.part` — a browser's, another tool's — sitting
     /// beside a download of `x` used to be deleted (it could not be
     /// identified as a partial of `x`) or truncated. blink's partials now
@@ -2480,7 +2519,13 @@ mod integration {
         // Simulate an interrupted download of /a.bin: a partial plus the
         // sidecar naming where those bytes came from.
         tokio::fs::write(&part, &a_bytes[..10_000]).await.unwrap();
-        crate::transport::write_part_meta(&dst, "/a.bin", Some(a_bytes.len() as u64)).await;
+        crate::transport::write_part_meta(
+            &dst,
+            "/a.bin",
+            Some(a_bytes.len() as u64),
+            &crate::transport::origin_of(&test_session(port)),
+        )
+        .await;
 
         // Now download a different remote file to the same local name.
         transport
@@ -2528,7 +2573,13 @@ mod integration {
         }
 
         tokio::fs::write(&part, &bytes[..15_000]).await.unwrap();
-        crate::transport::write_part_meta(&dst, "/c.bin", Some(bytes.len() as u64)).await;
+        crate::transport::write_part_meta(
+            &dst,
+            "/c.bin",
+            Some(bytes.len() as u64),
+            &crate::transport::origin_of(&test_session(port)),
+        )
+        .await;
 
         transport
             .download("/c.bin", &dst, None)
