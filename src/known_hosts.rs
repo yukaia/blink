@@ -300,6 +300,13 @@ pub fn append(host: &str, port: u16, key_type: &str, key_b64: &str) -> Result<()
     // Ensure we write at the end even though `append(true)` should guarantee
     // it; on some platforms the read above moved the cursor.
     file.seek(SeekFrom::End(0))?;
+    // A file whose last line has no newline — hand-edited, say — would have
+    // this entry glued onto that line, changing its key blob: that host is
+    // then rejected as "key changed" and this one is never found. End the
+    // line first. An empty file needs nothing.
+    if !raw.is_empty() && !raw.ends_with('\n') {
+        writeln!(file)?;
+    }
     writeln!(file, "{stored_host} {key_type} {key_b64}")?;
     // Lock released on drop.
     Ok(())
@@ -496,6 +503,68 @@ mod tests {
     const ED_KEY: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIGoodkey";
     const ED_KEY_2: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIOtherkey";
     const RSA_KEY: &str = "AAAAB3NzaC1yc2EAAA==";
+
+    // -- appending after a line with no newline ------------------------------
+    //
+    // `append` used to write its entry straight after whatever the file ended
+    // with. A hand-edited file missing its final newline got the new entry
+    // glued onto its last line, which changed that host's key blob: the host
+    // was then hard-rejected as "key changed", and the new one not found.
+
+    fn write_known_hosts(contents: &str) -> std::path::PathBuf {
+        let path = known_hosts_path().unwrap();
+        fs::write(&path, contents).unwrap();
+        path
+    }
+
+    #[test]
+    fn appending_after_a_last_line_without_a_newline_keeps_both_entries() {
+        let _home = crate::paths::test_home();
+        let path = write_known_hosts(&format!("a.example ssh-ed25519 {ED_KEY}"));
+
+        append("b.example", 22, "ssh-ed25519", ED_KEY_2).unwrap();
+
+        assert_eq!(
+            check("a.example", 22, "ssh-ed25519", ED_KEY).unwrap(),
+            KeyStatus::Trusted,
+            "the existing entry must survive intact",
+        );
+        assert_eq!(
+            check("b.example", 22, "ssh-ed25519", ED_KEY_2).unwrap(),
+            KeyStatus::Trusted,
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("a.example ssh-ed25519 {ED_KEY}\nb.example ssh-ed25519 {ED_KEY_2}\n"),
+            "one newline between them, and no blank line",
+        );
+    }
+
+    #[test]
+    fn appending_to_an_empty_file_starts_on_its_first_line() {
+        let _home = crate::paths::test_home();
+        let path = write_known_hosts("");
+
+        append("b.example", 22, "ssh-ed25519", ED_KEY_2).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("b.example ssh-ed25519 {ED_KEY_2}\n"),
+        );
+    }
+
+    #[test]
+    fn appending_after_a_newline_adds_no_blank_line() {
+        let _home = crate::paths::test_home();
+        let path = write_known_hosts(&format!("a.example ssh-ed25519 {ED_KEY}\n"));
+
+        append("b.example", 22, "ssh-ed25519", ED_KEY_2).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("a.example ssh-ed25519 {ED_KEY}\nb.example ssh-ed25519 {ED_KEY_2}\n"),
+        );
+    }
 
     #[test]
     fn trusted_canonical_form() {

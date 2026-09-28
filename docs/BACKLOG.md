@@ -66,18 +66,9 @@ so SFTP would return zero). One log line per listing, as now, not one
 per skipped line. `an_unparsable_listing_line_becomes_no_entry_at_all`
 in the FTP harness is the place to assert it.
 
-## Appending to known_hosts can corrupt its last entry
+## `blink connect` splits user and host at the first `@`
 
 Found in the 2026-09-26 codebase audit, like every entry below.
-
-`known_hosts::append` writes the new line without checking the file ends
-in a newline. On a hand-edited file without one, the new entry is glued
-onto the last line; that host's key blob then no longer matches, so it is
-hard-rejected as "key changed". Probed: `a.example` read as `Changed`,
-`b.example` as `Unknown`. Fix: write a newline first when the file is
-non-empty and does not end in one.
-
-## `blink connect` splits user and host at the first `@`
 
 `Session::from_url` (`session.rs`) uses `split_once('@')`, so
 `ftp://user@example.com@files.host.net/` gives user `user` and host

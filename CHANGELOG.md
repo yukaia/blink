@@ -10,6 +10,13 @@ the git history for those.
 
 ### Fixed
 
+- **Saving a host key no longer corrupts the last entry in `known_hosts`.**
+  If the file did not end with a newline — after a hand edit, say — the
+  new entry was written onto the end of its last line. That host's stored
+  key then no longer matched, so its next connect was refused as a changed
+  key, and the newly saved host was not found either. blink now ends the
+  line first.
+
 - **Opening an image no longer freezes blink.** Decoding, scaling and
   encoding a previewed image for the terminal ran on the UI thread, when it
   opened and again on every resize, so the whole interface — transfer
