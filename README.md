@@ -297,7 +297,9 @@ blink known-hosts remove host.example.com --port 2222
 
 `blink open` exits with an error if the session name is not found.
 `blink connect` accepts any URL in the form `protocol://[user@]host[:port][/path]`
-where protocol is one of `sftp`, `scp`, `ftp`, or `ftps`. Both commands
+where protocol is one of `sftp`, `scp`, `ftp`, or `ftps`. A username may
+itself contain `@` — `ftp://me@example.com@ftp.example.net` logs in as
+`me@example.com` — since the host is whatever follows the last one. Both commands
 prompt for a password if the session uses password auth, or go straight to
 the Connection screen for key and agent auth.
 

@@ -654,7 +654,10 @@ impl Session {
             None => (rest, "/".to_string()),
         };
 
-        let (username, hostport) = match authority.split_once('@') {
+        // Split at the last `@`: a host cannot contain one, so everything
+        // before it is the user, and email-address usernames — common on FTP
+        // hosting — stay whole. `%40` also works, decoded below.
+        let (username, hostport) = match authority.rsplit_once('@') {
             Some((u, h)) => (u.to_string(), h),
             None => (String::new(), authority),
         };
@@ -912,6 +915,32 @@ mod tests {
         let s = Session::from_url("sftp://user@[::1]:2022/data").unwrap();
         assert_eq!(s.host, "::1");
         assert_eq!(s.port, 2022);
+    }
+
+    // Email-address usernames are common on FTP hosting. The host cannot
+    // contain `@`, so everything before the last one is the user; splitting
+    // at the first gave user `user` and host `example.com@files.host.net`.
+
+    #[test]
+    fn from_url_takes_the_last_at_as_the_host_separator() {
+        let s = Session::from_url("ftp://user@example.com@files.host.net/").unwrap();
+        assert_eq!(s.username, "user@example.com");
+        assert_eq!(s.host, "files.host.net");
+    }
+
+    #[test]
+    fn from_url_email_username_with_port_and_path() {
+        let s = Session::from_url("ftps://me@corp.example@ftp.example.net:2121/in/box").unwrap();
+        assert_eq!(s.username, "me@corp.example");
+        assert_eq!(s.host, "ftp.example.net");
+        assert_eq!(s.port, 2121);
+        assert_eq!(s.remote_dir, "/in/box");
+    }
+
+    #[test]
+    fn from_url_still_rejects_a_password_beside_an_email_username() {
+        let err = Session::from_url("ftp://user@example.com:secret@files.host.net/").unwrap_err();
+        assert!(err.to_string().contains("password"), "{err}");
     }
 
     #[test]

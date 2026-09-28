@@ -10,6 +10,11 @@ the git history for those.
 
 ### Fixed
 
+- **`blink connect` accepts email-address usernames.** The URL was split at
+  its first `@`, so `ftp://user@example.com@files.host.net` connected as
+  `user` to a host named `example.com@files.host.net`. It is now split at
+  the last `@`, as curl and most URL parsers do.
+
 - **Saving a host key no longer corrupts the last entry in `known_hosts`.**
   If the file did not end with a newline — after a hand edit, say — the
   new entry was written onto the end of its last line. That host's stored

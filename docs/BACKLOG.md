@@ -66,17 +66,9 @@ so SFTP would return zero). One log line per listing, as now, not one
 per skipped line. `an_unparsable_listing_line_becomes_no_entry_at_all`
 in the FTP harness is the place to assert it.
 
-## `blink connect` splits user and host at the first `@`
+## FTP downloads do not check the size they received
 
 Found in the 2026-09-26 codebase audit, like every entry below.
-
-`Session::from_url` (`session.rs`) uses `split_once('@')`, so
-`ftp://user@example.com@files.host.net/` gives user `user` and host
-`example.com@files.host.net` (probed). Email-address usernames are common
-on FTP hosting. curl and most URL parsers split at the last `@`; use
-`rsplit_once`. A `%40`-encoded `@` already works.
-
-## FTP downloads do not check the size they received
 
 `ftp_download` (`ftp_impl.rs`) renames `.part` into place on `226`
 without comparing the bytes received against the size `SIZE` reported.
