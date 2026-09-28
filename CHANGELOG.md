@@ -8,6 +8,19 @@ the git history for those.
 
 ## [Unreleased]
 
+### Added
+
+- **Mouse support.** Click to focus a pane and move its cursor;
+  double-click a directory to enter it, or a file to transfer it — a
+  remote file downloads, a local one uploads, just that file. The scroll
+  wheel moves the cursor in the file panes, the transfer list and the
+  session list, and scrolls the viewer; the bottom pane's tabs and
+  transfers respond to clicks, and a session double-clicked connects.
+  `mouse = false` under `[terminal]` in `config.ini` turns it off, leaving
+  mouse capture off so the terminal's own text selection works. File panes
+  now keep their scroll position while the cursor stays in view, instead
+  of shifting with every move.
+
 ## [0.8.2] — 2026-09-28
 
 ### Changed

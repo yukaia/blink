@@ -516,6 +516,24 @@ In the viewer: `↑` / `↓` or `k` / `j` scroll a line, `PgUp` / `PgDn` (or
 `space`) scroll a page, `Home` / `g` and `End` / `G` jump to the top and
 bottom, and `q` / `esc` close it.
 
+### Mouse
+
+On by default; `mouse = false` under `[terminal]` in `config.ini` turns it
+off and leaves the terminal's own text selection alone.
+
+- **Click** a file pane to focus it; click a row to move the cursor there.
+- **Double-click** a directory (or `..`) to enter it; a remote file to
+  download it, or a local file to upload it — just that file, whatever
+  else is selected.
+- **Scroll wheel** moves the cursor in the pane under the mouse, the
+  transfer list, and the session list, and scrolls the viewer.
+- **Click** the TRANSFERS / LOG tabs to switch them, and a transfer to select
+  it. In the session selector, click a session to select it and
+  double-click to connect.
+
+Prompts and modals ignore the mouse. With capture on, most terminals need
+Shift held to select text.
+
 ## Supported viewer formats
 
 `v` opens the in-app viewer for the cursor item. Whether a file is recognised

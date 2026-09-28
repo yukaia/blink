@@ -7,9 +7,9 @@
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
-use super::{App, Pane, Screen};
+use super::{App, BottomPane, Pane, Screen};
 use crate::tui::hit::row_in;
 use crate::tui::state::PaneState;
 
@@ -24,6 +24,7 @@ pub(super) const WHEEL_STEP: isize = 3;
 pub(super) enum ClickTarget {
     Local(usize),
     Remote(usize),
+    Session(usize),
 }
 
 /// The last left press on something a double-click can act on.
@@ -40,8 +41,11 @@ impl App {
     /// [`Self::handle_mouse`] with the time of the event given, so tests can
     /// place two presses either side of [`DOUBLE_CLICK`].
     pub(super) fn handle_mouse_at(&mut self, m: MouseEvent, now: Instant) {
-        if self.screen == Screen::Main {
-            self.mouse_main(m, now);
+        match self.screen {
+            Screen::Main => self.mouse_main(m, now),
+            Screen::Viewer => self.mouse_viewer(m),
+            Screen::SessionSelect => self.mouse_session_select(m, now),
+            _ => {}
         }
     }
 
@@ -86,6 +90,68 @@ impl App {
                 _ => {}
             }
             return;
+        }
+
+        let left = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
+        if left && row_in(self.hit.transfers_tab.get(), col, row).is_some() {
+            self.bottom_pane = BottomPane::Transfers;
+            self.active_pane = Pane::Transfers;
+            return;
+        }
+        if left && row_in(self.hit.log_tab.get(), col, row).is_some() {
+            self.bottom_pane = BottomPane::Log;
+            self.active_pane = Pane::Log;
+            return;
+        }
+        if let Some(r) = row_in(self.hit.transfer_list.get(), col, row) {
+            match m.kind {
+                MouseEventKind::ScrollUp => self.move_transfer_cursor(-WHEEL_STEP),
+                MouseEventKind::ScrollDown => self.move_transfer_cursor(WHEEL_STEP),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.bottom_pane = BottomPane::Transfers;
+                    self.active_pane = Pane::Transfers;
+                    if r < self.active_jobs().len() {
+                        self.transfer_cursor = r;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// The wheel over the viewer body scrolls its text. Images don't scroll.
+    fn mouse_viewer(&mut self, m: MouseEvent) {
+        if row_in(self.hit.viewer_body.get(), m.column, m.row).is_none() {
+            return;
+        }
+        match m.kind {
+            MouseEventKind::ScrollUp => self.viewer_scroll(-WHEEL_STEP),
+            MouseEventKind::ScrollDown => self.viewer_scroll(WHEEL_STEP),
+            _ => {}
+        }
+    }
+
+    /// A click selects a session; a double-click connects, as Enter does;
+    /// the wheel moves the selection.
+    fn mouse_session_select(&mut self, m: MouseEvent, now: Instant) {
+        let Some(r) = row_in(self.hit.session_list.get(), m.column, m.row) else {
+            return;
+        };
+        let len = self.sessions.len();
+        match m.kind {
+            MouseEventKind::ScrollUp => {
+                self.session_cursor = self.session_cursor.saturating_sub(WHEEL_STEP as usize);
+            }
+            MouseEventKind::ScrollDown if len > 0 => {
+                self.session_cursor = (self.session_cursor + WHEEL_STEP as usize).min(len - 1);
+            }
+            MouseEventKind::Down(MouseButton::Left) if r < len => {
+                self.session_cursor = r;
+                if self.is_double_click(ClickTarget::Session(r), now) {
+                    self.handle_session_select(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -423,5 +489,110 @@ mod tests {
         a.handle_mouse_at(press(c, r), t + Duration::from_millis(100));
         assert_eq!(a.local.path, "/tmp");
         assert_eq!(a.transfer_manager.as_ref().unwrap().queue_counts(), (0, 0));
+    }
+
+    use crate::session::Session;
+    use crate::tui::app::BottomPane;
+
+    fn centre(r: ratatui::layout::Rect) -> (u16, u16) {
+        (r.x + r.width / 2, r.y)
+    }
+
+    #[test]
+    fn clicking_a_tab_shows_that_page_and_focuses_the_bottom_pane() {
+        let mut a = app_on_main(0);
+        draw(&a);
+        let (c, r) = centre(a.hit.log_tab.get().unwrap());
+        a.handle_mouse_at(press(c, r), Instant::now());
+        assert_eq!(a.bottom_pane, BottomPane::Log);
+        assert_eq!(a.active_pane, Pane::Log);
+        let (c, r) = centre(a.hit.transfers_tab.get().unwrap());
+        a.handle_mouse_at(press(c, r), Instant::now());
+        assert_eq!(a.bottom_pane, BottomPane::Transfers);
+        assert_eq!(a.active_pane, Pane::Transfers);
+    }
+
+    #[test]
+    fn clicking_a_transfer_row_selects_it() {
+        let mut a = app_on_main(0);
+        let m = crate::transfer::TransferManager::new(4).0;
+        for i in 0..3 {
+            m.enqueue_download(format!("/r/{i}"), format!("/l/{i}").into())
+                .unwrap();
+            m.take_next_pending().unwrap();
+        }
+        a.transfer_manager = Some(m);
+        a.bottom_pane = BottomPane::Transfers;
+        draw(&a);
+        let list = a.hit.transfer_list.get().unwrap();
+        a.handle_mouse_at(press(list.x + 2, list.y + 2), Instant::now());
+        assert_eq!(a.active_pane, Pane::Transfers);
+        assert_eq!(a.transfer_cursor, 2);
+        a.handle_mouse_at(wheel(false, list.x + 2, list.y), Instant::now());
+        assert_eq!(a.transfer_cursor, 0);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_viewer_text() {
+        let mut a = app_on_main(0);
+        let tokens = (0..100)
+            .map(|i| vec![(crate::highlight::TokenKind::Plain, format!("line {i}"))])
+            .collect();
+        a.viewer = Some(crate::tui::state::Viewer {
+            name: "t.txt".into(),
+            kind: crate::tui::state::ViewerKind::Text { tokens, scroll: 0 },
+            id: 1,
+        });
+        a.screen = Screen::Viewer;
+        draw(&a);
+        let body = a.hit.viewer_body.get().unwrap();
+        a.handle_mouse_at(wheel(true, body.x + 1, body.y + 1), Instant::now());
+        match &a.viewer.as_ref().unwrap().kind {
+            crate::tui::state::ViewerKind::Text { scroll, .. } => assert_eq!(*scroll, 3),
+            _ => unreachable!(),
+        }
+    }
+
+    fn selector_with(n: usize) -> App {
+        let mut a = crate::tui::app::App::new(
+            crate::config::Config::default(),
+            crate::theme::Theme::load("dracula").unwrap(),
+        );
+        a.sessions = (0..n)
+            .map(|i| {
+                let mut s = Session::from_url(&format!("sftp://me@h{i}.example")).unwrap();
+                s.auth = crate::session::AuthMethod::Password;
+                s
+            })
+            .collect();
+        a
+    }
+
+    #[test]
+    fn a_click_selects_a_session_and_the_wheel_moves_the_selection() {
+        let mut a = selector_with(5);
+        draw(&a);
+        let rows = a.hit.session_list.get().unwrap();
+        a.handle_mouse_at(press(rows.x + 4, rows.y + 3), Instant::now());
+        assert_eq!(a.session_cursor, 3);
+        a.handle_mouse_at(wheel(false, rows.x + 4, rows.y), Instant::now());
+        assert_eq!(a.session_cursor, 0);
+        a.handle_mouse_at(wheel(true, rows.x + 4, rows.y), Instant::now());
+        assert_eq!(a.session_cursor, 3);
+    }
+
+    #[test]
+    fn a_double_click_on_a_session_connects_as_enter_does() {
+        let mut a = selector_with(2);
+        draw(&a);
+        let rows = a.hit.session_list.get().unwrap();
+        let t = Instant::now();
+        a.handle_mouse_at(press(rows.x + 4, rows.y + 1), t);
+        a.handle_mouse_at(
+            press(rows.x + 4, rows.y + 1),
+            t + Duration::from_millis(100),
+        );
+        assert_eq!(a.screen, Screen::PasswordPrompt, "password auth asks first");
+        assert_eq!(a.pending_session.as_ref().unwrap().host, "h1.example");
     }
 }
