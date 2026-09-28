@@ -328,6 +328,10 @@ pub struct App {
     image_needs_redraw: bool,
     /// The remote listing in flight, if any — see `refresh_remote_pane`.
     remote_listing: Option<RemoteListing>,
+    /// The last unreadable-entries warning given, as (path, readable,
+    /// unreadable), so an unchanged directory isn't warned about on every
+    /// refresh. See `App::report_unreadable_entries`.
+    unreadable_warned: Option<(String, usize, usize)>,
     /// Force a full terminal repaint on the next loop iteration. Used when
     /// closing an image viewer: sixel and kitty graphics live outside
     /// ratatui's cell buffer, so ratatui's diffing renderer doesn't know to
@@ -427,6 +431,7 @@ impl App {
             next_viewer_id: 1,
             image_needs_redraw: false,
             remote_listing: None,
+            unreadable_warned: None,
             needs_terminal_clear: false,
             status_message: None,
             should_quit: false,
@@ -833,6 +838,7 @@ impl App {
         self.bottom_pane = BottomPane::Log;
         self.remote = PaneState::empty();
         self.remote_listing = None;
+        self.unreadable_warned = None;
 
         // 4. Reset local pane focus and refresh the sessions list.
         self.active_pane = Pane::Local;
@@ -2241,6 +2247,88 @@ mod tests {
         }
     }
 
+    // -- entries a listing could not read ------------------------------------
+    //
+    // An FTP server whose listing lines blink cannot parse produced a pane
+    // that was short, or empty, with no reason given: the warning went to a
+    // debug log discarded by default. The count now reaches the log pane.
+
+    fn listed(a: &mut App, path: &str, entries: usize, unreadable: usize) {
+        let entries = (0..entries)
+            .map(|i| {
+                crate::transport::RemoteEntry::new(
+                    format!("f{i}"),
+                    crate::transport::EntryKind::File,
+                    1,
+                    None,
+                    None,
+                )
+            })
+            .collect();
+        a.remote.path = path.into();
+        a.handle_app_event(AppEvent::Listed {
+            path: path.into(),
+            entries,
+            unreadable,
+        });
+    }
+
+    #[test]
+    fn a_listing_with_unreadable_entries_says_so() {
+        let mut a = app();
+        listed(&mut a, "/pub", 37, 3);
+        assert!(
+            logged(&a, "3 of 40 entries in /pub couldn't be read"),
+            "{:?}",
+            a.log.back().map(|l| &l.message),
+        );
+    }
+
+    #[test]
+    fn a_listing_with_nothing_readable_says_why_the_pane_is_empty() {
+        let mut a = app();
+        listed(&mut a, "/pub", 0, 12);
+        assert!(logged(&a, "none of the 12 entries in /pub could be read"));
+    }
+
+    #[test]
+    fn a_complete_listing_says_nothing() {
+        let mut a = app();
+        let before = a.log.len();
+        listed(&mut a, "/pub", 5, 0);
+        assert_eq!(a.log.len(), before);
+    }
+
+    /// Every refresh of the same directory would repeat the same warning;
+    /// uploads trigger refreshes by the batch. Say it once per change.
+    #[test]
+    fn the_same_warning_is_not_repeated_on_every_refresh() {
+        let mut a = app();
+        listed(&mut a, "/pub", 37, 3);
+        let after_first = a.log.len();
+        listed(&mut a, "/pub", 37, 3);
+        assert_eq!(a.log.len(), after_first, "unchanged, so not repeated");
+        listed(&mut a, "/pub", 36, 4);
+        assert_eq!(a.log.len(), after_first + 1, "changed, so said again");
+    }
+
+    #[test]
+    fn a_download_walk_that_skipped_unreadable_entries_says_so() {
+        let mut a = app();
+        a.handle_app_event(AppEvent::WalkComplete {
+            plan: Vec::new(),
+            conflict_indices: Vec::new(),
+            symlinks_skipped: 0,
+            unencodable_skipped: 0,
+            unreadable_skipped: 12,
+            kind: Direction::Download,
+        });
+        assert!(logged(
+            &a,
+            "skipped 12 entries whose listing lines couldn't be read"
+        ));
+    }
+
     // -- coalesced remote refreshes -------------------------------------------
     //
     // Every completed upload asked for a listing, and each request spawned
@@ -2262,16 +2350,13 @@ mod tests {
         fn protocol(&self) -> crate::session::Protocol {
             crate::session::Protocol::Sftp
         }
-        async fn list(
-            &mut self,
-            _: &str,
-        ) -> crate::error::Result<Vec<crate::transport::RemoteEntry>> {
+        async fn list(&mut self, _: &str) -> crate::error::Result<crate::transport::Listing> {
             self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.release.acquire().await.unwrap().forget();
             if self.fail {
                 Err(crate::error::BlinkError::transport("listing refused"))
             } else {
-                Ok(Vec::new())
+                Ok(crate::transport::Listing::default())
             }
         }
         async fn download(

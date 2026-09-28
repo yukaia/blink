@@ -169,7 +169,11 @@ impl App {
         tokio::spawn(async move {
             let mut transport = t.lock().await;
             let event = match transport.list(&path).await {
-                Ok(entries) => AppEvent::Listed { path, entries },
+                Ok(listing) => AppEvent::Listed {
+                    path,
+                    entries: listing.entries,
+                    unreadable: listing.unreadable,
+                },
                 Err(e) => AppEvent::ListFailed {
                     path,
                     error: e.to_string(),

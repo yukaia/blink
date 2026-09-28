@@ -52,6 +52,10 @@ pub enum PlannedJob {
 pub struct WalkResult {
     pub plan: Vec<PlannedJob>,
     pub symlinks_skipped: usize,
+    /// Remote entries skipped because a listing could not read them — an
+    /// FTP line in no format blink parses. Counted so the batch can say it
+    /// is incomplete; see [`crate::transport::Listing`].
+    pub unreadable_skipped: usize,
     /// Local entries whose names are not valid UTF-8 and so cannot be sent
     /// as a remote path. Counted rather than silently dropped — see
     /// [`walk_local`].
@@ -154,6 +158,7 @@ pub async fn walk_remote(
 ) -> Result<WalkResult> {
     let mut out: Vec<PlannedJob> = Vec::new();
     let mut symlinks_skipped: usize = 0;
+    let mut unreadable_skipped: usize = 0;
     let mut dirs_visited: usize = 0;
 
     // Iterative DFS. Stack holds (remote_path_to_visit, local_path_dest).
@@ -196,7 +201,9 @@ pub async fn walk_remote(
         // before the next iteration, so other work gets a turn.
         let entries = {
             let mut t = transport.lock().await;
-            t.list(&remote_dir).await?
+            let listing = t.list(&remote_dir).await?;
+            unreadable_skipped += listing.unreadable;
+            listing.entries
         };
 
         // Pre-collect subdirs so we can push them in reverse for a stable
@@ -264,6 +271,7 @@ pub async fn walk_remote(
     Ok(WalkResult {
         plan: out,
         symlinks_skipped,
+        unreadable_skipped,
         unencodable_skipped: 0,
     })
 }
@@ -354,6 +362,7 @@ pub async fn walk_local(local_root: &Path, remote_root: &str) -> Result<WalkResu
     Ok(WalkResult {
         plan: out,
         symlinks_skipped,
+        unreadable_skipped: 0,
         unencodable_skipped,
     })
 }
@@ -412,7 +421,7 @@ pub async fn find_upload_conflicts(
             t.list(&dir).await
         };
         let listing = match result {
-            Ok(l) => l,
+            Ok(l) => l.entries,
             // "Directory doesn't exist yet" genuinely has no conflicts —
             // that is the normal case when uploading into a new tree.
             Err(BlinkError::NotFound(_)) => continue,
@@ -471,18 +480,20 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Transport for EmptyDirTree {
-        async fn list(&mut self, _remote_path: &str) -> Result<Vec<transport::RemoteEntry>> {
-            Ok((0..self.fan_out)
-                .map(|i| {
-                    transport::RemoteEntry::new(
-                        format!("d{i}"),
-                        EntryKind::Directory,
-                        0,
-                        None,
-                        None,
-                    )
-                })
-                .collect())
+        async fn list(&mut self, _remote_path: &str) -> Result<transport::Listing> {
+            Ok(transport::Listing::complete(
+                (0..self.fan_out)
+                    .map(|i| {
+                        transport::RemoteEntry::new(
+                            format!("d{i}"),
+                            EntryKind::Directory,
+                            0,
+                            None,
+                            None,
+                        )
+                    })
+                    .collect(),
+            ))
         }
 
         fn protocol(&self) -> crate::session::Protocol {
@@ -553,7 +564,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Transport for GatedTree {
-        async fn list(&mut self, remote_path: &str) -> Result<Vec<transport::RemoteEntry>> {
+        async fn list(&mut self, remote_path: &str) -> Result<transport::Listing> {
             if remote_path != "/quick" {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 let _ = self.gates.send(tx);
@@ -566,17 +577,19 @@ mod tests {
             } else {
                 0
             };
-            Ok((0..n)
-                .map(|i| {
-                    transport::RemoteEntry::new(
-                        format!("d{i}"),
-                        EntryKind::Directory,
-                        0,
-                        None,
-                        None,
-                    )
-                })
-                .collect())
+            Ok(transport::Listing::complete(
+                (0..n)
+                    .map(|i| {
+                        transport::RemoteEntry::new(
+                            format!("d{i}"),
+                            EntryKind::Directory,
+                            0,
+                            None,
+                            None,
+                        )
+                    })
+                    .collect(),
+            ))
         }
 
         fn protocol(&self) -> crate::session::Protocol {
@@ -723,16 +736,21 @@ mod tests {
     /// Transport stub whose root directory holds exactly the given files.
     struct FileList {
         names: Vec<String>,
+        /// Entries the listing reports it could not read.
+        unreadable: usize,
     }
 
     #[async_trait::async_trait]
     impl Transport for FileList {
-        async fn list(&mut self, _remote_path: &str) -> Result<Vec<transport::RemoteEntry>> {
-            Ok(self
-                .names
-                .iter()
-                .map(|n| transport::RemoteEntry::new(n.clone(), EntryKind::File, 3, None, None))
-                .collect())
+        async fn list(&mut self, _remote_path: &str) -> Result<transport::Listing> {
+            Ok(transport::Listing {
+                entries: self
+                    .names
+                    .iter()
+                    .map(|n| transport::RemoteEntry::new(n.clone(), EntryKind::File, 3, None, None))
+                    .collect(),
+                unreadable: self.unreadable,
+            })
         }
 
         fn protocol(&self) -> crate::session::Protocol {
@@ -777,6 +795,24 @@ mod tests {
         }
     }
 
+    /// A recursive download used to miss the entries a listing could not
+    /// read without a word. The walk now adds them up, so the batch can say
+    /// how many were left out.
+    #[tokio::test]
+    async fn walk_remote_counts_entries_its_listings_could_not_read() {
+        let root = scratch("unreadable");
+        let t = FileList {
+            names: vec!["a.txt".into(), "b.txt".into()],
+            unreadable: 3,
+        };
+
+        let result = walk_remote(&shared(t), "/srv", &root).await.expect("walk");
+
+        assert_eq!(result.plan.len(), 2, "the readable entries are planned");
+        assert_eq!(result.unreadable_skipped, 3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn walk_remote_addresses_files_by_the_name_the_server_sent() {
         // A right-to-left override in the name sanitizes to a space. Fetching
@@ -785,6 +821,7 @@ mod tests {
         let raw = "re\u{202E}port.txt";
         let t = FileList {
             names: vec![raw.to_string()],
+            unreadable: 0,
         };
 
         let result = walk_remote(&shared(t), "/srv", &root).await.expect("walk");
@@ -810,6 +847,7 @@ mod tests {
         let real = "invoice .pdf";
         let t = FileList {
             names: vec![decoy.to_string(), real.to_string()],
+            unreadable: 0,
         };
 
         let result = walk_remote(&shared(t), "/srv", &root).await.expect("walk");
@@ -955,7 +993,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Transport for FailingList {
-        async fn list(&mut self, _: &str) -> Result<Vec<transport::RemoteEntry>> {
+        async fn list(&mut self, _: &str) -> Result<transport::Listing> {
             Err((self.err)())
         }
         fn protocol(&self) -> crate::session::Protocol {

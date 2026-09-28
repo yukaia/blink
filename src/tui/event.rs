@@ -52,6 +52,9 @@ pub enum AppEvent {
     Listed {
         path: String,
         entries: Vec<RemoteEntry>,
+        /// Entries the server listed that could not be read. See
+        /// [`crate::transport::Listing`].
+        unreadable: usize,
     },
 
     /// A directory listing failed.
@@ -106,6 +109,9 @@ pub enum AppEvent {
         /// Local entries skipped because their names are not valid UTF-8 and
         /// so have no faithful remote form.
         unencodable_skipped: usize,
+        /// Remote entries skipped because their listing lines could not be
+        /// read. Always zero for an upload walk.
+        unreadable_skipped: usize,
         kind: Direction,
     },
 

@@ -301,6 +301,31 @@ impl RemoteEntry {
     }
 }
 
+/// A directory listing, and how many of its entries could not be read.
+///
+/// An FTP server answers `LIST` with text lines in a format blink has to
+/// parse, and a line matching no format it knows is skipped. That used to
+/// go only to the debug log, so the pane came up short, or empty, with no
+/// reason given — and a recursive download silently missed those entries.
+/// Carrying the count with the listing lets each caller say so. SFTP
+/// listings are structured, so theirs is always zero.
+#[derive(Debug, Clone, Default)]
+pub struct Listing {
+    pub entries: Vec<RemoteEntry>,
+    /// Entries the server listed that could not be read.
+    pub unreadable: usize,
+}
+
+impl Listing {
+    /// A listing every entry of which was read.
+    pub fn complete(entries: Vec<RemoteEntry>) -> Self {
+        Self {
+            entries,
+            unreadable: 0,
+        }
+    }
+}
+
 /// Progress update emitted while a single file is in flight.
 #[derive(Debug, Clone)]
 pub struct ProgressUpdate {
@@ -397,7 +422,7 @@ pub trait Transport: Send + Sync {
     fn protocol(&self) -> Protocol;
 
     /// List entries in `remote_path`. Implementations must NOT include `.` or `..`.
-    async fn list(&mut self, remote_path: &str) -> Result<Vec<RemoteEntry>>;
+    async fn list(&mut self, remote_path: &str) -> Result<Listing>;
 
     /// Download `remote_path` to `local_path`, sending progress to `progress`
     /// if a sender is provided.
@@ -610,7 +635,7 @@ pub(crate) mod mock {
             Protocol::Sftp
         }
 
-        async fn list(&mut self, remote_path: &str) -> Result<Vec<RemoteEntry>> {
+        async fn list(&mut self, remote_path: &str) -> Result<crate::transport::Listing> {
             let p = if remote_path.ends_with('/') {
                 remote_path.to_string()
             } else {
@@ -667,7 +692,7 @@ pub(crate) mod mock {
                     None,
                 ));
             }
-            Ok(out)
+            Ok(crate::transport::Listing::complete(out))
         }
 
         async fn download(
@@ -1219,14 +1244,14 @@ mod tests {
     #[tokio::test]
     async fn mock_list_empty() {
         let mut m = mock::MockTransport::new();
-        let entries = m.list("/").await.unwrap();
+        let entries = m.list("/").await.unwrap().entries;
         assert!(entries.is_empty());
     }
 
     #[tokio::test]
     async fn mock_list_with_file() {
         let mut m = mock::MockTransport::new().with_file("/hello.txt", b"world");
-        let entries = m.list("/").await.unwrap();
+        let entries = m.list("/").await.unwrap().entries;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].raw_name, "hello.txt");
         assert!(!entries[0].is_dir());
@@ -1237,7 +1262,7 @@ mod tests {
     async fn mock_list_with_dir() {
         let mut m = mock::MockTransport::new();
         m.mkdir("/subdir").await.unwrap();
-        let entries = m.list("/").await.unwrap();
+        let entries = m.list("/").await.unwrap().entries;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].raw_name, "subdir");
     }
@@ -1265,7 +1290,7 @@ mod tests {
     async fn mock_rename() {
         let mut m = mock::MockTransport::new().with_file("/old.txt", b"data");
         m.rename("/old.txt", "/new.txt").await.unwrap();
-        let entries = m.list("/").await.unwrap();
+        let entries = m.list("/").await.unwrap().entries;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].raw_name, "new.txt");
         assert!(m.metadata("/old.txt").await.unwrap().is_none());
@@ -1278,7 +1303,7 @@ mod tests {
             .with_file("/a.txt", b"aaa")
             .with_file("/b.txt", b"bbb");
         m.delete_file("/a.txt").await.unwrap();
-        let entries = m.list("/").await.unwrap();
+        let entries = m.list("/").await.unwrap().entries;
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].raw_name, "b.txt");
     }

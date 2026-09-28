@@ -140,6 +140,7 @@ impl App {
                 conflict_indices,
                 symlinks_skipped,
                 unencodable_skipped,
+                unreadable_skipped: 0,
                 kind: Direction::Upload,
             });
         });
@@ -201,6 +202,7 @@ impl App {
             // plus per-file Download jobs.
             let mut plan: Vec<PlannedJob> = Vec::new();
             let mut symlinks_skipped: usize = 0;
+            let mut unreadable_skipped: usize = 0;
             {
                 for (remote, local, is_dir) in roots {
                     let chunk = if is_dir {
@@ -208,6 +210,7 @@ impl App {
                         match walk {
                             Ok(r) => {
                                 symlinks_skipped += r.symlinks_skipped;
+                                unreadable_skipped += r.unreadable_skipped;
                                 r.plan
                             }
                             Err(e) => {
@@ -240,6 +243,7 @@ impl App {
                 // Remote-side walks build local paths through
                 // `safe_local_name`, not through UTF-8 decoding.
                 unencodable_skipped: 0,
+                unreadable_skipped,
                 kind: Direction::Download,
             });
         });

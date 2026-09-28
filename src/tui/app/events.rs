@@ -228,12 +228,17 @@ impl App {
                 };
                 self.screen = Screen::KeyPassphrasePrompt;
             }
-            AppEvent::Listed { path, entries } => {
+            AppEvent::Listed {
+                path,
+                entries,
+                unreadable,
+            } => {
                 self.finish_remote_listing(&path);
                 // Discard stale responses (user navigated again before this returned).
                 if path != self.remote.path {
                     return;
                 }
+                self.report_unreadable_entries(&path, entries.len(), unreadable);
                 self.remote
                     .set_entries(super::build_remote_pane_entries(&entries, &path));
             }
@@ -312,8 +317,25 @@ impl App {
                 conflict_indices,
                 symlinks_skipped,
                 unencodable_skipped,
+                unreadable_skipped,
                 kind,
             } => {
+                // The walk left these out: the batch is incomplete, and the
+                // user would otherwise believe it whole.
+                if unreadable_skipped > 0 {
+                    let noun = if unreadable_skipped == 1 {
+                        "entry"
+                    } else {
+                        "entries"
+                    };
+                    self.push_log(
+                        LogLevel::Warn,
+                        format!(
+                            "skipped {unreadable_skipped} {noun} whose listing lines \
+                             couldn't be read: the server's listing format isn't supported"
+                        ),
+                    );
+                }
                 if unencodable_skipped > 0 {
                     let noun = if unencodable_skipped == 1 {
                         "file"
@@ -644,4 +666,35 @@ fn lands_under(remote_path: &str, dir: &str) -> bool {
         format!("{dir}/")
     };
     remote_path.starts_with(&prefix)
+}
+
+impl App {
+    /// Tell the user when a listing of the shown directory could not read
+    /// some of its entries, instead of leaving the pane short — or empty —
+    /// with no reason. Said once per change: a directory is re-listed on
+    /// every refresh, and an upload batch refreshes it repeatedly.
+    fn report_unreadable_entries(&mut self, path: &str, readable: usize, unreadable: usize) {
+        if unreadable == 0 {
+            self.unreadable_warned = None;
+            return;
+        }
+        let key = (path.to_string(), readable, unreadable);
+        if self.unreadable_warned.as_ref() == Some(&key) {
+            return;
+        }
+        self.unreadable_warned = Some(key);
+        let message = if readable == 0 {
+            format!(
+                "none of the {unreadable} entries in {path} could be read: the server's \
+                 listing format isn't supported"
+            )
+        } else {
+            format!(
+                "{unreadable} of {} entries in {path} couldn't be read: the server's \
+                 listing format isn't supported",
+                readable + unreadable
+            )
+        };
+        self.push_log(LogLevel::Warn, message);
+    }
 }

@@ -861,15 +861,15 @@ A few things worth knowing before you use this in anger:
   need a different connect path; the `transport/ftps.rs` seam is small.
 - **FTP directory listings are parsed as POSIX (`ls -l`) or DOS, nothing
   else.** blink issues `LIST` and never `MLSD`/`MLST`, so it parses with
-  those two parsers only. A server whose listing format is neither shows an
-  empty directory. Each such listing writes one `skipped unparsable listing
-  lines` warning, with the skipped and total line counts, to the debug log —
-  which is discarded unless `BLINK_LOG_FILE` is set, so the TUI itself says
-  nothing. The alternative — the library's fallback parser, which accepts
-  *any* line and names the file after it — put entries in the pane that
-  addressed nothing, which was worse. Real-world dialect coverage is
-  untested: the FTP test suite runs against an in-process server, not
-  vsftpd or IIS.
+  those two parsers only. Lines in neither format are skipped, and the log
+  pane says how many ("3 of 40 entries in /pub couldn't be read"), or that
+  none could be, when the directory comes up empty for that reason. A
+  recursive download that skipped entries this way says how many, so the
+  batch isn't mistaken for complete. The alternative — the library's
+  fallback parser, which accepts *any* line and names the file after it —
+  put entries in the pane that addressed nothing, which was worse.
+  Real-world dialect coverage is untested: the FTP test suite runs against
+  an in-process server, not vsftpd or IIS.
 - **FTPS uses the embedded Mozilla CA bundle** (`webpki-roots`) for trust
   anchors rather than the system trust store. Self-signed certs and
   privately-rooted CAs aren't trusted by default. The per-session

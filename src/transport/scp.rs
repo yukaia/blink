@@ -85,7 +85,7 @@ macro_rules! delegate_inner_transport {
             async fn list(
                 &mut self,
                 remote_path: &str,
-            ) -> $crate::error::Result<Vec<$crate::transport::RemoteEntry>> {
+            ) -> $crate::error::Result<$crate::transport::Listing> {
                 self.inner.list(remote_path).await
             }
 

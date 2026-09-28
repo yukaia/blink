@@ -1007,7 +1007,7 @@ impl Transport for SftpTransport {
         Protocol::Sftp
     }
 
-    async fn list(&mut self, remote_path: &str) -> Result<Vec<RemoteEntry>> {
+    async fn list(&mut self, remote_path: &str) -> Result<super::Listing> {
         let entries = self
             .sftp
             .read_dir(remote_path)
@@ -1035,7 +1035,8 @@ impl Transport for SftpTransport {
                 attrs.permissions,
             ));
         }
-        Ok(out)
+        // Structured replies: every entry is read.
+        Ok(super::Listing::complete(out))
     }
 
     async fn download(
@@ -2372,7 +2373,8 @@ mod integration {
 
         let entries = with_timeout(transport.list("/"), "list after the preview")
             .await
-            .expect("the connection must still serve a listing");
+            .expect("the connection must still serve a listing")
+            .entries;
         let mut names: Vec<_> = entries.iter().map(|e| e.display_name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(names, ["big.bin", "small.txt"]);

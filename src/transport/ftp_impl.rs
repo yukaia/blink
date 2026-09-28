@@ -48,7 +48,7 @@ macro_rules! delegate_ftp_transport {
             async fn list(
                 &mut self,
                 remote_path: &str,
-            ) -> $crate::error::Result<Vec<$crate::transport::RemoteEntry>> {
+            ) -> $crate::error::Result<$crate::transport::Listing> {
                 self.begin_call().await?;
                 let result =
                     $crate::transport::ftp_impl::ftp_list(&mut self.stream, remote_path).await;
@@ -299,7 +299,7 @@ where
 pub async fn ftp_list<T: TokioTlsStream + Send>(
     stream: &mut ImplAsyncFtpStream<T>,
     remote_path: &str,
-) -> Result<Vec<RemoteEntry>> {
+) -> Result<crate::transport::Listing> {
     check_ftp_path("list", remote_path)?;
     let lines = timed_ftp("list", remote_path, stream.list(Some(remote_path))).await?;
 
@@ -350,8 +350,9 @@ pub async fn ftp_list<T: TokioTlsStream + Send>(
     // One line per call, not one per skipped line: against a server whose
     // LIST format neither parser accepts, *every* line is unparsable, and
     // this runs on every interactive navigation — a per-line warn would
-    // bury the log under one keystroke. Silence was worse still: the pane
-    // just came up empty with nothing anywhere saying why.
+    // bury the log under one keystroke. The count also goes back with the
+    // listing, which is how the user hears of it; this line is for the
+    // debug log.
     if skipped > 0 {
         tracing::warn!(
             path = %remote_path,
@@ -360,7 +361,10 @@ pub async fn ftp_list<T: TokioTlsStream + Send>(
             "skipped unparsable listing lines",
         );
     }
-    Ok(out)
+    Ok(crate::transport::Listing {
+        entries: out,
+        unreadable: skipped,
+    })
 }
 
 pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
@@ -1344,7 +1348,11 @@ mod integration {
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
-        let mut entries = transport.list("/pub").await.expect("list should succeed");
+        let mut entries = transport
+            .list("/pub")
+            .await
+            .expect("list should succeed")
+            .entries;
         entries.sort_by(|a, b| a.raw_name.cmp(&b.raw_name));
 
         let names: Vec<&str> = entries.iter().map(|e| e.raw_name.as_str()).collect();
@@ -2207,6 +2215,31 @@ mod integration {
     /// it falls through to the MLSX parsers, which split on `;` and name the
     /// file the last token, so any non-empty line parses. `ftp_list` calls the
     /// LIST parsers directly instead, and an unparsable line is skipped.
+    /// Skipping a line it cannot parse is right; saying nothing about it was
+    /// not. The listing carries the count so the caller can tell the user.
+    #[tokio::test]
+    async fn an_unparsable_listing_line_is_counted() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/a.txt".to_string(), b"x".to_vec());
+        let faults = Faults {
+            unparsable_list_line: true,
+            ..Faults::default()
+        };
+        let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let listing = transport
+            .list("/")
+            .await
+            .expect("the listing itself succeeds");
+        assert!(listing.entries.is_empty());
+        assert_eq!(listing.unreadable, 1, "the garbage line is counted");
+    }
+
     #[tokio::test]
     async fn an_unparsable_listing_line_becomes_no_entry_at_all() {
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
@@ -2225,7 +2258,7 @@ mod integration {
 
         // Either an error or an empty listing is acceptable — a panic is not,
         // and neither is a garbage entry addressed at a nonexistent path.
-        match transport.list("/").await {
+        match transport.list("/").await.map(|l| l.entries) {
             Err(_) => {}
             Ok(entries) => assert!(
                 entries.is_empty(),
@@ -2323,7 +2356,8 @@ mod integration {
 
         let entries = with_timeout(transport.list("/"), "list after the preview")
             .await
-            .expect("the connection must still serve a listing");
+            .expect("the connection must still serve a listing")
+            .entries;
         assert_eq!(entries.len(), 2);
         let small = with_timeout(transport.read_to_bytes("/small.txt"), "second preview")
             .await
@@ -2413,7 +2447,8 @@ mod integration {
 
         let entries = with_timeout(transport.list("/"), "list after the reset")
             .await
-            .expect("the connection must still serve a listing");
+            .expect("the connection must still serve a listing")
+            .entries;
         assert_eq!(entries.len(), 2);
     }
 
@@ -2438,7 +2473,8 @@ mod integration {
     ) {
         let entries = with_timeout(transport.list("/"), "list after the break")
             .await
-            .expect("the connection must serve the next listing");
+            .expect("the connection must serve the next listing")
+            .entries;
         assert_eq!(entries.len(), 2);
         let small = with_timeout(transport.read_to_bytes("/small.txt"), "next preview")
             .await

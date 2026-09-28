@@ -31,6 +31,15 @@ the git history for those.
 
 ### Fixed
 
+- **FTP listing lines blink can't read are no longer skipped silently.** A
+  server whose directory listing lines match neither the POSIX nor the DOS
+  format had them dropped with a warning only in the debug log, discarded
+  by default: the pane came up short, or empty, with no reason given — and
+  a recursive download quietly missed those entries while reporting
+  success. The log pane now says how many entries of a directory couldn't
+  be read (once, not on every refresh), and a download batch says how many
+  it had to leave out.
+
 - **A download can no longer resume from another server's partial file.**
   The resume record held only the remote path and size, so two servers —
   or two accounts on one — with a file at the same path and size,
