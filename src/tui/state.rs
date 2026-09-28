@@ -68,6 +68,11 @@ pub struct PaneState {
     /// subset; otherwise it's the full list.
     pub entries: Vec<PaneEntry>,
     pub cursor: usize,
+    /// The first entry the pane showed when last drawn. The window only
+    /// scrolls when the cursor leaves it — see [`scrolled_window`] — so a
+    /// click on row `r` means entry `view_offset + r`. A `Cell` because the
+    /// renderer, which only has `&App`, is what updates it.
+    pub view_offset: std::cell::Cell<usize>,
     /// Active substring filter, if any. Case-insensitive match against
     /// `entry.display_name` — the user filters on what they can read. The
     /// `..` parent entry is always retained so the user can
@@ -96,6 +101,7 @@ impl PaneState {
             path: String::new(),
             entries: Vec::new(),
             cursor: 0,
+            view_offset: std::cell::Cell::new(0),
             filter: None,
             all_entries: None,
             selected: std::collections::HashSet::new(),
@@ -248,6 +254,32 @@ impl PaneState {
             self.cursor = self.entries.len() - 1;
         }
     }
+}
+
+/// The entries a list `height` rows tall shows, given the first one it
+/// showed last time (`offset`) and where the cursor is.
+///
+/// The window keeps its place while the cursor stays inside it and scrolls
+/// just far enough to show the cursor when it leaves. A list that shrank is
+/// pulled up so no empty rows sit below its end.
+pub fn scrolled_window(
+    offset: usize,
+    cursor: usize,
+    len: usize,
+    height: usize,
+) -> std::ops::Range<usize> {
+    if len == 0 || height == 0 {
+        return 0..0;
+    }
+    let cursor = cursor.min(len - 1);
+    let mut start = offset.min(len.saturating_sub(height));
+    if cursor < start {
+        start = cursor;
+    }
+    if cursor >= start + height {
+        start = cursor + 1 - height;
+    }
+    start..(start + height).min(len)
 }
 
 #[cfg(test)]
@@ -429,6 +461,49 @@ mod pane_tests {
         p.toggle_selected();
         p.clear_selection();
         assert_eq!(p.selected_count(), 0);
+    }
+
+    // -- scrolled_window ------------------------------------------------------
+    //
+    // The window used to be a function of the cursor alone, so any move
+    // past the first screenful shifted the whole list. A click moves the
+    // cursor; with that window the clicked row jumped away and a
+    // double-click could never land twice on one entry.
+
+    use super::scrolled_window;
+
+    #[test]
+    fn the_window_stays_put_while_the_cursor_moves_inside_it() {
+        assert_eq!(scrolled_window(10, 15, 100, 10), 10..20);
+        assert_eq!(scrolled_window(10, 10, 100, 10), 10..20);
+        assert_eq!(scrolled_window(10, 19, 100, 10), 10..20);
+    }
+
+    #[test]
+    fn the_window_scrolls_just_enough_when_the_cursor_leaves_it() {
+        assert_eq!(
+            scrolled_window(10, 20, 100, 10),
+            11..21,
+            "one past the bottom"
+        );
+        assert_eq!(scrolled_window(10, 9, 100, 10), 9..19, "one past the top");
+        assert_eq!(scrolled_window(0, 50, 100, 10), 41..51, "a jump");
+    }
+
+    #[test]
+    fn the_window_clamps_when_the_list_shrinks() {
+        assert_eq!(scrolled_window(50, 3, 5, 10), 0..5, "fits entirely");
+        assert_eq!(
+            scrolled_window(90, 19, 20, 10),
+            10..20,
+            "no empty rows below"
+        );
+    }
+
+    #[test]
+    fn an_empty_list_or_pane_shows_nothing() {
+        assert_eq!(scrolled_window(0, 0, 0, 10), 0..0);
+        assert_eq!(scrolled_window(0, 0, 10, 0), 0..0);
     }
 }
 
