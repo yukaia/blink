@@ -1249,6 +1249,17 @@ mod tests {
         assert_eq!(s.remote_dir, "/srv/www");
     }
 
+    /// The README's session example, copied as is, must load. See the same
+    /// test for `config.ini`: inline `; notes` are read as part of values.
+    #[test]
+    fn the_readme_session_example_loads() {
+        let body =
+            crate::config::tests::readme_ini_block("### `sessions/<name>.ini` — per session");
+        let s = load_written("readme", &body).expect("the documented example must load");
+        assert_eq!(s.protocol, Protocol::Sftp);
+        assert_eq!(s.port, 22);
+    }
+
     /// A minimal session file carrying one `[transfer] parallel_downloads`
     /// value, loaded back.
     fn parallel_from(tag: &str, value: &str) -> Option<u8> {

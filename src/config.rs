@@ -7,9 +7,14 @@
 //! confirm_quit = true
 //!
 //! [terminal]
-//! image_preview = auto    ; auto | kitty | sixel | iterm2 | none
-//! mouse = true            ; false: no mouse capture, the terminal's own selection
+//! ; auto | kitty | sixel | iterm2 | none
+//! image_preview = auto
+//! ; false: no mouse capture, the terminal's own selection
+//! mouse = true
 //! ```
+//!
+//! rust-ini is built without inline comments: a `;` after a value is part
+//! of the value, so comments go on lines of their own.
 
 use std::fs;
 use std::path::Path;
@@ -268,7 +273,7 @@ fn parse_bool(s: &str) -> Result<bool> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // -- mouse ------------------------------------------------------------------
@@ -281,6 +286,27 @@ mod tests {
         let cfg = Config::load_from(&path);
         let _ = std::fs::remove_dir_all(&dir);
         cfg
+    }
+
+    /// The first ```ini block after `heading` in the README.
+    pub(crate) fn readme_ini_block(heading: &str) -> String {
+        let readme = include_str!("../README.md");
+        let after = &readme[readme.find(heading).expect("heading in README")..];
+        let start = after.find("```ini\n").expect("an ini block") + "```ini\n".len();
+        let len = after[start..].find("```").expect("the block ends");
+        after[start..start + len].to_string()
+    }
+
+    /// Someone copying the README's example must get a blink that starts.
+    /// rust-ini is built without inline comments, so `key = value ; note`
+    /// reads the note as part of the value: `mouse = true ; …` was not a
+    /// boolean, and `Config::load` refused to start.
+    #[test]
+    fn the_readme_config_example_loads() {
+        let cfg = load_str("readme", &readme_ini_block("### `config.ini` — global"))
+            .expect("the documented example must load");
+        assert_eq!(cfg.general.theme, "dracula");
+        assert!(cfg.terminal.mouse);
     }
 
     #[test]

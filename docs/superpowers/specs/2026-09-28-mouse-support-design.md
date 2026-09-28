@@ -128,8 +128,9 @@ Enter does; the wheel moves the selection.
 ```ini
 [terminal]
 image_preview = auto
-mouse = true        ; false leaves mouse capture off: the terminal's own
-                    ; text selection works, and blink ignores the mouse
+; false leaves mouse capture off: the terminal's own text selection works,
+; and blink ignores the mouse
+mouse = true
 ```
 
 Parsed with the existing `parse_bool`; absent means `true`. `Config::save`

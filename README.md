@@ -397,15 +397,22 @@ connects can't write duplicate or interleaved lines.
 
 ```ini
 [general]
-theme = dracula             ; one of the seven built-ins, or a user theme
-parallel_downloads = 2      ; default; sessions can override (max 10)
+; one of the seven built-ins, or a user theme
+theme = dracula
+; default; sessions can override (max 10)
+parallel_downloads = 2
 confirm_quit = true
 
 [terminal]
-image_preview = auto        ; auto | kitty | sixel | iterm2 | none
-mouse = true                ; false: no mouse capture — the terminal's own
-                            ; text selection works, and blink ignores the mouse
+; auto | kitty | sixel | iterm2 | none
+image_preview = auto
+; false: no mouse capture — the terminal's own text selection works, and
+; blink ignores the mouse
+mouse = true
 ```
+
+Comments go on lines of their own: a `;` after a value is read as part of
+the value.
 
 An out-of-range `parallel_downloads` — `0`, or anything above the maximum —
 is clamped into range rather than rejected, in `config.ini` and in the
@@ -420,32 +427,37 @@ back to the global setting rather than locking you out of that host.
 ```ini
 [session]
 name = production
-protocol = sftp             ; sftp | scp | ftp | ftps
+; sftp | scp | ftp | ftps
+protocol = sftp
 host = prod.example.com
 port = 22
 username = me
 remote_dir = /var/www
-local_dir = ~/work/prod     ; optional override; ~ expands
+; optional override; ~ expands
+local_dir = ~/work/prod
 
 [auth]
-method = key                ; password | key | agent
-key_path = ~/.ssh/id_ed25519
+; password | key | agent
+method = key
+; an absolute path
+key_path = /home/me/.ssh/id_ed25519
 
 [transfer]
-parallel_downloads = 4      ; optional override
+; optional override
+parallel_downloads = 4
 
 [appearance]
-theme = tokyo-night         ; optional override
+; optional override
+theme = tokyo-night
 
 [tls]
-accept_invalid_certs = false  ; FTPS only; default false. true switches
-                              ; from CA-chain validation to TOFU pinning:
-                              ; hostname is still verified, the handshake
-                              ; signature is still verified, and the
-                              ; cert SHA-256 is pinned on first connect.
-cert_sha256 = abc123…         ; auto-populated by the TOFU pin above; do
-                              ; not edit by hand. Clear it (delete the
-                              ; line) if the legitimate cert rotates.
+; FTPS only; default false. true switches from CA-chain validation to TOFU
+; pinning: the hostname is still verified, the handshake signature is still
+; verified, and the cert SHA-256 is pinned on first connect.
+accept_invalid_certs = false
+; With accept_invalid_certs = true, blink adds the pinned certificate's
+; SHA-256 here on the first connect, as cert_sha256 = <64 hex digits>. Do not
+; edit it by hand; delete the line if the legitimate certificate rotates.
 ```
 
 Passwords are never written to disk; in-memory copies are wiped with
