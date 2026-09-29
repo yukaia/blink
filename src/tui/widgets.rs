@@ -196,6 +196,7 @@ pub mod bottom_pane {
     use crate::tui::app::{BottomPane, LogLevel};
 
     pub fn render(f: &mut Frame, app: &App, area: Rect) {
+        app.hit.bottom_pane.set(Some(area));
         let focused = matches!(app.active_pane, Pane::Transfers | Pane::Log);
         let border_color = if focused {
             app.theme.border_active

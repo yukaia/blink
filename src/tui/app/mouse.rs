@@ -118,6 +118,16 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+        // Anywhere else in the bottom pane — the log, empty space, the
+        // border — a click focuses the page it is showing, as a click
+        // anywhere in a file pane focuses that pane.
+        if left && row_in(self.hit.bottom_pane.get(), col, row).is_some() {
+            self.active_pane = match self.bottom_pane {
+                BottomPane::Transfers => Pane::Transfers,
+                BottomPane::Log => Pane::Log,
+            };
         }
     }
 
@@ -693,5 +703,24 @@ mod tests {
             "the moved cursor must be visible"
         );
         assert_eq!(a.transfer_cursor, 3);
+    }
+
+    /// A file pane focuses on a click anywhere in it; the bottom pane only
+    /// answered on its tabs and transfer rows, so a click into the log or
+    /// on the border did nothing.
+    #[test]
+    fn a_click_anywhere_in_the_bottom_pane_focuses_the_page_it_shows() {
+        let mut a = app_on_main(0);
+        a.bottom_pane = BottomPane::Log;
+        a.active_pane = Pane::Local;
+        draw(&a);
+        let pane = a.hit.bottom_pane.get().unwrap();
+        a.handle_mouse_at(press(pane.x + pane.width / 2, pane.y + 3), Instant::now());
+        assert_eq!(a.active_pane, Pane::Log, "a click in the log body");
+
+        a.active_pane = Pane::Local;
+        a.handle_mouse_at(press(pane.x, pane.y + 3), Instant::now());
+        assert_eq!(a.active_pane, Pane::Log, "a click on the border");
+        assert_eq!(a.bottom_pane, BottomPane::Log, "the page shown stays");
     }
 }
