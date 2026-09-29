@@ -104,15 +104,17 @@ impl App {
             return;
         }
         if let Some(r) = row_in(self.hit.transfer_list.get(), col, row) {
+            // Any gesture here focuses the bottom pane, the wheel included:
+            // the transfer cursor is only drawn while it is focused, so
+            // moving it unfocused would move a highlight nobody can see —
+            // and what `c` would cancel.
+            self.bottom_pane = BottomPane::Transfers;
+            self.active_pane = Pane::Transfers;
             match m.kind {
                 MouseEventKind::ScrollUp => self.move_transfer_cursor(-WHEEL_STEP),
                 MouseEventKind::ScrollDown => self.move_transfer_cursor(WHEEL_STEP),
-                MouseEventKind::Down(MouseButton::Left) => {
-                    self.bottom_pane = BottomPane::Transfers;
-                    self.active_pane = Pane::Transfers;
-                    if r < self.active_jobs().len() {
-                        self.transfer_cursor = r;
-                    }
+                MouseEventKind::Down(MouseButton::Left) if r < self.active_jobs().len() => {
+                    self.transfer_cursor = r;
                 }
                 _ => {}
             }
@@ -665,5 +667,31 @@ mod tests {
         let (c, r) = local_row(&a, 3);
         a.handle_mouse_at(press(c, r), Instant::now());
         assert_eq!(a.local.cursor, before, "a row past the end moves nothing");
+    }
+
+    /// The transfer cursor is only drawn while the bottom pane is focused.
+    /// A wheel that moved it with a file pane focused moved an invisible
+    /// highlight — and what `c` would cancel. It focuses the pane instead.
+    #[test]
+    fn the_wheel_over_the_transfer_list_focuses_it() {
+        let mut a = app_on_main(0);
+        let m = crate::transfer::TransferManager::new(4).0;
+        for i in 0..5 {
+            m.enqueue_download(format!("/r/{i}"), format!("/l/{i}").into())
+                .unwrap();
+            m.take_next_pending().unwrap();
+        }
+        a.transfer_manager = Some(m);
+        a.bottom_pane = BottomPane::Transfers;
+        a.active_pane = Pane::Local;
+        draw(&a);
+        let list = a.hit.transfer_list.get().unwrap();
+        a.handle_mouse_at(wheel(true, list.x + 2, list.y), Instant::now());
+        assert_eq!(
+            a.active_pane,
+            Pane::Transfers,
+            "the moved cursor must be visible"
+        );
+        assert_eq!(a.transfer_cursor, 3);
     }
 }
