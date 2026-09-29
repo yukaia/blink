@@ -294,11 +294,9 @@ mod tests {
         draw(&a);
         let (c, r) = local_row(&a, 0);
         a.handle_mouse_at(press(c, r), Instant::now());
-        let e = &a.local.entries[a.local.cursor];
-        assert!(
-            e.raw_name == ".." || e.raw_name.contains('7'),
-            "{}",
-            e.raw_name
+        assert_eq!(
+            a.local.entries[a.local.cursor].raw_name, "file007",
+            "row 0 of the filtered list, not of the full one (file000)",
         );
     }
 
@@ -483,12 +481,28 @@ mod tests {
             PaneEntry::new("f".into(), false, 1),
         ]);
         draw(&a);
+        let mut rx = a.app_event_rx.take().unwrap();
         let (c, r) = local_row(&a, 0);
         let t = Instant::now();
         a.handle_mouse_at(press(c, r), t);
         a.handle_mouse_at(press(c, r), t + Duration::from_millis(100));
         assert_eq!(a.local.path, "/tmp");
-        assert_eq!(a.transfer_manager.as_ref().unwrap().queue_counts(), (0, 0));
+        // A transfer would show as the walk it starts reporting back.
+        // Entering the directory posts a listing, so watch every event for
+        // a while and fail on a walk.
+        let watch = tokio::time::sleep(Duration::from_millis(300));
+        tokio::pin!(watch);
+        loop {
+            tokio::select! {
+                () = &mut watch => break,
+                Some(ev) = rx.recv() => {
+                    assert!(
+                        !matches!(ev, AppEvent::WalkComplete { .. } | AppEvent::WalkFailed { .. }),
+                        "`..` must never be transferred",
+                    );
+                }
+            }
+        }
     }
 
     use crate::session::Session;
@@ -620,5 +634,36 @@ mod tests {
         a.handle_mouse_at(press(c, r), t + Duration::from_millis(150));
         assert_eq!(a.local.path, "/tmp", "two single clicks, not a double");
         assert_eq!(a.local.cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn a_click_on_the_footer_focuses_without_moving_the_cursor() {
+        let mut a = app_on_main(10);
+        a.active_pane = Pane::Remote;
+        a.local.cursor = 5;
+        draw(&a);
+        let list = a.hit.local_list.get().unwrap();
+        a.handle_mouse_at(press(list.x + 2, list.y + list.height), Instant::now());
+        assert_eq!(a.active_pane, Pane::Local);
+        assert_eq!(a.local.cursor, 5);
+    }
+
+    /// The pane was scrolled well down when drawn; a refresh then left a
+    /// short listing. Row 3 of the old window is past its end.
+    #[tokio::test]
+    async fn a_click_after_a_scrolled_listing_shrank_hits_nothing() {
+        let mut a = app_on_main(200);
+        a.local.cursor = 150;
+        draw(&a);
+        assert!(a.local.view_offset.get() > 0, "the pane was scrolled");
+        a.local.set_entries(
+            (0..5)
+                .map(|i| PaneEntry::new(format!("n{i}"), false, 1))
+                .collect(),
+        );
+        let before = a.local.cursor;
+        let (c, r) = local_row(&a, 3);
+        a.handle_mouse_at(press(c, r), Instant::now());
+        assert_eq!(a.local.cursor, before, "a row past the end moves nothing");
     }
 }
