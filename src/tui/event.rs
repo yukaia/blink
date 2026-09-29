@@ -9,7 +9,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use crossterm::event::{
     Event as CrosstermEvent, EventStream as CrosstermEventStream, KeyEvent, KeyEventKind,
-    MouseButton, MouseEvent, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -255,13 +255,19 @@ impl EventStream {
 /// The mouse events blink acts on: a left press and the wheel. Capture
 /// reports every movement too; dropping the rest here keeps them from
 /// waking the run loop into a redraw each.
+///
+/// A press with Ctrl or Alt held is dropped too, keeping those gestures free
+/// for a future selection feature instead of acting as a plain click. Shift
+/// is left alone: terminals use it to bypass capture for their own text
+/// selection, so a Shift-click seldom reaches blink at all.
 fn wanted_mouse(m: &MouseEvent) -> bool {
-    matches!(
-        m.kind,
-        MouseEventKind::Down(MouseButton::Left)
-            | MouseEventKind::ScrollUp
-            | MouseEventKind::ScrollDown
-    )
+    match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => !m
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT),
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => true,
+        _ => false,
+    }
 }
 
 /// Drop every immediately-available [`TransferEvent::Progress`] from `app`,
@@ -290,6 +296,31 @@ fn drain_progress(app: &mut mpsc::UnboundedReceiver<AppEvent>) -> Option<AppEven
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ctrl- and Alt-clicks are kept free for a future selection gesture:
+    /// until then they do nothing, rather than act as a plain click.
+    #[test]
+    fn a_press_with_ctrl_or_alt_held_is_not_wanted() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let ev = |kind, modifiers| MouseEvent {
+            kind,
+            column: 0,
+            row: 0,
+            modifiers,
+        };
+        let left = MouseEventKind::Down(MouseButton::Left);
+        for m in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ] {
+            assert!(!wanted_mouse(&ev(left, m)), "{m:?}-click");
+        }
+        assert!(
+            wanted_mouse(&ev(MouseEventKind::ScrollDown, KeyModifiers::CONTROL)),
+            "the wheel still works whatever is held",
+        );
+    }
 
     #[test]
     fn only_left_presses_and_the_wheel_are_wanted() {

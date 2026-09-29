@@ -540,11 +540,12 @@ off and leaves the terminal's own text selection alone.
 - **Scroll wheel** moves the cursor in the pane under the mouse, the
   transfer list, and the session list, and scrolls the viewer.
 - **Click** the TRANSFERS / LOG tabs to switch them, and a transfer to select
-  it. In the session selector, click a session to select it and
-  double-click to connect.
+  it; a click anywhere else in the bottom pane focuses it, and so does the
+  wheel over the transfer list. In the session selector, click a session to
+  select it and double-click to connect.
 
-Prompts and modals ignore the mouse. With capture on, most terminals need
-Shift held to select text.
+Prompts and modals ignore the mouse, and so do clicks with Ctrl or Alt held.
+With capture on, most terminals need Shift held to select text.
 
 ## Supported viewer formats
 

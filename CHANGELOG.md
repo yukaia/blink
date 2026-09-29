@@ -16,6 +16,7 @@ the git history for those.
   wheel moves the cursor in the file panes, the transfer list and the
   session list, and scrolls the viewer; the bottom pane's tabs and
   transfers respond to clicks, and a session double-clicked connects.
+  Clicks with Ctrl or Alt held are ignored, kept free for later.
   `mouse = false` under `[terminal]` in `config.ini` turns it off, leaving
   mouse capture off so the terminal's own text selection works. File panes
   now keep their scroll position while the cursor stays in view, instead

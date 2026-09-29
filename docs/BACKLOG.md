@@ -47,27 +47,3 @@ stays correct, but the `map_ftp` doc comment in `error_map.rs` that says
 suppaftp reports a closed connection as `BadResponse` needs rewording, and
 `a_dropped_control_connection_is_followed_by_a_reconnect` then passes
 through `ConnectionError` instead.
-
-## Mouse support: follow-ups from its review
-
-Found by the whole-branch review of mouse support (2026-09-28); all minor.
-
-- **Two tests are weaker than their names.** In `src/tui/app/mouse.rs`,
-  `double_clicking_the_parent_row_goes_up_and_transfers_nothing` checks
-  `queue_counts()` straight after the clicks, but an upload only reaches the
-  queue after its walk reports, so the check can't fail. And
-  `a_click_with_a_filter_lands_on_the_filtered_entry_drawn_there` accepts
-  any name containing `7` where it should require `file007`.
-- **The wheel over the transfer list moves a highlight nobody can see.**
-  The transfer cursor is only drawn while the bottom pane is focused
-  (`render_transfers`), but the wheel moves it with a file pane focused,
-  so after Tab the cursor, and what `c` cancels, is not where it was left.
-- **Clicking the LOG body or the bottom pane's border does nothing.** A
-  file pane focuses on a click anywhere in it; the bottom pane only
-  answers on its tabs and transfer rows.
-- **Two gestures have no test:** a click on a file pane's footer line, and
-  a click after the listing shrank while the pane was scrolled (offset
-  above zero). Both paths are correct by construction today.
-- **Ctrl- and Alt-clicks act as plain clicks.** `wanted_mouse` ignores
-  modifiers, so they move the cursor and can complete a double-click. A
-  future selection gesture would need them free.
