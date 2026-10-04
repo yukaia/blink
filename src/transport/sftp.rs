@@ -1605,7 +1605,7 @@ mod integration {
                 session.channel_success(id)?;
                 let sftp = SftpServer {
                     store: self.store.clone(),
-                    drained: std::collections::HashSet::new(),
+                    listings: std::collections::HashMap::new(),
                 };
                 // Spawn instead of awaiting: blink opens a second channel for
                 // the pipelined transfer session, and awaiting the sftp loop
@@ -1622,12 +1622,18 @@ mod integration {
 
     struct SftpServer {
         store: Store,
-        /// Directory handles already drained. SFTP has no "no more entries"
-        /// field: `readdir` is called repeatedly and signals the end by
-        /// returning `Eof`, so the server has to remember which handles it
-        /// has already answered.
-        drained: std::collections::HashSet<String>,
+        /// What each open directory handle has left to send. SFTP has no "no
+        /// more entries" field: `readdir` is called repeatedly and signals
+        /// the end by returning `Eof`, so the server has to remember how far
+        /// it got. The listing is taken on the first `readdir` and handed out
+        /// [`READDIR_BATCH`] entries at a time.
+        listings: std::collections::HashMap<String, std::vec::IntoIter<(String, bool)>>,
     }
+
+    /// Entries per `readdir` reply, as OpenSSH's server sends. One reply for
+    /// a whole large directory would be one packet past the 256 KiB russh-sftp
+    /// accepts since 3.0.1, which no real server sends.
+    const READDIR_BATCH: usize = 100;
 
     /// POSIX mode bits for the two kinds this store can hold. `FileAttributes`
     /// derives `is_dir` from these, and `is_dir` is what the client's walk
@@ -1769,7 +1775,7 @@ mod integration {
             // Namespaced so a directory handle cannot be mistaken for the
             // file handle of the same path, which `fstat` would size.
             let handle = format!("dir:{key}");
-            self.drained.remove(&handle);
+            self.listings.remove(&handle);
             Ok(SftpHandle { id, handle })
         }
 
@@ -1778,14 +1784,19 @@ mod integration {
             id: u32,
             handle: String,
         ) -> Result<russh_sftp::protocol::Name, Self::Error> {
-            if !self.drained.insert(handle.clone()) {
+            if !self.listings.contains_key(&handle) {
+                let Some(dir) = handle.strip_prefix("dir:") else {
+                    return Err(StatusCode::Failure);
+                };
+                let children = children_of(&*self.store.lock().await, dir);
+                self.listings.insert(handle.clone(), children.into_iter());
+            }
+            let remaining = self.listings.get_mut(&handle).expect("inserted above");
+            let batch: Vec<_> = remaining.by_ref().take(READDIR_BATCH).collect();
+            if batch.is_empty() {
                 return Err(StatusCode::Eof);
             }
-            let Some(dir) = handle.strip_prefix("dir:") else {
-                return Err(StatusCode::Failure);
-            };
-            let store = self.store.lock().await;
-            let files = children_of(&store, dir)
+            let files = batch
                 .into_iter()
                 .map(|(name, is_dir)| {
                     russh_sftp::protocol::File::new(
