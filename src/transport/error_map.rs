@@ -52,11 +52,12 @@ pub fn map_sftp(op: &str, path: &str, err: SftpError) -> BlinkError {
 ///
 /// - `ConnectionError(_)` / `SecureError(_)` → [`BlinkError::Disconnected`]
 /// - `BadResponse` and `UnexpectedResponse(421 NotAvailable)` →
-///   [`BlinkError::Disconnected`]. suppaftp reports a control connection
-///   the server closed before replying as `BadResponse`, not as a
-///   `ConnectionError`; and 421 is how a server says it is about to close
-///   it, often for idle time. Either way the connection is gone, and a
-///   reply that cannot be parsed leaves it out of step all the same.
+///   [`BlinkError::Disconnected`]. A reply that cannot be parsed leaves
+///   the control connection out of step, so it is as good as gone; and
+///   421 is how a server says it is about to close it, often for idle
+///   time. (A connection the server closed before replying comes back as
+///   `ConnectionError`; before suppaftp 12.1.1 it came back as
+///   `BadResponse`.)
 /// - `UnexpectedResponse(550 FileUnavailable)` → [`BlinkError::NotFound`].
 ///   FTP overloads 550 for "file not found" and "no access" — the
 ///   former is the dominant interpretation across server

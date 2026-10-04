@@ -2517,7 +2517,9 @@ mod integration {
     }
 
     /// A control connection the server closed is gone for good; the next
-    /// call reconnects rather than failing on the dead socket.
+    /// call reconnects rather than failing on the dead socket. suppaftp
+    /// reports the close as `ConnectionError(UnexpectedEof)` (12.1.1 on;
+    /// before that, `BadResponse`).
     #[tokio::test]
     async fn a_dropped_control_connection_is_followed_by_a_reconnect() {
         let faults = Faults::default();
