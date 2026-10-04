@@ -43,6 +43,18 @@ the git history for those.
   now keep their scroll position while the cursor stays in view, instead
   of shifting with every move.
 
+### Fixed
+
+- **A session whose name or path would not survive saving is refused, with
+  the reason.** The session file format reads a value that opens with a
+  quote as a quoted string, and trims spaces at either end, so such a
+  value came back changed. A session named `"prod"` reloaded as `prod`,
+  and since the file is named after the session, deleting or renaming it
+  then missed the file it was really in. Saving now refuses a name, host,
+  user, remote or local directory, or key path that starts with a quote or
+  starts or ends with whitespace, instead of writing one that loads as
+  something else. Session files written by hand load as before.
+
 ## [0.8.2] — 2026-09-28
 
 ### Changed

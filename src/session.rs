@@ -246,6 +246,20 @@ impl Session {
         validate_network_field("host", &self.host)?;
         validate_network_field("username", &self.username)?;
         validate_network_field("remote_dir", &self.remote_dir)?;
+        for (field, value) in [
+            ("name", self.name.as_str()),
+            ("host", &self.host),
+            ("username", &self.username),
+            ("remote_dir", &self.remote_dir),
+        ] {
+            validate_ini_round_trip("session", field, value)?;
+        }
+        if let Some(local) = &self.local_dir {
+            validate_ini_round_trip("session", "local_dir", &local.to_string_lossy())?;
+        }
+        if let AuthMethod::Key { path } = &self.auth {
+            validate_ini_round_trip("auth", "key_path", &path.to_string_lossy())?;
+        }
 
         if let Some(local) = &self.local_dir {
             let raw = local.to_string_lossy();
@@ -817,6 +831,30 @@ fn validate_network_field(field: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a value the INI parser would read back as something else.
+///
+/// rust-ini reads a value that opens with `"` or `'` as a quoted string,
+/// dropping the quotes, and trims whitespace from both ends of an unquoted
+/// one. No escape policy of its writer covers either, so such a value saved
+/// as is loads changed — and a changed `name` no longer matches the file it
+/// was saved under, so deleting or renaming the session misses that file.
+/// Refusing it is what keeps [`Session::validate`]'s promise that a saved
+/// session reads back as written. Only `save` checks this: files written by
+/// hand load as they always did.
+fn validate_ini_round_trip(section: &str, field: &str, value: &str) -> Result<()> {
+    if value.starts_with(['"', '\'']) {
+        return Err(BlinkError::config(format!(
+            "{section}.{field} must not start with a quote"
+        )));
+    }
+    if value.trim() != value {
+        return Err(BlinkError::config(format!(
+            "{section}.{field} must not start or end with whitespace"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1184,6 +1222,95 @@ mod tests {
             s.parallel_downloads = Some(ok);
             assert!(s.validate().is_ok(), "{ok} should be accepted");
         }
+    }
+
+    /// The INI parser reads a value that opens with a quote as a quoted
+    /// string, and trims whitespace at either end, so such values came back
+    /// changed: a session named `"prod"` loaded as `prod`, whose file name no
+    /// longer matched, so deleting or renaming it missed the real file.
+    /// Every value `validate` accepts must load back exactly as saved; the
+    /// rest must be refused before anything is written.
+    #[test]
+    fn every_value_validate_accepts_loads_back_as_saved() {
+        type Set = fn(&mut Session, &str);
+        let fields: [(&str, Set); 6] = [
+            ("name", |s, v| s.name = v.into()),
+            ("host", |s, v| s.host = v.into()),
+            ("username", |s, v| s.username = v.into()),
+            ("remote_dir", |s, v| s.remote_dir = format!("/srv/{v}")),
+            ("local_dir", |s, v| {
+                s.local_dir = Some(format!("/home/me/{v}").into())
+            }),
+            ("key_path", |s, v| {
+                s.auth = AuthMethod::Key {
+                    path: format!("/home/me/{v}").into(),
+                }
+            }),
+        ];
+        let values = [
+            "plain",
+            "\"quoted\"",
+            "'single'",
+            "\"open",
+            "a\"b",
+            " lead",
+            "trail ",
+            "\ttab",
+            "semi;colon",
+            "#hash",
+            "back\\slash",
+            "it's",
+        ];
+        let mut refused = 0;
+        for (field, set) in fields {
+            for value in values {
+                let _home = crate::paths::test_home();
+                let mut s = valid();
+                // `remote_dir` and the paths carry the value after a prefix,
+                // so the leading cases are covered by `name` and friends.
+                set(&mut s, value);
+                if s.validate().is_err() {
+                    refused += 1;
+                    assert!(
+                        s.save().is_err(),
+                        "{field} = {value:?}: save must refuse too"
+                    );
+                    continue;
+                }
+                s.save()
+                    .unwrap_or_else(|e| panic!("{field} = {value:?}: save failed: {e}"));
+                let back = Session::load_from(&s.path().unwrap())
+                    .unwrap_or_else(|e| panic!("{field} = {value:?}: load failed: {e}"));
+                assert_eq!(
+                    (
+                        &back.name,
+                        &back.host,
+                        &back.username,
+                        &back.remote_dir,
+                        &back.local_dir
+                    ),
+                    (&s.name, &s.host, &s.username, &s.remote_dir, &s.local_dir),
+                    "{field} = {value:?}",
+                );
+                assert_eq!(
+                    format!("{:?}", back.auth),
+                    format!("{:?}", s.auth),
+                    "{field} = {value:?}"
+                );
+            }
+        }
+        assert!(refused > 0, "the quoted and padded cases must be refused");
+    }
+
+    #[test]
+    fn a_name_in_quotes_is_refused_with_the_reason() {
+        let mut s = valid();
+        s.name = "\"prod\"".into();
+        let err = s.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("session.name") && err.contains("quote"),
+            "{err}"
+        );
     }
 
     const MAX_PARALLEL_FOR_TEST: u8 = crate::config::MAX_PARALLEL;
