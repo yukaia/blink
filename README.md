@@ -704,6 +704,12 @@ terminal. The following properties are enforced in the current codebase.
   caution in the session selector. FTPS no longer shares that colour, having
   previously been shown with the same caution as plain FTP despite being
   encrypted.
+- **FTP data connections go to the server, wherever PASV points.** A
+  `227` reply names an address as well as a port, and the server chooses
+  it — so a hostile one could aim the data connection at any host, such as
+  a service on your own network that an upload would then write to. blink
+  dials the control connection's peer on the reply's port instead, as curl
+  does by default. Applies to FTP and FTPS alike.
 - **One crypto backend, not two.** `ring` serves both transports: rustls uses
   it for FTPS, and `russh` is built against it rather than its default
   `aws-lc-rs`. Compiling two backends is how the FTPS transport once came to

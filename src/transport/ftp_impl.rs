@@ -885,12 +885,16 @@ mod integration {
     /// on what was *issued*, not only on what came back.
     pub(super) type Log = Arc<Mutex<Vec<String>>>;
 
+    /// TEST-NET-1 (RFC 5737): reserved for documentation, never routed, so
+    /// a client that dials it gets no answer.
+    pub(super) const FOREIGN_PASV_IP: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 1);
+
     /// Protocol-level malformations the server emits on demand. suppaftp 10.0
     /// converted these from panic to `FtpError`; no off-the-shelf server will
     /// produce them on request, which is why this one is hand-rolled.
     ///
-    /// Every field is read: `bad_pasv_octet` and `unparsable_list_line` by
-    /// PASV/LIST below, `abrupt_close` by the abrupt-close branch of LIST,
+    /// Every field is read: `bad_pasv_octet`, `foreign_pasv_ip` and
+    /// `unparsable_list_line` by PASV/LIST below, `abrupt_close` by the abrupt-close branch of LIST,
     /// RETR and STOR/APPE alike, `hostile_listing_names` by LIST,
     /// `reset_data_after`, `stall_next_retr` and `drop_on_next_retr` by
     /// RETR, as are `trickle` and `stall_next_data_after`, `report_size` by
@@ -900,6 +904,9 @@ mod integration {
     pub(super) struct Faults {
         /// PASV reply carrying an out-of-range octet.
         pub bad_pasv_octet: bool,
+        /// PASV reply naming [`FOREIGN_PASV_IP`] rather than this server,
+        /// with the port of the data listener it really bound.
+        pub foreign_pasv_ip: bool,
         /// A LIST body no parser can turn into entries.
         pub unparsable_list_line: bool,
         /// Close control and data connections after `150`, sending no `226`.
@@ -1083,6 +1090,13 @@ mod integration {
                     pasv = Some(data_listener);
                     let reply = if faults.bad_pasv_octet {
                         "227 Entering Passive Mode (127,0,0,1,999,0)\r\n".to_string()
+                    } else if faults.foreign_pasv_ip {
+                        let [a, b, c, d] = FOREIGN_PASV_IP.octets();
+                        format!(
+                            "227 Entering Passive Mode ({a},{b},{c},{d},{},{})\r\n",
+                            port / 256,
+                            port % 256
+                        )
                     } else {
                         format!(
                             "227 Entering Passive Mode (127,0,0,1,{},{})\r\n",
@@ -2209,6 +2223,34 @@ mod integration {
             issued.iter().any(|c| c == "PASV"),
             "PASV should have been issued; commands issued: {issued:?}",
         );
+    }
+
+    /// The address in a PASV reply is the server's to choose, and a hostile
+    /// one could name any host — a service on the user's own network, which
+    /// an upload would then send its bytes to. blink connects to the control
+    /// connection's peer instead, on the port the reply gives, as curl does.
+    /// Here the reply names an unrouted address while the data listener is
+    /// on the server itself, so following the reply would time out.
+    #[tokio::test]
+    async fn a_pasv_reply_cannot_point_the_data_connection_elsewhere() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/a.txt".to_string(), b"x".to_vec());
+
+        let faults = Faults {
+            foreign_pasv_ip: true,
+            ..Faults::default()
+        };
+        let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let listing = with_timeout(transport.list("/"), "a listing over PASV")
+            .await
+            .expect("the data connection should reach the server itself");
+        assert_eq!(listing.entries.len(), 1, "{:?}", listing.entries);
     }
 
     /// A garbage body must not become an entry. `File::from_str` would let it:

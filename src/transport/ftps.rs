@@ -89,9 +89,18 @@ impl FtpsTransport {
         }
 
         let addr = format!("{}:{}", session.host, session.port);
-        let plain = AsyncRustlsFtpStream::connect(&addr)
+        let mut plain = AsyncRustlsFtpStream::connect(&addr)
             .await
             .map_err(|e| BlinkError::connect(format!("ftps connect to {addr}: {e}")))?;
+
+        // Dial the data connection at the control connection's peer, on the
+        // port the PASV reply gives, not at the address the reply names. The
+        // server picks that address, so a hostile one could aim uploads at
+        // any host it likes, such as a service on the user's own network;
+        // NAT'd servers that advertise a private address need this anyway.
+        // curl has ignored the PASV address by default since 7.74. The
+        // setting carries through `into_secure` below.
+        plain.set_passive_nat_workaround(true);
 
         // Used by the pinning verifier to publish the leaf cert hash back
         // to this function after the TLS handshake completes. Only set on

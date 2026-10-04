@@ -20,6 +20,14 @@ the git history for those.
   with a known one; a known host that presents only a type not on file is
   refused as a changed key. If a server really did retire its old key
   type, `blink known-hosts remove <host>` and reconnect.
+- **An FTP server can no longer point blink's data connections at another
+  host.** In passive mode blink connected to whatever address the server's
+  `227` reply named, so a hostile server — or, for plain FTP, anyone on
+  the path — could aim them anywhere: a service on your own network would
+  receive an upload's bytes, or be probed for open ports. blink now
+  connects to the server it is already talking to, on the port the reply
+  gives, as curl does by default. This also fixes servers behind NAT that
+  advertise a private address. Applies to FTP and FTPS alike.
 
 ### Added
 

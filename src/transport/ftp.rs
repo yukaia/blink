@@ -48,6 +48,14 @@ impl FtpTransport {
             .await
             .map_err(|e| BlinkError::connect(format!("ftp connect to {addr}: {e}")))?;
 
+        // Dial the data connection at the control connection's peer, on the
+        // port the PASV reply gives, not at the address the reply names. The
+        // server picks that address, so a hostile one could aim uploads at
+        // any host it likes, such as a service on the user's own network;
+        // NAT'd servers that advertise a private address need this anyway.
+        // curl has ignored the PASV address by default since 7.74.
+        stream.set_passive_nat_workaround(true);
+
         let (user, pw) = if session.username.is_empty() {
             ("anonymous", "anonymous@")
         } else {
