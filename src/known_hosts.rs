@@ -35,11 +35,16 @@
 //!   keytype, key)` triple.
 //! - [`KeyStatus::Changed`] — some matching line has the same `(host,
 //!   keytype)` but a different key. Hard error (possible MITM).
-//! - [`KeyStatus::Unknown`] — no matching line for the host, or only
-//!   matching lines for *different* keytypes. Ask the user.
+//! - [`KeyStatus::Changed`] too when the host has lines, but none for the
+//!   presented keytype. blink asks for the stored keytypes first (see
+//!   [`stored_key_types`]), so a server that still holds one of those keys
+//!   presents it; one that presents another type instead is what a man in
+//!   the middle without the real keys looks like. Prompting as if this were
+//!   a first connection would let one habitual "accept" hand it over.
+//! - [`KeyStatus::Unknown`] — no line for the host at all. Ask the user.
 //!
-//! In particular, a host with both `ssh-ed25519` and `ssh-rsa` entries does
-//! not flag `Changed` when only one of them is presented — that's normal
+//! A host with both `ssh-ed25519` and `ssh-rsa` entries does not flag
+//! `Changed` when only one of them is presented — that's normal
 //! multi-algorithm behaviour.
 
 use std::fs::{self, OpenOptions};
@@ -195,12 +200,15 @@ pub fn check(host: &str, port: u16, key_type: &str, key_b64: &str) -> Result<Key
 }
 
 fn check_in_str(raw: &str, host: &str, port: u16, key_type: &str, key_b64: &str) -> KeyStatus {
-    // OpenSSH semantics: keep scanning all matching lines.
+    // Keep scanning all matching lines.
     // - Any line whose (host, key_type, key_b64) all match → Trusted.
     // - Else if any line with this (host, key_type) has a different blob →
-    //   remember it as a potential Changed result.
+    //   Changed, naming that line.
+    // - Else if the host has a line of another type → Changed, naming the
+    //   first such line. See the module docs.
     // - Else → Unknown.
     let mut changed: Option<KeyStatus> = None;
+    let mut other_type: Option<KeyStatus> = None;
 
     for line in raw.lines() {
         let line = line.trim();
@@ -217,7 +225,14 @@ fn check_in_str(raw: &str, host: &str, port: u16, key_type: &str, key_b64: &str)
             continue;
         }
         if file_type != key_type {
-            // Different algorithm for the same host is normal; ignore.
+            // Normal for a host with several keys, as long as one of the
+            // presented type matches; remembered in case none does.
+            if other_type.is_none() {
+                other_type = Some(KeyStatus::Changed {
+                    stored_key_type: error::sanitize(file_type.to_string()),
+                    stored_key_b64: error::sanitize(file_b64.to_string()),
+                });
+            }
             continue;
         }
         if file_b64 == key_b64 {
@@ -233,7 +248,41 @@ fn check_in_str(raw: &str, host: &str, port: u16, key_type: &str, key_b64: &str)
         }
     }
 
-    changed.unwrap_or(KeyStatus::Unknown)
+    changed.or(other_type).unwrap_or(KeyStatus::Unknown)
+}
+
+/// The keytypes stored for `host:port`, in file order, each once.
+///
+/// The SSH client puts these first in its host-key preference, as OpenSSH
+/// does, so a server holding several keys presents one blink can check —
+/// which is what lets [`check`] treat any other type as `Changed`. A read
+/// error yields an empty list: the preference is only an ordering, and
+/// [`check`] fails closed on the same error.
+pub fn stored_key_types(host: &str, port: u16) -> Vec<String> {
+    match known_hosts_path().and_then(|p| read_bounded(&p).map_err(BlinkError::from)) {
+        Ok(raw) => stored_key_types_in_str(&raw, host, port),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn stored_key_types_in_str(raw: &str, host: &str, port: u16) -> Vec<String> {
+    let mut types: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.splitn(3, ' ');
+        let (Some(file_host), Some(file_type), Some(_)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if host_matches(file_host, host, port) && !types.iter().any(|t| t == file_type) {
+            types.push(file_type.to_string());
+        }
+    }
+    types
 }
 
 /// Append a new entry to the known-hosts file.
@@ -638,9 +687,11 @@ mod tests {
     }
 
     #[test]
-    fn multi_algorithm_host_returns_unknown_for_third_algo() {
-        // Host has ed25519 + rsa lines. Presenting ecdsa is Unknown,
-        // not Changed (no matching key_type to compare against).
+    fn a_known_host_presenting_only_a_new_algorithm_is_changed() {
+        // Host has ed25519 + rsa lines. Presenting ecdsa means the server
+        // offered none of the stored types, even though blink asks for those
+        // first — the downgrade a man in the middle without the real keys
+        // would attempt. It must read as Changed, not as a first connection.
         let raw = format!(
             "prod.example.com ssh-ed25519 {ED_KEY}\n\
              prod.example.com ssh-rsa {RSA_KEY}\n"
@@ -652,7 +703,49 @@ mod tests {
             "ecdsa-sha2-nistp256",
             "anything",
         );
+        match r {
+            KeyStatus::Changed {
+                stored_key_type, ..
+            } => assert_eq!(stored_key_type, "ssh-ed25519", "the first stored line"),
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_same_algorithm_mismatch_is_reported_over_an_other_algorithm_one() {
+        let raw = format!(
+            "prod.example.com ssh-rsa {RSA_KEY}\n\
+             prod.example.com ssh-ed25519 {ED_KEY}\n"
+        );
+        match check_in_str(&raw, "prod.example.com", 22, "ssh-ed25519", ED_KEY_2) {
+            KeyStatus::Changed {
+                stored_key_type, ..
+            } => assert_eq!(stored_key_type, "ssh-ed25519"),
+            other => panic!("expected Changed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn another_hosts_algorithms_do_not_make_a_key_changed() {
+        let raw = format!("other.example.com ssh-ed25519 {ED_KEY}\n");
+        let r = check_in_str(&raw, "prod.example.com", 22, "ssh-rsa", RSA_KEY);
         assert_eq!(r, KeyStatus::Unknown);
+    }
+
+    #[test]
+    fn stored_key_types_lists_each_type_once_for_that_host_only() {
+        let raw = format!(
+            "prod.example.com ssh-rsa {RSA_KEY}\n\
+             other.example.com ecdsa-sha2-nistp256 AAAA\n\
+             [prod.example.com]:2222 ssh-ed25519 {ED_KEY}\n\
+             prod.example.com ssh-ed25519 {ED_KEY}\n\
+             prod.example.com ssh-ed25519 {ED_KEY_2}\n"
+        );
+        assert_eq!(
+            stored_key_types_in_str(&raw, "prod.example.com", 22),
+            vec!["ssh-rsa".to_string(), "ssh-ed25519".to_string()],
+        );
+        assert!(stored_key_types_in_str(&raw, "absent.example.com", 22).is_empty());
     }
 
     #[test]

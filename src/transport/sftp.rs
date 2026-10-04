@@ -274,6 +274,31 @@ impl Handler for KnownHostsHandler {
     }
 }
 
+/// The host-key algorithms to offer, those of a type `known_hosts` already
+/// holds for this host first.
+///
+/// The client's order decides which of its keys a server proves itself
+/// with. Asking for a stored type first means a server with several keys
+/// presents one blink can check, so `known_hosts::check` can treat any
+/// other type as a changed key without rejecting honest servers. This is
+/// OpenSSH's behaviour too. The rest of the default list follows in its own
+/// order, so a host seen for the first time negotiates as before.
+fn host_key_preference(stored_types: &[String]) -> Vec<ssh_key::Algorithm> {
+    // Stored types are key types, as `PublicKey::algorithm` names them; the
+    // three RSA signature algorithms all verify an `ssh-rsa` key.
+    let key_type = |alg: &ssh_key::Algorithm| match alg {
+        ssh_key::Algorithm::Rsa { .. } => "ssh-rsa".to_string(),
+        other => other.as_str().to_string(),
+    };
+    let (mut known, rest): (Vec<_>, Vec<_>) = russh::Preferred::default()
+        .key
+        .iter()
+        .cloned()
+        .partition(|alg| stored_types.contains(&key_type(alg)));
+    known.extend(rest);
+    known
+}
+
 /// Hash algorithm to request for a public-key authentication attempt.
 ///
 /// RSA keys must ask for `rsa-sha2-512` explicitly: OpenSSH 8.8+ (Sept 2021)
@@ -391,10 +416,15 @@ impl SftpTransport {
         trust: SessionTrust,
         user_wait: crate::transport::UserWait,
     ) -> Result<Self> {
+        let stored_types = known_hosts::stored_key_types(&session.host, session.port);
         let config = Arc::new(client::Config {
             keepalive_interval: Some(KEEPALIVE_INTERVAL),
             keepalive_max: KEEPALIVE_MAX,
             window_size: CHANNEL_WINDOW,
+            preferred: russh::Preferred {
+                key: host_key_preference(&stored_types).into(),
+                ..russh::Preferred::default()
+            },
             ..client::Config::default()
         });
         let addr = format!("{}:{}", session.host, session.port);
@@ -1282,7 +1312,55 @@ impl Transport for SftpTransport {
 
 #[cfg(test)]
 mod tests {
-    use super::{chunk_offsets, read_local_full, reply_within_request, rsa_hash_alg};
+    use super::{
+        chunk_offsets, host_key_preference, read_local_full, reply_within_request, rsa_hash_alg,
+    };
+
+    #[test]
+    fn a_host_seen_before_is_asked_for_its_stored_key_types_first() {
+        use super::ssh_key::{Algorithm, EcdsaCurve, HashAlg};
+
+        let default = russh::Preferred::default().key.to_vec();
+        assert_eq!(
+            host_key_preference(&[]),
+            default,
+            "a new host: default order"
+        );
+
+        let pref = host_key_preference(&["ssh-rsa".to_string()]);
+        assert_eq!(
+            pref[..3],
+            [
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha512)
+                },
+                Algorithm::Rsa {
+                    hash: Some(HashAlg::Sha256)
+                },
+                Algorithm::Rsa { hash: None },
+            ],
+            "every RSA signature algorithm verifies a stored ssh-rsa key",
+        );
+        assert_eq!(
+            pref[3],
+            Algorithm::Ed25519,
+            "the rest follow in default order"
+        );
+        assert_eq!(pref.len(), default.len(), "nothing is dropped");
+
+        let pref =
+            host_key_preference(&["ecdsa-sha2-nistp384".to_string(), "ssh-ed25519".to_string()]);
+        assert_eq!(
+            pref[..2],
+            [
+                Algorithm::Ed25519,
+                Algorithm::Ecdsa {
+                    curve: EcdsaCurve::NistP384
+                },
+            ],
+            "stored types keep the default order among themselves",
+        );
+    }
 
     /// OpenSSH 8.8+ disabled `ssh-rsa` (SHA-1) by default in Sept 2021, so an
     /// RSA key that does not ask for `rsa-sha2-512` fails against any current
@@ -1804,13 +1882,25 @@ mod integration {
         store: Store,
         host_key: &str,
     ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        start_server_with_host_keys(store, &[host_key]).await
+    }
+
+    /// As [`start_server_with_host_key`], for a server holding several host
+    /// keys — the case where the client's preference picks which one it
+    /// proves itself with.
+    async fn start_server_with_host_keys(
+        store: Store,
+        host_keys: &[&str],
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let config = Arc::new(russh::server::Config {
-            keys: vec![
-                russh::keys::PrivateKey::from_openssh(host_key)
-                    .expect("test host key should parse"),
-            ],
+            keys: host_keys
+                .iter()
+                .map(|k| {
+                    russh::keys::PrivateKey::from_openssh(k).expect("test host key should parse")
+                })
+                .collect(),
             ..Default::default()
         });
 
@@ -2132,6 +2222,109 @@ mod integration {
                 }
             }
         }
+    }
+
+    /// Connect to `port` without answering any host-key prompt, reporting
+    /// whether one was raised and whether the key was refused as changed.
+    async fn connect_unprompted(port: u16) -> (crate::error::Result<SftpTransport>, bool, bool) {
+        let session = Session {
+            name: "it".to_string(),
+            protocol: Protocol::Sftp,
+            host: "127.0.0.1".to_string(),
+            port,
+            username: "tester".to_string(),
+            remote_dir: "/".to_string(),
+            local_dir: None,
+            auth: AuthMethod::Password,
+            parallel_downloads: None,
+            theme: None,
+            accept_invalid_certs: false,
+            cert_sha256: None,
+        };
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let mut fut = Box::pin(SftpTransport::connect(
+            &session,
+            Some("pw"),
+            ev_tx,
+            crate::known_hosts::SessionTrust::new(),
+            crate::transport::UserWait::new().0,
+        ));
+        let (mut prompted, mut changed) = (false, false);
+        loop {
+            tokio::select! {
+                res = &mut fut => {
+                    // The handler sends its event before the connect fails,
+                    // but `select!` may see both ready and take this arm.
+                    while let Ok(ev) = ev_rx.try_recv() {
+                        prompted |= matches!(ev, AppEvent::HostKeyUnknown { .. });
+                        changed |= matches!(ev, AppEvent::HostKeyChanged { .. });
+                    }
+                    return (res, prompted, changed);
+                }
+                Some(ev) = ev_rx.recv() => match ev {
+                    AppEvent::HostKeyUnknown { decision_tx, .. } => {
+                        prompted = true;
+                        let _ = decision_tx.send(HostKeyDecision::Reject);
+                    }
+                    AppEvent::HostKeyChanged { .. } => changed = true,
+                    _ => {}
+                },
+            }
+        }
+    }
+
+    /// Store `pem`'s public key in this test's known_hosts for 127.0.0.1.
+    fn store_host_key(port: u16, pem: &str) {
+        use base64::Engine as _;
+        let public = russh::keys::PrivateKey::from_openssh(pem)
+            .unwrap()
+            .public_key()
+            .clone();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(public.to_bytes().unwrap());
+        crate::known_hosts::append("127.0.0.1", port, public.algorithm().as_str(), &b64).unwrap();
+    }
+
+    /// A server with several host keys proves itself with the one the client
+    /// asks for first. blink asks for the stored type first, so a known host
+    /// that also holds a key of a type blink prefers is still recognised —
+    /// not prompted for as if new, and not refused as changed.
+    #[tokio::test]
+    async fn a_known_host_is_recognised_by_its_stored_key_type() {
+        let _home = crate::paths::test_home();
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let (port, _c) = start_server_with_host_keys(
+            store,
+            &[
+                super::super::sftp_test_keys::ED25519_KEY,
+                super::super::sftp_test_keys::RSA_KEY,
+            ],
+        )
+        .await;
+        store_host_key(port, super::super::sftp_test_keys::RSA_KEY);
+
+        let (res, prompted, changed) = connect_unprompted(port).await;
+        assert!(!prompted, "a known host must not be prompted for");
+        assert!(!changed, "nor refused as changed");
+        res.expect("the stored RSA key must be negotiated and trusted")
+            .close()
+            .await
+            .unwrap();
+    }
+
+    /// The downgrade: a known host that presents only a key of a type not
+    /// stored for it is refused as changed, not offered as a new host.
+    #[tokio::test]
+    async fn a_known_host_presenting_a_new_key_type_is_refused() {
+        let _home = crate::paths::test_home();
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let (port, _c) =
+            start_server_with_host_key(store, super::super::sftp_test_keys::ED25519_KEY).await;
+        store_host_key(port, super::super::sftp_test_keys::RSA_KEY);
+
+        let (res, prompted, changed) = connect_unprompted(port).await;
+        assert!(res.is_err(), "the connection must be refused");
+        assert!(changed, "as a changed key");
+        assert!(!prompted, "never as a first connection");
     }
 
     /// Write a fixture key where `AuthMethod::Key` can find it. Named per

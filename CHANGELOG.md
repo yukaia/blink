@@ -8,6 +8,19 @@ the git history for those.
 
 ## [Unreleased]
 
+### Security
+
+- **A known SSH host presenting a different kind of key is refused, not
+  offered as new.** A host on file with, say, an Ed25519 key that presented
+  an RSA key read as an unknown host, and got the ordinary "trust this
+  host?" prompt rather than the changed-key refusal — so a man in the
+  middle without the real key could be one habitual "accept" away from the
+  connection. blink now asks first for the key types it has on file for the
+  host, as OpenSSH does, so a server holding several keys proves itself
+  with a known one; a known host that presents only a type not on file is
+  refused as a changed key. If a server really did retire its old key
+  type, `blink known-hosts remove <host>` and reconnect.
+
 ### Added
 
 - **Mouse support.** Click to focus a pane and move its cursor;

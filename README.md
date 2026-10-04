@@ -344,9 +344,16 @@ blink versions in the `host:port` form are still accepted on lookup, so
 upgrades don't force re-verification.
 
 Match semantics also follow OpenSSH: a host with both an ed25519 and an
-rsa entry is normal multi-algorithm behaviour, not a mismatch. The
-"changed key" hard-reject fires only when the *same* keytype on file
-has a different key blob.
+rsa entry is normal multi-algorithm behaviour, not a mismatch. When
+connecting, blink asks first for the keytypes it has on file for the host,
+so a server holding several keys proves itself with one blink can check.
+The "changed key" hard-reject fires when the keytype on file has a
+different key blob, and also when a known host presents only a keytype
+that isn't on file — a server that still had its stored key would have
+used it, so a new type in its place is treated as a changed key, not a
+first connection. If a server really did drop its old key type, forget
+the host (`blink known-hosts remove <host>`, above) and accept the new
+key.
 
 When connecting via SFTP or SCP for the first time, blink shows a prompt
 with the server's SHA-256 fingerprint and three choices:
@@ -669,8 +676,10 @@ terminal. The following properties are enforced in the current codebase.
   prompt; a changed key is a hard rejection with a warning screen that
   only `Enter` / `Esc` / `q` dismisses. Keys are stored in OpenSSH format.
   Matching follows OpenSSH `(host, keytype)` semantics: multi-algorithm
-  hosts (an ed25519 *and* an rsa entry) coexist normally; "changed key"
-  only fires when the same keytype has a different blob.
+  hosts (an ed25519 *and* an rsa entry) coexist normally, and the stored
+  keytypes are asked for first. "Changed key" fires when the same keytype
+  has a different blob, or when a known host presents only a keytype not on
+  file — so a man in the middle cannot pass a downgrade off as a new host.
 - **SSH host certificates are refused, fail-closed.** `known_hosts` maps a
   host to a literal key and blink has no `@cert-authority` support, so
   nothing here can check a certificate's CA signature, principals, or
