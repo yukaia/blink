@@ -19,7 +19,7 @@ RustCrypto/RSA#680 (implicit rejection) or #702 (blinding the default
 decryption paths), which track RustCrypto/RSA#626. Check those first, then
 whether russh has moved its pin to that release.
 
-Last checked 2026-10-04: russh 0.64.0 (blink is on 0.63.3) still pins
+Last checked 2026-10-04: russh 0.64.0 (blink is on it) still pins
 `rsa =0.10.0-rc.18` and `ssh-key =0.7.0-rc.11`; #626, #680 and #702 all
 open, untouched since June.
 

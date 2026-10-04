@@ -1,7 +1,7 @@
 //! SFTP transport built on russh + russh-sftp.
 //!
 //! NOTE: russh and russh-sftp evolve their APIs across minor versions. The
-//! shape below targets `russh` 0.63.x and `russh-sftp` 2.4.x. If a `cargo build`
+//! shape below targets `russh` 0.64.x and `russh-sftp` 3.0.x. If a `cargo build`
 //! reports method-not-found errors here, check the exact constructor / method
 //! names against the version actually pulled in by `Cargo.lock`. The trait
 //! interface in `transport::Transport` is stable; only this file should need
@@ -19,6 +19,11 @@
 //! `channel_open_*` callbacks return `()` and take a `ChannelOpenHandle` that
 //! must be accepted explicitly (dropping it rejects the channel); and russh
 //! dropped its `internal-russh-forked-ssh-key` fork for upstream `ssh-key`.
+//!
+//! The 0.63 → 0.64 jump needed nothing here. It removed the
+//! `legacy-ed25519-pkcs8-parser` feature, which blink never enabled, and
+//! added host-key rotation (`hostkeys-00@openssh.com`) support that blink
+//! does not use: `known_hosts` learns keys only through the prompt.
 
 use crate::transfer::MAX_QUEUED_JOBS;
 use std::path::Path;

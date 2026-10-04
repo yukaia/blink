@@ -72,6 +72,12 @@ the git history for those.
   was shown in the viewer without the filtering every log line gets, so
   bidi overrides and zero-width characters could reach the screen.
 
+### Dependencies
+
+- `russh` 0.63 -> 0.64. No code changes. 0.64 removes the
+  `legacy-ed25519-pkcs8-parser` feature, which blink never enabled, and
+  still pins `rsa` and `ssh-key` to the same release candidates.
+
 ## [0.8.2] — 2026-09-28
 
 ### Changed
