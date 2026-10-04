@@ -2280,6 +2280,24 @@ mod tests {
         ));
     }
 
+    /// A failed read's error can carry the server's own words — an SFTP
+    /// status message, an FTP reply — and the viewer shows it directly, not
+    /// through the log, which sanitizes everything it is given.
+    #[test]
+    fn a_read_error_shown_in_the_viewer_is_sanitized() {
+        let mut a = loading_viewer_app("x.txt");
+        a.handle_app_event(AppEvent::ViewFailed {
+            name: "x.txt".into(),
+            error: "denied\u{1b}[2J\u{202E}txt.exe".into(),
+        });
+        let reason = unsupported_reason(&a);
+        assert!(reason.starts_with("read failed: denied"), "{reason}");
+        assert!(
+            !reason.contains('\u{1b}') && !reason.contains('\u{202E}'),
+            "{reason:?}"
+        );
+    }
+
     /// A local file is read through the same limit, so one that is larger
     /// than its listing said — or never ends, like a FIFO or device named
     /// `*.txt` — costs at most one byte past the limit.

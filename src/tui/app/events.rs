@@ -461,7 +461,10 @@ impl App {
                 if let Some(viewer) = self.viewer.as_mut()
                     && viewer.name == name
                 {
-                    viewer.kind = ViewerKind::Unsupported(format!("read failed: {error}"));
+                    // Shown as is, not via the log, so sanitized here.
+                    viewer.kind = ViewerKind::Unsupported(crate::error::sanitize(format!(
+                        "read failed: {error}"
+                    )));
                 }
                 self.push_log(LogLevel::Error, format!("view {name} failed: {error}"));
             }

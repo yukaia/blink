@@ -62,6 +62,10 @@ the git history for those.
   the UI thread. The limit is now checked against what arrives as well,
   and a local file is read only to one byte past it, so a FIFO or a file
   still growing cannot stall the viewer either.
+- **The viewer's read-error message is sanitized like the rest.** When a
+  preview failed, the error — which can quote the server's own reply —
+  was shown in the viewer without the filtering every log line gets, so
+  bidi overrides and zero-width characters could reach the screen.
 
 ## [0.8.2] — 2026-09-28
 
