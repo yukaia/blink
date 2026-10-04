@@ -28,6 +28,11 @@ the git history for those.
   connects to the server it is already talking to, on the port the reply
   gives, as curl does by default. This also fixes servers behind NAT that
   advertise a private address. Applies to FTP and FTPS alike.
+- **An SFTP server can no longer make blink allocate gigabytes with one
+  packet header.** russh-sftp before 3.0.1 set aside a buffer as large as
+  each incoming packet's 4-byte length field claimed — up to 4 GiB — before
+  any of the packet arrived. 3.0.1 refuses packets over 256 KiB, which is
+  larger than any reply blink asks for.
 
 ### Added
 
