@@ -299,7 +299,7 @@ impl Session {
             && (pin.len() != 64 || !pin.bytes().all(|b| b.is_ascii_hexdigit()))
         {
             return Err(BlinkError::config(
-                "tls.cert_sha256 must be 64 lowercase hex characters",
+                "tls.cert_sha256 must be 64 hex characters",
             ));
         }
 
@@ -538,16 +538,15 @@ impl Session {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(|v| {
-                // Reject anything but lowercase hex of length 64. Be strict —
-                // a malformed pin would either silently accept the wrong cert
-                // (uppercase mismatch in eq_ignore_case is fine, but garbage
-                // characters would slip through). Normalize to lowercase.
+                // Reject anything but 64 hex digits, in either case. Be
+                // strict — garbage characters would slip through the
+                // verifier's case-insensitive compare. Normalize to lowercase.
                 let lower = v.to_ascii_lowercase();
                 if lower.len() == 64 && lower.bytes().all(|b| b.is_ascii_hexdigit()) {
                     Ok(lower)
                 } else {
                     Err(BlinkError::config(
-                        "tls.cert_sha256 must be 64 lowercase hex characters",
+                        "tls.cert_sha256 must be 64 hex characters",
                     ))
                 }
             })
@@ -1300,6 +1299,20 @@ mod tests {
             }
         }
         assert!(refused > 0, "the quoted and padded cases must be refused");
+    }
+
+    /// Pins compare case-insensitively and load normalized to lowercase, so
+    /// uppercase is valid; the message used to say it was not.
+    #[test]
+    fn a_pin_may_be_uppercase_and_the_message_says_so() {
+        let mut s = valid();
+        s.accept_invalid_certs = true;
+        s.cert_sha256 = Some("AB".repeat(32));
+        assert!(s.validate().is_ok());
+        s.cert_sha256 = Some("zz".repeat(32));
+        let err = s.validate().unwrap_err().to_string();
+        assert!(err.contains("64 hex characters"), "{err}");
+        assert!(!err.contains("lowercase"), "{err}");
     }
 
     #[test]
