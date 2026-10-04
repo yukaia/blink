@@ -409,6 +409,11 @@ impl App {
                     && viewer.name == name
                 {
                     viewer.kind = match kind {
+                        // The listing's size was checked before the fetch;
+                        // this checks what actually came. See `too_large`.
+                        _ if let Some(reason) = preview::too_large(&kind, bytes.len() as u64) => {
+                            ViewerKind::Unsupported(reason)
+                        }
                         FileViewKind::Text => {
                             let text = if preview::is_nfo_file(&name) {
                                 preview::decode_cp437(&bytes)

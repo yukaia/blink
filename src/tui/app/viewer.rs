@@ -83,8 +83,9 @@ impl App {
         match source {
             ViewSource::Local => {
                 let path = std::path::PathBuf::from(&self.local.path).join(&raw_name);
+                let limit = preview::view_limit(&kind);
                 tokio::spawn(async move {
-                    let event = match tokio::fs::read(&path).await {
+                    let event = match read_local_bounded(&path, limit).await {
                         Ok(buf) => AppEvent::ViewLoaded {
                             name,
                             kind,
@@ -289,4 +290,21 @@ pub(super) fn tokenize_lines(
         out.push(tokens);
     }
     out
+}
+
+/// Read at most `limit + 1` bytes of `path`: enough for the viewer to tell
+/// a file over its limit from one at it, however large the file has grown
+/// since it was listed — or if it never ends, like a FIFO.
+pub(super) async fn read_local_bounded(
+    path: &std::path::Path,
+    limit: u64,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt as _;
+    let mut buf = Vec::new();
+    tokio::fs::File::open(path)
+        .await?
+        .take(limit + 1)
+        .read_to_end(&mut buf)
+        .await?;
+    Ok(buf)
 }

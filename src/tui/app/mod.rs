@@ -2230,6 +2230,72 @@ mod tests {
         (a, rx)
     }
 
+    /// An app with the viewer open on `name`, still loading.
+    fn loading_viewer_app(name: &str) -> App {
+        let mut a = app();
+        a.viewer = Some(Viewer {
+            name: name.into(),
+            kind: ViewerKind::Loading,
+            id: 1,
+        });
+        a
+    }
+
+    fn unsupported_reason(a: &App) -> String {
+        match &a.viewer.as_ref().expect("the viewer stays open").kind {
+            ViewerKind::Unsupported(reason) => reason.clone(),
+            _ => panic!("expected the viewer to refuse"),
+        }
+    }
+
+    /// The text limit was checked against the size in the listing only, but
+    /// a fetch may return up to the image cap — 25 times as much — when the
+    /// listing understates the size or the file grew since. All of it was
+    /// then sanitized and tokenized on the UI thread, freezing the TUI.
+    #[test]
+    fn text_fetched_past_the_text_limit_is_refused_not_tokenized() {
+        let mut a = loading_viewer_app("big.txt");
+        let bytes = vec![b'a'; crate::preview::TEXT_VIEW_LIMIT as usize + 1];
+        a.handle_app_event(AppEvent::ViewLoaded {
+            name: "big.txt".into(),
+            kind: crate::preview::FileViewKind::Text,
+            bytes: bytes::Bytes::from(bytes),
+        });
+        let reason = unsupported_reason(&a);
+        assert!(reason.contains("too large"), "{reason}");
+    }
+
+    #[test]
+    fn text_at_the_text_limit_still_opens() {
+        let mut a = loading_viewer_app("ok.txt");
+        let bytes = vec![b'a'; crate::preview::TEXT_VIEW_LIMIT as usize];
+        a.handle_app_event(AppEvent::ViewLoaded {
+            name: "ok.txt".into(),
+            kind: crate::preview::FileViewKind::Text,
+            bytes: bytes::Bytes::from(bytes),
+        });
+        assert!(matches!(
+            a.viewer.as_ref().unwrap().kind,
+            ViewerKind::Text { .. }
+        ));
+    }
+
+    /// A local file is read through the same limit, so one that is larger
+    /// than its listing said — or never ends, like a FIFO or device named
+    /// `*.txt` — costs at most one byte past the limit.
+    #[tokio::test]
+    async fn a_local_view_reads_at_most_one_byte_past_its_limit() {
+        let home = crate::paths::test_home();
+        let path = home.path().join("big.txt");
+        std::fs::write(&path, vec![b'a'; 100]).unwrap();
+        let read = super::viewer::read_local_bounded(&path, 10).await.unwrap();
+        assert_eq!(read.len(), 11);
+        let read = super::viewer::read_local_bounded(&path, 1000)
+            .await
+            .unwrap();
+        assert_eq!(read.len(), 100);
+    }
+
     async fn next_render(rx: &mut tokio::sync::mpsc::UnboundedReceiver<AppEvent>) -> AppEvent {
         let ev = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv())
             .await

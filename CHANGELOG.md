@@ -54,6 +54,14 @@ the git history for those.
   user, remote or local directory, or key path that starts with a quote or
   starts or ends with whitespace, instead of writing one that loads as
   something else. Session files written by hand load as before.
+- **Viewing a text file larger than its listing said no longer freezes the
+  UI.** The 1 MB text limit was checked against the size in the directory
+  listing only, while a remote fetch is capped at 25 MB, the image limit.
+  A listing that understated the size, or a file that grew after it was
+  listed, could push all 25 MB through the text viewer's preparation on
+  the UI thread. The limit is now checked against what arrives as well,
+  and a local file is read only to one byte past it, so a FIFO or a file
+  still growing cannot stall the viewer either.
 
 ## [0.8.2] — 2026-09-28
 

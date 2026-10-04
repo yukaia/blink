@@ -408,7 +408,7 @@ pub enum FileViewKind {
     Unsupported(String),
 }
 
-const TEXT_VIEW_LIMIT: u64 = 1_000_000; // 1 MB
+pub(crate) const TEXT_VIEW_LIMIT: u64 = 1_000_000; // 1 MB
 
 /// Largest image accepted for preview, checked against the size the server
 /// reports in its directory listing.
@@ -440,25 +440,42 @@ const _: () = {
 
 /// Decide what kind of viewer to open for `name` (with the given `size`).
 pub fn detect_view_kind(name: &str, size: u64) -> FileViewKind {
-    if is_previewable_image(name) {
-        if size > IMAGE_VIEW_LIMIT {
-            return FileViewKind::Unsupported(format!(
-                "image too large ({})",
-                crate::transfer::format_bytes(size)
-            ));
-        }
-        return FileViewKind::Image;
+    let kind = if is_previewable_image(name) {
+        FileViewKind::Image
+    } else if is_viewable_text(name) {
+        FileViewKind::Text
+    } else {
+        return FileViewKind::Unsupported("unsupported file type".into());
+    };
+    too_large(&kind, size)
+        .map(FileViewKind::Unsupported)
+        .unwrap_or(kind)
+}
+
+/// The most bytes a viewer of `kind` accepts.
+pub(crate) fn view_limit(kind: &FileViewKind) -> u64 {
+    match kind {
+        FileViewKind::Text => TEXT_VIEW_LIMIT,
+        FileViewKind::Image => IMAGE_VIEW_LIMIT,
+        FileViewKind::Unsupported(_) => 0,
     }
-    if is_viewable_text(name) {
-        if size > TEXT_VIEW_LIMIT {
-            return FileViewKind::Unsupported(format!(
-                "text too large ({})",
-                crate::transfer::format_bytes(size)
-            ));
-        }
-        return FileViewKind::Text;
-    }
-    FileViewKind::Unsupported("unsupported file type".into())
+}
+
+/// Why `size` bytes are too many for a viewer of `kind`, if they are.
+///
+/// Checked twice: against the size the listing reports, before fetching,
+/// and against the bytes that actually arrive. The listing can understate a
+/// file, or the file can grow in between, and a remote fetch is capped only
+/// at the image limit — for text, 25 times the limit, all of it sanitized
+/// and tokenized on the UI thread.
+pub(crate) fn too_large(kind: &FileViewKind, size: u64) -> Option<String> {
+    let what = match kind {
+        FileViewKind::Text => "text",
+        FileViewKind::Image => "image",
+        FileViewKind::Unsupported(_) => return None,
+    };
+    (size > view_limit(kind))
+        .then(|| format!("{what} too large ({})", crate::transfer::format_bytes(size)))
 }
 
 /// Heuristic: file extension tells us whether a file is likely an image we
