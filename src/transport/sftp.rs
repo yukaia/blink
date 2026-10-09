@@ -1080,8 +1080,8 @@ impl Transport for SftpTransport {
         local_path: &Path,
         progress: Option<mpsc::UnboundedSender<ProgressUpdate>>,
     ) -> Result<()> {
-        // Stream into `<local>.blink-part` and rename onto the final path only on
-        // success. This keeps the user's existing file (if any) untouched
+        // Stream into the partial (`part_path`) and rename onto the final
+        // path only on success. This keeps the user's existing file (if any) untouched
         // until the download is fully complete and fsynced, and isolates
         // partial bytes from a previous attempt under a recognisable suffix.
         let part = super::part_path(local_path);
@@ -1173,8 +1173,8 @@ impl Transport for SftpTransport {
         let do_fsync = xfer.fsync;
         let posix_rename = xfer.posix_rename;
 
-        // Stream into `<remote>.blink-part` and rename onto the final name only
-        // on success — the remote mirror of the download path. An
+        // Stream into the remote partial (`remote_part_path`) and rename
+        // onto the final name only on success — the remote mirror of the download path. An
         // interrupted or failed upload must never leave a truncated file
         // under the destination name.
         let part = super::remote_part_path(remote_path);

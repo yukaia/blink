@@ -17,7 +17,7 @@ use crate::error::Result;
 use crate::session::{Protocol, Session};
 
 /// Suffix of the files a transfer writes while it is in flight: a local
-/// `<name>.blink-part` for a download, a remote one for an upload.
+/// partial for a download, a remote one for an upload. See [`part_name`].
 ///
 /// Specific to blink on purpose. It used to be `.part`, which browsers and
 /// other tools use too, and blink deleted or truncated a file of that name
@@ -25,27 +25,71 @@ use crate::session::{Protocol, Session};
 /// server. No one else writes `.blink-part`.
 const PART_SUFFIX: &str = ".blink-part";
 
-/// The on-disk path a download writes to while it's in flight.
+/// Suffix of a partial's provenance sidecar. See [`part_meta_path`].
+const META_SUFFIX: &str = ".meta";
+
+/// Longest file name, in bytes, that most filesystems accept: ext4, XFS,
+/// btrfs, APFS and ZFS all stop at 255. NTFS counts 255 UTF-16 units, and
+/// no character takes more of those than it takes UTF-8 bytes, so a name
+/// within this many bytes fits there too.
+const MAX_NAME_BYTES: usize = 255;
+
+/// The name of the partial for a file named `name`:
+/// `<name>.<hash>.blink-part`, where `<hash>` is the first 8 hex digits of
+/// the SHA-256 of `name_bytes`, the name's exact bytes.
 ///
-/// We always stream into `<final>.blink-part` and rename onto the final
-/// name only once the transfer has completed and been fsynced. That way:
+/// The hash keeps the partial from being any file's own name. It used to be
+/// plain `<name>.blink-part`, which is also the name of a file called that:
+/// downloading `foo` beside a downloaded `foo.blink-part` deleted it as a
+/// stale partial, and parallel jobs for the two wrote one file. A file now
+/// shares its name with a partial only if it carries that partial's hash.
+///
+/// `name` is shortened, on a character boundary, as far as the partial's
+/// sidecar needs to stay within [`MAX_NAME_BYTES`]; the hash covers the
+/// whole name, so two names alike up to the cut still differ. `name` is
+/// display only and may be lossy; only `name_bytes` decides the hash.
+fn part_name(name_bytes: &[u8], name: &str) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let hash = Sha256::digest(name_bytes);
+    let mut tag = String::with_capacity(8);
+    for b in &hash[..4] {
+        let _ = write!(&mut tag, "{b:02x}");
+    }
+    let budget = MAX_NAME_BYTES - META_SUFFIX.len() - PART_SUFFIX.len() - tag.len() - 1;
+    let mut cut = name.len().min(budget);
+    while !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}.{tag}{PART_SUFFIX}", &name[..cut])
+}
+
+/// The on-disk path a download writes to while it's in flight, beside
+/// `local` and named by [`part_name`].
+///
+/// We always stream into the partial and rename onto the final name only
+/// once the transfer has completed and been fsynced. That way:
 ///
 /// - An interrupted download leaves the partial bytes under a distinguishable
-///   suffix instead of next to the user's pre-existing real file.
+///   name instead of next to the user's pre-existing real file.
 /// - Resume code can identify the partial unambiguously (the bare final
 ///   filename never holds half a download).
 /// - On power loss after rename, the parent-directory fsync in
 ///   [`crate::paths::sync_parent_dir`] guarantees the rename is durable.
 pub(crate) fn part_path(local: &Path) -> PathBuf {
-    let mut s = local.as_os_str().to_owned();
-    s.push(PART_SUFFIX);
-    PathBuf::from(s)
+    let name = local.file_name().unwrap_or_default();
+    local.with_file_name(part_name(name.as_encoded_bytes(), &name.to_string_lossy()))
 }
 
 /// The remote path an upload writes to while it's in flight; renamed onto
-/// `remote` once the whole file is stored. See [`PART_SUFFIX`].
+/// `remote` once the whole file is stored. Named as [`part_path`] names a
+/// local partial.
 pub(crate) fn remote_part_path(remote: &str) -> String {
-    format!("{remote}{PART_SUFFIX}")
+    match remote.rsplit_once('/') {
+        Some((dir, name)) => format!("{dir}/{}", part_name(name.as_bytes(), name)),
+        None => part_name(remote.as_bytes(), remote),
+    }
 }
 
 /// Sidecar recording which remote file a `.blink-part` holds bytes of.
@@ -53,7 +97,7 @@ pub(crate) fn remote_part_path(remote: &str) -> String {
 /// See [`decide_resume`] for why bytes alone are not enough to resume.
 pub(crate) fn part_meta_path(local: &Path) -> PathBuf {
     let mut s = part_path(local).into_os_string();
-    s.push(".meta");
+    s.push(META_SUFFIX);
     PathBuf::from(s)
 }
 
@@ -1104,45 +1148,114 @@ mod tests {
         assert_eq!(d, ResumeDecision::Fresh, "nothing to resume from");
     }
 
+    /// The final component of `path`, as a `&str`.
+    fn file_name(path: &Path) -> &str {
+        path.file_name().unwrap().to_str().unwrap()
+    }
+
     #[test]
     fn part_meta_path_sits_beside_the_partial() {
-        assert_eq!(
-            part_meta_path(Path::new("/tmp/file.iso")),
-            PathBuf::from("/tmp/file.iso.blink-part.meta")
-        );
+        let local = Path::new("/tmp/file.iso");
+        let mut expected = part_path(local).into_os_string();
+        expected.push(".meta");
+        assert_eq!(part_meta_path(local), PathBuf::from(expected));
     }
 
     // part_path
     #[test]
-    fn part_path_appends_suffix() {
-        assert_eq!(
-            part_path(Path::new("/tmp/file.iso")),
-            PathBuf::from("/tmp/file.iso.blink-part")
+    fn a_partial_keeps_its_files_name_and_directory() {
+        let part = part_path(Path::new("/tmp/archive.tar.gz"));
+        assert_eq!(part.parent(), Some(Path::new("/tmp")));
+        let name = file_name(&part);
+        let hash = name
+            .strip_prefix("archive.tar.gz.")
+            .and_then(|rest| rest.strip_suffix(".blink-part"))
+            .unwrap_or_else(|| panic!("unexpected partial name {name}"));
+        assert_eq!(hash.len(), 8, "{name}");
+        assert!(
+            hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "{name}"
         );
     }
 
+    /// Resume finds the partial by computing its name again.
     #[test]
-    fn part_path_preserves_compound_extensions() {
-        // foo.tar.gz -> foo.tar.gz.blink-part (not foo.tar.blink-part)
-        assert_eq!(
-            part_path(Path::new("/tmp/archive.tar.gz")),
-            PathBuf::from("/tmp/archive.tar.gz.blink-part")
-        );
+    fn a_partials_name_is_the_same_every_time() {
+        let local = Path::new("/tmp/README");
+        assert_eq!(part_path(local), part_path(local));
+    }
+
+    /// A file whose own name ends in the partial suffix used to share its
+    /// name with the partial of the file it was named after: downloading
+    /// `foo` deleted a downloaded `foo.blink-part`, and two parallel jobs
+    /// for the pair wrote one file.
+    #[test]
+    fn a_file_named_like_a_partial_is_not_that_partial() {
+        let foo = Path::new("/d/foo");
+        let lookalike = Path::new("/d/foo.blink-part");
+        assert_ne!(part_path(foo), lookalike);
+        assert_ne!(part_path(foo), part_path(lookalike));
+        assert_ne!(remote_part_path("/d/foo"), "/d/foo.blink-part");
+    }
+
+    #[tokio::test]
+    async fn resuming_a_download_leaves_a_file_named_like_its_partial_alone() {
+        let home = crate::paths::test_home();
+        let local = home.path().join("foo");
+        let lookalike = home.path().join("foo.blink-part");
+        std::fs::write(&lookalike, b"a file of its own").unwrap();
+
+        let offset = resume_offset(&local, "/r/foo", Some(10), "origin").await;
+
+        assert_eq!(offset, 0);
+        assert_eq!(std::fs::read(&lookalike).unwrap(), b"a file of its own");
     }
 
     #[test]
-    fn part_path_with_no_extension() {
+    fn a_remote_partial_is_named_as_a_local_one_is() {
+        let remote = remote_part_path("/srv/data.csv");
+        let local = part_path(Path::new("/srv/data.csv"));
+        assert_eq!(remote, local.to_str().unwrap());
         assert_eq!(
-            part_path(Path::new("/tmp/README")),
-            PathBuf::from("/tmp/README.blink-part")
+            remote_part_path("data.csv"),
+            file_name(&part_path(Path::new("data.csv")))
         );
     }
 
+    /// Most filesystems cap a name at 255 bytes. A name near the cap used to
+    /// leave no room for the suffix, so its partial (or sidecar) could not
+    /// be created.
     #[test]
-    fn remote_part_path_uses_the_same_suffix() {
-        assert_eq!(
-            remote_part_path("/srv/data.csv"),
-            "/srv/data.csv.blink-part"
+    fn a_partial_of_a_name_at_the_length_cap_fits_under_it() {
+        let long = "a".repeat(255);
+        let part = part_path(&Path::new("/d").join(&long));
+        assert!(file_name(&part).len() <= 255, "{}", file_name(&part).len());
+        let meta = part_meta_path(&Path::new("/d").join(&long));
+        assert!(file_name(&meta).len() <= 255, "{}", file_name(&meta).len());
+        let remote = remote_part_path(&format!("/d/{long}"));
+        assert!(remote.len() - "/d/".len() <= 255, "{}", remote.len());
+    }
+
+    /// Shortening must not split a character: the name stays valid UTF-8,
+    /// so it can be created on any filesystem and sent to any server.
+    #[test]
+    fn a_shortened_partial_name_keeps_whole_characters() {
+        let long = "é".repeat(127); // 254 bytes, two per character
+        let remote = remote_part_path(&format!("/d/{long}"));
+        let name = remote.strip_prefix("/d/").unwrap();
+        assert!(name.len() <= 255 - ".meta".len(), "{}", name.len());
+        assert!(name.starts_with("éé"), "{name}");
+    }
+
+    /// Two long names that differ only past the point where they are
+    /// shortened still get partials of their own.
+    #[test]
+    fn long_names_alike_until_their_ends_get_distinct_partials() {
+        let a = format!("{}-a", "x".repeat(250));
+        let b = format!("{}-b", "x".repeat(250));
+        assert_ne!(
+            part_path(&Path::new("/d").join(a)),
+            part_path(&Path::new("/d").join(b))
         );
     }
 

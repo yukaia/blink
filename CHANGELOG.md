@@ -48,6 +48,20 @@ the git history for those.
   now keep their scroll position while the cursor stays in view, instead
   of shifting with every move.
 
+### Changed
+
+- **Partial transfers are named `<name>.<hash>.blink-part`.** `<hash>` is
+  8 hex digits of the SHA-256 of the file's name. A partial used to be
+  plain `<name>.blink-part`, which is also the name of a real file called
+  that: downloading `foo` beside a downloaded `foo.blink-part` deleted it
+  as a stale partial, parallel downloads of the two wrote one file, and an
+  upload of `foo` truncated a `foo.blink-part` on the server. A name too
+  long to take the suffix within the usual 255-byte limit is now shortened
+  in the partial's name, where its partial or `.meta` record used to fail
+  to be created. Partial downloads left by earlier versions are not
+  resumed; download those files again, and delete the old `.blink-part`
+  and `.blink-part.meta` files by hand.
+
 ### Fixed
 
 - **The file viewer no longer shows a file it was not opened on.** A fetch

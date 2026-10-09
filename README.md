@@ -107,17 +107,20 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   a `cancelled` job status); checkpoints written by older blink versions
   (versions 1 and 2) still load and resume normally.
 - **Download resume is provenance-checked.** A partial download,
-  `<dest>.blink-part`, records bytes, not which remote file they came from,
-  so blink writes a `<dest>.blink-part.meta` sidecar alongside it naming the
-  server and account (`user@host:port`), the remote path, and the size the
-  server reported. Resume only happens when the sidecar identifies the same
-  remote file on the same server at the same reported size; anything
-  unproven restarts from byte zero instead of risking a silently corrupt
-  file.
+  `<dest>.<hash>.blink-part`, records bytes, not which remote file they came
+  from, so blink writes a `<dest>.<hash>.blink-part.meta` sidecar alongside
+  it naming the server and account (`user@host:port`), the remote path, and
+  the size the server reported. Resume only happens when the sidecar
+  identifies the same remote file on the same server at the same reported
+  size; anything unproven restarts from byte zero instead of risking a
+  silently corrupt file.
 - **Partial files have a name of their own.** In-flight transfers write
-  `<name>.blink-part`, locally for a download and on the server for an
-  upload, so blink never touches a `<name>.part` that a browser or another
-  tool left beside the file.
+  `<name>.<hash>.blink-part`, locally for a download and on the server for
+  an upload, where `<hash>` is 8 hex digits of the SHA-256 of `<name>`. So
+  blink never touches a `<name>.part` that a browser or another tool left
+  beside the file, nor a file that is itself called `<name>.blink-part`. A
+  name too long to take the suffix within the usual 255-byte limit is
+  shortened in the partial's name only; the hash still tells it apart.
 
 ### Sessions
 
@@ -866,16 +869,16 @@ RGBA buffer is already allocated.
   so a 100k-job batch doesn't generate ~200k full plan rewrites. Any
   lost mark on a crash just causes the affected job to be re-queued on
   resume — never silently skipped.
-- Downloads write to a `<local>.blink-part` sibling and rename onto the
+- Downloads write to a `<local>.<hash>.blink-part` sibling and rename onto the
   final name only after `flush` + `sync_all`. The user's existing file (if
   any) isn't truncated until the new download has fsynced cleanly. A
-  `<local>.blink-part.meta` sidecar is written alongside it, recording the
+  `<local>.<hash>.blink-part.meta` sidecar is written alongside it, recording the
   remote path and the size the server reported — the provenance a resume
   needs to tell "my interrupted download" from "an unrelated file that
   happens to share this local name" (see "download resume is
   provenance-checked" under Transfers).
 - Uploads mirror this on the remote side: bytes stream into
-  `<remote>.blink-part` and the final name is only created by rename after
+  `<remote>.<hash>.blink-part` and the final name is only created by rename after
   the upload completes (and fsyncs, where the server supports
   `fsync@openssh.com`). SFTP uses `posix-rename@openssh.com` for an
   atomic replace when the server offers it; otherwise (and on FTP/FTPS,
@@ -883,7 +886,7 @@ RGBA buffer is already allocated.
   and the rename retried — that window can expose "old file gone, new
   file still at `.blink-part`", but never a truncated file under the
   final name. An upload interrupted by a hard kill or dropped connection
-  can leave a stale `<remote>.blink-part` behind; re-running the upload
+  can leave a stale `<remote>.<hash>.blink-part` behind; re-running the upload
   reuses (truncates) it.
 - Config directories are created with mode 0700 on Unix (not
   world-readable). A `BLINK_LOG_FILE` is created with mode 0600, since at
@@ -956,7 +959,7 @@ A few things worth knowing before you use this in anger:
   that window leaves the affected job in its previous state on resume,
   which is the same safe outcome as a crash mid-transfer (Pending →
   re-queued, InProgress → re-queued, Done → re-run). Partial downloads
-  live at `<name>.blink-part`; the final name is only created via rename
+  live at `<name>.<hash>.blink-part`; the final name is only created via rename
   after fsync. `mkdir` is idempotent on the remote side, so re-runs are
   safe across the board. A resumed partial is only trusted if its
   `.blink-part.meta` sidecar names the same server, remote path and

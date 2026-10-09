@@ -379,7 +379,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
         tokio::fs::create_dir_all(parent).await?;
     }
 
-    // Stream into `<local>.blink-part` and rename on success — see
+    // Stream into the partial and rename on success — see
     // [`crate::transport::part_path`] for the rationale.
     let part = super::part_path(local_path);
 
@@ -497,11 +497,12 @@ pub async fn ftp_upload<T: TokioTlsStream + Send>(
     let total = tokio::fs::metadata(local_path).await?.len();
     let mut local = tokio::fs::File::open(local_path).await?;
 
-    // Stream into `<remote>.blink-part` and rename onto the final name only on
-    // success, so an interrupted upload never leaves a truncated file under
-    // the destination name. A failed upload may leave the `.blink-part` behind:
-    // after a data-channel error the control channel's state is uncertain,
-    // so we don't risk further commands to clean it up.
+    // Stream into the remote partial (`remote_part_path`) and rename onto
+    // the final name only on success, so an interrupted upload never leaves
+    // a truncated file under the destination name. A failed upload may
+    // leave the `.blink-part` behind: after a data-channel error the control
+    // channel's state is uncertain, so we don't risk further commands to
+    // clean it up.
     let part = super::remote_part_path(remote_path);
 
     let mut writer = timed_ftp("stor", &part, stream.put_with_stream(&part)).await?;

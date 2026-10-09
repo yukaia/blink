@@ -748,10 +748,11 @@ pub struct DiscardOutcome {
 /// Delete the `.blink-part` files belonging to `cp`'s unfinished downloads,
 /// and their sidecars. Reports how many were removed, and what could not be.
 ///
-/// A download streams into `<dest>.blink-part` and renames onto `<dest>` only
-/// on success, so an interrupted batch leaves partials scattered across the
-/// destination tree. The checkpoint is the only record of where they are —
-/// once it is gone, nothing can find them again and they sit there forever.
+/// A download streams into its partial ([`crate::transport::part_path`])
+/// and renames onto `<dest>` only on success, so an interrupted batch
+/// leaves partials scattered across the destination tree. The checkpoint
+/// is the only record of where they are — once it is gone, nothing can
+/// find them again and they sit there forever.
 ///
 /// Only `Done` jobs are skipped: their `.blink-part` was already renamed
 /// away, and a file at that path now would belong to some other transfer.
