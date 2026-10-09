@@ -2257,6 +2257,7 @@ mod tests {
         let mut a = loading_viewer_app("big.txt");
         let bytes = vec![b'a'; crate::preview::TEXT_VIEW_LIMIT as usize + 1];
         a.handle_app_event(AppEvent::ViewLoaded {
+            viewer_id: 1,
             name: "big.txt".into(),
             kind: crate::preview::FileViewKind::Text,
             bytes: bytes::Bytes::from(bytes),
@@ -2270,6 +2271,7 @@ mod tests {
         let mut a = loading_viewer_app("ok.txt");
         let bytes = vec![b'a'; crate::preview::TEXT_VIEW_LIMIT as usize];
         a.handle_app_event(AppEvent::ViewLoaded {
+            viewer_id: 1,
             name: "ok.txt".into(),
             kind: crate::preview::FileViewKind::Text,
             bytes: bytes::Bytes::from(bytes),
@@ -2287,6 +2289,7 @@ mod tests {
     fn a_read_error_shown_in_the_viewer_is_sanitized() {
         let mut a = loading_viewer_app("x.txt");
         a.handle_app_event(AppEvent::ViewFailed {
+            viewer_id: 1,
             name: "x.txt".into(),
             error: "denied\u{1b}[2J\u{202E}txt.exe".into(),
         });
@@ -2296,6 +2299,46 @@ mod tests {
             !reason.contains('\u{1b}') && !reason.contains('\u{202E}'),
             "{reason:?}"
         );
+    }
+
+    /// A fetch can outlive the viewer that started it: open a slow remote
+    /// `README.md`, close it, open a local `README.md`. The local one loads
+    /// first, and the remote bytes arriving after must not replace it. The
+    /// two openings share a name, so only the id tells them apart.
+    #[test]
+    fn a_load_for_an_earlier_viewer_of_the_same_name_is_ignored() {
+        let mut a = loading_viewer_app("README.md");
+        a.handle_app_event(AppEvent::ViewLoaded {
+            viewer_id: 1,
+            name: "README.md".into(),
+            kind: crate::preview::FileViewKind::Text,
+            bytes: bytes::Bytes::from_static(b"local"),
+        });
+        a.handle_app_event(AppEvent::ViewLoaded {
+            viewer_id: 0,
+            name: "README.md".into(),
+            kind: crate::preview::FileViewKind::Text,
+            bytes: bytes::Bytes::from_static(b"remote"),
+        });
+        let ViewerKind::Text { tokens, .. } = &a.viewer.as_ref().unwrap().kind else {
+            panic!("expected the viewer to show text");
+        };
+        let shown: String = tokens[0].iter().map(|(_, text)| text.as_str()).collect();
+        assert_eq!(shown, "local");
+    }
+
+    #[test]
+    fn a_failure_for_an_earlier_viewer_of_the_same_name_is_ignored() {
+        let mut a = loading_viewer_app("README.md");
+        a.handle_app_event(AppEvent::ViewFailed {
+            viewer_id: 0,
+            name: "README.md".into(),
+            error: "permission denied".into(),
+        });
+        assert!(matches!(
+            a.viewer.as_ref().unwrap().kind,
+            ViewerKind::Loading
+        ));
     }
 
     /// A local file is read through the same limit, so one that is larger

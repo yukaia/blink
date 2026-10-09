@@ -68,7 +68,7 @@ impl App {
         }
 
         // Open the modal in Loading state. Subsequent ViewLoaded / ViewFailed
-        // events populate `kind`.
+        // events carrying this `id` populate `kind`.
         let id = self.next_viewer_id;
         self.next_viewer_id += 1;
         self.viewer = Some(Viewer {
@@ -87,11 +87,13 @@ impl App {
                 tokio::spawn(async move {
                     let event = match read_local_bounded(&path, limit).await {
                         Ok(buf) => AppEvent::ViewLoaded {
+                            viewer_id: id,
                             name,
                             kind,
                             bytes: Bytes::from(buf),
                         },
                         Err(e) => AppEvent::ViewFailed {
+                            viewer_id: id,
                             name,
                             error: e.to_string(),
                         },
@@ -117,8 +119,14 @@ impl App {
                 tokio::spawn(async move {
                     let mut transport = t.lock().await;
                     let event = match transport.read_to_bytes(&remote_path).await {
-                        Ok(bytes) => AppEvent::ViewLoaded { name, kind, bytes },
+                        Ok(bytes) => AppEvent::ViewLoaded {
+                            viewer_id: id,
+                            name,
+                            kind,
+                            bytes,
+                        },
                         Err(e) => AppEvent::ViewFailed {
+                            viewer_id: id,
                             name,
                             error: e.to_string(),
                         },

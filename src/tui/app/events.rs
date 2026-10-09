@@ -403,10 +403,18 @@ impl App {
                     format!("preparing {label} failed: {error}"),
                 );
             }
-            AppEvent::ViewLoaded { name, kind, bytes } => {
+            AppEvent::ViewLoaded {
+                viewer_id,
+                name,
+                kind,
+                bytes,
+            } => {
                 let mut needs_redraw = false;
+                // By id, not name: a fetch can outlive its viewer, and a
+                // later one opened on a file of the same name — the local
+                // twin of a remote file, say — must not take its bytes.
                 if let Some(viewer) = self.viewer.as_mut()
-                    && viewer.name == name
+                    && viewer.id == viewer_id
                 {
                     viewer.kind = match kind {
                         // The listing's size was checked before the fetch;
@@ -457,9 +465,13 @@ impl App {
                     self.image_needs_redraw = true;
                 }
             }
-            AppEvent::ViewFailed { name, error } => {
+            AppEvent::ViewFailed {
+                viewer_id,
+                name,
+                error,
+            } => {
                 if let Some(viewer) = self.viewer.as_mut()
-                    && viewer.name == name
+                    && viewer.id == viewer_id
                 {
                     // Shown as is, not via the log, so sanitized here.
                     viewer.kind = ViewerKind::Unsupported(crate::error::sanitize(format!(

@@ -50,6 +50,12 @@ the git history for those.
 
 ### Fixed
 
+- **The file viewer no longer shows a file it was not opened on.** A fetch
+  was matched to the viewer by file name alone, so one that outlived its
+  viewer could fill a later viewer of a file with the same name: open a
+  slow remote `README.md`, close it, open a local `README.md`, and the
+  remote bytes arriving last replaced the local file's. Each opening of
+  the viewer now only takes what was fetched for it.
 - **A session whose name or path would not survive saving is refused, with
   the reason.** The session file format reads a value that opens with a
   quote as a quoted string, and trims spaces at either end, so such a

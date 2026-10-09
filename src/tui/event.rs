@@ -124,15 +124,20 @@ pub enum AppEvent {
     /// A recursive walk failed.
     WalkFailed { error: String, kind: Direction },
 
-    /// File contents fetched for the viewer.
+    /// File contents fetched for viewer `viewer_id`.
     ViewLoaded {
+        viewer_id: u64,
         name: String,
         kind: FileViewKind,
         bytes: Bytes,
     },
 
-    /// File-fetch for the viewer failed.
-    ViewFailed { name: String, error: String },
+    /// File-fetch for viewer `viewer_id` failed.
+    ViewFailed {
+        viewer_id: u64,
+        name: String,
+        error: String,
+    },
 
     /// An image render for viewer `viewer_id`, made for `area`, finished:
     /// the escape sequence to write, or why it failed.
