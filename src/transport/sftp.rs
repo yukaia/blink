@@ -178,15 +178,40 @@ impl Handler for KnownHostsHandler {
 
         let display_host = self.display_host();
 
-        match known_hosts::check(&self.host, self.port, &key_type, &key_b64) {
-            Ok(KeyStatus::Trusted) => return Ok(true),
-            Ok(KeyStatus::Changed {
+        // Not in the file, but the user may already have accepted a key for
+        // this host this session. Every worker connection lands here, and
+        // re-asking would pop a modal mid-transfer for each one. That key
+        // vouches for the host as a stored one does, so another is changed.
+        let (status, trusted_once) =
+            match known_hosts::check(&self.host, self.port, &key_type, &key_b64) {
+                Ok(KeyStatus::Unknown) => (
+                    self.trust.check(&self.host, self.port, &key_type, &key_b64),
+                    true,
+                ),
+                Ok(status) => (status, false),
+                Err(e) => {
+                    // Fail closed: if we cannot read the known-hosts file we
+                    // cannot verify the host key, so reject the connection
+                    // rather than prompting the user (which would be
+                    // fail-open).
+                    tracing::error!(
+                        host = %display_host,
+                        "known_hosts read error — rejecting connection: {e}"
+                    );
+                    return Ok(false);
+                }
+            };
+
+        match status {
+            KeyStatus::Trusted => return Ok(true),
+            KeyStatus::Changed {
                 stored_key_type, ..
-            }) => {
+            } => {
                 tracing::warn!(
                     host = %display_host,
                     stored = %stored_key_type,
                     presented = %key_type,
+                    trusted_once,
                     "host key mismatch — rejecting connection",
                 );
                 // Send the changed-key event so the TUI can surface a clear
@@ -198,33 +223,14 @@ impl Handler for KnownHostsHandler {
                     stored_key_type,
                     presented_key_type: key_type,
                     fingerprint,
+                    trusted_once,
                 };
                 if let Some(tx) = self.event_tx.take() {
                     let _ = tx.send(event);
                 }
                 return Ok(false);
             }
-            Err(e) => {
-                // Fail closed: if we cannot read the known-hosts file we
-                // cannot verify the host key, so reject the connection rather
-                // than prompting the user (which would be fail-open).
-                tracing::error!(
-                    host = %display_host,
-                    "known_hosts read error — rejecting connection: {e}"
-                );
-                return Ok(false);
-            }
-            Ok(KeyStatus::Unknown) => {}
-        }
-
-        // Not in the file, but the user may already have accepted it for this
-        // session. Every worker connection lands here, and re-asking would
-        // pop a modal mid-transfer for each one.
-        if self
-            .trust
-            .is_trusted(&self.host, self.port, &key_type, &key_b64)
-        {
-            return Ok(true);
+            KeyStatus::Unknown => {}
         }
 
         // Unknown key: send the details to the TUI and await the user's call.
@@ -2243,6 +2249,15 @@ mod integration {
     /// Connect to `port` without answering any host-key prompt, reporting
     /// whether one was raised and whether the key was refused as changed.
     async fn connect_unprompted(port: u16) -> (crate::error::Result<SftpTransport>, bool, bool) {
+        connect_unprompted_trusting(port, crate::known_hosts::SessionTrust::new()).await
+    }
+
+    /// As [`connect_unprompted`], with `trust` as the session's accept-once
+    /// store.
+    async fn connect_unprompted_trusting(
+        port: u16,
+        trust: crate::known_hosts::SessionTrust,
+    ) -> (crate::error::Result<SftpTransport>, bool, bool) {
         let session = Session {
             name: "it".to_string(),
             protocol: Protocol::Sftp,
@@ -2262,7 +2277,7 @@ mod integration {
             &session,
             Some("pw"),
             ev_tx,
-            crate::known_hosts::SessionTrust::new(),
+            trust,
             crate::transport::UserWait::new().0,
         ));
         let (mut prompted, mut changed) = (false, false);
@@ -2289,15 +2304,58 @@ mod integration {
         }
     }
 
-    /// Store `pem`'s public key in this test's known_hosts for 127.0.0.1.
-    fn store_host_key(port: u16, pem: &str) {
+    /// `pem`'s public key as its type and base64 blob, as known_hosts holds it.
+    fn host_key_entry(pem: &str) -> (String, String) {
         use base64::Engine as _;
         let public = russh::keys::PrivateKey::from_openssh(pem)
             .unwrap()
             .public_key()
             .clone();
         let b64 = base64::engine::general_purpose::STANDARD.encode(public.to_bytes().unwrap());
-        crate::known_hosts::append("127.0.0.1", port, public.algorithm().as_str(), &b64).unwrap();
+        (public.algorithm().as_str().to_string(), b64)
+    }
+
+    /// Store `pem`'s public key in this test's known_hosts for 127.0.0.1.
+    fn store_host_key(port: u16, pem: &str) {
+        let (key_type, b64) = host_key_entry(pem);
+        crate::known_hosts::append("127.0.0.1", port, &key_type, &b64).unwrap();
+    }
+
+    /// A key trusted once vouches for its host for the session. A worker
+    /// connection that meets another key there is refused as a changed key —
+    /// not prompted for, where a stray keypress could accept the impostor.
+    #[tokio::test]
+    async fn a_key_other_than_the_one_trusted_once_is_refused() {
+        let _home = crate::paths::test_home();
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let (port, _c) =
+            start_server_with_host_key(store, super::super::sftp_test_keys::ED25519_KEY).await;
+        let trust = crate::known_hosts::SessionTrust::new();
+        let (key_type, b64) = host_key_entry(super::super::sftp_test_keys::RSA_KEY);
+        trust.trust("127.0.0.1", port, &key_type, &b64);
+
+        let (res, prompted, changed) = connect_unprompted_trusting(port, trust).await;
+        assert!(res.is_err(), "the connection must be refused");
+        assert!(changed, "as a changed key");
+        assert!(!prompted, "never as a first connection");
+    }
+
+    #[tokio::test]
+    async fn the_key_trusted_once_is_accepted_again() {
+        let _home = crate::paths::test_home();
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let (port, _c) =
+            start_server_with_host_key(store, super::super::sftp_test_keys::ED25519_KEY).await;
+        let trust = crate::known_hosts::SessionTrust::new();
+        let (key_type, b64) = host_key_entry(super::super::sftp_test_keys::ED25519_KEY);
+        trust.trust("127.0.0.1", port, &key_type, &b64);
+
+        let (res, prompted, changed) = connect_unprompted_trusting(port, trust).await;
+        assert!(!prompted && !changed);
+        res.expect("the trusted key is accepted")
+            .close()
+            .await
+            .unwrap();
     }
 
     /// A server with several host keys proves itself with the one the client

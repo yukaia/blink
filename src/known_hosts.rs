@@ -47,6 +47,7 @@
 //! `Changed` when only one of them is presented — that's normal
 //! multi-algorithm behaviour.
 
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -98,37 +99,45 @@ pub enum KeyStatus {
 /// Cloning shares the underlying set, so a decision made on any connection is
 /// immediately visible to the rest. Dropping the last clone — which happens on
 /// disconnect — forgets the decision, which is the scope the prompt promised.
+///
+/// Accepting a key vouches for the host for the session, as a known_hosts
+/// entry does: [`SessionTrust::check`] answers the way [`check`] does, so any
+/// other key from that host is a changed key, not a new host to ask about.
 #[derive(Clone, Default)]
 pub struct SessionTrust {
-    accepted: std::sync::Arc<parking_lot::Mutex<std::collections::HashSet<String>>>,
+    accepted: std::sync::Arc<parking_lot::Mutex<HashMap<TrustedHost, TrustedKey>>>,
 }
+
+/// (case-folded host, port).
+type TrustedHost = (String, u16);
+/// (key type, base64 key) accepted for a [`TrustedHost`].
+type TrustedKey = (String, String);
 
 impl SessionTrust {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Host is case-folded to match [`check`]'s lookup semantics; the key
-    /// blob and algorithm are compared verbatim.
-    fn entry(host: &str, port: u16, key_type: &str, key_b64: &str) -> String {
-        format!(
-            "{}\u{0}{port}\u{0}{key_type}\u{0}{key_b64}",
-            host.to_ascii_lowercase()
-        )
-    }
-
     /// Record that the user accepted this key for the current session.
     pub fn trust(&self, host: &str, port: u16, key_type: &str, key_b64: &str) {
-        self.accepted
-            .lock()
-            .insert(Self::entry(host, port, key_type, key_b64));
+        self.accepted.lock().insert(
+            (host.to_ascii_lowercase(), port),
+            (key_type.to_string(), key_b64.to_string()),
+        );
     }
 
-    /// Whether this exact key was already accepted for the current session.
-    pub fn is_trusted(&self, host: &str, port: u16, key_type: &str, key_b64: &str) -> bool {
-        self.accepted
-            .lock()
-            .contains(&Self::entry(host, port, key_type, key_b64))
+    /// Check a presented key against what this session accepted. Host is
+    /// case-folded to match [`check`]'s lookup semantics; the key blob and
+    /// algorithm are compared verbatim.
+    pub fn check(&self, host: &str, port: u16, key_type: &str, key_b64: &str) -> KeyStatus {
+        match self.accepted.lock().get(&(host.to_ascii_lowercase(), port)) {
+            None => KeyStatus::Unknown,
+            Some((t, k)) if t == key_type && k == key_b64 => KeyStatus::Trusted,
+            Some((t, k)) => KeyStatus::Changed {
+                stored_key_type: t.clone(),
+                stored_key_b64: k.clone(),
+            },
+        }
     }
 }
 
@@ -476,14 +485,14 @@ fn read_bounded_from_handle(file: &mut std::fs::File) -> Result<String> {
 
 #[cfg(test)]
 mod trust_tests {
-    use super::SessionTrust;
+    use super::{KeyStatus, SessionTrust};
 
     const KEY: &str = "AAAAC3NzaC1lZDI1NTE5AAAAIGoodkey";
 
     #[test]
-    fn an_untrusted_key_is_not_trusted() {
+    fn an_untrusted_key_is_unknown() {
         let t = SessionTrust::new();
-        assert!(!t.is_trusted("h", 22, "ssh-ed25519", KEY));
+        assert_eq!(t.check("h", 22, "ssh-ed25519", KEY), KeyStatus::Unknown);
     }
 
     #[test]
@@ -493,27 +502,45 @@ mod trust_tests {
         // own connection, and without this every one of them re-prompted.
         let t = SessionTrust::new();
         t.trust("h", 22, "ssh-ed25519", KEY);
-        assert!(t.is_trusted("h", 22, "ssh-ed25519", KEY));
+        assert_eq!(t.check("h", 22, "ssh-ed25519", KEY), KeyStatus::Trusted);
+    }
+
+    /// Accepting a key once vouches for that host, as a known_hosts entry
+    /// does: another key from it later in the session is the man in the
+    /// middle the first prompt was guarding against, and must be refused,
+    /// not offered as a host seen for the first time.
+    #[test]
+    fn another_key_from_a_host_trusted_once_is_a_changed_key() {
+        let t = SessionTrust::new();
+        t.trust("h", 22, "ssh-ed25519", KEY);
+        let changed = KeyStatus::Changed {
+            stored_key_type: "ssh-ed25519".into(),
+            stored_key_b64: KEY.into(),
+        };
+        assert_eq!(
+            t.check("h", 22, "ssh-ed25519", "OTHERKEY"),
+            changed,
+            "different key"
+        );
+        assert_eq!(
+            t.check("H", 22, "ssh-rsa", KEY),
+            changed,
+            "different algorithm"
+        );
     }
 
     #[test]
-    fn trust_is_scoped_to_the_exact_key() {
+    fn trust_is_scoped_to_the_host_and_port() {
         let t = SessionTrust::new();
         t.trust("h", 22, "ssh-ed25519", KEY);
-        assert!(
-            !t.is_trusted("h", 22, "ssh-ed25519", "OTHERKEY"),
-            "different key"
-        );
-        assert!(
-            !t.is_trusted("h", 22, "ssh-rsa", KEY),
-            "different algorithm"
-        );
-        assert!(
-            !t.is_trusted("h", 2222, "ssh-ed25519", KEY),
+        assert_eq!(
+            t.check("h", 2222, "ssh-ed25519", KEY),
+            KeyStatus::Unknown,
             "different port"
         );
-        assert!(
-            !t.is_trusted("other", 22, "ssh-ed25519", KEY),
+        assert_eq!(
+            t.check("other", 22, "ssh-ed25519", KEY),
+            KeyStatus::Unknown,
             "different host"
         );
     }
@@ -524,7 +551,10 @@ mod trust_tests {
         let t = SessionTrust::new();
         let worker = t.clone();
         t.trust("h", 22, "ssh-ed25519", KEY);
-        assert!(worker.is_trusted("h", 22, "ssh-ed25519", KEY));
+        assert_eq!(
+            worker.check("h", 22, "ssh-ed25519", KEY),
+            KeyStatus::Trusted
+        );
     }
 
     #[test]
@@ -534,14 +564,17 @@ mod trust_tests {
         let a = SessionTrust::new();
         let b = SessionTrust::new();
         a.trust("h", 22, "ssh-ed25519", KEY);
-        assert!(!b.is_trusted("h", 22, "ssh-ed25519", KEY));
+        assert_eq!(b.check("h", 22, "ssh-ed25519", KEY), KeyStatus::Unknown);
     }
 
     #[test]
     fn host_matching_is_case_insensitive() {
         let t = SessionTrust::new();
         t.trust("Host.Example.COM", 22, "ssh-ed25519", KEY);
-        assert!(t.is_trusted("host.example.com", 22, "ssh-ed25519", KEY));
+        assert_eq!(
+            t.check("host.example.com", 22, "ssh-ed25519", KEY),
+            KeyStatus::Trusted
+        );
     }
 }
 

@@ -188,6 +188,9 @@ pub enum AppEvent {
         stored_key_type: String,
         presented_key_type: String,
         fingerprint: String,
+        /// The expected key was one the user trusted once this session, not
+        /// one stored in known_hosts — so there is no entry to remove.
+        trusted_once: bool,
     },
 
     /// The server presented an SSH host certificate, which blink cannot

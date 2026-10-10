@@ -653,6 +653,9 @@ pub struct HostKeyChangedInfo {
     pub stored_key_type: String,
     pub presented_key_type: String,
     pub fingerprint: String,
+    /// The expected key was trusted once this session rather than stored,
+    /// so the modal has no `known-hosts remove` command to offer.
+    pub trusted_once: bool,
 }
 
 // ---------------------------------------------------------------------------

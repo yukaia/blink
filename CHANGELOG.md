@@ -64,6 +64,25 @@ the git history for those.
 
 ### Fixed
 
+- **A host key trusted once is held to for the rest of the session.**
+  "Trust once" accepted that exact key, and nothing else about the host:
+  a transfer connection that later met a different key from the same
+  host got the ordinary "new host" prompt, where a key stored in
+  known_hosts would have been refused as changed. That second key is the
+  man in the middle the first prompt guarded against. It is now refused
+  as a changed key, and the warning says to reconnect, since there is no
+  stored entry to remove.
+- **Prompts raised by background work no longer take your keystrokes.**
+  The overwrite question a recursive transfer asks, and the host-key
+  prompt a transfer connection raises, opened whenever that work got
+  there and answered on single letters. Typing a rename to `yearly.csv`
+  as one opened answered "overwrite all" with the `y`, and the rename was
+  lost; a host-key prompt could be accepted the same way. Opened over the
+  file viewer or help, the host-key prompt also left Esc unable to leave
+  either. Such a prompt now waits, with a log line saying so, until you
+  are back at the file list, and ignores keys for a moment as it opens. A
+  second recursive transfer's overwrite question also no longer replaces
+  the first's unanswered: it is asked next.
 - **Transfers prepared on one server are no longer started on the next.**
   A recursive upload or download first walks the tree into a list of
   transfers, and that walk kept running after a disconnect. If it

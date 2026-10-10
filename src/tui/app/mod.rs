@@ -29,6 +29,10 @@ use crate::tui::{TICK_INTERVAL, TuiTerminal};
 
 use crate::transport::CONNECT_TIMEOUT;
 
+/// How long a prompt that opened on its own ignores the keys that answer
+/// it: a key already on its way was meant for whatever was there before.
+const PROMPT_ARMING_DELAY: std::time::Duration = std::time::Duration::from_millis(750);
+
 /// Which screen is the user currently looking at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Screen {
@@ -265,6 +269,9 @@ pub struct App {
 
     // Overwrite confirmation (shared between rename and upload)
     pub pending_overwrite: Option<OverwritePending>,
+    /// Walks' overwrite questions not yet asked, oldest first. See
+    /// [`App::open_waiting_prompt`].
+    waiting_overwrites: std::collections::VecDeque<OverwritePending>,
 
     // Async plumbing
     app_event_tx: mpsc::UnboundedSender<AppEvent>,
@@ -332,6 +339,9 @@ pub struct App {
     /// from an earlier connection is dropped rather than applied to the
     /// current one.
     connection: u64,
+    /// When the prompt on screen will take its answer keys, for one that
+    /// opened on its own. See [`App::open_waiting_prompt`].
+    prompt_ready_at: Option<std::time::Instant>,
     /// Set to true when an image viewer needs its graphics escape sequences
     /// re-emitted (initial open, terminal resize). The run loop emits and
     /// clears this flag after each `terminal.draw`.
@@ -443,6 +453,8 @@ impl App {
             last_click: None,
             next_viewer_id: 1,
             connection: 0,
+            prompt_ready_at: None,
+            waiting_overwrites: std::collections::VecDeque::new(),
             image_needs_redraw: false,
             remote_listing: None,
             unreadable_warned: None,
@@ -681,6 +693,12 @@ impl App {
     // -------------------------------------------------------------------
 
     fn handle_key(&mut self, key: KeyEvent) {
+        self.dispatch_key(key);
+        // The key may have left a screen a waiting prompt held off for.
+        self.open_waiting_prompt();
+    }
+
+    fn dispatch_key(&mut self, key: KeyEvent) {
         // A key between two clicks breaks the pair: what the second click
         // lands on may no longer be what the first one did.
         self.last_click = None;
@@ -778,6 +796,63 @@ impl App {
     }
 
     // -------------------------------------------------------------------
+    // Prompts that open on their own
+    // -------------------------------------------------------------------
+
+    /// Open a prompt that background work raised, if the user is somewhere
+    /// it can open without taking their keystrokes.
+    ///
+    /// A worker's host-key prompt and a walk's overwrite question arrive
+    /// whenever that work gets there, and both answer on single letters. One
+    /// opening over a form took the next letter typed as its answer — the
+    /// `y` of a rename to `yearly.csv` overwrote every conflict — and threw
+    /// the form away. Over the viewer or help it became their return
+    /// screen, stranding the user there. So they wait for a screen where
+    /// nothing is being typed, and on opening ignore their keys for
+    /// [`PROMPT_ARMING_DELAY`], for a key already on its way.
+    ///
+    /// The host-key prompt goes first: a connection is blocked on it.
+    pub(super) fn open_waiting_prompt(&mut self) {
+        if let Some(prompt) = self.pending_host_key.as_ref()
+            && self.screen != Screen::ConfirmHostKey
+            && matches!(
+                self.screen,
+                Screen::Main | Screen::Connection | Screen::SessionSelect
+            )
+        {
+            // The connection gave up waiting (`HOST_KEY_DECISION_TIMEOUT`)
+            // or went away: there is nothing left to answer.
+            if prompt.decision_tx.as_ref().is_none_or(|tx| tx.is_closed()) {
+                let host = prompt.host.clone();
+                self.pending_host_key = None;
+                self.push_log(
+                    LogLevel::Warn,
+                    format!("the host-key prompt for {host} expired while it waited"),
+                );
+            } else {
+                self.previous_screen = self.screen.clone();
+                self.screen = Screen::ConfirmHostKey;
+                self.prompt_ready_at = Some(Instant::now() + PROMPT_ARMING_DELAY);
+                return;
+            }
+        }
+        if self.screen == Screen::Main
+            && self.pending_overwrite.is_none()
+            && let Some(next) = self.waiting_overwrites.pop_front()
+        {
+            self.pending_overwrite = Some(next);
+            self.screen = Screen::ConfirmOverwrite;
+            self.prompt_ready_at = Some(Instant::now() + PROMPT_ARMING_DELAY);
+        }
+    }
+
+    /// Whether the prompt on screen opened on its own too recently to take
+    /// a key as its answer.
+    pub(super) fn prompt_arming(&self) -> bool {
+        self.prompt_ready_at.is_some_and(|t| Instant::now() < t)
+    }
+
+    // -------------------------------------------------------------------
     // Disconnect (return to the session selector)
     // -------------------------------------------------------------------
 
@@ -854,6 +929,8 @@ impl App {
         self.pending_trust = crate::known_hosts::SessionTrust::new();
         self.pending_cancel = None;
         self.pending_overwrite = None;
+        self.waiting_overwrites.clear();
+        self.prompt_ready_at = None;
         self.pending_delete = None;
         self.transfer_cursor = 0;
         self.bottom_pane = BottomPane::Log;
@@ -1400,6 +1477,173 @@ mod tests {
             Screen::Main,
             "the return screen must survive a second prompt",
         );
+    }
+
+    // -- prompts that open on their own ------------------------------------
+    //
+    // A walk's overwrite question and a worker's host-key prompt arrive
+    // whenever the background work gets there. Both answer on single
+    // letters, so one opening mid-word took the next letter typed as its
+    // answer: the `y` of a rename to `yearly.csv` overwrote every conflict.
+
+    fn host_key_event() -> (
+        AppEvent,
+        tokio::sync::oneshot::Receiver<crate::transport::sftp::HostKeyDecision>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let ev = AppEvent::HostKeyUnknown {
+            host: "h".into(),
+            key_type: "ssh-ed25519".into(),
+            fingerprint: "SHA256:abc".into(),
+            decision_tx: tx,
+        };
+        (ev, rx)
+    }
+
+    fn conflicting_walk(a: &App) -> AppEvent {
+        AppEvent::WalkComplete {
+            connection: a.connection,
+            plan: vec![upload(0)],
+            conflict_indices: vec![0],
+            symlinks_skipped: 0,
+            unencodable_skipped: 0,
+            unreadable_skipped: 0,
+            unverifiable_uploads: 0,
+            kind: Direction::Upload,
+        }
+    }
+
+    fn renaming(a: &mut App) {
+        a.screen = Screen::Rename;
+        a.rename_input = "ear".into();
+    }
+
+    #[test]
+    fn a_host_key_prompt_waits_while_the_user_types() {
+        let mut a = app();
+        renaming(&mut a);
+        let (ev, mut rx) = host_key_event();
+        a.handle_app_event(ev);
+
+        a.handle_key(press(KeyCode::Char('y')));
+
+        assert_eq!(a.screen, Screen::Rename);
+        assert_eq!(a.rename_input, "eary", "the keystroke is the user's");
+        assert!(rx.try_recv().is_err(), "and answers nothing");
+        assert!(logged(&a, "host-key prompt"), "the wait is said");
+    }
+
+    #[test]
+    fn an_overwrite_question_waits_while_the_user_types() {
+        let mut a = app_with_manager();
+        renaming(&mut a);
+        a.handle_app_event(conflicting_walk(&a));
+
+        a.handle_key(press(KeyCode::Char('y')));
+
+        assert_eq!(a.screen, Screen::Rename);
+        assert_eq!(a.rename_input, "eary");
+        assert!(a.transfer_manager.as_ref().unwrap().snapshot().is_empty());
+    }
+
+    #[test]
+    fn a_waiting_prompt_opens_once_the_user_is_done() {
+        let mut a = app_with_manager();
+        renaming(&mut a);
+        a.handle_app_event(conflicting_walk(&a));
+
+        a.handle_key(press(KeyCode::Esc));
+
+        assert_eq!(a.screen, Screen::ConfirmOverwrite);
+        assert!(a.pending_overwrite.is_some());
+    }
+
+    /// Over the viewer or help, the prompt took their place as the screen to
+    /// return to, and Esc from either then returned to itself, for good.
+    #[test]
+    fn a_host_key_prompt_waits_out_the_viewer() {
+        let mut a = app();
+        a.screen = Screen::Help;
+        a.previous_screen = Screen::Main;
+        let (ev, _rx) = host_key_event();
+        a.handle_app_event(ev);
+        assert_eq!(a.screen, Screen::Help);
+
+        a.handle_key(press(KeyCode::Esc));
+        assert_eq!(a.screen, Screen::ConfirmHostKey);
+        a.prompt_ready_at = None;
+        a.handle_key(press(KeyCode::Char('n')));
+
+        assert_eq!(a.screen, Screen::Main);
+    }
+
+    #[test]
+    fn a_host_key_prompt_ignores_keys_as_it_opens() {
+        let mut a = app();
+        a.screen = Screen::Main;
+        let (ev, mut rx) = host_key_event();
+        a.handle_app_event(ev);
+        assert_eq!(a.screen, Screen::ConfirmHostKey);
+
+        a.handle_key(press(KeyCode::Char('y')));
+        assert_eq!(a.screen, Screen::ConfirmHostKey, "too soon to be an answer");
+        assert!(rx.try_recv().is_err());
+
+        a.prompt_ready_at = None;
+        a.handle_key(press(KeyCode::Char('y')));
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            crate::transport::sftp::HostKeyDecision::AcceptAndSave,
+        );
+    }
+
+    #[test]
+    fn an_overwrite_question_ignores_keys_as_it_opens() {
+        let mut a = app_with_manager();
+        a.screen = Screen::Main;
+        a.handle_app_event(conflicting_walk(&a));
+        assert_eq!(a.screen, Screen::ConfirmOverwrite);
+
+        a.handle_key(press(KeyCode::Char('y')));
+
+        assert_eq!(
+            a.screen,
+            Screen::ConfirmOverwrite,
+            "too soon to be an answer"
+        );
+        assert!(a.transfer_manager.as_ref().unwrap().snapshot().is_empty());
+    }
+
+    /// Each finished walk replaced the question before it, and the plan it
+    /// held was lost unanswered.
+    #[test]
+    fn a_second_overwrite_question_waits_for_the_first() {
+        let mut a = app_with_manager();
+        a.screen = Screen::Main;
+        a.handle_app_event(conflicting_walk(&a));
+        a.handle_app_event(conflicting_walk(&a));
+
+        a.prompt_ready_at = None;
+        a.handle_key(press(KeyCode::Char('n')));
+
+        assert_eq!(a.screen, Screen::ConfirmOverwrite, "the second is asked");
+        assert!(a.pending_overwrite.is_some());
+    }
+
+    /// The worker gives up after `HOST_KEY_DECISION_TIMEOUT`; a prompt it no
+    /// longer waits on must not open as if it still mattered.
+    #[test]
+    fn a_host_key_prompt_abandoned_while_waiting_does_not_open() {
+        let mut a = app();
+        renaming(&mut a);
+        let (ev, rx) = host_key_event();
+        a.handle_app_event(ev);
+        drop(rx);
+
+        a.handle_key(press(KeyCode::Esc));
+
+        assert_eq!(a.screen, Screen::Main);
+        assert!(a.pending_host_key.is_none());
     }
 
     // -- transfer log lines ------------------------------------------------
@@ -2554,6 +2798,7 @@ mod tests {
     #[test]
     fn uploads_that_could_not_be_checked_are_explained_before_the_prompt() {
         let mut a = app_with_manager();
+        a.screen = Screen::Main;
         a.handle_app_event(AppEvent::WalkComplete {
             connection: a.connection,
             plan: vec![upload(0)],
@@ -2918,7 +3163,36 @@ mod tests {
             stored_key_type: "ssh-ed25519".into(),
             presented_key_type: "ssh-rsa".into(),
             fingerprint: "SHA256:abc".into(),
+            trusted_once: false,
         }
+    }
+
+    fn changed_modal_text(info: HostKeyChangedInfo) -> String {
+        let mut a = app();
+        a.host_key_changed_info = Some(info);
+        a.screen = Screen::HostKeyChanged;
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 60)).unwrap();
+        t.draw(|f| a.draw(f)).unwrap();
+        let buf = t.backend().buffer().clone();
+        buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn a_changed_stored_key_points_at_removing_it() {
+        let text = changed_modal_text(changed_info());
+        assert!(text.contains("blink known-hosts remove h"), "{text}");
+    }
+
+    /// A key trusted once was never stored: there is nothing to remove, and
+    /// reconnecting is what forgets it.
+    #[test]
+    fn a_changed_key_trusted_once_points_at_reconnecting() {
+        let text = changed_modal_text(HostKeyChangedInfo {
+            trusted_once: true,
+            ..changed_info()
+        });
+        assert!(!text.contains("known-hosts remove"), "{text}");
+        assert!(text.contains("reconnect and accept it"), "{text}");
     }
 
     #[tokio::test]

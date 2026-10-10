@@ -2338,6 +2338,23 @@ pub mod host_key_changed {
             )
         };
 
+        // A key trusted once was never stored, so there is nothing to
+        // remove: dismissing disconnects, which forgets it, and the next
+        // connect asks afresh.
+        let (advice, action, command) = if info.trusted_once {
+            (
+                "You trusted this host's key once, for this session only.",
+                "Only if you have confirmed the new fingerprint out of band,",
+                "reconnect and accept it when asked.".to_string(),
+            )
+        } else {
+            (
+                "Only if you know the key was legitimately replaced, and",
+                "have confirmed the new fingerprint out of band, run:",
+                remove_cmd,
+            )
+        };
+
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -2390,19 +2407,13 @@ pub mod host_key_changed {
                 ),
             ]),
             Line::from(""),
-            Line::from(Span::styled(
-                "Only if you know the key was legitimately replaced, and",
-                Style::default().fg(app.theme.dim),
-            ))
-            .alignment(Alignment::Center),
-            Line::from(Span::styled(
-                "have confirmed the new fingerprint out of band, run:",
-                Style::default().fg(app.theme.dim),
-            ))
-            .alignment(Alignment::Center),
+            Line::from(Span::styled(advice, Style::default().fg(app.theme.dim)))
+                .alignment(Alignment::Center),
+            Line::from(Span::styled(action, Style::default().fg(app.theme.dim)))
+                .alignment(Alignment::Center),
             Line::from(""),
             Line::from(Span::styled(
-                remove_cmd,
+                command,
                 Style::default()
                     .fg(app.theme.accent)
                     .add_modifier(Modifier::BOLD),

@@ -47,6 +47,8 @@ impl App {
             Screen::SessionSelect => self.mouse_session_select(m, now),
             _ => {}
         }
+        // As for a key: a click may have closed what a prompt waited on.
+        self.open_waiting_prompt();
     }
 
     /// Record a press on `target`; true when it completes a double-click. A

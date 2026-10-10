@@ -485,6 +485,9 @@ impl App {
 
     pub(super) fn handle_confirm_host_key(&mut self, key: KeyEvent) {
         use crate::transport::sftp::HostKeyDecision;
+        if self.prompt_arming() {
+            return;
+        }
         let decision = match key.code {
             // y / Y — accept and save to known_hosts
             KeyCode::Char('y') | KeyCode::Char('Y') => Some(HostKeyDecision::AcceptAndSave),
@@ -570,6 +573,9 @@ impl App {
     }
 
     pub(super) fn handle_confirm_overwrite(&mut self, key: KeyEvent) {
+        if self.prompt_arming() {
+            return;
+        }
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 // Y always means "overwrite" / "proceed" for backward

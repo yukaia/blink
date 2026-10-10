@@ -408,8 +408,18 @@ impl App {
                         },
                         Direction::CreateDir => unreachable!(),
                     };
-                    self.pending_overwrite = Some(pending);
-                    self.screen = Screen::ConfirmOverwrite;
+                    // Asked when the user is free to answer, after any
+                    // question already asked: see `open_waiting_prompt`.
+                    self.waiting_overwrites.push_back(pending);
+                    self.open_waiting_prompt();
+                    if !self.waiting_overwrites.is_empty() {
+                        self.push_log(
+                            LogLevel::Info,
+                            "a batch is waiting to ask about overwriting; \
+                             it asks once you're back at the file list"
+                                .into(),
+                        );
+                    }
                 }
             }
             AppEvent::WalkFailed {
@@ -519,23 +529,36 @@ impl App {
                 fingerprint,
                 decision_tx,
             } => {
+                // A prompt already up or waiting is replaced: the dropped
+                // `PendingHostKey` answers its own oneshot with `Reject`, so
+                // the connection it belonged to still unwinds. (The shared
+                // `SessionTrust` makes concurrent prompts rare, but the state
+                // machine shouldn't depend on that.)
                 self.pending_host_key = Some(PendingHostKey {
-                    host,
+                    host: host.clone(),
                     key_type,
                     fingerprint,
                     decision_tx: Some(decision_tx),
                     opened_at: std::time::Instant::now(),
                 });
-                // Don't let a second prompt make this modal its own return
-                // target — that strands the user on it. (The shared
-                // `SessionTrust` means concurrent prompts are now rare, but
-                // the state machine shouldn't depend on that.) The dropped
-                // `PendingHostKey` above answers its own oneshot with
-                // `Reject`, so the connection it belonged to still unwinds.
-                if self.screen != Screen::ConfirmHostKey {
-                    self.previous_screen = self.screen.clone();
+                if self.screen == Screen::ConfirmHostKey {
+                    // Shown in place, keeping the screen to return to — the
+                    // prompt itself must never become that, or it strands
+                    // the user on it. Its keys wait as a new prompt's do.
+                    self.prompt_ready_at =
+                        Some(std::time::Instant::now() + super::PROMPT_ARMING_DELAY);
+                } else {
+                    self.open_waiting_prompt();
+                    if self.screen != Screen::ConfirmHostKey {
+                        self.push_log(
+                            LogLevel::Warn,
+                            format!(
+                                "a host-key prompt for {host} is waiting; it opens \
+                                 once you're back at the file list"
+                            ),
+                        );
+                    }
                 }
-                self.screen = Screen::ConfirmHostKey;
             }
             AppEvent::HostKeyChanged {
                 host,
@@ -544,6 +567,7 @@ impl App {
                 stored_key_type,
                 presented_key_type,
                 fingerprint,
+                trusted_once,
             } => {
                 self.push_log(
                     LogLevel::Error,
@@ -559,6 +583,7 @@ impl App {
                     stored_key_type,
                     presented_key_type,
                     fingerprint,
+                    trusted_once,
                 });
                 self.pending_session = None;
                 self.screen = Screen::HostKeyChanged;
