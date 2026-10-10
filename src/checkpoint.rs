@@ -63,7 +63,7 @@
 //! latest marks, which only means those jobs run again on resume. What it
 //! can never do is record a job as `done` that had not finished.
 //!
-//! Writes are atomic: the JSON is written to a `.tmp` sibling file then
+//! Writes are atomic: the JSON is written to a temp file beside it then
 //! renamed into place, so a crash mid-write never produces a truncated file.
 //!
 //! ## Version migration
@@ -291,31 +291,11 @@ impl Checkpoint {
         Ok(paths::checkpoints_dir()?.join(format!("{safe_name}-{suffix}-{}.json", kind.as_str())))
     }
 
-    /// Atomically and durably write `content` to `path` via a `.tmp` sibling
-    /// + rename.
-    ///
-    /// The full pattern is:
-    ///   1. write tempfile, flush, `sync_all` (data is on the platter)
-    ///   2. rename tempfile over the destination
-    ///   3. `sync_all` the parent directory (rename is journaled) — Unix only;
-    ///      Windows journals rename through its own filesystem semantics.
-    ///
-    /// Without (1), a power loss between rename and the filesystem journal
-    /// commit can leave the destination as a zero-byte file (the rename is
-    /// visible, the data isn't). Without (3), the rename itself can be
-    /// rolled back on power loss even though it returned Ok.
+    /// Atomically and durably write `content` to `path`. See
+    /// [`paths::atomic_write`].
     fn atomic_write(path: &Path, content: &str) -> Result<()> {
         use std::io::Write as _;
-
-        let tmp = path.with_extension("tmp");
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(content.as_bytes())?;
-            f.sync_all()?;
-        }
-        std::fs::rename(&tmp, path)?;
-        paths::sync_parent_dir(path)?;
-        Ok(())
+        paths::atomic_write(path, |f| f.write_all(content.as_bytes()))
     }
 
     /// Force-write this checkpoint to disk, overwriting any previous one

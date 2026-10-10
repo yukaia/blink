@@ -396,25 +396,16 @@ pub fn remove_host(host: &str, port: u16) -> Result<usize> {
         return Ok(0);
     }
 
-    // Atomic + durable write, same pattern as every other file blink owns:
-    // tempfile → sync_all → rename → fsync the parent directory. Without the
-    // syncs a power loss can leave a zero-byte known_hosts, which would
-    // silently downgrade every stored host to "unknown".
+    // Atomic + durable write, as for every other file blink owns: a power
+    // loss can't leave a zero-byte known_hosts, which would silently
+    // downgrade every stored host to "unknown". See `paths::atomic_write`.
     //
     // Note this does NOT take the advisory lock `append` uses: that lock
     // lives on the original inode, and renaming a replacement over it can't
     // be serialised against it that way. A concurrent accept-and-save racing
     // this removal can therefore be lost — the consequence is one re-prompt
     // on the next connect, not a wrong trust decision.
-    let tmp = path.with_extension("tmp");
-    {
-        use std::io::Write as _;
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(filtered.as_bytes())?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, &path)?;
-    paths::sync_parent_dir(&path)?;
+    paths::atomic_write(&path, |f| f.write_all(filtered.as_bytes()))?;
     Ok(removed)
 }
 

@@ -387,6 +387,45 @@ pub fn sync_parent_dir(path: &Path) -> Result<()> {
     }
 }
 
+/// Atomically and durably replace `path` with what `write` puts in a file:
+/// write a temp file beside it, `sync_all`, rename it over `path`, then
+/// [`sync_parent_dir`]. Without the syncs, a power loss between the rename
+/// and the journal commit can leave a zero-byte file or undo the rename.
+///
+/// The temp file's name is unique to this process and call, and it is
+/// opened create-new. A fixed `<name>.tmp` was shared by every blink running
+/// at once: two saving the same file wrote into one temp file, and could
+/// rename a mix of both into place. Create-new also means whatever already
+/// sits at the name, a link included, is never written through. On failure
+/// the temp file is removed, and `path` is left as it was.
+pub fn atomic_write(
+    path: &Path,
+    write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = path.with_file_name(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    let written = write(&mut f).and_then(|()| f.sync_all()).and_then(|()| {
+        drop(f);
+        fs::rename(&tmp, path)
+    });
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    sync_parent_dir(path)
+}
+
 /// Default local working directory: the user's home dir.
 ///
 /// Falls back to the filesystem root rather than a relative path so that the
@@ -408,6 +447,119 @@ pub fn default_local_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- atomic_write -------------------------------------------------------
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn atomic_write_replaces_the_file_and_leaves_nothing_else() {
+        let _home = test_home();
+        let dir = root_dir().unwrap();
+        let path = dir.join("f.ini");
+        fs::write(&path, "old").unwrap();
+
+        atomic_write(&path, |f| {
+            use std::io::Write as _;
+            f.write_all(b"new")
+        })
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(names_in(&dir), ["f.ini"]);
+    }
+
+    #[test]
+    fn a_failed_atomic_write_keeps_the_file_and_cleans_up() {
+        let _home = test_home();
+        let dir = root_dir().unwrap();
+        let path = dir.join("f.ini");
+        fs::write(&path, "old").unwrap();
+
+        let res = atomic_write(&path, |_| Err(std::io::Error::other("disk full")));
+
+        assert!(res.is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "old");
+        assert_eq!(names_in(&dir), ["f.ini"], "no temp file left behind");
+    }
+
+    /// Two blink processes saving one file — a theme cycle in each, say —
+    /// shared one `<name>.tmp`: each truncated and wrote it under the other,
+    /// so a mix of both could be renamed into place, and the slower rename
+    /// failed outright. Writers here are threads, but the file system sees
+    /// the same thing.
+    #[test]
+    fn concurrent_atomic_writes_each_land_whole() {
+        let _home = test_home();
+        let dir = root_dir().unwrap();
+        let path = dir.join("f.ini");
+        let contents: Vec<String> = (0..8)
+            .map(|i| char::from(b'a' + i).to_string().repeat(64 * 1024))
+            .collect();
+
+        let errors: Vec<String> = std::thread::scope(|s| {
+            let handles: Vec<_> = contents
+                .iter()
+                .map(|c| {
+                    let path = path.clone();
+                    s.spawn(move || {
+                        (0..20)
+                            .filter_map(|_| {
+                                atomic_write(&path, |f| {
+                                    use std::io::Write as _;
+                                    // In pieces, as `Ini::write_to` writes.
+                                    for chunk in c.as_bytes().chunks(4096) {
+                                        f.write_all(chunk)?;
+                                    }
+                                    Ok(())
+                                })
+                                .err()
+                                .map(|e| e.to_string())
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .flat_map(|h| h.join().unwrap())
+                .collect()
+        });
+
+        assert!(errors.is_empty(), "{errors:?}");
+        let landed = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains(&landed), "a mix of writers landed");
+        assert_eq!(names_in(&dir), ["f.ini"]);
+    }
+
+    /// The temp file is opened create-new: something already at its name —
+    /// a link planted there — is never written through.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_never_writes_through_an_existing_file() {
+        let _home = test_home();
+        let dir = root_dir().unwrap();
+        let path = dir.join("f.ini");
+        let victim = dir.join("victim");
+        fs::write(&victim, "untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("f.tmp")).unwrap();
+
+        atomic_write(&path, |f| {
+            use std::io::Write as _;
+            f.write_all(b"new")
+        })
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+    }
 
     #[test]
     fn a_guard_redirects_away_from_the_shared_home() {

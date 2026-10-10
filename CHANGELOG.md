@@ -64,6 +64,13 @@ the git history for those.
 
 ### Fixed
 
+- **Two blink instances saving the same file no longer corrupt it.** The
+  config, session, checkpoint and known_hosts files were each saved
+  through one fixed temp file beside them, such as `config.tmp`. Two
+  instances saving at once wrote into the same temp file, so a mix of
+  both could be renamed into place, and the other save failed. Each save
+  now writes its own temp file, removes it if the save fails, and never
+  writes through a link left at its name.
 - **Downloads left out for their names are now reported.** A remote file
   whose name can't be a local file name — one with a backslash in it, or
   on Windows a reserved name such as `NUL` — is skipped, but a recursive

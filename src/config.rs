@@ -156,7 +156,7 @@ impl Config {
         Ok(cfg)
     }
 
-    /// Serialize and write `config.ini` atomically (write to `.tmp`, rename).
+    /// Serialize and write `config.ini` atomically. See [`paths::atomic_write`].
     ///
     /// Load-modify-save (rather than rebuild-from-scratch) so user-added
     /// keys and sections — forward-compat options, experimental flags,
@@ -165,7 +165,6 @@ impl Config {
     /// every `t` keystroke silently dropped anything blink didn't recognise.
     pub fn save(&self) -> Result<()> {
         let path = paths::config_file()?;
-        let tmp = path.with_extension("tmp");
 
         // Start from the file on disk so unknown sections / keys round-trip.
         // If the file doesn't exist, won't parse, or is larger than we are
@@ -199,16 +198,7 @@ impl Config {
             )
             .set("mouse", self.terminal.mouse.to_string());
 
-        // Atomic + durable write — same pattern as session / checkpoint:
-        // tempfile → sync_all → rename → fsync parent dir.
-        {
-            let mut f = fs::File::create(&tmp)?;
-            ini.write_to(&mut f)?;
-            f.sync_all()?;
-        }
-        fs::rename(&tmp, &path)?;
-        paths::sync_parent_dir(&path)?;
-        Ok(())
+        paths::atomic_write(&path, |f| ini.write_to(f))
     }
 }
 

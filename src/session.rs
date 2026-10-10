@@ -306,7 +306,7 @@ impl Session {
         Ok(())
     }
 
-    /// Serialize and write the session file atomically (write to `.tmp`, rename).
+    /// Serialize and write the session file atomically. See [`paths::atomic_write`].
     ///
     /// Refuses to write a session that [`Self::validate`] rejects, so the
     /// file on disk is always one `load_from` can read back.
@@ -314,7 +314,6 @@ impl Session {
         self.validate()?;
 
         let path = self.path()?;
-        let tmp = path.with_extension("tmp");
 
         let mut ini = Ini::new();
         ini.with_section(Some("session"))
@@ -363,17 +362,7 @@ impl Session {
             }
         }
 
-        // Atomic + durable write: tempfile → sync_all → rename → fsync the
-        // parent directory. Without the syncs, a power loss between rename
-        // and the filesystem's journal commit can leave a zero-byte session
-        // file or revert the rename entirely. See [`paths::sync_parent_dir`].
-        {
-            let mut f = fs::File::create(&tmp)?;
-            ini.write_to(&mut f)?;
-            f.sync_all()?;
-        }
-        fs::rename(&tmp, &path)?;
-        paths::sync_parent_dir(&path)?;
+        paths::atomic_write(&path, |f| ini.write_to(f))?;
 
         // Migration: older blink versions wrote at `<sanitized>.ini` with no
         // hash suffix. After a successful save under the new name, remove
