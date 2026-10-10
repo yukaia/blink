@@ -1508,6 +1508,7 @@ mod tests {
             symlinks_skipped: 0,
             unencodable_skipped: 0,
             unreadable_skipped: 0,
+            unsafe_skipped: 0,
             unverifiable_uploads: 0,
             kind: Direction::Upload,
         }
@@ -2806,6 +2807,7 @@ mod tests {
             symlinks_skipped: 0,
             unencodable_skipped: 0,
             unreadable_skipped: 0,
+            unsafe_skipped: 0,
             unverifiable_uploads: 5,
             kind: Direction::Upload,
         });
@@ -2835,6 +2837,7 @@ mod tests {
             symlinks_skipped: 0,
             unencodable_skipped: 0,
             unreadable_skipped: 0,
+            unsafe_skipped: 0,
             unverifiable_uploads: 0,
             kind: Direction::Upload,
         });
@@ -2858,6 +2861,7 @@ mod tests {
             symlinks_skipped: 0,
             unencodable_skipped: 0,
             unreadable_skipped: 0,
+            unsafe_skipped: 0,
             unverifiable_uploads: 0,
             kind: Direction::Upload,
         });
@@ -2901,6 +2905,105 @@ mod tests {
     }
 
     #[test]
+    fn a_download_walk_that_skipped_unsafe_names_says_so() {
+        let mut a = app();
+        a.handle_app_event(AppEvent::WalkComplete {
+            connection: a.connection,
+            plan: Vec::new(),
+            conflict_indices: Vec::new(),
+            symlinks_skipped: 0,
+            unencodable_skipped: 0,
+            unreadable_skipped: 0,
+            unsafe_skipped: 2,
+            unverifiable_uploads: 0,
+            kind: Direction::Download,
+        });
+        assert!(logged(
+            &a,
+            "skipped 2 entries whose names can't be used as local file names"
+        ));
+    }
+
+    /// The selection itself went through the same check, and what failed
+    /// it vanished without a word.
+    #[test]
+    fn a_selected_download_with_an_unsafe_name_says_so() {
+        let mut a = app_with_manager();
+        a.remote.path = "/srv".into();
+        a.enqueue_downloads(vec![("back\\slash".into(), false), ("ok".into(), false)]);
+        assert!(
+            logged(
+                &a,
+                "skipped 1 entry whose name can't be used as a local file name"
+            ),
+            "{:?}",
+            a.log.iter().map(|l| &l.message).collect::<Vec<_>>(),
+        );
+        assert!(logged(&a, "preparing 1 download(s)"));
+    }
+
+    // -- local names that are not UTF-8 ------------------------------------
+    //
+    // The local pane addresses files by `String`, so a name that isn't UTF-8
+    // was decoded lossily and the decoded name — a file that doesn't exist —
+    // was what an upload, the viewer or entering the directory then used.
+
+    fn lossy_entry(is_dir: bool) -> PaneEntry {
+        #[cfg(unix)]
+        let name = {
+            use std::os::unix::ffi::OsStrExt;
+            std::ffi::OsStr::from_bytes(b"bad\xffname").to_os_string()
+        };
+        #[cfg(windows)]
+        let name = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0x62, 0xD800, 0x61])
+        };
+        PaneEntry::local(&name, is_dir, 1)
+    }
+
+    fn on_lossy_local(is_dir: bool) -> App {
+        let mut a = app_with_manager();
+        a.screen = Screen::Main;
+        a.active_pane = Pane::Local;
+        a.local.path = "/l".into();
+        a.local
+            .set_entries(vec![PaneEntry::parent(), lossy_entry(is_dir)]);
+        a.local.cursor = 1;
+        a
+    }
+
+    #[test]
+    fn a_local_name_that_is_not_utf8_is_marked() {
+        assert!(lossy_entry(false).lossy_name);
+        assert!(!PaneEntry::local(std::ffi::OsStr::new("fine"), false, 1).lossy_name);
+    }
+
+    #[test]
+    fn uploading_a_local_name_that_is_not_utf8_says_why_not() {
+        let mut a = on_lossy_local(false);
+        a.start_selected_uploads();
+        assert!(logged(&a, "not valid UTF-8"));
+        assert!(!logged(&a, "preparing"), "nothing is uploaded");
+    }
+
+    #[test]
+    fn viewing_a_local_name_that_is_not_utf8_says_why_not() {
+        let mut a = on_lossy_local(false);
+        a.handle_view_request();
+        assert!(a.viewer.is_none());
+        assert!(logged(&a, "not valid UTF-8"));
+    }
+
+    #[test]
+    fn entering_a_local_dir_whose_name_is_not_utf8_says_why_not() {
+        let mut a = on_lossy_local(true);
+        a.local_enter();
+        assert_eq!(a.local.path, "/l", "stays put");
+        assert!(logged(&a, "not valid UTF-8"));
+    }
+
+    #[test]
     fn a_download_walk_that_skipped_unreadable_entries_says_so() {
         let mut a = app();
         a.handle_app_event(AppEvent::WalkComplete {
@@ -2910,6 +3013,7 @@ mod tests {
             symlinks_skipped: 0,
             unencodable_skipped: 0,
             unreadable_skipped: 12,
+            unsafe_skipped: 0,
             unverifiable_uploads: 0,
             kind: Direction::Download,
         });

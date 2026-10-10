@@ -212,6 +212,10 @@ impl App {
             }
             return;
         }
+        if entry.lossy_name {
+            self.report_lossy_names(1);
+            return;
+        }
         let file = vec![(entry.raw_name.clone(), false)];
         match pane {
             Pane::Local => self.start_uploads(file),

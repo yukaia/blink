@@ -47,10 +47,24 @@ impl App {
         // and the remote path written to. `selection` also keeps the `..`
         // row out, so a stray space on it can't turn into an upload of the
         // parent directory.
-        let entries = self.local.selection();
+        let (lossy, entries): (Vec<_>, Vec<_>) = self
+            .local
+            .selected_entries()
+            .into_iter()
+            .partition(|e| e.lossy_name);
+        let entries: Vec<(String, bool)> = entries
+            .into_iter()
+            .map(|e| (e.raw_name.clone(), e.is_dir))
+            .collect();
+        let lossy = lossy.len();
+        if lossy > 0 {
+            self.report_lossy_names(lossy);
+        }
 
         if entries.is_empty() {
-            self.push_log(LogLevel::Warn, "no items to upload".into());
+            if lossy == 0 {
+                self.push_log(LogLevel::Warn, "no items to upload".into());
+            }
             return;
         }
 
@@ -58,6 +72,19 @@ impl App {
         // not surprise the user later if they select more items meanwhile.
         self.local.clear_selection();
         self.start_uploads(entries);
+    }
+
+    /// Log `count` local entries left out of an upload because their names
+    /// are not valid UTF-8 — the same reason a directory upload skips them.
+    pub(super) fn report_lossy_names(&mut self, count: usize) {
+        let noun = if count == 1 { "file" } else { "files" };
+        self.push_log(
+            LogLevel::Warn,
+            format!(
+                "skipped {count} {noun} whose name is not valid UTF-8 and \
+                 has no faithful remote form"
+            ),
+        );
     }
 
     /// Upload `entries` — `(raw_name, is_dir)` in the local pane's directory
@@ -156,6 +183,7 @@ impl App {
                 symlinks_skipped,
                 unencodable_skipped,
                 unreadable_skipped: 0,
+                unsafe_skipped: 0,
                 unverifiable_uploads: conflicts.unverifiable,
                 kind: Direction::Upload,
             });
@@ -205,6 +233,8 @@ impl App {
                 Some((remote, local_base.join(safe), *is_dir))
             })
             .collect();
+        // Said, as the walk says what it leaves out: the user picked these.
+        self.report_unsafe_names(selections.len() - roots.len());
 
         let pending_count = roots.len();
         self.push_log(
@@ -212,6 +242,20 @@ impl App {
             format!("preparing {pending_count} download(s)…"),
         );
         self.start_download_walk(roots);
+    }
+
+    /// Log `count` remote entries left out of a download because their
+    /// names can't be used as local file names.
+    pub(super) fn report_unsafe_names(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let what = if count == 1 {
+            "entry whose name can't be used as a local file name"
+        } else {
+            "entries whose names can't be used as local file names"
+        };
+        self.push_log(LogLevel::Warn, format!("skipped {count} {what}"));
     }
 
     /// Spawn the download preparation task: walks every root (file or dir)
@@ -231,6 +275,7 @@ impl App {
             let mut plan: Vec<PlannedJob> = Vec::new();
             let mut symlinks_skipped: usize = 0;
             let mut unreadable_skipped: usize = 0;
+            let mut unsafe_skipped: usize = 0;
             {
                 for (remote, local, is_dir) in roots {
                     let chunk = if is_dir {
@@ -239,6 +284,7 @@ impl App {
                             Ok(r) => {
                                 symlinks_skipped += r.symlinks_skipped;
                                 unreadable_skipped += r.unreadable_skipped;
+                                unsafe_skipped += r.unsafe_skipped;
                                 r.plan
                             }
                             Err(e) => {
@@ -274,6 +320,7 @@ impl App {
                 // `safe_local_name`, not through UTF-8 decoding.
                 unencodable_skipped: 0,
                 unreadable_skipped,
+                unsafe_skipped,
                 unverifiable_uploads: 0,
                 kind: Direction::Download,
             });

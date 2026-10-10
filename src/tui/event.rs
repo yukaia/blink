@@ -122,6 +122,9 @@ pub enum AppEvent {
         /// Remote entries skipped because their listing lines could not be
         /// read. Always zero for an upload walk.
         unreadable_skipped: usize,
+        /// Remote entries skipped because their names can't be used as local
+        /// file names. Always zero for an upload walk.
+        unsafe_skipped: usize,
         /// Uploads counted as possible conflicts only because their
         /// destination's listing could not be fully read. Always zero for a
         /// download walk.

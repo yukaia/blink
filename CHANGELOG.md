@@ -64,6 +64,16 @@ the git history for those.
 
 ### Fixed
 
+- **Downloads left out for their names are now reported.** A remote file
+  whose name can't be a local file name — one with a backslash in it, or
+  on Windows a reserved name such as `NUL` — is skipped, but a recursive
+  download said so only in the debug log, and a selected one vanished
+  without a word. Both now give a log line with the count.
+- **Local files whose names aren't valid UTF-8 are refused with the
+  reason.** The local pane showed such a name with replacement characters,
+  then used that altered name to upload, view or open it, which failed
+  with "not found". They are now refused up front, saying why, as a
+  directory upload already skipped them.
 - **A host key trusted once is held to for the rest of the session.**
   "Trust once" accepted that exact key, and nothing else about the host:
   a transfer connection that later met a different key from the same

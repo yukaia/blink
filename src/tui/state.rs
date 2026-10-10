@@ -34,6 +34,9 @@ pub struct PaneEntry {
     pub is_dir: bool,
     pub size: u64,
     pub previewable_image: bool,
+    /// A local name that is not valid UTF-8. `raw_name` is then a lossy
+    /// decoding of it, which names no file, so nothing may address it.
+    pub lossy_name: bool,
 }
 
 impl PaneEntry {
@@ -46,6 +49,15 @@ impl PaneEntry {
             is_dir,
             size,
             previewable_image,
+            lossy_name: false,
+        }
+    }
+
+    /// An entry for a local file, as `read_dir` named it.
+    pub fn local(name: &std::ffi::OsStr, is_dir: bool, size: u64) -> Self {
+        Self {
+            lossy_name: name.to_str().is_none(),
+            ..Self::new(name.to_string_lossy().into_owned(), is_dir, size)
         }
     }
 
@@ -180,17 +192,24 @@ impl PaneState {
     /// Shared by the upload and download paths so the two cannot drift on
     /// which entries they consider.
     pub fn selection(&self) -> Vec<(String, bool)> {
-        let selected: Vec<(String, bool)> = self
+        self.selected_entries()
+            .into_iter()
+            .map(|e| (e.raw_name.clone(), e.is_dir))
+            .collect()
+    }
+
+    /// The entries [`Self::selection`] names.
+    pub fn selected_entries(&self) -> Vec<&PaneEntry> {
+        let selected: Vec<&PaneEntry> = self
             .all_rows()
             .iter()
             .filter(|e| self.is_selected(e) && !e.is_parent())
-            .map(|e| (e.raw_name.clone(), e.is_dir))
             .collect();
         if !selected.is_empty() {
             return selected;
         }
         match self.entries.get(self.cursor) {
-            Some(e) if !e.is_parent() => vec![(e.raw_name.clone(), e.is_dir)],
+            Some(e) if !e.is_parent() => vec![e],
             _ => Vec::new(),
         }
     }

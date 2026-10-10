@@ -85,11 +85,25 @@ impl App {
         }
     }
 
+    /// Log that the local entry shown as `name` can't be opened: its name is
+    /// not valid UTF-8, and the pane addresses files by `String`.
+    pub(super) fn report_unopenable(&mut self, name: &str) {
+        self.push_log(
+            LogLevel::Warn,
+            format!("can't open {name}: its name is not valid UTF-8"),
+        );
+    }
+
     pub(super) fn local_enter(&mut self) {
         let Some(entry) = self.local.entries.get(self.local.cursor) else {
             return;
         };
         if !entry.is_dir {
+            return;
+        }
+        if entry.lossy_name {
+            let name = entry.display_name.clone();
+            self.report_unopenable(&name);
             return;
         }
         let mut path = std::path::PathBuf::from(&self.local.path);
@@ -232,10 +246,9 @@ impl App {
                     Ok(m) => m,
                     Err(_) => continue,
                 };
-                let name = entry.file_name().to_string_lossy().to_string();
                 let is_dir = meta.is_dir();
-                entries.push(PaneEntry::new(
-                    name,
+                entries.push(PaneEntry::local(
+                    &entry.file_name(),
                     is_dir,
                     if is_dir { 0 } else { meta.len() },
                 ));

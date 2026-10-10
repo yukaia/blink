@@ -60,6 +60,10 @@ pub struct WalkResult {
     /// as a remote path. Counted rather than silently dropped — see
     /// [`walk_local`].
     pub unencodable_skipped: usize,
+    /// Remote entries whose names can't be used as a local file name (see
+    /// [`safe_local_name`]) or joined onto their directory's path. Always
+    /// zero for a local walk.
+    pub unsafe_skipped: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +163,7 @@ pub async fn walk_remote(
     let mut out: Vec<PlannedJob> = Vec::new();
     let mut symlinks_skipped: usize = 0;
     let mut unreadable_skipped: usize = 0;
+    let mut unsafe_skipped: usize = 0;
     let mut dirs_visited: usize = 0;
 
     // Iterative DFS. Stack holds (remote_path_to_visit, local_path_dest).
@@ -225,6 +230,7 @@ pub async fn walk_remote(
                     "skipping remote entry with unsafe name: {:?}",
                     entry.display_name
                 );
+                unsafe_skipped += 1;
                 continue;
             };
             let Some(remote_child) = transport::join_remote(&remote_dir, &entry.raw_name) else {
@@ -232,6 +238,7 @@ pub async fn walk_remote(
                     "skipping remote entry whose name cannot be joined: {:?}",
                     entry.display_name
                 );
+                unsafe_skipped += 1;
                 continue;
             };
             let local_child = local_dir.join(safe_name);
@@ -273,6 +280,7 @@ pub async fn walk_remote(
         symlinks_skipped,
         unreadable_skipped,
         unencodable_skipped: 0,
+        unsafe_skipped,
     })
 }
 
@@ -364,6 +372,7 @@ pub async fn walk_local(local_root: &Path, remote_root: &str) -> Result<WalkResu
         symlinks_skipped,
         unreadable_skipped: 0,
         unencodable_skipped,
+        unsafe_skipped: 0,
     })
 }
 
@@ -835,6 +844,24 @@ mod tests {
 
         assert_eq!(result.plan.len(), 2, "the readable entries are planned");
         assert_eq!(result.unreadable_skipped, 3);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A name that can't be a local file name — a separator in it, say — is
+    /// left out of the plan. That went to the debug log alone, so the batch
+    /// looked whole; it is now counted for the TUI to report.
+    #[tokio::test]
+    async fn walk_remote_counts_entries_it_cannot_name_locally() {
+        let root = scratch("unsafe");
+        let t = FileList {
+            names: vec!["a.txt".into(), "back\\slash".into()],
+            unreadable: 0,
+        };
+
+        let result = walk_remote(&shared(t), "/srv", &root).await.expect("walk");
+
+        assert_eq!(result.plan.len(), 1, "the nameable entry is planned");
+        assert_eq!(result.unsafe_skipped, 1);
         let _ = std::fs::remove_dir_all(&root);
     }
 

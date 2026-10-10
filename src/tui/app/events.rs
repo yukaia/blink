@@ -332,6 +332,7 @@ impl App {
                 symlinks_skipped,
                 unencodable_skipped,
                 unreadable_skipped,
+                unsafe_skipped,
                 unverifiable_uploads,
                 kind,
             } => {
@@ -369,6 +370,7 @@ impl App {
                         ),
                     );
                 }
+                self.report_unsafe_names(unsafe_skipped);
                 if unencodable_skipped > 0 {
                     let noun = if unencodable_skipped == 1 {
                         "file"

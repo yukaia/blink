@@ -37,6 +37,10 @@ impl App {
                     Some(e) if !e.is_dir => e.clone(),
                     _ => return,
                 };
+                if entry.lossy_name {
+                    self.report_unopenable(&entry.display_name);
+                    return;
+                }
                 (
                     entry.raw_name,
                     entry.display_name,
