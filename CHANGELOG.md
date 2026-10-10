@@ -64,6 +64,20 @@ the git history for those.
 
 ### Fixed
 
+- **A rename confirmed as an overwrite now overwrites over SFTP.** Renaming
+  onto an existing name asked "overwrite?", then sent a plain SFTP rename,
+  which OpenSSH's server refuses when the target exists, so the confirmed
+  rename failed. It now uses the server's atomic replacing rename where
+  offered, and otherwise removes the target first — only after checking
+  the file being renamed is still there, so the target is never lost for
+  nothing. Over FTP the rename is sent as before: whether it may replace
+  a file is the server's setting.
+- **A download whose server ends a file early mid-way now fails.** Parts
+  of a download are fetched in parallel and written in order. If one came
+  back short and later ones still had data, the rest was written straight
+  after it, putting every following byte at the wrong place; the file
+  could still come out the right size and be kept as complete. Such a
+  download now fails instead, and nothing is renamed into place.
 - **Two blink instances saving the same file no longer corrupt it.** The
   config, session, checkpoint and known_hosts files were each saved
   through one fixed temp file beside them, such as `config.tmp`. Two

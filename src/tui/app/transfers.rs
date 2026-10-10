@@ -339,7 +339,7 @@ impl App {
         match op {
             OverwritePending::Rename { from, to, .. } => {
                 self.clear_rename_form();
-                self.start_rename(from, to);
+                self.start_rename(from, to, true);
             }
             OverwritePending::DownloadPlan {
                 plan,

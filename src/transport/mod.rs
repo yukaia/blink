@@ -488,6 +488,11 @@ pub trait Transport: Send + Sync {
     /// Rename / move on the remote side.
     async fn rename(&mut self, from: &str, to: &str) -> Result<()>;
 
+    /// Rename `from` to `to`, replacing `to` if it exists — for a rename the
+    /// user confirmed as an overwrite. [`Self::rename`] may refuse an
+    /// existing target, as SFTP v3 does.
+    async fn rename_over(&mut self, from: &str, to: &str) -> Result<()>;
+
     /// Delete a single remote file.
     async fn delete_file(&mut self, remote_path: &str) -> Result<()>;
 
@@ -658,6 +663,12 @@ pub(crate) mod mock {
             }
         }
 
+        /// The files this mock serves, shared, to seed or inspect.
+        #[allow(dead_code)]
+        pub fn files(&self) -> Arc<Mutex<HashMap<String, Vec<u8>>>> {
+            Arc::clone(&self.files)
+        }
+
         #[allow(dead_code)]
         pub fn with_file(self, path: &str, contents: &[u8]) -> Self {
             let mut parent = path.rsplit_once('/').map(|(p, _)| p).unwrap_or("/");
@@ -779,6 +790,16 @@ pub(crate) mod mock {
         }
 
         async fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+            // SFTP v3 semantics, as OpenSSH's server has them.
+            if self.files.lock().unwrap().contains_key(to) {
+                return Err(crate::error::BlinkError::transport(format!(
+                    "rename {from} -> {to}: Failure"
+                )));
+            }
+            self.rename_over(from, to).await
+        }
+
+        async fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
             let mut files = self.files.lock().unwrap();
             if let Some(data) = files.remove(from) {
                 files.insert(to.to_string(), data);

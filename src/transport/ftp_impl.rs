@@ -109,6 +109,15 @@ macro_rules! delegate_ftp_transport {
                 self.settle(result)
             }
 
+            async fn rename_over(&mut self, from: &str, to: &str) -> $crate::error::Result<()> {
+                // RNTO onto an existing name replaces it where the server
+                // permits overwriting (vsftpd does; ProFTPD only with
+                // `AllowOverwrite on`) and is refused otherwise. FTP has no
+                // replacing rename to fall back on, and deleting the target
+                // first would lose it if the rename were then refused.
+                self.rename(from, to).await
+            }
+
             async fn delete_file(&mut self, remote_path: &str) -> $crate::error::Result<()> {
                 $crate::transport::ftp_impl::check_ftp_path("dele", remote_path)?;
                 self.begin_call().await?;

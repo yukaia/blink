@@ -293,7 +293,7 @@ impl App {
 
         self.clear_rename_form();
         self.screen = Screen::Main;
-        self.start_rename(from, to);
+        self.start_rename(from, to, false);
     }
 
     /// Reset every field of the rename form together, so a new field can't
@@ -305,7 +305,10 @@ impl App {
         self.rename_error = None;
     }
 
-    pub(super) fn start_rename(&mut self, from: String, to: String) {
+    /// Rename `from` to `to`. `overwrite` is the user's confirmation that an
+    /// existing `to` should be replaced; without it, a target that turned up
+    /// since the listing makes the rename fail rather than vanish.
+    pub(super) fn start_rename(&mut self, from: String, to: String, overwrite: bool) {
         let Some(t) = self.transport.clone() else {
             self.push_log(LogLevel::Warn, "not connected".into());
             return;
@@ -319,7 +322,12 @@ impl App {
         self.push_log(LogLevel::Info, format!("renaming: {from_label}"));
         tokio::spawn(async move {
             let mut transport = t.lock().await;
-            let event = match transport.rename(&from, &to).await {
+            let renamed = if overwrite {
+                transport.rename_over(&from, &to).await
+            } else {
+                transport.rename(&from, &to).await
+            };
+            let event = match renamed {
                 Ok(()) => AppEvent::Renamed { from, to },
                 Err(e) => AppEvent::RenameFailed {
                     from,

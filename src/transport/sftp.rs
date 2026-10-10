@@ -869,14 +869,27 @@ async fn pipelined_download(
                 let raw = Arc::clone(raw);
                 let handle = handle.to_string();
                 let label = label.to_string();
-                async move { read_full(&raw, &handle, &label, off, len).await }
+                async move {
+                    let data = read_full(&raw, &handle, &label, off, len).await?;
+                    Ok::<_, BlinkError>((off, data))
+                }
             })
             .buffered(concurrency);
 
         while let Some(chunk) = stream.next().await {
-            let data = chunk?;
+            let (off, data) = chunk?;
             if data.is_empty() {
                 break;
+            }
+            // Chunks are appended, not written at their offsets, so each must
+            // start where the last one ended. One that doesn't follows a
+            // chunk that hit end of file early: appending it would put every
+            // byte from here on at the wrong place in the file.
+            if off != done {
+                return Err(BlinkError::transport(format!(
+                    "{label}: the server reported end of file at byte {done}, \
+                     then sent data from byte {off}"
+                )));
             }
             local.write_all(&data).await?;
             done += data.len() as u64;
@@ -1236,6 +1249,18 @@ impl Transport for SftpTransport {
             .rename(from, to)
             .await
             .map_err(|e| map_sftp("rename", &label, e))
+    }
+
+    async fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
+        // Making room for the rename, below, deletes `to` when the server
+        // has no `posix-rename`. Done for a source that has gone since the
+        // listing, that would destroy the target and then fail.
+        if self.metadata(from).await?.is_none() {
+            return Err(BlinkError::not_found(format!("rename {from}")));
+        }
+        let xfer = self.transfer_session().await?;
+        let (raw, posix_rename) = (Arc::clone(&xfer.raw), xfer.posix_rename);
+        finalize_remote_rename(&raw, posix_rename, from, to).await
     }
 
     async fn delete_file(&mut self, remote_path: &str) -> Result<()> {
@@ -1674,6 +1699,22 @@ mod integration {
         out
     }
 
+    /// Fault: reads of `path` at an offset in `[start, end)` report end of
+    /// file, as a misbehaving server or a file rewritten mid-transfer can.
+    /// Stored in the store under [`eof_gap_key`] as `start..end`.
+    fn eof_gap_key(path: &str) -> String {
+        format!("\0eof-gap:{path}")
+    }
+
+    fn in_eof_gap(files: &HashMap<String, Vec<u8>>, path: &str, offset: u64) -> bool {
+        let Some(spec) = files.get(&eof_gap_key(path)) else {
+            return false;
+        };
+        let spec = String::from_utf8_lossy(spec);
+        let (start, end) = spec.split_once("..").unwrap();
+        (start.parse().unwrap()..end.parse().unwrap()).contains(&offset)
+    }
+
     fn ok_status(id: u32) -> Status {
         Status {
             id,
@@ -1732,7 +1773,7 @@ mod integration {
             let store = self.store.lock().await;
             let content = store.get(&handle).ok_or(StatusCode::NoSuchFile)?;
             let off = offset as usize;
-            if off >= content.len() {
+            if off >= content.len() || in_eof_gap(&store, &handle, offset) {
                 return Err(StatusCode::Eof);
             }
             // Deliberately short: forces the client to re-request the rest.
@@ -1840,6 +1881,14 @@ mod integration {
         }
 
         async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+            // A path that is in the store neither as a file nor as a
+            // directory does not exist, as a real server would say.
+            {
+                let store = self.store.lock().await;
+                if !store.contains_key(&path) && !store.contains_key(&format!("{path}/")) {
+                    return Err(StatusCode::NoSuchFile);
+                }
+            }
             self.fstat(id, path).await
         }
 
@@ -2682,6 +2731,82 @@ mod integration {
             "the download must start over, not continue another server's bytes",
         );
         let _ = std::fs::remove_file(&dst);
+        let _ = transport.close().await;
+    }
+
+    /// Chunks are fetched in parallel and appended in order. One that ended
+    /// early, with later chunks still returning data, had the rest appended
+    /// straight after it: every byte past the gap landed at the wrong
+    /// offset, the drain after the last chunk made the size come out right,
+    /// and the scrambled file was renamed into place as a success.
+    #[tokio::test]
+    async fn a_download_that_ends_early_mid_file_fails() {
+        let payload = pseudo_random(3 * super::TRANSFER_CHUNK);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/gap.bin".to_string(), payload.clone());
+            // Inside the first chunk, ending at the second.
+            let gap = format!("100000..{}", super::TRANSFER_CHUNK);
+            files.insert(eof_gap_key("/gap.bin"), gap.into_bytes());
+        }
+        let (port, _c) = start_server(store).await;
+        let mut transport = connect(port).await;
+
+        let dst = std::env::temp_dir().join(format!("blink-eof-gap-{port}.bin"));
+        let _ = std::fs::remove_file(&dst);
+        let res = transport.download("/gap.bin", &dst, None).await;
+
+        assert!(res.is_err(), "a download with a hole in it must fail");
+        assert!(!dst.exists(), "and nothing is renamed into place");
+        let _ = std::fs::remove_file(crate::transport::part_path(&dst));
+        crate::transport::clear_part_meta(&dst).await;
+        let _ = transport.close().await;
+    }
+
+    /// A rename the user confirmed as an overwrite. SFTP v3 rename, which
+    /// OpenSSH's server implements, refuses a target that exists — as this
+    /// harness does — so the confirmation promised what the rename then
+    /// failed to do.
+    #[tokio::test]
+    async fn a_confirmed_rename_replaces_the_target() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/a.txt".to_string(), b"from a".to_vec());
+            files.insert("/b.txt".to_string(), b"old b".to_vec());
+        }
+        let (port, _c) = start_server(Arc::clone(&store)).await;
+        let mut transport = connect(port).await;
+
+        transport.rename_over("/a.txt", "/b.txt").await.unwrap();
+
+        let files = store.lock().await;
+        assert_eq!(files.get("/b.txt").map(Vec::as_slice), Some(&b"from a"[..]));
+        assert!(!files.contains_key("/a.txt"));
+        drop(files);
+        let _ = transport.close().await;
+    }
+
+    /// Making room for the rename deletes the target. With the source gone —
+    /// renamed or deleted since the listing — that would destroy the target
+    /// and then fail, losing the file the user meant to replace for nothing.
+    #[tokio::test]
+    async fn a_confirmed_rename_of_a_missing_file_keeps_the_target() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/b.txt".to_string(), b"old b".to_vec());
+        let (port, _c) = start_server(Arc::clone(&store)).await;
+        let mut transport = connect(port).await;
+
+        assert!(transport.rename_over("/gone.txt", "/b.txt").await.is_err());
+
+        assert_eq!(
+            store.lock().await.get("/b.txt").map(Vec::as_slice),
+            Some(&b"old b"[..])
+        );
         let _ = transport.close().await;
     }
 

@@ -552,6 +552,9 @@ mod tests {
         async fn rename(&mut self, _: &str, _: &str) -> Result<()> {
             unreachable!()
         }
+        async fn rename_over(&mut self, _: &str, _: &str) -> Result<()> {
+            unreachable!()
+        }
         async fn delete_file(&mut self, _: &str) -> Result<()> {
             unreachable!()
         }
@@ -646,6 +649,9 @@ mod tests {
             unreachable!()
         }
         async fn rename(&mut self, _: &str, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn rename_over(&mut self, _: &str, _: &str) -> Result<()> {
             unreachable!()
         }
         async fn delete_file(&mut self, _: &str) -> Result<()> {
@@ -807,6 +813,9 @@ mod tests {
             unreachable!()
         }
         async fn rename(&mut self, _: &str, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn rename_over(&mut self, _: &str, _: &str) -> Result<()> {
             unreachable!()
         }
         async fn delete_file(&mut self, _: &str) -> Result<()> {
@@ -1068,6 +1077,9 @@ mod tests {
             unreachable!()
         }
         async fn rename(&mut self, _: &str, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn rename_over(&mut self, _: &str, _: &str) -> Result<()> {
             unreachable!()
         }
         async fn delete_file(&mut self, _: &str) -> Result<()> {

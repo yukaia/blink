@@ -3072,6 +3072,9 @@ mod tests {
         async fn rename(&mut self, _: &str, _: &str) -> crate::error::Result<()> {
             unimplemented!()
         }
+        async fn rename_over(&mut self, _: &str, _: &str) -> crate::error::Result<()> {
+            unimplemented!()
+        }
         async fn delete_file(&mut self, _: &str) -> crate::error::Result<()> {
             unimplemented!()
         }
@@ -3395,6 +3398,50 @@ mod tests {
             a.rename_source, raw,
             "the rename source must be the name on the wire",
         );
+    }
+
+    /// The overwrite prompt promised a replacement, and the rename then sent
+    /// was the plain one, which an SFTP v3 server — OpenSSH's — refuses when
+    /// the target exists. The mock refuses it the same way.
+    #[tokio::test]
+    async fn a_rename_confirmed_as_an_overwrite_replaces_the_target() {
+        let mut a = connected_app_with_remote(vec![
+            PaneEntry::new("a.txt".into(), false, 1),
+            PaneEntry::new("b.txt".into(), false, 1),
+        ]);
+        let mock = crate::transport::mock::MockTransport::new();
+        let files = mock.files();
+        files
+            .lock()
+            .unwrap()
+            .insert("/srv/a.txt".into(), b"from a".to_vec());
+        files
+            .lock()
+            .unwrap()
+            .insert("/srv/b.txt".into(), b"old b".to_vec());
+        a.transport = Some(Arc::new(Mutex::new(Box::new(mock) as Box<dyn Transport>)));
+        let mut rx = a.app_event_rx.take().unwrap();
+
+        a.open_rename();
+        a.rename_input = "b.txt".into();
+        a.submit_rename();
+        assert_eq!(a.screen, Screen::ConfirmOverwrite);
+        a.handle_confirm_overwrite(press(KeyCode::Char('y')));
+
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the rename reports")
+            .unwrap();
+        if let AppEvent::RenameFailed { error, .. } = &ev {
+            panic!("rename failed: {error}");
+        }
+        assert!(matches!(ev, AppEvent::Renamed { .. }));
+        let files = files.lock().unwrap();
+        assert_eq!(
+            files.get("/srv/b.txt").map(Vec::as_slice),
+            Some(&b"from a"[..])
+        );
+        assert!(!files.contains_key("/srv/a.txt"));
     }
 
     #[test]
