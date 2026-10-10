@@ -165,16 +165,19 @@ impl App {
         // long the listing took — and behind a recursive walk that had the
         // connection, that was the length of the whole walk.
         let tx = self.app_event_tx.clone();
+        let connection = self.connection;
 
         tokio::spawn(async move {
             let mut transport = t.lock().await;
             let event = match transport.list(&path).await {
                 Ok(listing) => AppEvent::Listed {
+                    connection,
                     path,
                     entries: listing.entries,
                     unreadable: listing.unreadable,
                 },
                 Err(e) => AppEvent::ListFailed {
+                    connection,
                     path,
                     error: e.to_string(),
                 },

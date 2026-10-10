@@ -100,6 +100,7 @@ impl App {
             return;
         };
         let tx = self.app_event_tx.clone();
+        let connection = self.connection;
         tokio::spawn(async move {
             // Phase 1: build the plan from local FS walks. Files become a
             // single Upload job; directories unfold into mkdirs + uploads.
@@ -117,6 +118,7 @@ impl App {
                         }
                         Err(e) => {
                             let _ = tx.send(AppEvent::WalkFailed {
+                                connection,
                                 error: e.to_string(),
                                 kind: Direction::Upload,
                             });
@@ -139,6 +141,7 @@ impl App {
                 Ok(c) => c,
                 Err(e) => {
                     let _ = tx.send(AppEvent::WalkFailed {
+                        connection,
                         error: e.to_string(),
                         kind: Direction::Upload,
                     });
@@ -147,6 +150,7 @@ impl App {
             };
 
             let _ = tx.send(AppEvent::WalkComplete {
+                connection,
                 plan,
                 conflict_indices: conflicts.indices,
                 symlinks_skipped,
@@ -218,6 +222,7 @@ impl App {
             return;
         };
         let tx = self.app_event_tx.clone();
+        let connection = self.connection;
         tokio::spawn(async move {
             // Phase 1: build the plan from remote walks. Files become a
             // single Download job; directories unfold into mkdirs (no-ops
@@ -238,6 +243,7 @@ impl App {
                             }
                             Err(e) => {
                                 let _ = tx.send(AppEvent::WalkFailed {
+                                    connection,
                                     error: e.to_string(),
                                     kind: Direction::Download,
                                 });
@@ -260,6 +266,7 @@ impl App {
             let conflict_indices = find_download_conflicts(&plan).await;
 
             let _ = tx.send(AppEvent::WalkComplete {
+                connection,
                 plan,
                 conflict_indices,
                 symlinks_skipped,

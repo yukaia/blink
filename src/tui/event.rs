@@ -50,8 +50,10 @@ pub enum AppEvent {
     /// `pending_session` is reused.
     ConnectKeyNeedsPassphrase,
 
-    /// A directory listing completed successfully.
+    /// A directory listing completed successfully, on connection
+    /// `connection` (see `App::connection`).
     Listed {
+        connection: u64,
         path: String,
         entries: Vec<RemoteEntry>,
         /// Entries the server listed that could not be read. See
@@ -59,8 +61,12 @@ pub enum AppEvent {
         unreadable: usize,
     },
 
-    /// A directory listing failed.
-    ListFailed { path: String, error: String },
+    /// A directory listing on connection `connection` failed.
+    ListFailed {
+        connection: u64,
+        path: String,
+        error: String,
+    },
 
     /// A local directory enumeration completed successfully. Mirror of
     /// `Listed` for the local pane: read_dir + per-entry metadata is
@@ -103,8 +109,10 @@ pub enum AppEvent {
     /// `conflict_indices` lists positions in `plan` whose destination already
     /// exists (file-only; mkdirs are silently merged). `symlinks_skipped`
     /// counts entries deliberately omitted from the plan because they were
-    /// symbolic links.
+    /// symbolic links. `connection` is the connection the walk ran on (see
+    /// `App::connection`); the plan is only good for that one.
     WalkComplete {
+        connection: u64,
         plan: Vec<crate::tui::plan::PlannedJob>,
         conflict_indices: Vec<usize>,
         symlinks_skipped: usize,
@@ -121,8 +129,12 @@ pub enum AppEvent {
         kind: Direction,
     },
 
-    /// A recursive walk failed.
-    WalkFailed { error: String, kind: Direction },
+    /// A recursive walk on connection `connection` failed.
+    WalkFailed {
+        connection: u64,
+        error: String,
+        kind: Direction,
+    },
 
     /// File contents fetched for viewer `viewer_id`.
     ViewLoaded {

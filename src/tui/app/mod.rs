@@ -326,6 +326,12 @@ pub struct App {
     last_click: Option<mouse::LastClick>,
     /// The id the next viewer opened gets. See [`Viewer::id`].
     next_viewer_id: u64,
+    /// Which connection this is, counting disconnects. Walks and listings
+    /// keep their own handle on the transport they started with, so they
+    /// outlive a disconnect; their results carry this number, and a result
+    /// from an earlier connection is dropped rather than applied to the
+    /// current one.
+    connection: u64,
     /// Set to true when an image viewer needs its graphics escape sequences
     /// re-emitted (initial open, terminal resize). The run loop emits and
     /// clears this flag after each `terminal.draw`.
@@ -436,6 +442,7 @@ impl App {
             hit: Default::default(),
             last_click: None,
             next_viewer_id: 1,
+            connection: 0,
             image_needs_redraw: false,
             remote_listing: None,
             unreadable_warned: None,
@@ -805,6 +812,8 @@ impl App {
         //    reference goes out of scope. The protocol-level QUIT is best
         //    effort regardless.
         let _ = self.transport.take();
+        // Anything still running on it reports under the old number.
+        self.connection += 1;
 
         let label = self
             .current_session
@@ -2496,6 +2505,7 @@ mod tests {
             .collect();
         a.remote.path = path.into();
         a.handle_app_event(AppEvent::Listed {
+            connection: a.connection,
             path: path.into(),
             entries,
             unreadable,
@@ -2545,6 +2555,7 @@ mod tests {
     fn uploads_that_could_not_be_checked_are_explained_before_the_prompt() {
         let mut a = app_with_manager();
         a.handle_app_event(AppEvent::WalkComplete {
+            connection: a.connection,
             plan: vec![upload(0)],
             conflict_indices: vec![0],
             symlinks_skipped: 0,
@@ -2560,10 +2571,95 @@ mod tests {
         assert_eq!(a.screen, Screen::ConfirmOverwrite, "and the user decides");
     }
 
+    /// A walk holds its own handle on the connection it started on, so it
+    /// outlives a disconnect. Its plan was made for that server: on the next
+    /// one it would upload to, or download from, paths nobody chose there,
+    /// past a conflict check made against a different file tree.
+    #[tokio::test]
+    async fn a_walk_from_an_earlier_connection_is_not_dispatched() {
+        let _home = crate::paths::test_home();
+        let mut a = app_with_manager();
+        let stale = a.connection;
+        a.disconnect();
+        a.transfer_manager = Some(TransferManager::new(1).0);
+
+        a.handle_app_event(AppEvent::WalkComplete {
+            connection: stale,
+            plan: vec![upload(0)],
+            conflict_indices: Vec::new(),
+            symlinks_skipped: 0,
+            unencodable_skipped: 0,
+            unreadable_skipped: 0,
+            unverifiable_uploads: 0,
+            kind: Direction::Upload,
+        });
+
+        assert!(a.transfer_manager.as_ref().unwrap().snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_walk_from_an_earlier_connection_does_not_ask_to_overwrite() {
+        let _home = crate::paths::test_home();
+        let mut a = app_with_manager();
+        let stale = a.connection;
+        a.disconnect();
+        a.transfer_manager = Some(TransferManager::new(1).0);
+        a.screen = Screen::Main;
+
+        a.handle_app_event(AppEvent::WalkComplete {
+            connection: stale,
+            plan: vec![upload(0)],
+            conflict_indices: vec![0],
+            symlinks_skipped: 0,
+            unencodable_skipped: 0,
+            unreadable_skipped: 0,
+            unverifiable_uploads: 0,
+            kind: Direction::Upload,
+        });
+
+        assert_eq!(a.screen, Screen::Main);
+        assert!(a.pending_overwrite.is_none());
+    }
+
+    /// The new server's directory can share the old one's path; its rows
+    /// must still be its own.
+    #[tokio::test]
+    async fn a_listing_from_an_earlier_connection_is_ignored() {
+        let _home = crate::paths::test_home();
+        let mut a = app();
+        let stale = a.connection;
+        a.disconnect();
+        a.remote.path = "/pub".into();
+        a.remote_listing = Some(RemoteListing {
+            path: "/pub".into(),
+            again: false,
+        });
+
+        a.handle_app_event(AppEvent::Listed {
+            connection: stale,
+            path: "/pub".into(),
+            entries: vec![crate::transport::RemoteEntry::new(
+                "f".into(),
+                crate::transport::EntryKind::File,
+                1,
+                None,
+                None,
+            )],
+            unreadable: 0,
+        });
+
+        assert!(a.remote.entries.is_empty(), "not the new server's rows");
+        assert!(
+            a.remote_listing.is_some(),
+            "the new server's own listing is still on its way",
+        );
+    }
+
     #[test]
     fn a_download_walk_that_skipped_unreadable_entries_says_so() {
         let mut a = app();
         a.handle_app_event(AppEvent::WalkComplete {
+            connection: a.connection,
             plan: Vec::new(),
             conflict_indices: Vec::new(),
             symlinks_skipped: 0,

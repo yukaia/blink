@@ -229,10 +229,16 @@ impl App {
                 self.screen = Screen::KeyPassphrasePrompt;
             }
             AppEvent::Listed {
+                connection,
                 path,
                 entries,
                 unreadable,
             } => {
+                // From a server since disconnected: neither its rows nor its
+                // place as the listing in flight, which may share its path.
+                if connection != self.connection {
+                    return;
+                }
                 self.finish_remote_listing(&path);
                 // Discard stale responses (user navigated again before this returned).
                 if path != self.remote.path {
@@ -242,7 +248,14 @@ impl App {
                 self.remote
                     .set_entries(super::build_remote_pane_entries(&entries, &path));
             }
-            AppEvent::ListFailed { path, error } => {
+            AppEvent::ListFailed {
+                connection,
+                path,
+                error,
+            } => {
+                if connection != self.connection {
+                    return;
+                }
                 self.finish_remote_listing(&path);
                 self.push_log(LogLevel::Error, format!("list {path} failed: {error}"));
             }
@@ -313,6 +326,7 @@ impl App {
                 self.push_log(LogLevel::Error, format!("delete {name} failed: {error}"));
             }
             AppEvent::WalkComplete {
+                connection,
                 plan,
                 conflict_indices,
                 symlinks_skipped,
@@ -321,6 +335,12 @@ impl App {
                 unverifiable_uploads,
                 kind,
             } => {
+                // The plan names paths on the server the walk ran on, and its
+                // conflicts were checked there. On any other it would write
+                // where nobody chose to, over files nobody was asked about.
+                if connection != self.connection {
+                    return;
+                }
                 // Said before the overwrite prompt opens, so its count is
                 // not a mystery: these may collide with nothing at all.
                 if unverifiable_uploads > 0 {
@@ -392,7 +412,14 @@ impl App {
                     self.screen = Screen::ConfirmOverwrite;
                 }
             }
-            AppEvent::WalkFailed { error, kind } => {
+            AppEvent::WalkFailed {
+                connection,
+                error,
+                kind,
+            } => {
+                if connection != self.connection {
+                    return;
+                }
                 let label = match kind {
                     Direction::Download => "downloads",
                     Direction::Upload => "uploads",

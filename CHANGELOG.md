@@ -64,6 +64,15 @@ the git history for those.
 
 ### Fixed
 
+- **Transfers prepared on one server are no longer started on the next.**
+  A recursive upload or download first walks the tree into a list of
+  transfers, and that walk kept running after a disconnect. If it
+  finished once another server was connected, its list was queued there:
+  local files went to paths chosen for the old server, overwriting files
+  the conflict check had never seen, and a download fetched whatever the
+  new server had at the old one's paths. A directory listing that outlived
+  its connection could likewise fill the pane on the next server. Both are
+  now dropped.
 - **The file viewer no longer shows a file it was not opened on.** A fetch
   was matched to the viewer by file name alone, so one that outlived its
   viewer could fill a later viewer of a file with the same name: open a
