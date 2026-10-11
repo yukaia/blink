@@ -53,3 +53,48 @@ Not reported upstream. If we change our minds, the issue to file
 cites #155 and #156 and asks for one of the fixes above.
 
 Last checked 2026-10-04: suppaftp 12.1.1, unchanged.
+
+## Checkpoints don't record which server and account they came from
+
+Checkpoints are keyed only by session name (`Checkpoint::path_for` in
+`checkpoint.rs`), and `Session::from_url` names an ad-hoc session after
+the bare host. So `sftp://alice@host` and `sftp://bob@host` share a
+checkpoint, and so do a saved session and a session renamed or edited to
+point at another server. Resuming an upload offered from one of these
+sends the first account's files to the second.
+
+The fix is to store `origin_of(session)` (`transport/mod.rs`, already used
+by the `.blink-part` sidecar) in the checkpoint, and have `offers_for` and
+resume skip or flag a checkpoint whose origin doesn't match. That is an
+on-disk format change, so it needs Yukaia's OK first. Still to decide:
+what to do with existing checkpoints that have no origin. The suggestion
+was to keep offering them, with a warning that blink can't confirm the
+server.
+
+## Download resume can't detect a same-size replacement
+
+`decide_resume` (`transport/mod.rs`) continues a `.blink-part` when the
+sidecar's origin, remote path and reported size all match. A remote file
+replaced by another of the same size between attempts passes all three,
+so the result is the old file's head joined to the new file's tail. Nothing
+reports this.
+
+The fix is to also record the remote mtime in `PartMeta` and restart when
+it differs or is missing. Adding the field is an on-disk format change to
+the sidecar, so it needs Yukaia's OK first. A `#[serde(default)]` field
+would leave old sidecars readable, but they would then restart rather
+than resume. FTP reports mtime only through `MDTM` (or `MLST`), so check
+what suppaftp gives before relying on it there.
+
+## Share the SSH agent login loop between Unix and Windows
+
+The `AuthMethod::Agent` arm in `transport/sftp.rs` has two copies of the
+same identity loop: an inline one under `#[cfg(unix)]`, and
+`try_agent_identities` under `#[cfg(windows)]`. They have already drifted.
+Unix reports the last rejection error and Windows only logs it. The
+"no identities" hints also differ.
+
+Make `try_agent_identities` cross-platform, and have both branches call it
+so they report errors the same way. Held back because the Windows build
+can't be checked here: do it where `cargo check --target
+x86_64-pc-windows-msvc` (or a Windows CI run) can confirm the result.
