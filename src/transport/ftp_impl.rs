@@ -402,13 +402,26 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
         .map(|n| n as u64);
     let total = reported_size.unwrap_or(0);
 
+    // MDTM, under the same deadline and for the same reason. It is what
+    // tells a replacement of the same size apart; a server that doesn't
+    // answer it can still download, but never resumes.
+    let reported_mtime = tokio::time::timeout(op_timeout(), stream.mdtm(remote_path))
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .and_then(|t| u64::try_from(t.and_utc().timestamp()).ok());
+    let stamp = super::RemoteStamp {
+        size: reported_size,
+        mtime: reported_mtime,
+    };
+
     // Resume only a partial identifiable as this file — see
     // `transport::decide_resume`. The previous guard here compared lengths
     // and was written `total > 0 && offset > total`, so a server that
     // doesn't answer SIZE skipped the staleness check entirely and resumed
-    // whatever happened to be on disk. Identity is checked independently of
-    // size, so an unknown size no longer means an unchecked resume.
-    let offset = super::resume_offset(local_path, remote_path, reported_size, origin).await;
+    // whatever happened to be on disk. Now a server that doesn't answer
+    // SIZE or MDTM restarts instead.
+    let offset = super::resume_offset(local_path, remote_path, stamp, origin).await;
 
     if offset > 0 {
         timed_ftp("rest", remote_path, stream.resume_transfer(offset as usize)).await?;
@@ -425,7 +438,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
         tokio::fs::File::create(&part).await?
     };
     // Identify the partial before writing to it — see the SFTP path.
-    super::write_part_meta(local_path, remote_path, reported_size, origin).await;
+    super::write_part_meta(local_path, remote_path, stamp, origin).await;
 
     let mut buf = vec![0u8; 64 * 1024];
     let mut done: u64 = offset;
@@ -965,6 +978,20 @@ mod integration {
     /// 256 KiB cap suppaftp 12.1 puts on a control-connection reply.
     const OVERSIZED_GREETING: usize = 8 * 1024 * 1024;
 
+    /// What the harness answers MDTM with for every stored file, and the
+    /// same instant in Unix seconds.
+    const HARNESS_MDTM: &str = "20260101120000";
+    const HARNESS_MTIME: u64 = 1_767_268_800;
+
+    /// The sidecar an interrupted download of a `len`-byte harness file
+    /// leaves.
+    fn harness_stamp(len: usize) -> crate::transport::RemoteStamp {
+        crate::transport::RemoteStamp {
+            size: Some(len as u64),
+            mtime: Some(HARNESS_MTIME),
+        }
+    }
+
     /// Bytes per data-connection write. Smaller than the transfer chunk so the
     /// client's read loop genuinely reassembles across reads.
     const DATA_SLICE: usize = 4096;
@@ -1153,6 +1180,16 @@ mod integration {
                         rest = arg.trim().parse().unwrap_or(0);
                     }
                     w.write_all(b"350 restart position accepted\r\n").await?;
+                }
+                "MDTM" => {
+                    let files = store.lock().await;
+                    match files.get(&arg) {
+                        Some(_) => {
+                            w.write_all(format!("213 {HARNESS_MDTM}\r\n").as_bytes())
+                                .await?
+                        }
+                        None => w.write_all(b"550 no such file\r\n").await?,
+                    }
                 }
                 "SIZE" => {
                     let files = store.lock().await;
@@ -1548,7 +1585,7 @@ mod integration {
         crate::transport::write_part_meta(
             &local,
             "/resume.bin",
-            Some(payload.len() as u64),
+            harness_stamp(payload.len()),
             &crate::transport::origin_of(&session),
         )
         .await;
@@ -1568,6 +1605,54 @@ mod integration {
             issued.iter().any(|c| c == "REST 30000"),
             "the download must resume from the partial's length, not restart; \
              commands issued: {issued:?}",
+        );
+    }
+
+    /// A partial of a file since replaced by another of the same size: the
+    /// sidecar's mtime is not the one MDTM reports now, so no REST, and the
+    /// new file's bytes land whole.
+    #[tokio::test]
+    async fn a_partial_of_a_since_modified_file_is_not_resumed() {
+        let payload = pseudo_random(50_000);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/resume.bin".to_string(), payload.clone());
+        let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+
+        let dir = tempdir_for_test("modified-since");
+        let local = dir.join("resume.bin");
+        let _ = std::fs::remove_file(&local);
+        std::fs::write(crate::transport::part_path(&local), vec![0u8; 20_000]).unwrap();
+        let older = crate::transport::RemoteStamp {
+            mtime: Some(HARNESS_MTIME - 3_600),
+            ..harness_stamp(payload.len())
+        };
+        crate::transport::write_part_meta(
+            &local,
+            "/resume.bin",
+            older,
+            &crate::transport::origin_of(&session),
+        )
+        .await;
+
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+        transport
+            .download("/resume.bin", &local, None)
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&local).unwrap(), payload);
+        let issued = log.lock().await.clone();
+        assert!(
+            issued.iter().any(|c| c == "MDTM /resume.bin"),
+            "the download must ask for the mtime: {issued:?}",
+        );
+        assert!(
+            !issued.iter().any(|c| c.starts_with("REST")),
+            "a modified file's partial must not be resumed: {issued:?}",
         );
     }
 
@@ -1591,7 +1676,7 @@ mod integration {
         crate::transport::write_part_meta(
             &local,
             "/resume.bin",
-            Some(payload.len() as u64),
+            harness_stamp(payload.len()),
             "tester@elsewhere.example:21",
         )
         .await;
@@ -1729,7 +1814,7 @@ mod integration {
         crate::transport::write_part_meta(
             &local,
             "/resume.bin",
-            Some(payload.len() as u64),
+            harness_stamp(payload.len()),
             &crate::transport::origin_of(&session),
         )
         .await;

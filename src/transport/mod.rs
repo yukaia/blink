@@ -109,6 +109,12 @@ pub(crate) struct PartMeta {
     /// The size the server reported when the partial was started, if it
     /// reported one. A change means the file was replaced between attempts.
     pub size: Option<u64>,
+    /// The modification time the server reported when the partial was
+    /// started, in seconds since the Unix epoch. Catches a replacement of
+    /// the same size, which `size` cannot. `None` in a sidecar written
+    /// before mtimes were recorded, which then restarts once.
+    #[serde(default)]
+    pub mtime: Option<u64>,
     /// The server and account the bytes came from, as [`origin_of`] names
     /// it. `None` in a sidecar written before origins were recorded, which
     /// is treated as unidentified.
@@ -131,6 +137,17 @@ pub(crate) fn origin_of(session: &Session) -> String {
     )
 }
 
+/// What the server said about a remote file as a download opened it: the
+/// two facts that change when the file is replaced. Either can be unknown —
+/// an FTP server may not answer `SIZE` or `MDTM` — and an unknown one
+/// cannot vouch for a partial.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RemoteStamp {
+    pub size: Option<u64>,
+    /// Seconds since the Unix epoch.
+    pub mtime: Option<u64>,
+}
+
 /// What to do with an existing `.blink-part` file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ResumeDecision {
@@ -150,9 +167,12 @@ pub(crate) enum ResumeDecision {
 /// a completed download. The corruption is silent and survives.
 ///
 /// So resume requires positive identification: a sidecar naming the same
-/// origin and remote path, and a server-reported size that hasn't moved
-/// since. Anything unproven restarts. Restarting costs bandwidth; resuming the wrong bytes
-/// costs the user a corrupt file they have no reason to re-check.
+/// origin and remote path, and a server-reported size and modification time
+/// that both match what the sidecar recorded. Anything unproven restarts,
+/// including a size or mtime unknown on either side: a server that can't
+/// say what the file is now can't show it wasn't replaced. Restarting costs
+/// bandwidth; resuming the wrong bytes costs the user a corrupt file they
+/// have no reason to re-check.
 ///
 /// Pure so the policy can be tested without touching a filesystem or a
 /// server; [`resume_offset`] does the I/O around it.
@@ -160,7 +180,7 @@ pub(crate) fn decide_resume(
     part_len: Option<u64>,
     meta: Option<&PartMeta>,
     remote_path: &str,
-    reported_size: Option<u64>,
+    now: RemoteStamp,
     origin: &str,
 ) -> ResumeDecision {
     // No partial, or an empty one — nothing to continue.
@@ -183,18 +203,17 @@ pub(crate) fn decide_resume(
         return ResumeDecision::Fresh;
     }
 
-    // The file was replaced between attempts: same path, different content.
-    if let (Some(then), Some(now)) = (meta.size, reported_size)
-        && then != now
-    {
+    // The file may have been replaced between attempts: same path,
+    // different content. Unknown on either side proves nothing either way.
+    let (Some(size), Some(mtime)) = (now.size, now.mtime) else {
+        return ResumeDecision::Fresh;
+    };
+    if meta.size != Some(size) || meta.mtime != Some(mtime) {
         return ResumeDecision::Fresh;
     }
 
-    // More bytes than the file has: the remote shrank, or the partial is
-    // not what it claims.
-    if let Some(now) = reported_size
-        && part_len > now
-    {
+    // More bytes than the file has: the partial is not what it claims.
+    if part_len > size {
         return ResumeDecision::Fresh;
     }
 
@@ -209,7 +228,7 @@ pub(crate) fn decide_resume(
 pub(crate) async fn resume_offset(
     local_path: &Path,
     remote_path: &str,
-    reported_size: Option<u64>,
+    now: RemoteStamp,
     origin: &str,
 ) -> u64 {
     let part = part_path(local_path);
@@ -221,7 +240,7 @@ pub(crate) async fn resume_offset(
         Err(_) => None,
     };
 
-    match decide_resume(part_len, meta.as_ref(), remote_path, reported_size, origin) {
+    match decide_resume(part_len, meta.as_ref(), remote_path, now, origin) {
         ResumeDecision::Resume(offset) => offset,
         ResumeDecision::Fresh => {
             if part_len.is_some() {
@@ -246,12 +265,13 @@ pub(crate) async fn resume_offset(
 pub(crate) async fn write_part_meta(
     local_path: &Path,
     remote_path: &str,
-    reported_size: Option<u64>,
+    stamp: RemoteStamp,
     origin: &str,
 ) {
     let meta = PartMeta {
         remote_path: remote_path.to_string(),
-        size: reported_size,
+        size: stamp.size,
+        mtime: stamp.mtime,
         origin: Some(origin.to_string()),
     };
     if let Ok(raw) = serde_json::to_vec(&meta) {
@@ -980,22 +1000,32 @@ mod tests {
     /// The server the tests below download from.
     const ORIGIN: &str = "me@files.example:22";
 
+    /// The modification time the remote file has in the tests below,
+    /// unless a test says otherwise.
+    const MTIME: u64 = 1_790_000_000;
+
     fn meta(remote: &str, size: Option<u64>) -> PartMeta {
         PartMeta {
             remote_path: remote.to_string(),
             size,
+            mtime: Some(MTIME),
             origin: Some(ORIGIN.to_string()),
         }
     }
 
-    /// `decide_resume` for a download from [`ORIGIN`].
+    /// `decide_resume` for a download from [`ORIGIN`] of a file last
+    /// modified at [`MTIME`].
     fn decide(
         part_len: Option<u64>,
         meta: Option<&PartMeta>,
         remote_path: &str,
         reported_size: Option<u64>,
     ) -> ResumeDecision {
-        decide_resume(part_len, meta, remote_path, reported_size, ORIGIN)
+        let now = RemoteStamp {
+            size: reported_size,
+            mtime: Some(MTIME),
+        };
+        decide_resume(part_len, meta, remote_path, now, ORIGIN)
     }
 
     // Two servers — or two accounts on one — can each hold a file at the
@@ -1131,31 +1161,72 @@ mod tests {
         );
     }
 
+    /// An unknown size on either side proves nothing about the file, so
+    /// it restarts. (Before mtimes were recorded this resumed: identity was
+    /// checked on path and origin alone, and a server that answers no
+    /// `SIZE` could have replaced the file with anything.)
     #[test]
-    fn resumes_with_an_unknown_remote_size_when_provenance_matches() {
-        // FTP servers may not answer SIZE. The old guard was written
-        // `total > 0 && offset > total`, so an unknown size skipped the
-        // staleness check entirely and resumed unconditionally. Identity is
-        // checked independently of size, so this is now safe — and a
-        // mismatched path is still refused (next test).
-        let d = decide(
-            Some(4_000),
-            Some(&meta("/a/report.pdf", None)),
-            "/a/report.pdf",
-            None,
+    fn restarts_when_the_size_is_unknown_on_either_side() {
+        for (then, now) in [(None, None), (None, Some(9_000)), (Some(9_000), None)] {
+            let d = decide(
+                Some(4_000),
+                Some(&meta("/a/report.pdf", then)),
+                "/a/report.pdf",
+                now,
+            );
+            assert_eq!(d, ResumeDecision::Fresh, "recorded {then:?}, now {now:?}");
+        }
+    }
+
+    /// The case size alone missed: a file replaced by another of the same
+    /// length.
+    #[test]
+    fn restarts_when_the_remote_file_was_modified_since_the_partial() {
+        let m = PartMeta {
+            mtime: Some(MTIME - 60),
+            ..meta("/a/report.pdf", Some(9_000))
+        };
+        assert_eq!(
+            decide(Some(4_000), Some(&m), "/a/report.pdf", Some(9_000)),
+            ResumeDecision::Fresh,
         );
-        assert_eq!(d, ResumeDecision::Resume(4_000));
     }
 
     #[test]
-    fn restarts_with_an_unknown_remote_size_when_provenance_differs() {
-        let d = decide(
-            Some(4_000),
-            Some(&meta("/a/report.pdf", None)),
-            "/b/report.pdf",
-            None,
+    fn restarts_when_the_mtime_is_unknown_on_either_side() {
+        let recorded = PartMeta {
+            mtime: None,
+            ..meta("/a/report.pdf", Some(9_000))
+        };
+        assert_eq!(
+            decide(Some(4_000), Some(&recorded), "/a/report.pdf", Some(9_000)),
+            ResumeDecision::Fresh,
+            "a sidecar from before mtimes were recorded",
         );
-        assert_eq!(d, ResumeDecision::Fresh);
+        let now = RemoteStamp {
+            size: Some(9_000),
+            mtime: None,
+        };
+        assert_eq!(
+            decide_resume(
+                Some(4_000),
+                Some(&meta("/a/report.pdf", Some(9_000))),
+                "/a/report.pdf",
+                now,
+                ORIGIN,
+            ),
+            ResumeDecision::Fresh,
+            "a server that no longer reports one",
+        );
+    }
+
+    #[test]
+    fn a_sidecar_without_an_mtime_still_parses() {
+        let old: PartMeta = serde_json::from_str(
+            r#"{"remote_path":"/a/report.pdf","size":9000,"origin":"me@files.example:22"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.mtime, None);
     }
 
     #[test]
@@ -1226,7 +1297,11 @@ mod tests {
         let lookalike = home.path().join("foo.blink-part");
         std::fs::write(&lookalike, b"a file of its own").unwrap();
 
-        let offset = resume_offset(&local, "/r/foo", Some(10), "origin").await;
+        let now = RemoteStamp {
+            size: Some(10),
+            mtime: Some(MTIME),
+        };
+        let offset = resume_offset(&local, "/r/foo", now, "origin").await;
 
         assert_eq!(offset, 0);
         assert_eq!(std::fs::read(&lookalike).unwrap(), b"a file of its own");

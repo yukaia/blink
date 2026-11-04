@@ -73,6 +73,15 @@ the git history for those.
 
 ### Changed
 
+- **An interrupted download resumes only when the file provably hasn't
+  changed.** The `.blink-part.meta` sidecar gains an `mtime` field, and a
+  partial is continued only when both the size and the modification time
+  match what the server reports now. A file replaced by another of the
+  same size used to resume, joining the old file's head to the new one's
+  tail. A size or mtime the server doesn't report (an FTP server without
+  `SIZE` or `MDTM`) now means a restart rather than an unchecked resume.
+  Partials left by earlier versions restart once.
+
 - **Partial transfers are named `<name>.<hash>.blink-part`.** `<hash>` is
   8 hex digits of the SHA-256 of the file's name. A partial used to be
   plain `<name>.blink-part`, which is also the name of a real file called

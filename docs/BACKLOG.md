@@ -45,28 +45,6 @@ what to do with existing checkpoints that have no origin. The suggestion
 was to keep offering them, with a warning that blink can't confirm the
 server.
 
-## Download resume can't detect a same-size replacement
-
-`decide_resume` (`transport/mod.rs`) continues a `.blink-part` when the
-sidecar's origin, remote path and reported size all match. A remote file
-replaced by another of the same size between attempts passes all three,
-so the result is the old file's head joined to the new file's tail. Nothing
-reports this.
-
-The fix is to also record the remote mtime in `PartMeta` and restart when
-it differs or is missing. Adding the field is an on-disk format change to
-the sidecar, so it needs Yukaia's OK first. A `#[serde(default)]` field
-would leave old sidecars readable, but they would then restart rather
-than resume. FTP reports mtime only through `MDTM` (or `MLST`), so check
-what suppaftp gives before relying on it there.
-
-A related gap in the same function: the size check runs only when both
-sides have a size. A sidecar with `size: None` (the server reported none
-when the partial started) resumes on origin and path alone, even if the
-server reports a size now. That contradicts the doc comment's "anything
-unproven restarts". Make `None` on either side restart, for size now and
-for mtime once it is added. That changes behaviour, not the format.
-
 ## Share the SSH agent login loop between Unix and Windows
 
 The `AuthMethod::Agent` arm in `transport/sftp.rs` has two copies of the

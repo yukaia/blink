@@ -1133,11 +1133,12 @@ impl Transport for SftpTransport {
             .map_err(|e| map_sftp("open", remote_path, e))?
             .handle;
 
-        let reported_size = raw
-            .fstat(&remote_handle)
-            .await
-            .ok()
-            .and_then(|a| a.attrs.size);
+        let attrs = raw.fstat(&remote_handle).await.ok().map(|a| a.attrs);
+        let reported_size = attrs.as_ref().and_then(|a| a.size);
+        let stamp = super::RemoteStamp {
+            size: reported_size,
+            mtime: attrs.as_ref().and_then(|a| a.mtime).map(u64::from),
+        };
 
         let total = reported_size.unwrap_or(0);
 
@@ -1146,7 +1147,7 @@ impl Transport for SftpTransport {
         // different remote file that shares this local name, one from an
         // older blink, or one whose file has since been replaced) is
         // discarded here so the create below starts from a clean state.
-        let offset = super::resume_offset(local_path, remote_path, reported_size, &origin).await;
+        let offset = super::resume_offset(local_path, remote_path, stamp, &origin).await;
 
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -1162,7 +1163,7 @@ impl Transport for SftpTransport {
         // Record what these bytes are before writing any, so an interrupt at
         // any point leaves an identifiable partial rather than an anonymous
         // one that the next attempt has to throw away.
-        super::write_part_meta(local_path, remote_path, reported_size, &origin).await;
+        super::write_part_meta(local_path, remote_path, stamp, &origin).await;
 
         let result = pipelined_download(
             &raw,
@@ -1831,6 +1832,8 @@ mod integration {
                 attrs: FileAttributes {
                     size: Some(size),
                     permissions: Some(if is_dir { MODE_DIR } else { MODE_FILE }),
+                    atime: Some(HARNESS_MTIME),
+                    mtime: Some(HARNESS_MTIME),
                     ..Default::default()
                 },
             })
@@ -2102,6 +2105,18 @@ mod integration {
 
         let _ = first.close().await;
         let _ = second.close().await;
+    }
+
+    /// The modification time the harness reports for every stored file.
+    const HARNESS_MTIME: u32 = 1_767_268_800;
+
+    /// The sidecar an interrupted download of a `len`-byte harness file
+    /// leaves.
+    fn harness_stamp(len: usize) -> crate::transport::RemoteStamp {
+        crate::transport::RemoteStamp {
+            size: Some(len as u64),
+            mtime: Some(u64::from(HARNESS_MTIME)),
+        }
     }
 
     fn test_session(port: u16) -> Session {
@@ -2737,7 +2752,7 @@ mod integration {
         crate::transport::write_part_meta(
             &dst,
             "/c.bin",
-            Some(bytes.len() as u64),
+            harness_stamp(bytes.len()),
             "tester@elsewhere.example:22",
         )
         .await;
@@ -2933,7 +2948,7 @@ mod integration {
         crate::transport::write_part_meta(
             &dst,
             "/a.bin",
-            Some(a_bytes.len() as u64),
+            harness_stamp(a_bytes.len()),
             &crate::transport::origin_of(&test_session(port)),
         )
         .await;
@@ -2983,11 +2998,15 @@ mod integration {
             let _ = tokio::fs::remove_file(f).await;
         }
 
-        tokio::fs::write(&part, &bytes[..15_000]).await.unwrap();
+        // The partial's bytes are marked (inverted), so the result shows
+        // whether they were kept: a download that restarted from zero would
+        // land the source unchanged and pass a plain equality check.
+        let head: Vec<u8> = bytes[..15_000].iter().map(|b| !b).collect();
+        tokio::fs::write(&part, &head).await.unwrap();
         crate::transport::write_part_meta(
             &dst,
             "/c.bin",
-            Some(bytes.len() as u64),
+            harness_stamp(bytes.len()),
             &crate::transport::origin_of(&test_session(port)),
         )
         .await;
@@ -2999,7 +3018,14 @@ mod integration {
 
         let got = tokio::fs::read(&dst).await.unwrap();
         assert_eq!(got.len(), bytes.len(), "resumed file has the wrong length");
-        assert!(got == bytes, "resumed bytes must match the source");
+        assert!(
+            got[..15_000] == head[..],
+            "the partial must be continued, not restarted"
+        );
+        assert!(
+            got[15_000..] == bytes[15_000..],
+            "the tail must come from the source at the offset"
+        );
 
         for f in [&dst, &part, &meta] {
             let _ = tokio::fs::remove_file(f).await;
