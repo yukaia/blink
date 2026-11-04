@@ -273,22 +273,7 @@ impl Checkpoint {
     /// `sha256(session)` to disambiguate; the suffix derives from the raw
     /// session name (no sanitisation), so it's stable per logical name.
     fn path_for(session: &str, kind: CheckpointKind) -> Result<PathBuf> {
-        use sha2::{Digest, Sha256};
-        let safe_name: String = session
-            .chars()
-            .map(|c| match c {
-                // Null byte plus all path-separator and shell-special chars.
-                '\0' | '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' ' => '_',
-                c => c,
-            })
-            .collect();
-        let hash = Sha256::digest(session.as_bytes());
-        let mut suffix = String::with_capacity(8);
-        for b in &hash[..4] {
-            use std::fmt::Write as _;
-            let _ = write!(&mut suffix, "{b:02x}");
-        }
-        Ok(paths::checkpoints_dir()?.join(format!("{safe_name}-{suffix}-{}.json", kind.as_str())))
+        Ok(paths::checkpoints_dir()?.join(file_name_for(session, kind, cfg!(windows))))
     }
 
     /// Atomically and durably write `content` to `path`. See
@@ -635,6 +620,48 @@ impl Checkpoint {
             sample_paths,
         }
     }
+}
+
+/// Longest file name every platform blink runs on accepts: 255 bytes on
+/// Linux and macOS, 255 UTF-16 units on Windows (never more than the UTF-8
+/// byte count).
+const MAX_FILE_NAME_BYTES: usize = 255;
+
+/// The body of [`Checkpoint::path_for`]: `{stem}-{hash8}-{kind}.json`, with
+/// the platform policy passed in so both branches are testable on any host.
+///
+/// The stem is cut, on a char boundary, to whatever keeps the whole name
+/// within [`MAX_FILE_NAME_BYTES`]; a longer name could never be written, so
+/// cutting it moves no existing checkpoint, and the hash (taken over the
+/// full session name) keeps cut names apart. On Windows, which refuses
+/// control characters in file names, those map to `_` as well; elsewhere
+/// they are left alone so existing checkpoints keep their names.
+fn file_name_for(session: &str, kind: CheckpointKind, windows_rules: bool) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let hash = Sha256::digest(session.as_bytes());
+    let mut tail = String::from("-");
+    for b in &hash[..4] {
+        let _ = write!(&mut tail, "{b:02x}");
+    }
+    let _ = write!(&mut tail, "-{}.json", kind.as_str());
+
+    let budget = MAX_FILE_NAME_BYTES - tail.len();
+    let mut stem = String::with_capacity(session.len().min(budget));
+    for c in session.chars() {
+        let c = match c {
+            // Null byte plus all path-separator and shell-special chars.
+            '\0' | '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' ' => '_',
+            '\u{1}'..='\u{1f}' if windows_rules => '_',
+            c => c,
+        };
+        if stem.len() + c.len_utf8() > budget {
+            break;
+        }
+        stem.push(c);
+    }
+    stem + &tail
 }
 
 /// Summaries of every checkpoint for `session` that still has work left.
@@ -1756,6 +1783,52 @@ mod merge_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_checkpoint_file_name_fits_the_platform_limit() {
+        for windows in [false, true] {
+            for session in [
+                "a".repeat(400),
+                "\u{e9}".repeat(200),
+                "\u{1f600}".repeat(100),
+            ] {
+                for kind in [CheckpointKind::Download, CheckpointKind::Upload] {
+                    let name = file_name_for(&session, kind, windows);
+                    assert!(name.len() <= MAX_FILE_NAME_BYTES, "{} bytes", name.len());
+                    assert!(name.ends_with(&format!("-{}.json", kind.as_str())));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_names_that_share_a_prefix_still_get_separate_files() {
+        let a = format!("{}a", "x".repeat(300));
+        let b = format!("{}b", "x".repeat(300));
+        assert_ne!(
+            file_name_for(&a, CheckpointKind::Download, false),
+            file_name_for(&b, CheckpointKind::Download, false)
+        );
+    }
+
+    #[test]
+    fn a_short_name_maps_as_it_always_has() {
+        // Existing checkpoints must keep their file names.
+        assert_eq!(
+            file_name_for("my prod", CheckpointKind::Download, false),
+            file_name_for("my prod", CheckpointKind::Download, true),
+        );
+        assert!(file_name_for("my prod", CheckpointKind::Upload, false).starts_with("my_prod-"));
+    }
+
+    #[test]
+    fn control_characters_map_only_under_windows_rules() {
+        let session = "tab\there\u{1b}";
+        let unix = file_name_for(session, CheckpointKind::Download, false);
+        let windows = file_name_for(session, CheckpointKind::Download, true);
+        assert!(unix.starts_with("tab\there\u{1b}-"), "{unix:?}");
+        assert!(windows.starts_with("tab_here_-"), "{windows:?}");
+    }
+
     use super::*;
     use std::path::PathBuf;
 

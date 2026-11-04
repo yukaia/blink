@@ -106,16 +106,3 @@ for one address then counts as trusted for the other. Hard to exploit,
 but the fix is cheap: don't accept the legacy form when the host
 contains `:`, or rewrite legacy lines to the canonical form on load.
 Rewriting changes the file, so it needs Yukaia's OK first.
-
-## Checkpoint file names have no length cap
-
-`Checkpoint::path_for` (`checkpoint.rs`) builds
-`{safe_name}-{hash8}-{kind}.json` from the full session name. A long
-name goes past the 255-byte file-name limit, and the checkpoint can't
-be written. `safe_name` also keeps control characters, which Windows
-rejects in file names. Truncate `safe_name` (on a char boundary) so the
-whole file name stays under 255 bytes; the hash suffix keeps truncated
-names unique. Names that are already too long can't have a checkpoint,
-so truncation moves nothing on disk. Mapping control characters to `_`
-does rename the checkpoint of a session whose name has them, so do that
-on Windows only, or let `offers_for` look under the old name too.
