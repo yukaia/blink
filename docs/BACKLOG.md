@@ -107,16 +107,6 @@ but the fix is cheap: don't accept the legacy form when the host
 contains `:`, or rewrite legacy lines to the canonical form on load.
 Rewriting changes the file, so it needs Yukaia's OK first.
 
-## Windows reserved names miss `CONIN$`, `CONOUT$` and superscript digits
-
-`WINDOWS_RESERVED_STEMS` (`tui/plan.rs`) lists `CON` … `LPT9`, but
-Windows also treats `CONIN$`, `CONOUT$`, and `COM¹`–`COM³` /
-`LPT¹`–`LPT³` (U+00B9, U+00B2, U+00B3) as devices. A server can name a
-download one of these, and on Windows it opens the device instead of
-writing a file. Add them, and add cases to the
-`safe_local_name_for(_, true)` tests. Windows only. The rules are
-compiled on every host, so this can be checked here.
-
 ## Checkpoint file names have no length cap
 
 `Checkpoint::path_for` (`checkpoint.rs`) builds

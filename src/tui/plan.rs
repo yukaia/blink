@@ -85,10 +85,43 @@ pub fn safe_local_name(name: &str) -> Option<&str> {
 
 /// Windows device names that resolve to hardware rather than a file,
 /// regardless of the directory they appear in. Writing to `NUL` silently
-/// discards the download; `COM1` opens a serial port.
-const WINDOWS_RESERVED_STEMS: [&str; 22] = [
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+/// discards the download; `COM1` opens a serial port. Microsoft's list
+/// ("Naming Files, Paths, and Namespaces") also has the console handles,
+/// the zero ports, and ports spelled with superscript digits (U+00B9,
+/// U+00B2, U+00B3), which a server can put in a name as easily as `NUL`.
+const WINDOWS_RESERVED_STEMS: [&str; 32] = [
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "CONIN$",
+    "CONOUT$",
+    "COM0",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "COM\u{b9}",
+    "COM\u{b2}",
+    "COM\u{b3}",
+    "LPT0",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+    "LPT\u{b9}",
+    "LPT\u{b2}",
+    "LPT\u{b3}",
 ];
 
 /// The body of [`safe_local_name`], with the platform policy passed in so both
@@ -125,7 +158,9 @@ fn safe_local_name_for(name: &str, windows_rules: bool) -> Option<&str> {
 
     // Reserved device names match on the stem before the first dot, and are
     // case-insensitive: `NUL`, `nul.txt` and `NUL.tar.gz` are all the device.
-    let stem = name.split('.').next().unwrap_or(name);
+    // Spaces before the first dot are dropped when Windows parses the name,
+    // so `NUL .txt` is the device as well.
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
     if WINDOWS_RESERVED_STEMS
         .iter()
         .any(|r| stem.eq_ignore_ascii_case(r))
@@ -1015,8 +1050,42 @@ mod tests {
     }
 
     #[test]
+    fn windows_rejects_the_less_known_device_names() {
+        // The console handles, the zero ports, and the ports Windows spells
+        // with superscript digits (U+00B9, U+00B2, U+00B3). A space before
+        // the extension is dropped when Windows parses the name, so
+        // `NUL .txt` is the device too.
+        for name in [
+            "CONIN$",
+            "conout$",
+            "CONIN$.log",
+            "COM0",
+            "lpt0",
+            "COM\u{b9}",
+            "com\u{b2}.txt",
+            "LPT\u{b3}",
+            "NUL .txt",
+        ] {
+            assert!(
+                safe_local_name_for(name, true).is_none(),
+                "expected {name:?} to be rejected on Windows"
+            );
+        }
+    }
+
+    #[test]
     fn windows_allows_names_merely_resembling_devices() {
-        for name in ["CONSOLE", "COM", "COM10", "NULL", "lpt", "nul_backup"] {
+        for name in [
+            "CONSOLE",
+            "COM",
+            "COM10",
+            "NULL",
+            "lpt",
+            "nul_backup",
+            "CONIN",
+            "COM\u{b9}0",
+            "COM4\u{b2}",
+        ] {
             assert_eq!(
                 safe_local_name_for(name, true),
                 Some(name),
