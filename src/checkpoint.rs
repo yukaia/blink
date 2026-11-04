@@ -1,8 +1,10 @@
 //! Walk checkpointing: persist a transfer plan to disk so an interrupted
 //! batch can be resumed without re-walking the remote / local tree.
 //!
-//! One checkpoint file is kept per (session, direction), named by a stable
-//! key derived from the session name and the transfer direction:
+//! One checkpoint file is kept per (session, origin, direction), named by a
+//! stable key derived from the session name, the server and account it
+//! connects to (`user@host:port`, as [`crate::transport::origin_of`] names
+//! it), and the transfer direction:
 //!
 //! ```text
 //! ~/.config/blink/checkpoints/<name>-<hash>-upload.json
@@ -10,20 +12,26 @@
 //! ```
 //!
 //! `<name>` is the session name with path-unsafe characters replaced by `_`,
-//! and `<hash>` the first eight hex digits of its SHA-256, so two names that
-//! sanitize alike ("my prod", "my_prod") keep separate files.
+//! and `<hash>` the first eight hex digits of the SHA-256 of the name and
+//! origin, so two names that sanitize alike ("my prod", "my_prod") keep
+//! separate files, and so do two accounts that share a name: an ad-hoc
+//! `sftp://alice@host` and `sftp://bob@host` are both named `host`. A
+//! checkpoint is only ever offered to, resumed by, or appended to by a
+//! connection to the server and account it was made for; resuming an
+//! upload made for one account used to send its files to the other.
 //!
 //! A new walk of the same direction *appends* its jobs to the checkpoint
 //! already tracking that direction rather than replacing it: replacing it
 //! destroyed the plan of a batch still running. The file is removed once
 //! nothing in it still needs to run.
 //!
-//! ## Format (version 3)
+//! ## Format (version 4)
 //!
 //! ```json
 //! {
-//!   "version": 3,
+//!   "version": 4,
 //!   "session": "production",
+//!   "origin": "deploy@prod.example.com:22",
 //!   "kind": "upload",
 //!   "jobs": [
 //!     { "type": "mkdir",    "remote_path": "/var/www/html/assets",
@@ -71,6 +79,12 @@
 //! Version 1 files used a boolean `done` field. They are automatically
 //! migrated on load: `done: true` → `status: "done"`, `done: false` →
 //! `status: "pending"`. The migrated document is written back as version 2.
+//!
+//! Files before version 4 have no `origin`, so nothing can say which server
+//! they were made for. They load (with `origin: None`) but are never
+//! offered or resumed; `blink checkpoints` lists them as orphaned, and
+//! `--clean` removes them with their partials. Under the version-4 key
+//! they also live at a different file name, which no lookup computes.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -98,7 +112,9 @@ const CHECKPOINT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 ///   2 — three-state `status` field: pending / in_progress / done
 ///   3 — adds the `cancelled` status. Purely additive: a version-2
 ///       document is a valid version-3 document and loads unchanged.
-const FORMAT_VERSION: u32 = 3;
+///   4 — adds `origin`, and keys the file name by it. An older document
+///       loads with no origin and is never offered (see the module docs).
+const FORMAT_VERSION: u32 = 4;
 
 /// Maximum checkpoint file size accepted on load (10 MiB).
 const MAX_CHECKPOINT_BYTES: u64 = 10 * 1024 * 1024;
@@ -233,6 +249,11 @@ pub struct Checkpoint {
     pub version: u32,
     /// Session name this checkpoint belongs to.
     pub session: String,
+    /// The server and account the batch runs against, as
+    /// [`crate::transport::origin_of`] names it. `None` in a file written
+    /// before version 4, which is then never offered.
+    #[serde(default)]
+    pub origin: Option<String>,
     /// Direction of the transfer batch.
     pub kind: CheckpointKind,
     /// Flat ordered plan. Directory mkdirs appear before any files inside them.
@@ -249,11 +270,18 @@ pub struct Checkpoint {
 }
 
 impl Checkpoint {
-    /// Create a new checkpoint for `session` and `kind` with `jobs`.
-    pub fn new(session: &str, kind: CheckpointKind, jobs: Vec<CheckpointJob>) -> Self {
+    /// Create a new checkpoint for `session` connected to `origin`, for
+    /// `kind`, with `jobs`.
+    pub fn new(
+        session: &str,
+        origin: &str,
+        kind: CheckpointKind,
+        jobs: Vec<CheckpointJob>,
+    ) -> Self {
         Self {
             version: FORMAT_VERSION,
             session: session.to_string(),
+            origin: Some(origin.to_string()),
             kind,
             jobs,
             dirty: true,
@@ -265,15 +293,24 @@ impl Checkpoint {
     // Persistence
     // -----------------------------------------------------------------------
 
-    /// Derive the checkpoint file path for a given session + direction.
+    /// Derive the checkpoint file path for a given session, origin and
+    /// direction.
     ///
     /// Two distinct session names ("my prod" vs "my_prod") would otherwise
     /// collapse to the same sanitised stem and silently overwrite each
-    /// other's checkpoint. Append the first eight hex chars of
-    /// `sha256(session)` to disambiguate; the suffix derives from the raw
-    /// session name (no sanitisation), so it's stable per logical name.
-    fn path_for(session: &str, kind: CheckpointKind) -> Result<PathBuf> {
-        Ok(paths::checkpoints_dir()?.join(file_name_for(session, kind, cfg!(windows))))
+    /// other's checkpoint, and two accounts sharing a session name would
+    /// share one file. Append the first eight hex chars of
+    /// `sha256(session, origin)` to disambiguate; the suffix derives from
+    /// the raw session name (no sanitisation), so it's stable per logical
+    /// name and server.
+    fn path_for(session: &str, origin: &str, kind: CheckpointKind) -> Result<PathBuf> {
+        Ok(paths::checkpoints_dir()?.join(file_name_for(session, origin, kind, cfg!(windows))))
+    }
+
+    /// The origin this checkpoint's file is keyed by. Empty for a file
+    /// from before version 4, whose name was keyed by session alone.
+    pub(crate) fn origin_key(&self) -> &str {
+        self.origin.as_deref().unwrap_or_default()
     }
 
     /// Atomically and durably write `content` to `path`. See
@@ -292,7 +329,7 @@ impl Checkpoint {
     /// completed, batch failed, app exiting) so the on-disk state is up to
     /// date before the in-memory checkpoint is dropped.
     pub fn flush(&mut self) -> Result<()> {
-        let path = Self::path_for(&self.session, self.kind)?;
+        let path = Self::path_for(&self.session, self.origin_key(), self.kind)?;
         let json = serde_json::to_string_pretty(self)
             .map_err(|e| BlinkError::config(format!("checkpoint serialize: {e}")))?;
         Self::atomic_write(&path, &json)?;
@@ -407,8 +444,8 @@ impl Checkpoint {
     }
 
     /// Remove the checkpoint file once the batch has fully completed.
-    pub fn remove(session: &str, kind: CheckpointKind) -> Result<()> {
-        let path = Self::path_for(session, kind)?;
+    pub fn remove(session: &str, origin: &str, kind: CheckpointKind) -> Result<()> {
+        let path = Self::path_for(session, origin, kind)?;
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             // Already gone — that's fine.
@@ -423,9 +460,12 @@ impl Checkpoint {
 
     /// Load and validate a checkpoint. Returns `None` if no file exists.
     /// Automatically migrates version 1 files to version 2 and rewrites them.
-    pub fn load(session: &str, kind: CheckpointKind) -> Result<Option<Self>> {
-        let path = Self::path_for(session, kind)?;
-        Self::load_from(&path)
+    ///
+    /// A file whose recorded origin is not `origin` reads as absent: it is
+    /// not this connection's to resume.
+    pub fn load(session: &str, origin: &str, kind: CheckpointKind) -> Result<Option<Self>> {
+        let path = Self::path_for(session, origin, kind)?;
+        Ok(Self::load_from(&path)?.filter(|cp| cp.origin.as_deref() == Some(origin)))
     }
 
     pub fn load_from(path: &Path) -> Result<Option<Self>> {
@@ -571,6 +611,8 @@ impl Checkpoint {
 pub struct CheckpointOffer {
     pub kind: CheckpointKind,
     pub session: String,
+    /// The server and account the checkpoint was made for.
+    pub origin: String,
     /// Jobs still to run: pending plus in-progress.
     pub remaining: usize,
     /// `remaining + done`. Cancelled jobs are excluded — that is work the
@@ -614,6 +656,7 @@ impl Checkpoint {
         CheckpointOffer {
             kind: self.kind,
             session: self.session.clone(),
+            origin: self.origin_key().to_string(),
             remaining,
             total: remaining + done,
             age,
@@ -636,11 +679,17 @@ const MAX_FILE_NAME_BYTES: usize = 255;
 /// full session name) keeps cut names apart. On Windows, which refuses
 /// control characters in file names, those map to `_` as well; elsewhere
 /// they are left alone so existing checkpoints keep their names.
-fn file_name_for(session: &str, kind: CheckpointKind, windows_rules: bool) -> String {
+fn file_name_for(session: &str, origin: &str, kind: CheckpointKind, windows_rules: bool) -> String {
     use sha2::{Digest, Sha256};
     use std::fmt::Write as _;
 
-    let hash = Sha256::digest(session.as_bytes());
+    // NUL can appear in neither a session name nor an origin, so the two
+    // can't run together ambiguously.
+    let hash = Sha256::new()
+        .chain_update(session.as_bytes())
+        .chain_update([0])
+        .chain_update(origin.as_bytes())
+        .finalize();
     let mut tail = String::from("-");
     for b in &hash[..4] {
         let _ = write!(&mut tail, "{b:02x}");
@@ -668,10 +717,10 @@ fn file_name_for(session: &str, kind: CheckpointKind, windows_rules: bool) -> St
 ///
 /// A file that is absent, empty of outstanding work, or unreadable yields
 /// no offer: connecting must never fail because of a checkpoint.
-pub fn offers_for(session: &str) -> Vec<CheckpointOffer> {
+pub fn offers_for(session: &str, origin: &str) -> Vec<CheckpointOffer> {
     let mut out = Vec::new();
     for kind in [CheckpointKind::Download, CheckpointKind::Upload] {
-        let Ok(path) = Checkpoint::path_for(session, kind) else {
+        let Ok(path) = Checkpoint::path_for(session, origin, kind) else {
             continue;
         };
         let cp = match Checkpoint::load_from(&path) {
@@ -682,6 +731,11 @@ pub fn offers_for(session: &str) -> Vec<CheckpointOffer> {
                 continue;
             }
         };
+        // The key includes the origin, so a mismatch means a file was
+        // copied or hand-edited; it is still not this connection's.
+        if cp.origin.as_deref() != Some(origin) {
+            continue;
+        }
         if cp.pending_count() == 0 {
             continue;
         }
@@ -698,8 +752,8 @@ pub fn offers_for(session: &str) -> Vec<CheckpointOffer> {
 /// so only partials of transfers that never finished are removed.
 ///
 /// Idempotent: a checkpoint that is already gone reports nothing removed.
-pub fn discard(session: &str, kind: CheckpointKind) -> Result<DiscardOutcome> {
-    let mut outcome = match Checkpoint::load(session, kind) {
+pub fn discard(session: &str, origin: &str, kind: CheckpointKind) -> Result<DiscardOutcome> {
+    let mut outcome = match Checkpoint::load(session, origin, kind) {
         Ok(Some(cp)) => remove_orphan_parts(&cp),
         // Absent, or unreadable — either way there is nothing to sweep, but
         // the file (if any) should still go.
@@ -713,7 +767,7 @@ pub fn discard(session: &str, kind: CheckpointKind) -> Result<DiscardOutcome> {
     // above may already have removed partials, and returning `Err` would
     // discard that count along with it, leaving the caller unable to report
     // what *did* get cleaned up.
-    if let Err(e) = Checkpoint::remove(session, kind) {
+    if let Err(e) = Checkpoint::remove(session, origin, kind) {
         outcome
             .failures
             .push(format!("could not remove the checkpoint file: {e}"));
@@ -896,6 +950,24 @@ fn known_sessions(listing: Result<crate::session::SessionListing>) -> KnownSessi
     }
 }
 
+/// Whether no connection can ever be offered `cp`.
+///
+/// A name missing from a list we know to be partial proves nothing, so a
+/// missing session only counts when the list is complete. A file with no
+/// origin (from before version 4) is orphaned whatever the list says.
+fn is_orphaned(cp: &Checkpoint, known: &KnownSessions) -> bool {
+    cp.origin.is_none() || (known.complete && !known.names.contains(&cp.session))
+}
+
+/// The `blink checkpoints` column naming a checkpoint's server: two
+/// accounts can share a session name, and their rows would read alike.
+fn origin_column(cp: &Checkpoint) -> String {
+    match &cp.origin {
+        Some(origin) => crate::error::sanitize_display(origin).into_owned(),
+        None => "(server unknown)".to_string(),
+    }
+}
+
 /// Print checkpoint info. Pass `clean` to remove completed/orphaned files,
 /// `force` to remove every file unconditionally.
 pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
@@ -943,9 +1015,7 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
         let pending = cp.pending_count();
         let done = cp.done_count();
         let total = pending + done;
-        // A name missing from a list we know to be partial proves nothing,
-        // so orphanhood is only claimed when the list is complete.
-        let orphaned = known.complete && !known.names.contains(&cp.session);
+        let orphaned = is_orphaned(&cp, &known);
 
         match disposition(pending, orphaned, clean, force) {
             Disposition::Remove(reason) => {
@@ -961,8 +1031,9 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
                 match fs::remove_file(path) {
                     Ok(()) => {
                         println!(
-                            "removed  {:<20}  {:<8}  {}/{} done  ({})",
+                            "removed  {:<20}  {:<28}  {:<8}  {}/{} done  ({})",
                             crate::error::sanitize_display(&cp.session),
+                            origin_column(&cp),
                             cp.kind.as_str(),
                             done,
                             total,
@@ -978,8 +1049,9 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
             Disposition::Keep { orphaned } => {
                 let flag = if orphaned { " [orphaned]" } else { "" };
                 println!(
-                    "{:<20}  {:<8}  {}/{} done  ({} remaining){}",
+                    "{:<20}  {:<28}  {:<8}  {}/{} done  ({} remaining){}",
                     crate::error::sanitize_display(&cp.session),
+                    origin_column(&cp),
                     cp.kind.as_str(),
                     done,
                     total,
@@ -1007,6 +1079,10 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
+/// The origin the tests' checkpoints are made for.
+#[cfg(test)]
+const TEST_ORIGIN: &str = "me@host:22";
+
 #[cfg(test)]
 mod policy_tests {
     use super::*;
@@ -1019,6 +1095,31 @@ mod policy_tests {
     }
 
     // -- what `--clean` and `--force` actually remove -----------------------
+
+    fn every_session_known(names: &[&str]) -> KnownSessions {
+        KnownSessions {
+            names: names.iter().map(|n| n.to_string()).collect(),
+            complete: true,
+            why: None,
+        }
+    }
+
+    #[test]
+    fn a_checkpoint_without_an_origin_is_orphaned_even_for_a_live_session() {
+        let mut cp = Checkpoint::new("prod", TEST_ORIGIN, CheckpointKind::Upload, vec![]);
+        let known = every_session_known(&["prod"]);
+        assert!(!is_orphaned(&cp, &known));
+        cp.origin = None;
+        assert!(is_orphaned(&cp, &known));
+        let partial = KnownSessions {
+            complete: false,
+            ..every_session_known(&[])
+        };
+        assert!(
+            is_orphaned(&cp, &partial),
+            "an incomplete session list can't save it: no origin is never offered",
+        );
+    }
 
     #[test]
     fn force_removes_a_checkpoint_that_still_has_work() {
@@ -1234,7 +1335,7 @@ mod sweep_tests {
         std::fs::write(crate::transport::part_path(&dir.join("a.bin")), b"x").unwrap();
         let theirs = dir.join("a.bin.part");
         std::fs::write(&theirs, b"theirs").unwrap();
-        let cp = Checkpoint::new("s", CheckpointKind::Download, vec![unfinished]);
+        let cp = Checkpoint::new("s", TEST_ORIGIN, CheckpointKind::Download, vec![unfinished]);
 
         let outcome = remove_orphan_parts(&cp);
 
@@ -1258,6 +1359,7 @@ mod sweep_tests {
         }
         let cp = Checkpoint::new(
             "s",
+            TEST_ORIGIN,
             CheckpointKind::Download,
             vec![unfinished, in_progress, finished],
         );
@@ -1286,6 +1388,7 @@ mod sweep_tests {
         let dir = scratch("missing");
         let cp = Checkpoint::new(
             "s",
+            TEST_ORIGIN,
             CheckpointKind::Download,
             vec![job(&dir, "never-started.bin", JobStatus::Pending)],
         );
@@ -1309,11 +1412,16 @@ mod sweep_tests {
         };
         std::fs::write(crate::transport::part_path(local_path), b"x").unwrap();
 
-        let mut cp = Checkpoint::new(&name, CheckpointKind::Download, vec![unfinished]);
+        let mut cp = Checkpoint::new(
+            &name,
+            TEST_ORIGIN,
+            CheckpointKind::Download,
+            vec![unfinished],
+        );
         cp.flush().expect("write the checkpoint");
-        let path = Checkpoint::path_for(&name, CheckpointKind::Download).unwrap();
+        let path = Checkpoint::path_for(&name, TEST_ORIGIN, CheckpointKind::Download).unwrap();
 
-        let outcome = discard(&name, CheckpointKind::Download).expect("discard");
+        let outcome = discard(&name, TEST_ORIGIN, CheckpointKind::Download).expect("discard");
 
         assert_eq!(outcome.parts_removed, 1);
         assert!(!path.exists(), "the checkpoint file must be gone");
@@ -1343,10 +1451,10 @@ mod sweep_tests {
         // `a_removal_failure_keeps_the_count_the_sweep_already_earned`.
         let _home = paths::test_home();
         let name = format!("blink-test-remove-fail-{}", std::process::id());
-        let path = Checkpoint::path_for(&name, CheckpointKind::Download).unwrap();
+        let path = Checkpoint::path_for(&name, TEST_ORIGIN, CheckpointKind::Download).unwrap();
         std::fs::create_dir(&path).expect("stand a directory in for the checkpoint file");
 
-        let result = discard(&name, CheckpointKind::Download);
+        let result = discard(&name, TEST_ORIGIN, CheckpointKind::Download);
 
         // `discard` could not remove the substituted directory — `remove_file`
         // refuses one — so take it out here. The test home sweeps the tree at
@@ -1383,7 +1491,12 @@ mod sweep_tests {
         };
         std::fs::write(crate::transport::part_path(local_path), b"x").unwrap();
 
-        let mut cp = Checkpoint::new(name, CheckpointKind::Download, vec![unfinished]);
+        let mut cp = Checkpoint::new(
+            name,
+            TEST_ORIGIN,
+            CheckpointKind::Download,
+            vec![unfinished],
+        );
         cp.flush().expect("write the checkpoint");
 
         let cp_dir = paths::checkpoints_dir().expect("checkpoints dir");
@@ -1402,7 +1515,7 @@ mod sweep_tests {
             return;
         }
 
-        let result = discard(name, CheckpointKind::Download);
+        let result = discard(name, TEST_ORIGIN, CheckpointKind::Download);
 
         // Restore before anything can panic — `expect` below is itself a
         // failure point, and the test home cannot remove a tree it has no
@@ -1429,10 +1542,11 @@ mod sweep_tests {
     fn discarding_an_unreadable_checkpoint_removes_the_file_and_sweeps_nothing() {
         let _home = paths::test_home();
         let name = format!("blink-test-corrupt-discard-{}", std::process::id());
-        let path = Checkpoint::path_for(&name, CheckpointKind::Download).unwrap();
+        let path = Checkpoint::path_for(&name, TEST_ORIGIN, CheckpointKind::Download).unwrap();
         std::fs::write(&path, b"{ not json").unwrap();
 
-        let outcome = discard(&name, CheckpointKind::Download).expect("must not error");
+        let outcome =
+            discard(&name, TEST_ORIGIN, CheckpointKind::Download).expect("must not error");
 
         assert_eq!(
             outcome,
@@ -1448,7 +1562,8 @@ mod sweep_tests {
     fn discarding_a_checkpoint_that_is_already_gone_is_fine() {
         let _home = paths::test_home();
         let name = format!("blink-test-absent-{}", std::process::id());
-        let outcome = discard(&name, CheckpointKind::Download).expect("must not error");
+        let outcome =
+            discard(&name, TEST_ORIGIN, CheckpointKind::Download).expect("must not error");
         assert_eq!(outcome, DiscardOutcome::default());
     }
 }
@@ -1472,6 +1587,7 @@ mod offer_tests {
         // already abandoned; counting it would overstate what is left.
         let cp = Checkpoint::new(
             "s",
+            TEST_ORIGIN,
             CheckpointKind::Download,
             vec![
                 dl(0, JobStatus::Done),
@@ -1488,10 +1604,79 @@ mod offer_tests {
         assert_eq!(offer.kind, CheckpointKind::Download);
     }
 
+    /// A checkpoint is offered only to a connection to the server and
+    /// account it was made for. An ad-hoc `sftp://alice@host` and
+    /// `sftp://bob@host` are both named `host`; resuming alice's upload as
+    /// bob would send her files to his account.
+    #[test]
+    fn a_checkpoint_is_offered_only_to_its_own_origin() {
+        let _home = crate::paths::test_home();
+        let mut cp = Checkpoint::new(
+            "host",
+            "alice@host:22",
+            CheckpointKind::Upload,
+            vec![dl(0, JobStatus::Pending)],
+        );
+        cp.flush().unwrap();
+
+        assert_eq!(offers_for("host", "alice@host:22").len(), 1);
+        assert!(offers_for("host", "bob@host:22").is_empty());
+        assert!(
+            Checkpoint::load("host", "bob@host:22", CheckpointKind::Upload)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A file that claims another origin than its name was keyed by (copied
+    /// or hand-edited) is still not this connection's.
+    #[test]
+    fn a_file_recording_another_origin_is_not_offered() {
+        let _home = crate::paths::test_home();
+        let mut cp = Checkpoint::new(
+            "host",
+            "alice@host:22",
+            CheckpointKind::Download,
+            vec![dl(0, JobStatus::Pending)],
+        );
+        cp.origin = Some("bob@host:22".into());
+        let path = Checkpoint::path_for("host", "alice@host:22", CheckpointKind::Download).unwrap();
+        std::fs::write(&path, serde_json::to_string(&cp).unwrap()).unwrap();
+
+        assert!(offers_for("host", "alice@host:22").is_empty());
+        assert!(
+            Checkpoint::load("host", "alice@host:22", CheckpointKind::Download)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A checkpoint from before version 4 records no origin, so it is never
+    /// offered — whether it sits at its old file name or the new one.
+    #[test]
+    fn a_checkpoint_without_an_origin_is_never_offered() {
+        let _home = crate::paths::test_home();
+        let v3 = r#"{"version":3,"session":"host","kind":"upload","jobs":[
+             {"type":"upload","local_path":"/l/0","remote_path":"/r/0","status":"pending"}
+           ]}"#;
+        for origin in ["", TEST_ORIGIN] {
+            let path = Checkpoint::path_for("host", origin, CheckpointKind::Upload).unwrap();
+            std::fs::write(&path, v3).unwrap();
+        }
+        let cp = Checkpoint::load_from(
+            &Checkpoint::path_for("host", TEST_ORIGIN, CheckpointKind::Upload).unwrap(),
+        )
+        .unwrap()
+        .expect("a v3 checkpoint still loads");
+        assert_eq!(cp.origin, None);
+
+        assert!(offers_for("host", TEST_ORIGIN).is_empty());
+    }
+
     #[test]
     fn the_offer_samples_at_most_three_outstanding_paths() {
         let jobs: Vec<CheckpointJob> = (0..10).map(|n| dl(n, JobStatus::Pending)).collect();
-        let cp = Checkpoint::new("s", CheckpointKind::Download, jobs);
+        let cp = Checkpoint::new("s", TEST_ORIGIN, CheckpointKind::Download, jobs);
 
         let offer = cp.to_offer(None);
 
@@ -1503,6 +1688,7 @@ mod offer_tests {
     fn the_offer_skips_finished_jobs_when_sampling() {
         let cp = Checkpoint::new(
             "s",
+            TEST_ORIGIN,
             CheckpointKind::Download,
             vec![dl(0, JobStatus::Done), dl(1, JobStatus::Pending)],
         );
@@ -1522,6 +1708,7 @@ mod offer_tests {
         // recognise, not the remote destination.
         let cp = Checkpoint::new(
             "s",
+            TEST_ORIGIN,
             CheckpointKind::Upload,
             vec![CheckpointJob::Upload {
                 local_path: PathBuf::from("/home/me/photos/a.cr2"),
@@ -1544,6 +1731,7 @@ mod offer_tests {
         // a server-supplied name must not carry escapes into the terminal.
         let cp = Checkpoint::new(
             "s",
+            TEST_ORIGIN,
             CheckpointKind::Download,
             vec![CheckpointJob::Download {
                 remote_path: "/srv/re\u{202E}port.bin".into(),
@@ -1565,7 +1753,7 @@ mod offer_tests {
     fn a_session_with_no_checkpoints_has_no_offers() {
         let _home = paths::test_home();
         let name = format!("blink-test-none-{}", std::process::id());
-        assert!(offers_for(&name).is_empty());
+        assert!(offers_for(&name, TEST_ORIGIN).is_empty());
     }
 
     #[test]
@@ -1574,12 +1762,13 @@ mod offer_tests {
         let _home = paths::test_home();
         let mut cp = Checkpoint::new(
             &name,
+            TEST_ORIGIN,
             CheckpointKind::Download,
             vec![dl(0, JobStatus::Done), dl(1, JobStatus::Pending)],
         );
         cp.flush().expect("write the checkpoint");
 
-        let offers = offers_for(&name);
+        let offers = offers_for(&name, TEST_ORIGIN);
 
         assert_eq!(offers.len(), 1);
         assert_eq!(offers[0].remaining, 1);
@@ -1593,13 +1782,14 @@ mod offer_tests {
         let _home = paths::test_home();
         let mut cp = Checkpoint::new(
             &name,
+            TEST_ORIGIN,
             CheckpointKind::Download,
             vec![dl(0, JobStatus::Done)],
         );
         cp.flush().expect("write the checkpoint");
 
         assert!(
-            offers_for(&name).is_empty(),
+            offers_for(&name, TEST_ORIGIN).is_empty(),
             "nothing left to resume means nothing to offer",
         );
     }
@@ -1609,11 +1799,11 @@ mod offer_tests {
         let name = format!("blink-test-both-{}", std::process::id());
         let _home = paths::test_home();
         for kind in [CheckpointKind::Download, CheckpointKind::Upload] {
-            let mut cp = Checkpoint::new(&name, kind, vec![dl(0, JobStatus::Pending)]);
+            let mut cp = Checkpoint::new(&name, TEST_ORIGIN, kind, vec![dl(0, JobStatus::Pending)]);
             cp.flush().expect("write the checkpoint");
         }
 
-        let offers = offers_for(&name);
+        let offers = offers_for(&name, TEST_ORIGIN);
 
         assert_eq!(offers.len(), 2);
         assert!(offers.iter().any(|o| o.kind == CheckpointKind::Download));
@@ -1628,6 +1818,7 @@ mod offer_tests {
         // module happens to be a `Download`.
         let cp = Checkpoint::new(
             "s",
+            TEST_ORIGIN,
             CheckpointKind::Upload,
             vec![
                 CheckpointJob::Mkdir {
@@ -1673,10 +1864,10 @@ mod offer_tests {
         let _home = paths::test_home();
         // Connecting must never fail because a checkpoint won't parse.
         let name = format!("blink-test-corrupt-{}", std::process::id());
-        let path = Checkpoint::path_for(&name, CheckpointKind::Download).unwrap();
+        let path = Checkpoint::path_for(&name, TEST_ORIGIN, CheckpointKind::Download).unwrap();
         std::fs::write(&path, b"{ not json").unwrap();
 
-        assert!(offers_for(&name).is_empty());
+        assert!(offers_for(&name, TEST_ORIGIN).is_empty());
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1703,7 +1894,12 @@ mod merge_tests {
 
     #[test]
     fn append_returns_the_base_index_of_the_added_jobs() {
-        let mut cp = Checkpoint::new("s", CheckpointKind::Download, vec![dl(0), dl(1)]);
+        let mut cp = Checkpoint::new(
+            "s",
+            TEST_ORIGIN,
+            CheckpointKind::Download,
+            vec![dl(0), dl(1)],
+        );
         let base = cp.append(vec![dl(2), dl(3)]);
         assert_eq!(base, 2, "the caller maps job ids from this offset");
         assert_eq!(cp.jobs.len(), 4);
@@ -1711,7 +1907,12 @@ mod merge_tests {
 
     #[test]
     fn append_preserves_the_progress_of_the_existing_jobs() {
-        let mut cp = Checkpoint::new("s", CheckpointKind::Download, vec![dl(0), dl(1)]);
+        let mut cp = Checkpoint::new(
+            "s",
+            TEST_ORIGIN,
+            CheckpointKind::Download,
+            vec![dl(0), dl(1)],
+        );
         cp.mark_done(0);
         cp.mark_in_progress(1);
 
@@ -1724,7 +1925,7 @@ mod merge_tests {
 
     #[test]
     fn append_into_an_empty_checkpoint_starts_at_zero() {
-        let mut cp = Checkpoint::new("s", CheckpointKind::Upload, Vec::new());
+        let mut cp = Checkpoint::new("s", TEST_ORIGIN, CheckpointKind::Upload, Vec::new());
         assert_eq!(cp.append(vec![dl(0)]), 0);
     }
 
@@ -1734,7 +1935,12 @@ mod merge_tests {
     fn a_cancelled_job_is_neither_resumed_nor_counted_done() {
         // Cancelling one batch must not re-queue it on the next resume, and
         // must not make the checkpoint look finished either.
-        let mut cp = Checkpoint::new("s", CheckpointKind::Download, vec![dl(0), dl(1)]);
+        let mut cp = Checkpoint::new(
+            "s",
+            TEST_ORIGIN,
+            CheckpointKind::Download,
+            vec![dl(0), dl(1)],
+        );
         cp.mark_cancelled(0);
 
         assert!(
@@ -1748,7 +1954,12 @@ mod merge_tests {
 
     #[test]
     fn cancelling_every_job_leaves_nothing_to_resume() {
-        let mut cp = Checkpoint::new("s", CheckpointKind::Download, vec![dl(0), dl(1)]);
+        let mut cp = Checkpoint::new(
+            "s",
+            TEST_ORIGIN,
+            CheckpointKind::Download,
+            vec![dl(0), dl(1)],
+        );
         cp.mark_cancelled(0);
         cp.mark_cancelled(1);
         assert_eq!(cp.pending_count(), 0);
@@ -1792,7 +2003,7 @@ mod tests {
                 "\u{1f600}".repeat(100),
             ] {
                 for kind in [CheckpointKind::Download, CheckpointKind::Upload] {
-                    let name = file_name_for(&session, kind, windows);
+                    let name = file_name_for(&session, TEST_ORIGIN, kind, windows);
                     assert!(name.len() <= MAX_FILE_NAME_BYTES, "{} bytes", name.len());
                     assert!(name.ends_with(&format!("-{}.json", kind.as_str())));
                 }
@@ -1805,26 +2016,44 @@ mod tests {
         let a = format!("{}a", "x".repeat(300));
         let b = format!("{}b", "x".repeat(300));
         assert_ne!(
-            file_name_for(&a, CheckpointKind::Download, false),
-            file_name_for(&b, CheckpointKind::Download, false)
+            file_name_for(&a, TEST_ORIGIN, CheckpointKind::Download, false),
+            file_name_for(&b, TEST_ORIGIN, CheckpointKind::Download, false)
         );
     }
 
     #[test]
-    fn a_short_name_maps_as_it_always_has() {
-        // Existing checkpoints must keep their file names.
+    fn a_short_name_maps_the_same_on_every_platform() {
         assert_eq!(
-            file_name_for("my prod", CheckpointKind::Download, false),
-            file_name_for("my prod", CheckpointKind::Download, true),
+            file_name_for("my prod", TEST_ORIGIN, CheckpointKind::Download, false),
+            file_name_for("my prod", TEST_ORIGIN, CheckpointKind::Download, true),
         );
-        assert!(file_name_for("my prod", CheckpointKind::Upload, false).starts_with("my_prod-"));
+        assert!(
+            file_name_for("my prod", TEST_ORIGIN, CheckpointKind::Upload, false)
+                .starts_with("my_prod-")
+        );
+    }
+
+    /// `sftp://alice@host` and `sftp://bob@host` are both named `host`; they
+    /// must not share a checkpoint file.
+    #[test]
+    fn two_accounts_sharing_a_session_name_get_separate_files() {
+        let kind = CheckpointKind::Upload;
+        assert_ne!(
+            file_name_for("host", "alice@host:22", kind, false),
+            file_name_for("host", "bob@host:22", kind, false),
+        );
+        // The separator keeps the name and origin from running together.
+        assert_ne!(
+            file_name_for("ab", "c", kind, false),
+            file_name_for("a", "bc", kind, false),
+        );
     }
 
     #[test]
     fn control_characters_map_only_under_windows_rules() {
         let session = "tab\there\u{1b}";
-        let unix = file_name_for(session, CheckpointKind::Download, false);
-        let windows = file_name_for(session, CheckpointKind::Download, true);
+        let unix = file_name_for(session, TEST_ORIGIN, CheckpointKind::Download, false);
+        let windows = file_name_for(session, TEST_ORIGIN, CheckpointKind::Download, true);
         assert!(unix.starts_with("tab\there\u{1b}-"), "{unix:?}");
         assert!(windows.starts_with("tab_here_-"), "{windows:?}");
     }
@@ -1840,7 +2069,7 @@ mod tests {
                 status: JobStatus::Pending,
             })
             .collect();
-        Checkpoint::new("session", CheckpointKind::Download, jobs)
+        Checkpoint::new("session", TEST_ORIGIN, CheckpointKind::Download, jobs)
     }
 
     #[test]
@@ -1912,6 +2141,7 @@ mod tests {
         let _home = paths::test_home();
         let mut cp = Checkpoint::new(
             &name,
+            TEST_ORIGIN,
             CheckpointKind::Download,
             vec![CheckpointJob::Download {
                 remote_path: "/remote/file0".into(),

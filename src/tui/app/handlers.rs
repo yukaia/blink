@@ -760,7 +760,7 @@ impl App {
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
                 self.pending_offers.pop_front();
-                match crate::checkpoint::discard(&offer.session, offer.kind) {
+                match crate::checkpoint::discard(&offer.session, &offer.origin, offer.kind) {
                     Ok(outcome) => {
                         let parts = outcome.parts_removed;
                         // `failures` can now include the checkpoint file

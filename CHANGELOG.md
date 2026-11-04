@@ -73,6 +73,18 @@ the git history for those.
 
 ### Changed
 
+- **Checkpoints record the server and account they were made for.** A
+  checkpoint was keyed by session name alone, so `sftp://alice@host` and
+  `sftp://bob@host` (both named `host`) shared one, as did a saved session
+  edited to point elsewhere. Resuming an upload offered from one sent
+  its files to the other. Checkpoints are now format version 4, carry an
+  `origin` (`user@host:port`), and are offered, resumed and appended to
+  only by a connection to that origin. `blink checkpoints` shows the
+  origin. Checkpoints from earlier versions say nothing about their
+  server, so they are no longer offered: `blink checkpoints` lists them as
+  orphaned, and `blink checkpoints --clean` removes them with their
+  partial downloads.
+
 - **An interrupted download resumes only when the file provably hasn't
   changed.** The `.blink-part.meta` sidecar gains an `mtime` field, and a
   partial is continued only when both the size and the modification time

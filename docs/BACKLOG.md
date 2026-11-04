@@ -28,23 +28,6 @@ russh: 0.65.1 (blink is on 0.64.1) still pins `rsa =0.10.0-rc.18` and
 `ssh-key =0.7.0-rc.11`. Once russh moves to rc.20 or later, check whether
 RUSTSEC-2023-0071 names a patched version before dropping the ignore.
 
-## Checkpoints don't record which server and account they came from
-
-Checkpoints are keyed only by session name (`Checkpoint::path_for` in
-`checkpoint.rs`), and `Session::from_url` names an ad-hoc session after
-the bare host. So `sftp://alice@host` and `sftp://bob@host` share a
-checkpoint, and so do a saved session and a session renamed or edited to
-point at another server. Resuming an upload offered from one of these
-sends the first account's files to the second.
-
-The fix is to store `origin_of(session)` (`transport/mod.rs`, already used
-by the `.blink-part` sidecar) in the checkpoint, and have `offers_for` and
-resume skip or flag a checkpoint whose origin doesn't match. That is an
-on-disk format change, so it needs Yukaia's OK first. Still to decide:
-what to do with existing checkpoints that have no origin. The suggestion
-was to keep offering them, with a warning that blink can't confirm the
-server.
-
 ## Share the SSH agent login loop between Unix and Windows
 
 The `AuthMethod::Agent` arm in `transport/sftp.rs` has two copies of the

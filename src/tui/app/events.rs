@@ -133,13 +133,16 @@ impl App {
                 let is_scp = session.protocol == crate::session::Protocol::Scp;
                 let is_cleartext = session.protocol.is_cleartext();
                 // Ask about unfinished work before asking about saving the
-                // session: checkpoints are keyed by session *name*, and
-                // accepting the save offer can rename it.
+                // session: checkpoints are keyed by session *name* (and
+                // origin), and accepting the save offer can rename it.
                 let mut offers: std::collections::VecDeque<PostConnectOffer> =
-                    crate::checkpoint::offers_for(&session.name)
-                        .into_iter()
-                        .map(PostConnectOffer::ResumeCheckpoint)
-                        .collect();
+                    crate::checkpoint::offers_for(
+                        &session.name,
+                        &crate::transport::origin_of(&session),
+                    )
+                    .into_iter()
+                    .map(PostConnectOffer::ResumeCheckpoint)
+                    .collect();
                 // An ad-hoc connect leaves nothing on disk. Offer to fix that
                 // now that the connection has proven it works — waiting until
                 // the user goes looking for the session is how "it connected

@@ -74,6 +74,15 @@ impl App {
         }
     }
 
+    /// The session name and origin the connected session's checkpoints are
+    /// keyed by — see [`crate::checkpoint`].
+    fn checkpoint_key(&self) -> (String, String) {
+        match self.current_session.as_ref() {
+            Some(s) => (s.name.clone(), crate::transport::origin_of(s)),
+            None => ("default".to_string(), String::new()),
+        }
+    }
+
     /// Flush a checkpoint, or drop it when it has no work left.
     ///
     /// "No work left" covers both the batch finishing and the batch being
@@ -85,9 +94,10 @@ impl App {
         };
         if cp.pending_count() == 0 {
             let session = cp.session.clone();
+            let origin = cp.origin_key().to_string();
             self.active_checkpoints.remove(&kind);
             self.checkpoint_job_map.retain(|_, (k, _)| *k != kind);
-            if let Err(e) = Checkpoint::remove(&session, kind) {
+            if let Err(e) = Checkpoint::remove(&session, &origin, kind) {
                 self.push_log(
                     LogLevel::Warn,
                     format!("could not remove checkpoint file: {e}"),
@@ -150,11 +160,7 @@ impl App {
             Direction::Download => CheckpointKind::Download,
             Direction::CreateDir => unreachable!(),
         };
-        let session_name = self
-            .current_session
-            .as_ref()
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| "default".to_string());
+        let (session_name, origin) = self.checkpoint_key();
 
         let ck_jobs: Vec<CheckpointJob> = plan
             .iter()
@@ -191,8 +197,10 @@ impl App {
         let base = match self.active_checkpoints.get_mut(&ck_kind) {
             Some(existing) => existing.append(ck_jobs),
             None => {
-                self.active_checkpoints
-                    .insert(ck_kind, Checkpoint::new(&session_name, ck_kind, ck_jobs));
+                self.active_checkpoints.insert(
+                    ck_kind,
+                    Checkpoint::new(&session_name, &origin, ck_kind, ck_jobs),
+                );
                 0
             }
         };
@@ -466,11 +474,7 @@ impl App {
             Direction::Download => CheckpointKind::Download,
             Direction::CreateDir => unreachable!(),
         };
-        let session_name = self
-            .current_session
-            .as_ref()
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| "default".to_string());
+        let (session_name, origin) = self.checkpoint_key();
 
         // Refuse while a batch of this direction is still tracked: the file
         // on disk *is* that batch's state, so re-queuing from it would
@@ -488,7 +492,7 @@ impl App {
             return;
         }
 
-        let checkpoint = match Checkpoint::load(&session_name, ck_kind) {
+        let checkpoint = match Checkpoint::load(&session_name, &origin, ck_kind) {
             Ok(Some(cp)) => cp,
             Ok(None) => {
                 self.push_log(LogLevel::Warn, "no checkpoint found to resume".into());
@@ -507,7 +511,7 @@ impl App {
                 LogLevel::Info,
                 "checkpoint is already complete — nothing to resume".into(),
             );
-            let _ = Checkpoint::remove(&session_name, ck_kind);
+            let _ = Checkpoint::remove(&session_name, &origin, ck_kind);
             return;
         }
 

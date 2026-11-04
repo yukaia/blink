@@ -1784,6 +1784,7 @@ mod tests {
         PostConnectOffer::ResumeCheckpoint(crate::checkpoint::CheckpointOffer {
             kind,
             session: "s".into(),
+            origin: "me@host:22".into(),
             remaining: 1,
             total: 2,
             age: None,
@@ -1829,8 +1830,10 @@ mod tests {
     fn app_with_queued_offer(tag: &str) -> (App, crate::paths::TestHome) {
         let (mut a, cleanup) = checkpoint_app(tag);
         let name = a.current_session.as_ref().unwrap().name.clone();
+        let origin = crate::transport::origin_of(a.current_session.as_ref().unwrap());
         let mut cp = crate::checkpoint::Checkpoint::new(
             &name,
+            &origin,
             CheckpointKind::Download,
             vec![crate::checkpoint::CheckpointJob::Download {
                 remote_path: "/srv/a.bin".into(),
@@ -1869,11 +1872,12 @@ mod tests {
     async fn discarding_from_the_offer_removes_the_checkpoint() {
         let (mut a, _cleanup) = app_with_queued_offer("discard");
         let name = a.current_session.as_ref().unwrap().name.clone();
+        let origin = crate::transport::origin_of(a.current_session.as_ref().unwrap());
 
         a.handle_offer_resume_checkpoint(press(KeyCode::Char('d')));
 
         assert!(
-            crate::checkpoint::offers_for(&name).is_empty(),
+            crate::checkpoint::offers_for(&name, &origin).is_empty(),
             "the checkpoint must be gone",
         );
         assert_eq!(a.screen, Screen::Main);
@@ -1883,11 +1887,12 @@ mod tests {
     async fn deferring_the_offer_leaves_the_checkpoint_on_disk() {
         let (mut a, _cleanup) = app_with_queued_offer("later");
         let name = a.current_session.as_ref().unwrap().name.clone();
+        let origin = crate::transport::origin_of(a.current_session.as_ref().unwrap());
 
         a.handle_offer_resume_checkpoint(press(KeyCode::Esc));
 
         assert_eq!(
-            crate::checkpoint::offers_for(&name).len(),
+            crate::checkpoint::offers_for(&name, &origin).len(),
             1,
             "later means later, not never",
         );
@@ -2195,6 +2200,7 @@ mod tests {
     async fn disconnecting_forgets_waiting_jobs_but_the_checkpoint_keeps_them() {
         let (mut a, _cleanup) = capped_app("overflow-disconnect");
         let name = a.current_session.as_ref().unwrap().name.clone();
+        let origin = crate::transport::origin_of(a.current_session.as_ref().unwrap());
 
         a.dispatch_plan(
             vec![download(0), download(1), download(2)],
@@ -2203,7 +2209,7 @@ mod tests {
         a.disconnect();
 
         assert!(a.waiting_jobs.is_empty(), "the next session starts clean");
-        let offers = crate::checkpoint::offers_for(&name);
+        let offers = crate::checkpoint::offers_for(&name, &origin);
         assert_eq!(offers.len(), 1);
         assert_eq!(offers[0].remaining, 3, "the waiting job is still on disk");
     }
