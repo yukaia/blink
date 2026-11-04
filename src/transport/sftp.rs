@@ -337,17 +337,28 @@ fn rsa_hash_alg(algorithm: &ssh_key::Algorithm) -> Option<ssh_key::HashAlg> {
     matches!(algorithm, ssh_key::Algorithm::Rsa { .. }).then_some(ssh_key::HashAlg::Sha512)
 }
 
-/// Attempt authentication against every identity in the agent.
-/// Returns `Ok(true)` on success, `Ok(false)` if no identity was accepted.
-/// Using a generic `S` avoids `Box<dyn AgentStream>` in the state machine,
-/// which lets the Rust compiler verify the `Send` bound for all code paths.
+/// What to suggest when the agent holds no keys.
 #[cfg(windows)]
-async fn try_agent_identities<S>(
-    handle: &mut Handle<KnownHostsHandler>,
+const AGENT_EMPTY_HINT: &str = "try `ssh-add` or load keys into Pageant";
+#[cfg(not(windows))]
+const AGENT_EMPTY_HINT: &str = "try `ssh-add`";
+
+/// Offer every identity in the agent until the server accepts one.
+///
+/// Shared by every platform's agent, so a failure reads the same wherever
+/// blink runs: the message says whether the agent was empty or every key
+/// was refused, and carries the last error a key's attempt raised. Errors
+/// come back as the message alone so a caller can add where the agent was
+/// found. Generic over the stream rather than `Box<dyn AgentStream>` so
+/// the compiler can check the `Send` bound on every path.
+#[cfg(any(unix, windows))]
+async fn try_agent_identities<H, S>(
+    handle: &mut Handle<H>,
     username: &str,
     agent: &mut russh::keys::agent::client::AgentClient<S>,
-) -> Result<bool>
+) -> std::result::Result<(), String>
 where
+    H: Handler,
     S: russh::keys::agent::client::AgentStream
         + tokio::io::AsyncRead
         + tokio::io::AsyncWrite
@@ -358,29 +369,42 @@ where
     let identities = agent
         .request_identities()
         .await
-        .map_err(|e| BlinkError::auth(format!("ssh-agent request_identities: {e}")))?;
+        .map_err(|e| format!("ssh-agent request_identities: {e}"))?;
     if identities.is_empty() {
-        return Err(BlinkError::auth(
-            "ssh-agent has no identities loaded (try `ssh-add` or load keys into Pageant)",
+        return Err(format!(
+            "ssh-agent has no identities loaded ({AGENT_EMPTY_HINT})"
         ));
     }
 
+    let mut last_err: Option<String> = None;
     for identity in identities {
-        // See the unix branch: identities may be keys or certificates.
+        // russh 0.60 models agent identities as plain keys OR OpenSSH
+        // certificates; `public_key` normalises both.
         let pubkey = identity.public_key().into_owned();
         let hash_alg = rsa_hash_alg(&pubkey.algorithm());
         match handle
             .authenticate_publickey_with(username, pubkey, hash_alg, agent)
             .await
         {
-            Ok(r) if r.success() => return Ok(true),
+            Ok(r) if r.success() => return Ok(()),
             Ok(_) => {}
             Err(e) => {
                 tracing::debug!("ssh-agent identity rejected: {e}");
+                last_err = Some(e.to_string());
             }
         }
+        // A server that counts attempts (OpenSSH's MaxAuthTries) hangs up
+        // once they run out; every later key would only fail the same way.
+        if handle.is_closed() {
+            break;
+        }
     }
-    Ok(false)
+    Err(format!(
+        "ssh-agent: no identity accepted{}",
+        last_err
+            .map(|e| format!(" (last error: {e})"))
+            .unwrap_or_default()
+    ))
 }
 
 pub struct SftpTransport {
@@ -513,43 +537,9 @@ impl SftpTransport {
                     let mut agent = russh::keys::agent::client::AgentClient::connect_env()
                         .await
                         .map_err(|e| BlinkError::auth(format!("ssh-agent connect: {e}")))?;
-
-                    let identities = agent.request_identities().await.map_err(|e| {
-                        BlinkError::auth(format!("ssh-agent request_identities: {e}"))
-                    })?;
-                    if identities.is_empty() {
-                        return Err(BlinkError::auth(
-                            "ssh-agent has no identities loaded (try `ssh-add`)",
-                        ));
-                    }
-
-                    let mut succeeded = false;
-                    let mut last_err: Option<String> = None;
-                    for identity in identities {
-                        // russh 0.60 models agent identities as plain keys OR
-                        // OpenSSH certificates; `public_key` normalises both.
-                        let pubkey = identity.public_key().into_owned();
-                        let hash_alg = rsa_hash_alg(&pubkey.algorithm());
-                        let auth_result = handle
-                            .authenticate_publickey_with(username, pubkey, hash_alg, &mut agent)
-                            .await;
-                        match auth_result {
-                            Ok(r) if r.success() => {
-                                succeeded = true;
-                                break;
-                            }
-                            Ok(_) => {}
-                            Err(e) => last_err = Some(e.to_string()),
-                        }
-                    }
-                    if !succeeded {
-                        return Err(BlinkError::auth(format!(
-                            "ssh-agent: no identity accepted{}",
-                            last_err
-                                .map(|e| format!(" (last error: {e})"))
-                                .unwrap_or_default()
-                        )));
-                    }
+                    try_agent_identities(&mut handle, username, &mut agent)
+                        .await
+                        .map_err(BlinkError::auth)?;
                     true
                 }
                 #[cfg(windows)]
@@ -558,33 +548,29 @@ impl SftpTransport {
 
                     const OPENSSH_PIPE: &str = r"\\.\pipe\openssh-ssh-agent";
 
-                    let succeeded = match AgentClient::connect_named_pipe(OPENSSH_PIPE).await {
-                        Ok(mut agent) => {
-                            try_agent_identities(&mut handle, username, &mut agent).await?
-                        }
+                    match AgentClient::connect_named_pipe(OPENSSH_PIPE).await {
+                        Ok(mut agent) => try_agent_identities(&mut handle, username, &mut agent)
+                            .await
+                            .map_err(BlinkError::auth)?,
                         Err(pipe_err) => {
                             // russh 0.60 made connect_pageant fallible;
                             // it previously returned the client directly.
                             let mut agent = AgentClient::connect_pageant().await.map_err(|e| {
                                 BlinkError::auth(format!(
-                                    "ssh-agent: no agent found (OpenSSH \
-                                             pipe error: {pipe_err}; Pageant \
-                                             error: {e})"
+                                    "ssh-agent: no agent found (OpenSSH pipe error: \
+                                     {pipe_err}; Pageant error: {e})"
                                 ))
                             })?;
+                            // Pageant answered, so the failure is its keys'.
+                            // Name it, and why the OpenSSH agent wasn't used.
                             try_agent_identities(&mut handle, username, &mut agent)
                                 .await
                                 .map_err(|e| {
                                     BlinkError::auth(format!(
-                                        "ssh-agent: no agent found \
-                                             (OpenSSH pipe error: {pipe_err}; {e})"
+                                        "{e} (via Pageant; OpenSSH pipe error: {pipe_err})"
                                     ))
                                 })?
                         }
-                    };
-
-                    if !succeeded {
-                        return Err(BlinkError::auth("ssh-agent: no identity accepted"));
                     }
                     true
                 }
@@ -1605,6 +1591,9 @@ mod integration {
     struct SshServer {
         channels: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
         store: Store,
+        /// Refuse every public key, as a server would whose
+        /// `authorized_keys` holds none of the client's.
+        reject_publickeys: bool,
     }
 
     // Native `async fn` in trait as of russh 0.60 — see the client Handler.
@@ -1625,6 +1614,9 @@ mod integration {
             _user: &str,
             _key: &russh::keys::ssh_key::PublicKey,
         ) -> Result<Auth, Self::Error> {
+            if self.reject_publickeys {
+                return Ok(Auth::reject());
+            }
             Ok(Auth::Accept)
         }
 
@@ -1983,6 +1975,20 @@ mod integration {
         store: Store,
         host_keys: &[&str],
     ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        start_server_inner(store, host_keys, false).await
+    }
+
+    /// As [`start_server`], but refusing every public key.
+    async fn start_server_rejecting_keys(store: Store) -> u16 {
+        let keys = [super::super::sftp_test_keys::ED25519_KEY];
+        start_server_inner(store, &keys, true).await.0
+    }
+
+    async fn start_server_inner(
+        store: Store,
+        host_keys: &[&str],
+        reject_publickeys: bool,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let config = Arc::new(russh::server::Config {
@@ -2004,6 +2010,7 @@ mod integration {
                 let handler = SshServer {
                     channels: Arc::new(Mutex::new(HashMap::new())),
                     store: store.clone(),
+                    reject_publickeys,
                 };
                 tokio::spawn(async move {
                     // RunningSession is dropped here; the session task it spawns
@@ -3326,5 +3333,100 @@ mod integration {
             }
             _ => panic!("expected AppEvent::HostKeyRevoked"),
         }
+    }
+
+    // ---- ssh-agent login --------------------------------------------------
+    //
+    // `try_agent_identities` is what every platform's agent branch runs, so
+    // these pin how an agent login fails and succeeds without a real agent:
+    // russh's own agent server, over an in-memory pipe.
+
+    /// An agent holding `keys` (OpenSSH private keys).
+    async fn agent_holding(
+        keys: &[&str],
+    ) -> russh::keys::agent::client::AgentClient<tokio::io::DuplexStream> {
+        let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+        let listener = futures::stream::iter([Ok(server_end)]);
+        tokio::spawn(russh::keys::agent::server::serve(listener, ()));
+        let mut agent = russh::keys::agent::client::AgentClient::connect(client_end);
+        for k in keys {
+            let key = russh::keys::PrivateKey::from_openssh(k).unwrap();
+            agent.add_identity(&key, &[]).await.unwrap();
+        }
+        agent
+    }
+
+    /// A client handle to the test server on `port`, host key verified (as
+    /// trusted once) but not yet authenticated.
+    async fn unauthenticated_handle(port: u16) -> russh::client::Handle<super::KnownHostsHandler> {
+        use base64::Engine as _;
+        let host_key =
+            russh::keys::PrivateKey::from_openssh(super::super::sftp_test_keys::ED25519_KEY)
+                .unwrap()
+                .public_key()
+                .clone();
+        let trust = crate::known_hosts::SessionTrust::new();
+        trust.trust(
+            "127.0.0.1",
+            port,
+            host_key.algorithm().as_str(),
+            &base64::engine::general_purpose::STANDARD.encode(host_key.to_bytes().unwrap()),
+        );
+        let handler = super::KnownHostsHandler {
+            host: "127.0.0.1".to_string(),
+            port,
+            event_tx: None,
+            trust,
+            user_wait: crate::transport::UserWait::new().0,
+        };
+        let config = Arc::new(russh::client::Config::default());
+        russh::client::connect(config, ("127.0.0.1", port), handler)
+            .await
+            .expect("connect to the test server")
+    }
+
+    #[tokio::test]
+    async fn an_agent_login_succeeds_with_a_key_the_server_accepts() {
+        let _home = crate::paths::test_home();
+        let (port, _c) = start_server(Arc::new(Mutex::new(HashMap::new()))).await;
+        let mut handle = unauthenticated_handle(port).await;
+        let mut agent = agent_holding(&[super::super::sftp_test_keys::ED25519_KEY]).await;
+
+        super::try_agent_identities(&mut handle, "tester", &mut agent)
+            .await
+            .expect("the agent's key is accepted");
+    }
+
+    #[tokio::test]
+    async fn an_empty_agent_says_so_and_how_to_fix_it() {
+        let _home = crate::paths::test_home();
+        let (port, _c) = start_server(Arc::new(Mutex::new(HashMap::new()))).await;
+        let mut handle = unauthenticated_handle(port).await;
+        let mut agent = agent_holding(&[]).await;
+
+        let err = super::try_agent_identities(&mut handle, "tester", &mut agent)
+            .await
+            .expect_err("nothing to offer");
+        assert!(err.contains("no identities loaded"), "{err}");
+        assert!(err.contains(super::AGENT_EMPTY_HINT), "{err}");
+    }
+
+    /// Every key is offered before giving up, and the failure says that it
+    /// was the keys, not the agent, that didn't work.
+    #[tokio::test]
+    async fn an_agent_login_reports_when_every_key_is_refused() {
+        let _home = crate::paths::test_home();
+        let port = start_server_rejecting_keys(Arc::new(Mutex::new(HashMap::new()))).await;
+        let mut handle = unauthenticated_handle(port).await;
+        let mut agent = agent_holding(&[
+            super::super::sftp_test_keys::ED25519_KEY,
+            super::super::sftp_test_keys::ECDSA_KEY,
+        ])
+        .await;
+
+        let err = super::try_agent_identities(&mut handle, "tester", &mut agent)
+            .await
+            .expect_err("the server refuses every key");
+        assert!(err.starts_with("ssh-agent: no identity accepted"), "{err}");
     }
 }

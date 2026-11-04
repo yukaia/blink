@@ -27,16 +27,3 @@ should carry them — confirm against its changelog. What's left is
 russh: 0.65.1 (blink is on 0.64.1) still pins `rsa =0.10.0-rc.18` and
 `ssh-key =0.7.0-rc.11`. Once russh moves to rc.20 or later, check whether
 RUSTSEC-2023-0071 names a patched version before dropping the ignore.
-
-## Share the SSH agent login loop between Unix and Windows
-
-The `AuthMethod::Agent` arm in `transport/sftp.rs` has two copies of the
-same identity loop: an inline one under `#[cfg(unix)]`, and
-`try_agent_identities` under `#[cfg(windows)]`. They have already drifted.
-Unix reports the last rejection error and Windows only logs it. The
-"no identities" hints also differ.
-
-Make `try_agent_identities` cross-platform, and have both branches call it
-so they report errors the same way. Held back because the Windows build
-can't be checked here: do it where `cargo check --target
-x86_64-pc-windows-msvc` (or a Windows CI run) can confirm the result.

@@ -108,6 +108,14 @@ the git history for those.
 
 ### Fixed
 
+- **Windows: a failed ssh-agent login says why.** When the agent's keys
+  were all refused, Windows reported only "no identity accepted", while
+  Unix also gave the last error; and a refusal by Pageant's keys was
+  reported as "no agent found". Both platforms now share one login loop
+  and report the same way, naming Pageant when it was the agent used.
+  The loop also stops offering keys once the server hangs up (as
+  OpenSSH's `MaxAuthTries` does) instead of failing each remaining one.
+
 - **Sessions with long names can be checkpointed again.** The checkpoint
   file was named after the whole session name, so a long one went past
   the file-name limit and the checkpoint could never be written. Names are
