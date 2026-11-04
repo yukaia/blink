@@ -205,6 +205,18 @@ pub enum AppEvent {
         host: String,
     },
 
+    /// The server presented a key a `@revoked` line in known_hosts names —
+    /// hard reject. Carries the reason so the TUI shows it instead of a
+    /// generic connect failure.
+    HostKeyRevoked {
+        /// Display form of the host, as for `HostCertificateRejected`.
+        host: String,
+        /// Algorithm of the presented key (sanitized).
+        key_type: String,
+        /// SHA-256 fingerprint of the presented key (sanitized).
+        fingerprint: String,
+    },
+
     /// Transfer dispatcher emitted an event. Reserved for the next wiring pass.
     #[allow(dead_code)]
     Transfer(TransferEvent),

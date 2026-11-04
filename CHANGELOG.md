@@ -10,6 +10,29 @@ the git history for those.
 
 ### Security
 
+- **`@revoked` lines in known_hosts are honoured.** A key marked
+  `@revoked` was skipped as an unreadable line, so another line trusting
+  it still let the connection through. blink now refuses a revoked key
+  outright, for every host and without a prompt, and logs why. The file
+  also reads comma-separated host lists, `!`-negated names, and fields
+  separated by tabs or several spaces, as OpenSSH writes them;
+  `blink known-hosts remove` takes just the one name out of a list.
+- **An IPv6 host can't borrow another address's stored key.** blink still
+  reads the `host:port` form older versions wrote, but for an IPv6 address
+  that form is ambiguous: `::1:22` is both `::1` on port 22 and `::1:22`.
+  It is no longer read for IPv6 hosts; blink always bracketed those.
+- **Windows: a server can no longer name a download after a device
+  blink missed.** `CONIN$`, `CONOUT$`, `COM0`/`LPT0`, the ports written
+  with superscript digits (`COM¹`), and names like `NUL .txt` (a space
+  before the extension) now count as reserved, like `NUL` and `COM1`
+  already did, and are skipped.
+- **TLS and constant-time fixes from dependency updates.** rustls 0.23.46
+  (RUSTSEC-2026-0346 to 0349, among them a key-exchange downgrade and a
+  1 GiB pre-authentication allocation), rustls-webpki 0.103.16 and
+  webpki-roots 1.0.11 (distrusted intermediates and emSign roots), all
+  reached through FTPS; crypto-bigint 0.7.10 and ctutils 0.4.8 (timing
+  leaks, RUSTSEC-2026-0387 and 0385) through SSH.
+
 - **A known SSH host presenting a different kind of key is refused, not
   offered as new.** A host on file with, say, an Ed25519 key that presented
   an RSA key read as an unknown host, and got the ordinary "trust this
@@ -64,6 +87,11 @@ the git history for those.
 
 ### Fixed
 
+- **Sessions with long names can be checkpointed again.** The checkpoint
+  file was named after the whole session name, so a long one went past
+  the file-name limit and the checkpoint could never be written. Names are
+  now cut to fit. On Windows, control characters in a session name are
+  also replaced, since Windows refuses them in file names.
 - **A rename confirmed as an overwrite now overwrites over SFTP.** Renaming
   onto an existing name asked "overwrite?", then sent a plain SFTP rename,
   which OpenSSH's server refuses when the target exists, so the confirmed
@@ -156,6 +184,8 @@ the git history for those.
 - `russh` 0.63 -> 0.64. No code changes. 0.64 removes the
   `legacy-ed25519-pkcs8-parser` feature, which blink never enabled, and
   still pins `rsa` and `ssh-key` to the same release candidates.
+- Lockfile refresh (`cargo update`): `suppaftp` 12.1.1 -> 12.2.1, `tokio`
+  1.53 -> 1.54 (RUSTSEC-2026-0386), and the security updates listed above.
 
 ## [0.8.2] — 2026-09-28
 

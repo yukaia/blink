@@ -602,6 +602,21 @@ impl App {
                     ),
                 );
             }
+            AppEvent::HostKeyRevoked {
+                host,
+                key_type,
+                fingerprint,
+            } => {
+                // No modal, as for a certificate: the revocation is the
+                // user's own known_hosts line, so there is nothing to decide.
+                self.push_log(
+                    LogLevel::Error,
+                    format!(
+                        "REVOKED HOST KEY for {host}: {key_type} {fingerprint} is marked \
+                         @revoked in known_hosts — connection refused"
+                    ),
+                );
+            }
         }
     }
 

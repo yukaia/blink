@@ -79,30 +79,3 @@ Make `try_agent_identities` cross-platform, and have both branches call it
 so they report errors the same way. Held back because the Windows build
 can't be checked here: do it where `cargo check --target
 x86_64-pc-windows-msvc` (or a Windows CI run) can confirm the result.
-
-## `known_hosts` reads only part of the OpenSSH format
-
-`check_in_str` (`known_hosts.rs`) splits each line on single spaces and
-compares the first field to the host. The README calls the file "standard
-OpenSSH format", but:
-
-- `@revoked` and `@cert-authority` lines are skipped as non-matching, so
-  a key marked revoked is never refused.
-- Comma-separated host lists (`a,b ssh-ed25519 …`), hashed `|1|` hosts
-  and tab-separated fields never match. These fail safe: the user gets
-  a trust prompt.
-
-blink writes its own file in the subset it reads, so this only bites
-someone who pastes lines in from `~/.ssh/known_hosts`. Either honour
-`@revoked` (refuse the key outright) and the other forms, or change the
-README to say the file is a subset. `@revoked` is the one that matters.
-
-## The legacy `host:port` known_hosts form is ambiguous for IPv6
-
-`host_matches` (`known_hosts.rs`) also accepts `legacy_host`'s
-`host:port`, so a line for `::1:22` matches host `::1` on port 22 and
-host `::1:22` on port 22 (canonical form, default port). A key trusted
-for one address then counts as trusted for the other. Hard to exploit,
-but the fix is cheap: don't accept the legacy form when the host
-contains `:`, or rewrite legacy lines to the canonical form on load.
-Rewriting changes the file, so it needs Yukaia's OK first.

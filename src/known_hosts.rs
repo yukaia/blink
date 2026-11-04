@@ -23,9 +23,17 @@
 //! ## Unsupported forms
 //!
 //! Hashed entries (`|1|salt|hash`) written by OpenSSH with
-//! `HashKnownHosts=yes` are **not** recognised. Blink writes its own file
-//! and only looks up entries it wrote itself; importing from
-//! `~/.ssh/known_hosts` is out of scope.
+//! `HashKnownHosts=yes` are **not** recognised, nor are wildcard patterns
+//! (`*.example.com`); neither ever matches, so such a host is asked about as
+//! a new one. Comma-separated host lists and `!`-negated names are read.
+//! `@cert-authority` lines are ignored, since blink refuses host
+//! certificates outright.
+//!
+//! ## Revocation
+//!
+//! A `@revoked` line refuses its key for **every** host, not only the ones
+//! it lists: a revoked key is a compromised one, and no other line can
+//! vouch for it.
 //!
 //! ## Match semantics
 //!
@@ -81,6 +89,9 @@ pub enum KeyStatus {
         /// The base64 key stored in the file.
         stored_key_b64: String,
     },
+    /// The presented key is on a `@revoked` line. Hard reject, whatever
+    /// other lines say about the host.
+    Revoked,
 }
 
 // ---------------------------------------------------------------------------
@@ -189,8 +200,66 @@ fn host_matches(file_host: &str, host: &str, port: u16) -> bool {
     if file_host.eq_ignore_ascii_case(&canonical) {
         return true;
     }
+    // Not for an IPv6 host: `::1:22` is legacy `::1` on port 22 and
+    // canonical `::1:22` on port 22 alike, so reading it both ways would
+    // let a key stored for one address vouch for the other. blink never
+    // wrote the legacy form for a host it could not connect to without
+    // brackets, so nothing that was trusted correctly stops matching.
+    if host.contains(':') {
+        return false;
+    }
     let legacy = legacy_host(host, port);
     file_host.eq_ignore_ascii_case(&legacy)
+}
+
+/// One non-comment line of a known_hosts file.
+struct Entry<'a> {
+    /// `@revoked`, `@cert-authority`, or another `@` marker.
+    marker: Option<&'a str>,
+    /// The comma-separated host list.
+    hosts: &'a str,
+    key_type: &'a str,
+    key_b64: &'a str,
+}
+
+/// Split a line into its fields, OpenSSH-style: any run of spaces or tabs
+/// separates them, and anything after the key is a comment. `None` for
+/// blanks, comments, and lines too short to be an entry.
+fn parse_line(line: &str) -> Option<Entry<'_>> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let mut fields = line.split_ascii_whitespace();
+    let first = fields.next()?;
+    let (marker, hosts) = if first.starts_with('@') {
+        (Some(first), fields.next()?)
+    } else {
+        (None, first)
+    };
+    Some(Entry {
+        marker,
+        hosts,
+        key_type: fields.next()?,
+        key_b64: fields.next()?,
+    })
+}
+
+/// Whether a comma-separated host list names `(host, port)`: some name
+/// matches it and no `!`-negated name does. Hashed (`|1|…`) names and
+/// wildcard patterns are never matched; see the module docs.
+fn hosts_match(hosts: &str, host: &str, port: u16) -> bool {
+    let mut matched = false;
+    for name in hosts.split(',') {
+        if let Some(negated) = name.strip_prefix('!') {
+            if host_matches(negated, host, port) {
+                return false;
+            }
+        } else if host_matches(name, host, port) {
+            matched = true;
+        }
+    }
+    matched
 }
 
 // ---------------------------------------------------------------------------
@@ -209,52 +278,48 @@ pub fn check(host: &str, port: u16, key_type: &str, key_b64: &str) -> Result<Key
 }
 
 fn check_in_str(raw: &str, host: &str, port: u16, key_type: &str, key_b64: &str) -> KeyStatus {
-    // Keep scanning all matching lines.
-    // - Any line whose (host, key_type, key_b64) all match → Trusted.
+    // - A `@revoked` line carrying the presented key → Revoked, for any
+    //   host: a revoked key is compromised and vouches for nothing.
+    // - Else any line whose (host, key_type, key_b64) all match → Trusted.
     // - Else if any line with this (host, key_type) has a different blob →
     //   Changed, naming that line.
     // - Else if the host has a line of another type → Changed, naming the
     //   first such line. See the module docs.
     // - Else → Unknown.
+    let entries: Vec<Entry<'_>> = raw.lines().filter_map(parse_line).collect();
+
+    if entries
+        .iter()
+        .any(|e| e.marker == Some("@revoked") && e.key_type == key_type && e.key_b64 == key_b64)
+    {
+        return KeyStatus::Revoked;
+    }
+
     let mut changed: Option<KeyStatus> = None;
     let mut other_type: Option<KeyStatus> = None;
 
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    // Other markers (`@cert-authority`) are not host keys: blink refuses
+    // host certificates before it gets here.
+    for e in entries.iter().filter(|e| e.marker.is_none()) {
+        if !hosts_match(e.hosts, host, port) {
             continue;
         }
-        let mut parts = line.splitn(3, ' ');
-        let (file_host, file_type, file_b64) = match (parts.next(), parts.next(), parts.next()) {
-            (Some(h), Some(t), Some(k)) => (h, t, k.trim()),
-            _ => continue, // malformed line — skip
+        let stored = || KeyStatus::Changed {
+            stored_key_type: error::sanitize(e.key_type.to_string()),
+            stored_key_b64: error::sanitize(e.key_b64.to_string()),
         };
-
-        if !host_matches(file_host, host, port) {
-            continue;
-        }
-        if file_type != key_type {
+        if e.key_type != key_type {
             // Normal for a host with several keys, as long as one of the
             // presented type matches; remembered in case none does.
-            if other_type.is_none() {
-                other_type = Some(KeyStatus::Changed {
-                    stored_key_type: error::sanitize(file_type.to_string()),
-                    stored_key_b64: error::sanitize(file_b64.to_string()),
-                });
-            }
+            other_type.get_or_insert_with(stored);
             continue;
         }
-        if file_b64 == key_b64 {
+        if e.key_b64 == key_b64 {
             return KeyStatus::Trusted;
         }
         // Same host, same algorithm, different blob — remember as Changed
         // (but keep scanning in case a later line is a Trusted match).
-        if changed.is_none() {
-            changed = Some(KeyStatus::Changed {
-                stored_key_type: error::sanitize(file_type.to_string()),
-                stored_key_b64: error::sanitize(file_b64.to_string()),
-            });
-        }
+        changed.get_or_insert_with(stored);
     }
 
     changed.or(other_type).unwrap_or(KeyStatus::Unknown)
@@ -276,19 +341,12 @@ pub fn stored_key_types(host: &str, port: u16) -> Vec<String> {
 
 fn stored_key_types_in_str(raw: &str, host: &str, port: u16) -> Vec<String> {
     let mut types: Vec<String> = Vec::new();
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut parts = line.splitn(3, ' ');
-        let (Some(file_host), Some(file_type), Some(_)) =
-            (parts.next(), parts.next(), parts.next())
-        else {
-            continue;
-        };
-        if host_matches(file_host, host, port) && !types.iter().any(|t| t == file_type) {
-            types.push(file_type.to_string());
+    for e in raw.lines().filter_map(parse_line) {
+        if e.marker.is_none()
+            && hosts_match(e.hosts, host, port)
+            && !types.iter().any(|t| t == e.key_type)
+        {
+            types.push(e.key_type.to_string());
         }
     }
     types
@@ -414,30 +472,44 @@ pub fn remove_host(host: &str, port: u16) -> Result<usize> {
 // ---------------------------------------------------------------------------
 
 /// Drop every entry matching `(host, port)` from `raw`, returning the
-/// rewritten contents and how many lines went away.
+/// rewritten contents and how many lines it changed.
 ///
 /// Comments and blank lines are preserved, and lines whose host field names a
 /// different host or a different port are left alone — removing a key must
-/// not disturb neighbouring entries.
+/// not disturb neighbouring entries. A line listing other names as well
+/// keeps them and loses only the ones naming this host. Marker lines are
+/// never touched: forgetting a host must not un-revoke a key.
 fn filter_out_host(raw: &str, host: &str, port: u16) -> (String, usize) {
-    let mut removed = 0usize;
-    let filtered: String = raw
-        .lines()
-        .filter(|line| {
-            let t = line.trim();
-            if t.is_empty() || t.starts_with('#') {
-                return true; // keep comments and blanks
-            }
-            let host_field = t.split(' ').next().unwrap_or("");
-            let matched = host_matches(host_field, host, port);
-            if matched {
-                removed += 1;
-            }
-            !matched
-        })
-        .map(|l| format!("{l}\n"))
-        .collect();
-    (filtered, removed)
+    let mut changed = 0usize;
+    let mut out = String::with_capacity(raw.len());
+    for line in raw.lines() {
+        let Some(e) = parse_line(line).filter(|e| e.marker.is_none()) else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        if !hosts_match(e.hosts, host, port) {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        changed += 1;
+        let kept: Vec<&str> = e
+            .hosts
+            .split(',')
+            .filter(|n| !host_matches(n, host, port))
+            .collect();
+        // Nothing left but negations (or nothing at all) names no host.
+        if kept.iter().all(|n| n.starts_with('!')) {
+            continue;
+        }
+        let rest = line.trim_start()[e.hosts.len()..].trim_start();
+        out.push_str(&kept.join(","));
+        out.push(' ');
+        out.push_str(rest);
+        out.push('\n');
+    }
+    (out, changed)
 }
 
 /// Open `path` and read at most `MAX_KNOWN_HOSTS_BYTES` into a `String`.
@@ -659,6 +731,106 @@ mod tests {
         let raw = format!("prod.example.com:22 ssh-ed25519 {ED_KEY}\n");
         let r = check_in_str(&raw, "prod.example.com", 22, "ssh-ed25519", ED_KEY);
         assert_eq!(r, KeyStatus::Trusted);
+    }
+
+    // -- OpenSSH line forms -------------------------------------------------
+
+    #[test]
+    fn a_revoked_key_is_refused_even_with_a_trusting_line() {
+        let raw = format!(
+            "prod.example.com ssh-ed25519 {ED_KEY}\n\
+             @revoked * ssh-ed25519 {ED_KEY}\n"
+        );
+        let r = check_in_str(&raw, "prod.example.com", 22, "ssh-ed25519", ED_KEY);
+        assert_eq!(r, KeyStatus::Revoked);
+    }
+
+    #[test]
+    fn a_revoked_key_is_refused_for_every_host() {
+        // Revocation means the key is compromised; it vouches for nothing.
+        let raw = format!("@revoked other.example ssh-ed25519 {ED_KEY}\n");
+        let r = check_in_str(&raw, "new.example.com", 22, "ssh-ed25519", ED_KEY);
+        assert_eq!(r, KeyStatus::Revoked);
+    }
+
+    #[test]
+    fn revoking_one_key_leaves_the_others_alone() {
+        let raw = format!(
+            "prod.example.com ssh-ed25519 {ED_KEY}\n\
+             @revoked * ssh-ed25519 {ED_KEY_2}\n"
+        );
+        let r = check_in_str(&raw, "prod.example.com", 22, "ssh-ed25519", ED_KEY);
+        assert_eq!(r, KeyStatus::Trusted);
+    }
+
+    #[test]
+    fn marker_lines_are_not_host_entries() {
+        let raw = format!(
+            "@cert-authority prod.example.com ssh-ed25519 {ED_KEY}\n\
+             @revoked prod.example.com ssh-rsa {RSA_KEY}\n"
+        );
+        let r = check_in_str(&raw, "prod.example.com", 22, "ssh-ed25519", ED_KEY);
+        assert_eq!(r, KeyStatus::Unknown);
+        assert!(stored_key_types_in_str(&raw, "prod.example.com", 22).is_empty());
+    }
+
+    #[test]
+    fn a_comma_separated_host_list_matches_each_name() {
+        let raw = format!("prod.example.com,10.0.0.5 ssh-ed25519 {ED_KEY}\n");
+        for host in ["prod.example.com", "10.0.0.5"] {
+            let r = check_in_str(&raw, host, 22, "ssh-ed25519", ED_KEY);
+            assert_eq!(r, KeyStatus::Trusted, "{host}");
+        }
+        assert_eq!(
+            stored_key_types_in_str(&raw, "10.0.0.5", 22),
+            vec!["ssh-ed25519".to_string()]
+        );
+    }
+
+    #[test]
+    fn fields_may_be_separated_by_tabs_and_runs_of_spaces() {
+        let raw = format!("prod.example.com\t ssh-ed25519   {ED_KEY} comment\n");
+        let r = check_in_str(&raw, "prod.example.com", 22, "ssh-ed25519", ED_KEY);
+        assert_eq!(r, KeyStatus::Trusted);
+    }
+
+    #[test]
+    fn a_negated_name_keeps_the_line_from_applying() {
+        let raw = format!("prod.example.com,!prod.example.com ssh-ed25519 {ED_KEY}\n");
+        let r = check_in_str(&raw, "prod.example.com", 22, "ssh-ed25519", ED_KEY);
+        assert_eq!(r, KeyStatus::Unknown);
+    }
+
+    #[test]
+    fn the_legacy_form_is_not_read_for_an_ipv6_host() {
+        // `::1:22` could be host `::1` on port 22 in the legacy form, or
+        // host `::1:22` on port 22 in the canonical one.
+        let raw = format!("::1:22 ssh-ed25519 {ED_KEY}\n");
+        let r = check_in_str(&raw, "::1", 22, "ssh-ed25519", ED_KEY);
+        assert_eq!(r, KeyStatus::Unknown);
+        let r = check_in_str(&raw, "::1:22", 22, "ssh-ed25519", ED_KEY);
+        assert_eq!(r, KeyStatus::Trusted);
+        let raw = format!("[::1]:2222 ssh-ed25519 {ED_KEY}\n");
+        let r = check_in_str(&raw, "::1", 2222, "ssh-ed25519", ED_KEY);
+        assert_eq!(r, KeyStatus::Trusted);
+    }
+
+    #[test]
+    fn remove_takes_one_name_out_of_a_host_list() {
+        let raw = format!(
+            "prod.example.com,10.0.0.5 ssh-ed25519 {ED_KEY}\n\
+             @revoked prod.example.com ssh-rsa {RSA_KEY}\n"
+        );
+        let (out, n) = filter_out_host(&raw, "prod.example.com", 22);
+        assert_eq!(n, 1);
+        assert_eq!(
+            out,
+            format!(
+                "10.0.0.5 ssh-ed25519 {ED_KEY}\n\
+                 @revoked prod.example.com ssh-rsa {RSA_KEY}\n"
+            ),
+            "the other name stays, and a revocation is never removed"
+        );
     }
 
     #[test]

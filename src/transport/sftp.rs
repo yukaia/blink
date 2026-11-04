@@ -230,6 +230,23 @@ impl Handler for KnownHostsHandler {
                 }
                 return Ok(false);
             }
+            KeyStatus::Revoked => {
+                tracing::warn!(
+                    host = %display_host,
+                    key_type = %key_type,
+                    %fingerprint,
+                    "host key is revoked in known_hosts — rejecting connection",
+                );
+                let event = crate::tui::event::AppEvent::HostKeyRevoked {
+                    host: display_host,
+                    key_type,
+                    fingerprint,
+                };
+                if let Some(tx) = self.event_tx.take() {
+                    let _ = tx.send(event);
+                }
+                return Ok(false);
+            }
             KeyStatus::Unknown => {}
         }
 
@@ -3254,5 +3271,34 @@ mod integration {
             "it waits the prompt's own limit, no less",
         );
         assert!(!*waiting.borrow(), "and ends the pause");
+    }
+
+    /// A key on a `@revoked` line is refused without a prompt, even when the
+    /// user accepted it once this session, and the TUI is told why.
+    #[tokio::test]
+    async fn a_revoked_key_is_refused_without_a_prompt() {
+        use base64::Engine as _;
+        use russh::client::Handler as _;
+        let _home = crate::paths::test_home();
+        let (mut handler, presented, mut ev_rx, _waiting) = prompting_handler();
+        let russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } = &presented else {
+            unreachable!()
+        };
+        let key_type = key.algorithm().as_str().to_string();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(key.to_bytes().unwrap());
+        std::fs::write(
+            crate::known_hosts::known_hosts_path().unwrap(),
+            format!("@revoked * {key_type} {b64}\n"),
+        )
+        .unwrap();
+        handler.trust.trust("example.test", 22, &key_type, &b64);
+
+        assert!(!handler.check_server_key(&presented).await.unwrap());
+        match ev_rx.try_recv() {
+            Ok(crate::tui::event::AppEvent::HostKeyRevoked { host, .. }) => {
+                assert_eq!(host, "example.test");
+            }
+            _ => panic!("expected AppEvent::HostKeyRevoked"),
+        }
     }
 }

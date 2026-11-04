@@ -28,7 +28,9 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
 - **Host-key verification** for SFTP/SCP — unknown keys trigger an
   interactive prompt (accept & save / trust once / reject); changed keys are
   hard-rejected with a clear warning. Keys are stored in
-  `~/.config/blink/known_hosts` in standard OpenSSH format. A server
+  `~/.config/blink/known_hosts` in OpenSSH's line format: comma-separated
+  host lists and `@revoked` lines are read, and a revoked key is refused
+  for every host; hashed and wildcard host names are not. A server
   presenting an SSH *host certificate* is refused rather than pinned.
 - Disconnect back to the session selector without quitting
 
