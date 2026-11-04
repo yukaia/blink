@@ -8,6 +8,8 @@ the git history for those.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-11-04
+
 ### Security
 
 - **`@revoked` lines in known_hosts are honoured.** A key marked
