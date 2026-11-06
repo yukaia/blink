@@ -19,6 +19,13 @@ the git history for those.
   rather than followed. Only shared download directories (`/tmp`, a drop
   folder) were exposed.
 
+### Fixed
+
+- **The session list scrolls.** Sessions past the bottom of the terminal
+  were never drawn, and the selection could move onto them out of sight.
+  The list now follows the cursor, and a click selects the session drawn
+  under it.
+
 ## [0.9.0] — 2026-11-04
 
 ### Security

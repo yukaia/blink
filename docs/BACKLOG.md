@@ -24,22 +24,6 @@ RUSTSEC-2023-0071 names a patched version before dropping the ignore.
 Last checked 2026-11-06: russh 0.65.1 is still the latest (blink is on
 0.64.1) and still pins `rsa =0.10.0-rc.18` and `ssh-key =0.7.0-rc.11`.
 
-## The session list doesn't scroll
-
-`render_session_list` (`tui/views.rs`) draws every session into one
-`Paragraph` with no scroll offset, so sessions past the bottom of the
-area are never drawn. The keyboard cursor still moves onto them, and the
-selection disappears off-screen; only the details pane shows which
-session is selected. How many fit depends on the terminal height. Mouse
-clicks are consistent with what's drawn (`mouse_session_select` maps a
-row to `sessions[r]`), so they'd need the same offset.
-
-Fix the way the file panes do it: keep a `view_offset` that follows the
-cursor (see `PaneState::view_offset` and its use in `mouse.rs`, "row `r`
-is entry `view_offset + r`"), render only the visible slice, and add the
-offset in `mouse_session_select`. A test with more sessions than rows
-should check that the cursor's row is drawn.
-
 ## Session file names have no length cap
 
 `Session::name_to_filename` (`session.rs`) has the problem

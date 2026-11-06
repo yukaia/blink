@@ -159,9 +159,10 @@ impl App {
             MouseEventKind::ScrollDown if len > 0 => {
                 self.session_cursor = (self.session_cursor + WHEEL_STEP as usize).min(len - 1);
             }
-            MouseEventKind::Down(MouseButton::Left) if r < len => {
-                self.session_cursor = r;
-                if self.is_double_click(ClickTarget::Session(r), now) {
+            MouseEventKind::Down(MouseButton::Left) if self.session_view_offset.get() + r < len => {
+                let idx = self.session_view_offset.get() + r;
+                self.session_cursor = idx;
+                if self.is_double_click(ClickTarget::Session(idx), now) {
                     self.handle_session_select(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                 }
             }
@@ -626,6 +627,43 @@ mod tests {
         );
         assert_eq!(a.screen, Screen::PasswordPrompt, "password auth asks first");
         assert_eq!(a.pending_session.as_ref().unwrap().host, "h1.example");
+    }
+
+    /// More sessions than rows: the list scrolls to keep the cursor drawn,
+    /// and a click means the session drawn on that row.
+    #[test]
+    fn a_long_session_list_scrolls_to_the_cursor_and_clicks_follow_it() {
+        let mut a = selector_with(60);
+        draw(&a);
+        let rows = a.hit.session_list.get().unwrap();
+        assert!(
+            (rows.height as usize) < 60,
+            "the test needs a list that overflows"
+        );
+
+        a.session_cursor = 59;
+        let buf = draw(&a);
+        let row_text = |y: u16| -> String {
+            (rows.x..rows.x + rows.width)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect()
+        };
+        let last = rows.y + rows.height - 1;
+        assert!(
+            row_text(last).contains("h59.example"),
+            "the cursor's row is drawn"
+        );
+        assert!(
+            !row_text(rows.y).contains("h0.example"),
+            "the top scrolled away"
+        );
+
+        a.handle_mouse_at(press(rows.x + 4, rows.y), Instant::now());
+        assert_eq!(
+            a.session_cursor,
+            60 - rows.height as usize,
+            "the top row is the first session drawn, not session 0"
+        );
     }
 
     /// A key press between two clicks breaks the pair. Otherwise a click,

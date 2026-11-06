@@ -179,6 +179,10 @@ pub struct App {
     // Session selector
     pub sessions: Vec<Session>,
     pub session_cursor: usize,
+    /// The first session the list showed when last drawn, as
+    /// [`crate::tui::state::PaneState::view_offset`] is for a pane: a click
+    /// on row `r` means session `session_view_offset + r`.
+    pub session_view_offset: std::cell::Cell<usize>,
 
     // Pending connect — set when transitioning to PasswordPrompt or Connection,
     // cleared when the connect resolves or the user cancels.
@@ -405,6 +409,7 @@ impl App {
             active_pane: Pane::Local,
             sessions,
             session_cursor: 0,
+            session_view_offset: std::cell::Cell::new(0),
             pending_session: None,
             pending_session_unsaved: false,
             pending_offers: std::collections::VecDeque::new(),

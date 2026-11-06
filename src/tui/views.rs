@@ -107,7 +107,22 @@ pub mod session_select {
                 Style::default().fg(app.theme.dim),
             )));
         } else {
-            for (i, s) in app.sessions.iter().enumerate() {
+            // Only the sessions that fit, scrolled to keep the cursor in
+            // view, as a file pane does.
+            let window = crate::tui::state::scrolled_window(
+                app.session_view_offset.get(),
+                app.session_cursor,
+                app.sessions.len(),
+                area.height.saturating_sub(2) as usize,
+            );
+            app.session_view_offset.set(window.start);
+            for (i, s) in app
+                .sessions
+                .iter()
+                .enumerate()
+                .skip(window.start)
+                .take(window.len())
+            {
                 let selected = i == app.session_cursor;
 
                 let prefix = if selected {
@@ -155,7 +170,8 @@ pub mod session_select {
                 lines.push(Line::from(line_spans).style(bg));
             }
         }
-        // Sessions start below the heading and its blank line, one per row.
+        // Sessions start below the heading and its blank line, one per row;
+        // row `r` is session `session_view_offset + r`.
         app.hit.session_list.set(Some(Rect {
             y: area.y + 2,
             height: area.height.saturating_sub(2),
