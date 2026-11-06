@@ -8,6 +8,17 @@ the git history for those.
 
 ## [Unreleased]
 
+### Security
+
+- **Downloads don't write through a symlink planted under the partial's
+  name.** A `.blink-part` file and its `.meta` sidecar have predictable
+  names, so anyone who could write to the download directory could plant
+  symlinks there and have blink truncate, append to or write JSON into
+  the file they pointed at. Partials are now created exclusively, resumed
+  with `O_NOFOLLOW` on Unix, and a symlink under either name is discarded
+  rather than followed. Only shared download directories (`/tmp`, a drop
+  folder) were exposed.
+
 ## [0.9.0] — 2026-11-04
 
 ### Security

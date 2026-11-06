@@ -1138,14 +1138,7 @@ impl Transport for SftpTransport {
         if let Some(parent) = local_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
-        let mut local = if offset > 0 {
-            tokio::fs::OpenOptions::new()
-                .append(true)
-                .open(&part)
-                .await?
-        } else {
-            tokio::fs::File::create(&part).await?
-        };
+        let mut local = super::open_part(&part, offset).await?;
         // Record what these bytes are before writing any, so an interrupt at
         // any point leaves an identifiable partial rather than an anonymous
         // one that the next attempt has to throw away.

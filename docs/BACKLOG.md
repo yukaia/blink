@@ -24,28 +24,6 @@ RUSTSEC-2023-0071 names a patched version before dropping the ignore.
 Last checked 2026-11-06: russh 0.65.1 is still the latest (blink is on
 0.64.1) and still pins `rsa =0.10.0-rc.18` and `ssh-key =0.7.0-rc.11`.
 
-## Partial downloads are opened through symlinks
-
-Both download paths (`sftp.rs` and `ftp_impl.rs`, the `File::create(&part)`
-and `.append(true)` opens) and `write_part_meta` (`transport/mod.rs`) use
-plain `tokio::fs` opens, which follow a symlink at the target. The
-`.blink-part` name and its `.meta` sidecar are predictable (a hash of the
-file name), so anyone who can write to the download directory can plant
-them ahead of time. A symlinked sidecar makes blink truncate the link's
-target and write JSON into it. A symlinked partial with a matching
-planted sidecar makes a resume append the download to the target.
-`resume_offset`'s `metadata` call also follows the link.
-
-This only matters for a download directory other users can write to
-(`/tmp`, a shared drop folder); a home directory isn't one. Fix on Unix:
-open with `custom_flags(libc::O_NOFOLLOW)` (or check `symlink_metadata`
-first and refuse), and create a fresh partial with `create_new(true)`
-after `resume_offset` removed the old one. `paths::atomic_write` already
-uses `create_new`. Windows needs privilege to make symlinks, so `cfg(unix)`
-is enough. Uploads have the same shape on the server
-(`remote_part_path`, opened with CREATE|TRUNC); that's the server's
-directory, so only note it there.
-
 ## The session list doesn't scroll
 
 `render_session_list` (`tui/views.rs`) draws every session into one

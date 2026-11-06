@@ -75,6 +75,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 bytes = "1"
 parking_lot = "0.12"
 
+# `O_NOFOLLOW` for opening partial downloads; see `transport::open_part`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

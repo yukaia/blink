@@ -429,14 +429,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
 
     let mut reader = timed_ftp("retr", remote_path, stream.retr_as_stream(remote_path)).await?;
 
-    let mut local = if offset > 0 {
-        tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(&part)
-            .await?
-    } else {
-        tokio::fs::File::create(&part).await?
-    };
+    let mut local = super::open_part(&part, offset).await?;
     // Identify the partial before writing to it — see the SFTP path.
     super::write_part_meta(local_path, remote_path, stamp, origin).await;
 

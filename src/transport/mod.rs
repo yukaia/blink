@@ -234,8 +234,15 @@ pub(crate) async fn resume_offset(
     let part = part_path(local_path);
     let meta_path = part_meta_path(local_path);
 
-    let part_len = tokio::fs::metadata(&part).await.ok().map(|m| m.len());
-    let meta: Option<PartMeta> = match tokio::fs::read(&meta_path).await {
+    // `symlink_metadata`, not `metadata`: a symlink planted under the
+    // partial's name is not a partial, whatever it points at. It reads as
+    // "no partial" and is removed below like any other stale one.
+    let part_len = tokio::fs::symlink_metadata(&part)
+        .await
+        .ok()
+        .filter(|m| m.is_file())
+        .map(|m| m.len());
+    let meta: Option<PartMeta> = match read_no_follow(&meta_path).await {
         Ok(raw) => serde_json::from_slice(&raw).ok(),
         Err(_) => None,
     };
@@ -274,9 +281,64 @@ pub(crate) async fn write_part_meta(
         mtime: stamp.mtime,
         origin: Some(origin.to_string()),
     };
-    if let Ok(raw) = serde_json::to_vec(&meta) {
-        let _ = tokio::fs::write(part_meta_path(local_path), raw).await;
+    let Ok(raw) = serde_json::to_vec(&meta) else {
+        return;
+    };
+    // Remove, then create exclusively: `create_new` refuses an existing
+    // path, symlink included, so a sidecar planted between the two makes
+    // this fail (and the next attempt restart) instead of writing through
+    // the link. Removing a symlink removes the link, not its target.
+    let path = part_meta_path(local_path);
+    let _ = tokio::fs::remove_file(&path).await;
+    let written = async {
+        let mut f = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await?;
+        tokio::io::AsyncWriteExt::write_all(&mut f, &raw).await
     }
+    .await;
+    if let Err(e) = written {
+        tracing::debug!(path = %path.display(), error = %e, "could not write the partial's sidecar");
+    }
+}
+
+/// Open the `.blink-part` file a download writes into.
+///
+/// The partial's name is predictable, so in a directory other users can
+/// write to (`/tmp`, a shared drop folder) someone could plant a symlink
+/// there and have the download truncate or append to whatever it points
+/// at. So neither open follows one:
+///
+/// - `offset == 0`: [`resume_offset`] has just removed any old partial, so
+///   create exclusively. `create_new` fails on any existing path, a symlink
+///   included.
+/// - `offset > 0`: append, with `O_NOFOLLOW` on Unix so a symlink swapped
+///   in after `resume_offset` looked fails the open. Windows needs
+///   privilege to create symlinks, so it gets no equivalent.
+pub(crate) async fn open_part(part: &Path, offset: u64) -> std::io::Result<tokio::fs::File> {
+    let mut opts = tokio::fs::OpenOptions::new();
+    if offset > 0 {
+        opts.append(true);
+        #[cfg(unix)]
+        opts.custom_flags(libc::O_NOFOLLOW);
+    } else {
+        opts.write(true).create_new(true);
+    }
+    opts.open(part).await
+}
+
+/// Read a file, refusing to follow a symlink at `path` on Unix.
+async fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    opts.custom_flags(libc::O_NOFOLLOW);
+    let mut f = opts.open(path).await?;
+    let mut raw = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut f, &mut raw).await?;
+    Ok(raw)
 }
 
 /// Drop the sidecar once the download has been renamed into place.
@@ -1305,6 +1367,78 @@ mod tests {
 
         assert_eq!(offset, 0);
         assert_eq!(std::fs::read(&lookalike).unwrap(), b"a file of its own");
+    }
+
+    /// A partial's name is predictable, so in a shared download directory
+    /// someone could plant symlinks under it ahead of the download.
+    #[cfg(unix)]
+    mod planted_symlinks {
+        use super::*;
+        use std::os::unix::fs::symlink;
+
+        fn stamp() -> RemoteStamp {
+            RemoteStamp {
+                size: Some(10),
+                mtime: Some(MTIME),
+            }
+        }
+
+        #[tokio::test]
+        async fn a_fresh_partial_is_not_created_through_a_symlink() {
+            let home = crate::paths::test_home();
+            let local = home.path().join("foo");
+            let victim = home.path().join("victim");
+            std::fs::write(&victim, b"precious").unwrap();
+            symlink(&victim, part_path(&local)).unwrap();
+
+            // `resume_offset` removes the link; a link re-planted after it
+            // looked still can't be opened through.
+            assert_eq!(resume_offset(&local, "/r/foo", stamp(), "origin").await, 0);
+            assert!(std::fs::symlink_metadata(part_path(&local)).is_err());
+            symlink(&victim, part_path(&local)).unwrap();
+            assert!(open_part(&part_path(&local), 0).await.is_err());
+            assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        }
+
+        #[tokio::test]
+        async fn a_resumed_partial_is_not_appended_through_a_symlink() {
+            let home = crate::paths::test_home();
+            let local = home.path().join("foo");
+            let victim = home.path().join("victim");
+            std::fs::write(&victim, b"precious").unwrap();
+            symlink(&victim, part_path(&local)).unwrap();
+
+            assert!(open_part(&part_path(&local), 4).await.is_err());
+            assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        }
+
+        #[tokio::test]
+        async fn a_symlinked_partial_with_a_matching_sidecar_is_not_resumed() {
+            let home = crate::paths::test_home();
+            let local = home.path().join("foo");
+            let victim = home.path().join("victim");
+            std::fs::write(&victim, b"precious").unwrap();
+            symlink(&victim, part_path(&local)).unwrap();
+            write_part_meta(&local, "/r/foo", stamp(), "origin").await;
+
+            assert_eq!(resume_offset(&local, "/r/foo", stamp(), "origin").await, 0);
+            assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        }
+
+        #[tokio::test]
+        async fn the_sidecar_is_not_written_through_a_symlink() {
+            let home = crate::paths::test_home();
+            let local = home.path().join("foo");
+            let victim = home.path().join("victim");
+            std::fs::write(&victim, b"precious").unwrap();
+            symlink(&victim, part_meta_path(&local)).unwrap();
+
+            write_part_meta(&local, "/r/foo", stamp(), "origin").await;
+
+            assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+            let meta = std::fs::symlink_metadata(part_meta_path(&local)).unwrap();
+            assert!(meta.is_file(), "the link is replaced by a real sidecar");
+        }
     }
 
     #[test]
