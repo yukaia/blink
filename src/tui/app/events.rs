@@ -18,7 +18,7 @@ use zeroize::Zeroize;
 
 use crate::preview::{self, FileViewKind};
 use crate::transfer::{Direction, Dispatcher, TransferEvent, TransferManager, format_bytes};
-use crate::tui::event::AppEvent;
+use crate::tui::event::{AppEvent, TrustSubject};
 use crate::tui::state::{
     HostKeyChangedInfo, OverwritePending, PendingHostKey, PostConnectOffer, ViewerKind,
 };
@@ -37,12 +37,23 @@ impl App {
                     return;
                 };
 
-                // FTPS TOFU: the verifier observed a new leaf-cert pin.
-                // Persist it onto the session so subsequent connects (and
-                // dispatcher workers spawned below) require the same cert.
+                // FTPS trust on first use: the user accepted a certificate
+                // the session had no pin for. Pin it in memory either way,
+                // so reconnects and the dispatcher workers spawned below
+                // require the same certificate; save it only if asked to.
                 if let Some(new_pin) = connected.new_cert_pin {
-                    session.cert_sha256 = Some(new_pin);
-                    if let Err(e) = session.save() {
+                    let fingerprint = crate::transport::ftps::colon_hex(&new_pin.sha256);
+                    session.cert_sha256 = Some(new_pin.sha256);
+                    if !new_pin.save {
+                        self.push_log(
+                            LogLevel::Info,
+                            format!(
+                                "trusting FTPS certificate {fingerprint} for `{}` \
+                                 for this connection only",
+                                session.name
+                            ),
+                        );
+                    } else if let Err(e) = session.save() {
                         // The pin is the whole of the trust decision for a
                         // session with chain validation disabled: without it
                         // on disk, the *next* connect trusts the first
@@ -63,7 +74,10 @@ impl App {
                     } else {
                         self.push_log(
                             LogLevel::Info,
-                            format!("pinned FTPS certificate for `{}`", session.name),
+                            format!(
+                                "pinned FTPS certificate {fingerprint} for `{}`",
+                                session.name
+                            ),
                         );
                     }
                 }
@@ -200,15 +214,19 @@ impl App {
                 // been open for its whole allowance, the prompt expiring is
                 // why the connect failed, and the server's refusal that
                 // followed would blame the wrong party.
-                let expired = self.pending_host_key.take().is_some_and(|p| {
+                let expired = self.pending_host_key.take().filter(|p| {
                     p.opened_at.elapsed() >= crate::transport::sftp::HOST_KEY_DECISION_TIMEOUT
                 });
-                if expired {
+                if let Some(p) = expired {
                     self.push_log(
                         LogLevel::Error,
                         format!(
-                            "connect failed: the host-key prompt timed out after {} s \
+                            "connect failed: the {} prompt timed out after {} s \
                              with no answer",
+                            match p.subject {
+                                TrustSubject::SshHostKey => "host-key",
+                                TrustSubject::FtpsCertificate => "certificate",
+                            },
                             crate::transport::sftp::HOST_KEY_DECISION_TIMEOUT.as_secs()
                         ),
                     );
@@ -529,6 +547,7 @@ impl App {
             } => self.image_rendered(viewer_id, area, result),
             AppEvent::Transfer(ev) => self.handle_transfer_event(ev),
             AppEvent::HostKeyUnknown {
+                subject,
                 host,
                 key_type,
                 fingerprint,
@@ -540,6 +559,7 @@ impl App {
                 // `SessionTrust` makes concurrent prompts rare, but the state
                 // machine shouldn't depend on that.)
                 self.pending_host_key = Some(PendingHostKey {
+                    subject,
                     host: host.clone(),
                     key_type,
                     fingerprint,
@@ -558,8 +578,12 @@ impl App {
                         self.push_log(
                             LogLevel::Warn,
                             format!(
-                                "a host-key prompt for {host} is waiting; it opens \
-                                 once you're back at the file list"
+                                "a {} prompt for {host} is waiting; it opens \
+                                 once you're back at the file list",
+                                match subject {
+                                    TrustSubject::SshHostKey => "host-key",
+                                    TrustSubject::FtpsCertificate => "certificate",
+                                }
                             ),
                         );
                     }

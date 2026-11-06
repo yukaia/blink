@@ -466,10 +466,12 @@ theme = tokyo-night
 [tls]
 ; FTPS only; default false. true switches from CA-chain validation to TOFU
 ; pinning: the hostname is still verified, the handshake signature is still
-; verified, and the cert SHA-256 is pinned on first connect.
+; verified, and on first connect blink shows the cert's SHA-256 and asks
+; before pinning it.
 accept_invalid_certs = false
 ; With accept_invalid_certs = true, blink adds the pinned certificate's
-; SHA-256 here on the first connect, as cert_sha256 = <64 hex digits>. Do not
+; SHA-256 here when you accept it and choose to save, as
+; cert_sha256 = <64 hex digits>. Do not
 ; edit it by hand; delete the line if the legitimate certificate rotates.
 ```
 
@@ -726,8 +728,12 @@ terminal. The following properties are enforced in the current codebase.
   `accept_invalid_certs = true` bypasses CA-chain trust, the cert's SAN
   must still match the configured hostname and the handshake signature
   must still verify against the cert's public key. The flag also enables
-  TOFU pinning: the leaf cert SHA-256 is recorded in the session on the
-  first connect; subsequent connects require an exact match.
+  TOFU pinning: on the first connect blink shows the leaf cert's SHA-256
+  (as `openssl x509 -fingerprint -sha256` prints it) and asks, before
+  sending the password, whether to trust it. Accepted, it's recorded in the
+  session, and subsequent connects require an exact match. The data
+  connections are held to the same certificate, during the first connect
+  too.
 - **30-second connect timeout** — applied to both the primary connection
   and every parallel worker connection. A server that accepts the TCP
   socket but stalls the handshake cannot pin connections indefinitely.
@@ -931,9 +937,9 @@ A few things worth knowing before you use this in anger:
   anchors rather than the system trust store. Self-signed certs and
   privately-rooted CAs aren't trusted by default. The per-session
   `accept_invalid_certs` toggle (visible in the edit-session form)
-  switches from CA-chain trust to TOFU pinning: the cert hash is
-  recorded on the first connect and subsequent connects require an exact
-  match. Hostname binding and handshake-signature verification stay on
+  switches from CA-chain trust to TOFU pinning: the first connect asks
+  you to accept the cert's fingerprint, which is then recorded, and
+  subsequent connects require an exact match. Hostname binding and handshake-signature verification stay on
   in both modes. There is no option to add a custom CA root without
   recompiling.
 - **RSA client keys carry a known timing-sidechannel risk.** The `rsa`

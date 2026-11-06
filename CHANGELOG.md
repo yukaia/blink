@@ -18,6 +18,15 @@ the git history for those.
   with `O_NOFOLLOW` on Unix, and a symlink under either name is discarded
   rather than followed. Only shared download directories (`/tmp`, a drop
   folder) were exposed.
+- **FTPS asks before trusting a certificate on first use.** With
+  `accept_invalid_certs` on, the first connect pinned whatever certificate
+  it was shown, logging only that it had, so a man in the middle on that
+  connect was trusted for good. blink now shows the certificate's SHA-256,
+  in `openssl x509 -fingerprint -sha256` form, in the host-key prompt and
+  waits for an answer before sending the password: accept and save pins
+  it in the session, trust once pins it for this connection only. During
+  that first connect, data connections must present the same certificate;
+  before, they were accepted whatever they presented.
 
 ### Fixed
 

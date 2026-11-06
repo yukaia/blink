@@ -1352,6 +1352,7 @@ mod tests {
     fn pending_host_key() -> PendingHostKey {
         let (tx, _rx) = tokio::sync::oneshot::channel();
         PendingHostKey {
+            subject: crate::tui::event::TrustSubject::SshHostKey,
             host: "h".into(),
             key_type: "ssh-ed25519".into(),
             fingerprint: "SHA256:abc".into(),
@@ -1469,6 +1470,7 @@ mod tests {
         for _ in 0..2 {
             let (tx, _rx) = tokio::sync::oneshot::channel();
             a.handle_app_event(AppEvent::HostKeyUnknown {
+                subject: crate::tui::event::TrustSubject::SshHostKey,
                 host: "h".into(),
                 key_type: "ssh-ed25519".into(),
                 fingerprint: "SHA256:abc".into(),
@@ -1497,6 +1499,7 @@ mod tests {
     ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let ev = AppEvent::HostKeyUnknown {
+            subject: crate::tui::event::TrustSubject::SshHostKey,
             host: "h".into(),
             key_type: "ssh-ed25519".into(),
             fingerprint: "SHA256:abc".into(),
@@ -2437,6 +2440,92 @@ mod tests {
         assert!(
             text_at(&buf, ratatui::layout::Rect { height: 1, ..rows }).contains("alpha.example")
         );
+    }
+
+    /// A certificate's fingerprint is wider than the modal; all of it must
+    /// be drawn, or the user can't compare it.
+    #[test]
+    fn a_certificate_prompt_draws_the_whole_fingerprint() {
+        use sha2::{Digest, Sha256};
+        let hex: String = Sha256::digest(b"cert")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let fingerprint = crate::transport::ftps::colon_hex(&hex);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mut a = app();
+        a.pending_host_key = Some(PendingHostKey {
+            subject: crate::tui::event::TrustSubject::FtpsCertificate,
+            host: "h:21".into(),
+            key_type: "TLS certificate, SHA-256".into(),
+            fingerprint: fingerprint.clone(),
+            decision_tx: Some(tx),
+            opened_at: std::time::Instant::now(),
+        });
+        a.screen = Screen::ConfirmHostKey;
+        let buf = draw(&a);
+        let area = buf.area;
+        let text: String = (area.y..area.y + area.height)
+            .map(|y| {
+                text_at(
+                    &buf,
+                    ratatui::layout::Rect {
+                        y,
+                        height: 1,
+                        ..area
+                    },
+                )
+            })
+            .collect::<String>()
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '│' && *c != ':')
+            .collect();
+        assert!(text.contains("unknowncertificate"));
+        assert!(
+            text.contains(&hex.to_ascii_uppercase()),
+            "every byte pair is drawn, in order"
+        );
+    }
+
+    fn ftps_connected(pin: &str, save: bool) -> App {
+        let mut a = app();
+        let mut s = Session::from_url("ftps://me@host.example").unwrap();
+        s.name = "it".into();
+        s.accept_invalid_certs = true;
+        a.pending_session = Some(s);
+        a.handle_app_event(AppEvent::Connected(crate::transport::Connected {
+            transport: Box::new(crate::transport::mock::MockTransport::new()),
+            new_cert_pin: Some(crate::transport::NewCertPin {
+                sha256: pin.into(),
+                save,
+            }),
+        }));
+        a
+    }
+
+    #[tokio::test]
+    async fn a_certificate_trusted_once_is_pinned_for_the_connection_but_not_saved() {
+        let _home = crate::paths::test_home();
+        let pin = "ab".repeat(32);
+        let a = ftps_connected(&pin, false);
+        let session = a.current_session.as_ref().unwrap();
+        assert_eq!(
+            session.cert_sha256.as_deref(),
+            Some(pin.as_str()),
+            "workers inherit it"
+        );
+        assert!(Session::list_all().unwrap().is_empty());
+        assert!(logged(&a, "AB:AB"));
+    }
+
+    #[tokio::test]
+    async fn an_accepted_certificate_is_saved_and_logged_with_its_fingerprint() {
+        let _home = crate::paths::test_home();
+        let pin = "ab".repeat(32);
+        let a = ftps_connected(&pin, true);
+        let saved = Session::list_all().unwrap();
+        assert_eq!(saved[0].cert_sha256.as_deref(), Some(pin.as_str()));
+        assert!(logged(&a, "pinned FTPS certificate AB:AB"));
     }
 
     #[test]

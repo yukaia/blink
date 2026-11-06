@@ -607,22 +607,32 @@ pub trait Transport: Send + Sync {
 /// caller may want to persist back onto the session.
 pub struct Connected {
     pub transport: Box<dyn Transport>,
-    /// Hex SHA-256 of the FTPS server's leaf certificate, set only when an
-    /// FTPS connect with `accept_invalid_certs=true` captured a new pin
-    /// (TOFU). The caller should write this into `session.cert_sha256` and
-    /// save the session.
-    pub new_cert_pin: Option<String>,
+    /// Set only when an FTPS connect with `accept_invalid_certs = true` met
+    /// a certificate the session had no pin for, and the user accepted it.
+    /// The caller writes it into `session.cert_sha256`, and saves the
+    /// session if [`NewCertPin::save`] says to.
+    pub new_cert_pin: Option<NewCertPin>,
+}
+
+/// A certificate the user accepted on first use. See [`Connected`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewCertPin {
+    /// Lowercase hex SHA-256 of the leaf certificate, as `cert_sha256` holds it.
+    pub sha256: String,
+    /// "Accept and save" rather than "trust once".
+    pub save: bool,
 }
 
 /// Build the right transport for `session`. The password (if any) must be
 /// resolved by the caller before this is invoked — we never store it on disk.
 ///
-/// `app_event_tx` is forwarded to the SFTP/SCP handler for the host-key
-/// confirmation flow. FTP/FTPS do not use host-key verification.
+/// `app_event_tx` carries the trust prompts: the SFTP/SCP host-key one, and
+/// FTPS's for an unpinned certificate.
 ///
 /// `user_wait` is how the SSH handler marks time spent on its host-key
 /// prompt, so the caller's connect deadline can exclude it; see
-/// [`within_deadline_excluding_waits`]. FTP/FTPS never prompt.
+/// [`within_deadline_excluding_waits`]. FTPS prompts for a certificate it
+/// has no pin for, when chain validation is off; plain FTP never prompts.
 ///
 /// `trust` carries the keys the user accepted for this session without
 /// saving them. It must be the *same* store for every connection a connected
@@ -636,7 +646,8 @@ pub async fn open(
     trust: crate::known_hosts::SessionTrust,
     user_wait: UserWait,
 ) -> Result<Connected> {
-    let (transport, new_cert_pin): (Box<dyn Transport>, Option<String>) = match session.protocol {
+    let (transport, new_cert_pin): (Box<dyn Transport>, Option<NewCertPin>) = match session.protocol
+    {
         Protocol::Sftp => (
             Box::new(
                 sftp::SftpTransport::connect(session, password, app_event_tx, trust, user_wait)
@@ -656,7 +667,8 @@ pub async fn open(
             None,
         ),
         Protocol::Ftps => {
-            let (t, pin) = ftps::FtpsTransport::connect(session, password).await?;
+            let (t, pin) =
+                ftps::FtpsTransport::connect(session, password, &app_event_tx, &user_wait).await?;
             (Box::new(t), pin)
         }
     };

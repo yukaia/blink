@@ -24,23 +24,6 @@ RUSTSEC-2023-0071 names a patched version before dropping the ignore.
 Last checked 2026-11-06: russh 0.65.1 is still the latest (blink is on
 0.64.1) and still pins `rsa =0.10.0-rc.18` and `ssh-key =0.7.0-rc.11`.
 
-## FTPS trust-on-first-use pins without showing the certificate
-
-With `accept_invalid_certs = true`, the first connect pins whatever leaf
-certificate it gets (`ftps.rs`, `PinningVerifier`, `None` arm), and the
-log says only "pinned FTPS certificate for `name`" (`tui/app/events.rs`).
-SFTP shows the host-key fingerprint and asks. Here the user has nothing
-to compare out of band, so a man in the middle on the first connect is
-pinned silently.
-
-Cheapest step: put the SHA-256 in that log line. Fuller fix: prompt with
-the fingerprint the way `HostKeyUnknown` does, and pin only on accept.
-Also, during that first session the verifier accepts any certificate on
-the *data* connections too, since `expected_pin` is still `None` there.
-Those go to the control connection's peer, so this adds little beyond
-the control connection itself, but a prompt-then-pin design should check
-data connections against the captured pin.
-
 ## Encrypted keys are detected by matching error text
 
 `SftpTransport::connect`'s `AuthMethod::Key` arm (`sftp.rs`) decides a key

@@ -636,6 +636,7 @@ pub struct PendingDelete {
 /// Holds everything needed to render the prompt and to send the user's
 /// decision back to the SFTP connect task via the one-shot channel.
 pub struct PendingHostKey {
+    pub subject: crate::tui::event::TrustSubject,
     pub host: String,
     pub key_type: String,
     pub fingerprint: String,

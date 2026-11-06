@@ -2221,17 +2221,34 @@ pub mod confirm_disconnect {
 
 pub mod confirm_host_key {
     use super::*;
+    use crate::tui::event::TrustSubject;
 
     pub fn render(f: &mut Frame, app: &App) {
         let area = f.area();
         let modal = super::centered_rect(66, 52, area);
         f.render_widget(Clear, modal);
 
+        let Some(phk) = app.pending_host_key.as_ref() else {
+            return;
+        };
+        let (title, explanation, type_label) = match phk.subject {
+            TrustSubject::SshHostKey => (
+                " unknown host key ",
+                "The server's host key is not in your known-hosts file.",
+                "  Key type:    ",
+            ),
+            TrustSubject::FtpsCertificate => (
+                " unknown certificate ",
+                "This session has no certificate pinned for the server.",
+                "  Type:        ",
+            ),
+        };
+
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(app.theme.warning))
             .title(Span::styled(
-                " unknown host key ",
+                title,
                 Style::default()
                     .fg(app.theme.warning)
                     .add_modifier(Modifier::BOLD),
@@ -2239,22 +2256,43 @@ pub mod confirm_host_key {
         let inner = block.inner(modal);
         f.render_widget(block, modal);
 
-        let (host, key_type, fingerprint) = match app.pending_host_key.as_ref() {
-            Some(phk) => (
-                phk.host.as_str(),
-                phk.key_type.as_str(),
-                phk.fingerprint.as_str(),
-            ),
-            None => return,
-        };
+        let (host, key_type) = (phk.host.as_str(), phk.key_type.as_str());
 
-        let lines = vec![
+        // A certificate's fingerprint, `AB:CD:…`, is 95 columns: wider than
+        // the modal. Break it, between byte pairs, onto as many lines as it
+        // takes rather than let the end be cut off.
+        const LABEL: &str = "  Fingerprint: ";
+        let room = (inner.width as usize).saturating_sub(LABEL.len()).max(12);
+        let room = if phk.subject == TrustSubject::FtpsCertificate {
+            // Whole `AB:` pairs, less the trailing colon: 3k - 1 columns.
+            (room + 1) / 3 * 3 - 1
+        } else {
+            room
+        };
+        let mut fingerprint_lines = Vec::new();
+        let mut rest = phk.fingerprint.as_str();
+        while !rest.is_empty() {
+            let mut cut = rest.len().min(room);
+            while !rest.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let (piece, tail) = rest.split_at(cut);
+            rest = tail.strip_prefix(':').unwrap_or(tail);
+            let label = if fingerprint_lines.is_empty() {
+                LABEL
+            } else {
+                "               "
+            };
+            fingerprint_lines.push(Line::from(vec![
+                Span::styled(label, Style::default().fg(app.theme.dim)),
+                Span::styled(piece.to_string(), Style::default().fg(app.theme.accent)),
+            ]));
+        }
+
+        let mut lines = vec![
             Line::from(""),
-            Line::from(Span::styled(
-                "The server's host key is not in your known-hosts file.",
-                Style::default().fg(app.theme.fg),
-            ))
-            .alignment(Alignment::Center),
+            Line::from(Span::styled(explanation, Style::default().fg(app.theme.fg)))
+                .alignment(Alignment::Center),
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Host:        ", Style::default().fg(app.theme.dim)),
@@ -2266,13 +2304,12 @@ pub mod confirm_host_key {
                 ),
             ]),
             Line::from(vec![
-                Span::styled("  Key type:    ", Style::default().fg(app.theme.dim)),
+                Span::styled(type_label, Style::default().fg(app.theme.dim)),
                 Span::styled(key_type, Style::default().fg(app.theme.fg)),
             ]),
-            Line::from(vec![
-                Span::styled("  Fingerprint: ", Style::default().fg(app.theme.dim)),
-                Span::styled(fingerprint, Style::default().fg(app.theme.accent)),
-            ]),
+        ];
+        lines.extend(fingerprint_lines);
+        lines.extend([
             Line::from(""),
             Line::from(Span::styled(
                 "Verify this fingerprint out-of-band before accepting.",
@@ -2305,7 +2342,7 @@ pub mod confirm_host_key {
                 Span::raw(" reject"),
             ])
             .alignment(Alignment::Center),
-        ];
+        ]);
 
         f.render_widget(Paragraph::new(lines), inner);
     }

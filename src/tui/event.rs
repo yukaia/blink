@@ -162,11 +162,14 @@ pub enum AppEvent {
         result: std::result::Result<Vec<u8>, String>,
     },
 
-    /// The SFTP/SCP transport encountered an unknown host key and needs the
+    /// A connect met a server identity it has no record of (an SSH host key
+    /// not in known_hosts, or an FTPS certificate with no pin) and needs the
     /// user to decide whether to trust it. The `decision_tx` sender must be
     /// resolved (by sending a [`crate::transport::sftp::HostKeyDecision`])
     /// before the connect task can proceed.
     HostKeyUnknown {
+        /// What is being trusted, which sets the prompt's wording.
+        subject: TrustSubject,
         /// Display form of the host (bare for the default SSH port,
         /// `[host]:port` otherwise) — used only for the modal label.
         host: String,
@@ -435,4 +438,13 @@ mod tests {
         let (_tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
         assert!(drain_progress(&mut rx).is_none());
     }
+}
+
+/// What a [`AppEvent::HostKeyUnknown`] prompt asks the user to trust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustSubject {
+    /// An SSH host key, saved to known_hosts on accept.
+    SshHostKey,
+    /// An FTPS server's leaf certificate, pinned in the session on accept.
+    FtpsCertificate,
 }

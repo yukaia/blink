@@ -254,6 +254,7 @@ impl Handler for KnownHostsHandler {
         let (decision_tx, decision_rx) = oneshot::channel();
 
         let event = crate::tui::event::AppEvent::HostKeyUnknown {
+            subject: crate::tui::event::TrustSubject::SshHostKey,
             host: display_host.clone(),
             key_type: key_type.clone(),
             fingerprint,
