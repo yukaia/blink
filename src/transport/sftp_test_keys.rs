@@ -11,6 +11,15 @@
 //! ssh-keygen -t rsa -b 2048 -N '' -C blink-test-rsa -f rsa
 //! ```
 //!
+//! The encrypted ones, passphrase [`TEST_PASSPHRASE`], one per container
+//! format a passphrase-protected key can come in:
+//!
+//! ```sh
+//! ssh-keygen -t ed25519 -N blink-test -C blink-test-ed25519-encrypted -f ed25519_enc
+//! ssh-keygen -t rsa -b 1024 -m PEM -N blink-test -C x -f rsa_pem_enc
+//! ssh-keygen -t ecdsa -b 256 -m PKCS8 -N blink-test -C x -f ecdsa_pkcs8_enc
+//! ```
+//!
 //! They are fixtures rather than generated per run because RSA keygen is
 //! ruinously slow: 19.7 s for one 2048-bit key through `PrivateKey::random`,
 //! measured against a suite that runs in under a second, and the cost varies
@@ -68,4 +77,50 @@ bq9NHbBYx24jS8heQBwArLakUjqqZA69Eyoh19L6l/THgBfQAAAIEAvKdx1ZtESLSKG9AM
 yq1eLilFjtk2Pyu5ALGcVh0S5d/bvKQKefR7eJv3x1870DD6fMDAFedEGQK73Brb50oO3Y
 QUjiIrs5LJiscWEAAAAOYmxpbmstdGVzdC1yc2EBAgMEBQ==
 -----END OPENSSH PRIVATE KEY-----
+"#;
+
+/// The passphrase of the `*_ENCRYPTED` keys below.
+pub(super) const TEST_PASSPHRASE: &str = "blink-test";
+
+/// Ed25519 private key, OpenSSH format, encrypted.
+pub(super) const ED25519_KEY_ENCRYPTED: &str = r#"-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABDm6Y81+9
+LuKZRpEqNVa2rsAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIO69nfRYLFWhEI5y
+Zyu21T6cOPcIH90HtN1hiJ3qyHP5AAAAoMQHXLIGg00ePsY/efrWBozWRHzrOnObKSKMpg
+qXLWJmxT4sFUXLjyd84V4mXoqMJSijcLPCxA73OTkgu1iE8E4keMGl1hYXeIK0jrgnWDJW
+BRcf4wVP3WAkea2moHfSOSZFhqlZCImdtNEjkw7h5/SzAW/RsqrQVcYn4GamMeaBranTHo
+ZxelkWu+KjM9PIzH/goFKh8t82ACtQZkMb6aM=
+-----END OPENSSH PRIVATE KEY-----
+"#;
+
+/// RSA private key, legacy PEM (`Proc-Type: 4,ENCRYPTED`), encrypted.
+pub(super) const RSA_PEM_KEY_ENCRYPTED: &str = r#"-----BEGIN RSA PRIVATE KEY-----
+Proc-Type: 4,ENCRYPTED
+DEK-Info: AES-128-CBC,57E8943BD9A77FE49E6B933170B902E5
+
+1bDTdT4o+HBqR8JGvmmtOU7HoaOLF6xoYHfTaTStFh3TGdFgX4/0ParGyOBGBaEw
+dkALf2Ecy3mNfYyyNaskpvL4uMLiE5/j3D5A0ctqkbJ2Tk20AxEsnQ/CB8Jnj7Wd
+sQmIwdS828n6TxM/BbwaA5atUF7GxGw5xIHHXRQb6fUNBFPQatHRiP3pRjhZiJJO
+n4EN+7ZYPqmsfHgk9rC1BX/xk5NX/3HjRckTXaqSsgh7B9QaJgJlUrRBMYbRWZUL
+d1MO/aU6Nb7bG4Oic3+2t/xVzQplReq+eig5l4bObTiSgJUjwIkgq5C6JYhC/F58
+NCTSBY6y/Ix8ZCMKrYG7+XVt2aI9N+54Li3Zn+Rd9sIcmV+oX0f78W1TQcOATHUK
+O9eK/iQdFtZDoP3RQ7xsYFiHM+lsvaEw8VjFJGz8J3rEqNLuiubobum0BdMDqyNG
+jIjdWab3rI/eeI73CsZayyLbcTGOLv7mBGZADwEyB3g5e8epmJ4GkraYnqgICvjK
+83DlU2qky3ZbBVm0lrtBIV/A6pz8MVU07E695T3xyiufd9FcMyzK8lFKHz2+Gl6o
+56o/WsD6TINT0OTsqAiw2PM6dBTwkNgGkn496wOCRlyyHUCCf/RPdTgY1bUUb43G
+mq6H/biO+dpKUzo5J3LtNTDCuJPbCBbjgOho/jGP4i8okYRTpcc4J99aR1RGC8gI
+VvqN9yo2MjMDM7IAMdeqfyDAVeadqFzaV1NKPpiQogb0dBFR7F6zFpklWccaXOO3
+L9g8YKkE2URI/35N5hVYdeh7PFswk/5SWBEjMWoz3K4SGLAC1s1GSRUTaiNEBLkp
+-----END RSA PRIVATE KEY-----
+"#;
+
+/// ECDSA P-256 private key, PKCS#8 (`ENCRYPTED PRIVATE KEY`).
+pub(super) const ECDSA_PKCS8_KEY_ENCRYPTED: &str = r#"-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIH0MF8GCSqGSIb3DQEFDTBSMDEGCSqGSIb3DQEFDDAkBBClDmyjqtjff3RFz0tp
+iWS7AgIIADAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBAgQQMwRO7PD/dtBG0zbN
+uSPp5QSBkAZOc8uaZxeOd0ok+QF6j2olTIf46GEqmvJ7zDoUXeHi/g5pJE5kPHYT
+rLwZDEZH1FDvTBHxUkzbk8m6VGzE4lJpXIPuS2BC0XbWmMffkZyQKLU7Tm8HjDyJ
+CSJrAt5DyJO9eSYngvtFDi/VijHDQM1kLY0Ft++x8Nusjkzftyb4M6E8sMTvyGY8
+BOiOJ/w9YA==
+-----END ENCRYPTED PRIVATE KEY-----
 "#;

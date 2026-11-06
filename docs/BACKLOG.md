@@ -24,17 +24,6 @@ RUSTSEC-2023-0071 names a patched version before dropping the ignore.
 Last checked 2026-11-06: russh 0.65.1 is still the latest (blink is on
 0.64.1) and still pins `rsa =0.10.0-rc.18` and `ssh-key =0.7.0-rc.11`.
 
-## Encrypted keys are detected by matching error text
-
-`SftpTransport::connect`'s `AuthMethod::Key` arm (`sftp.rs`) decides a key
-needs a passphrase by lowercasing the error and looking for
-"encrypted", "passphrase" or "decrypt". russh has a variant for the
-missing-passphrase case, `russh::keys::Error::KeyIsEncrypted`; match that,
-plus whatever a wrong passphrase returns (check against an encrypted
-test key in `sftp_test_keys.rs`), and treat everything else as a load
-error. Otherwise a wording change upstream silently breaks the
-passphrase prompt.
-
 ## `Direction::CreateDir` reaches five `unreachable!()`s
 
 `transfer::Direction` carries `CreateDir` for planned mkdirs, so every

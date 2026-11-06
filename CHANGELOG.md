@@ -46,6 +46,11 @@ the git history for those.
   changing a saved session's host, port or username leaves its old
   checkpoints unoffered, but `--clean` kept them because the name still
   existed. They now count as orphaned.
+- **A wrong key passphrase asks again.** Mistyping the passphrase of an
+  OpenSSH-format or legacy PEM key failed the connect with "cryptographic
+  error" or "padding error" instead of asking again, and an encrypted
+  PKCS#8 key (`BEGIN ENCRYPTED PRIVATE KEY`) never asked at all. blink now
+  tells these apart by russh's error type rather than its message text.
 
 ## [0.9.0] — 2026-11-04
 

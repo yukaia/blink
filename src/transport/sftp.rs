@@ -34,7 +34,7 @@ use bytes::Bytes;
 use futures::stream::{FuturesUnordered, StreamExt};
 use russh::client::{self, Handle, Handler};
 use russh::keys::key::PrivateKeyWithHashAlg;
-use russh::keys::{load_secret_key, ssh_key};
+use russh::keys::ssh_key;
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::rawsession::Limits;
 use russh_sftp::client::{RawSftpSession, SftpSession};
@@ -461,6 +461,54 @@ const CHANNEL_WINDOW: u32 = 16 * 1024 * 1024;
 const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const KEEPALIVE_MAX: usize = 3;
 
+/// Load the private key at `path`, with `passphrase` if one was given.
+///
+/// [`BlinkError::KeyNeedsPassphrase`] when the key is encrypted and either
+/// no passphrase was given or the one given didn't decrypt it, so the TUI
+/// asks (again); a load error otherwise.
+fn load_key(path: &Path, passphrase: Option<&str>) -> Result<russh::keys::PrivateKey> {
+    let load_error =
+        |e: &dyn std::fmt::Display| BlinkError::auth(format!("load key {}: {e}", path.display()));
+    let text = std::fs::read_to_string(path).map_err(|e| load_error(&e))?;
+    russh::keys::decode_secret_key(&text, passphrase).map_err(|e| {
+        if key_needs_passphrase(&e, &text, passphrase.is_some()) {
+            BlinkError::KeyNeedsPassphrase
+        } else {
+            load_error(&e)
+        }
+    })
+}
+
+/// Whether `err`, from decoding the key `text`, means a passphrase is
+/// missing or wrong.
+///
+/// By error variant rather than message text, which upstream can reword.
+/// The variants, per format, as russh 0.64 reports them:
+///
+/// | format                  | no passphrase        | wrong passphrase            |
+/// |-------------------------|----------------------|-----------------------------|
+/// | OpenSSH                 | `KeyIsEncrypted`     | `SshKey(Crypto)`            |
+/// | legacy PEM (`Proc-Type`)| `KeyIsEncrypted`     | `Unpad(_)`                  |
+/// | PKCS#8 (`ENCRYPTED …`)  | a DER parse error    | `Pkcs8(EncryptedPrivateKey)`|
+///
+/// russh doesn't recognise an encrypted PKCS#8 key as encrypted, and parses
+/// it as a plain one, so for that format the PEM label decides. The
+/// wrong-passphrase variants count only when a passphrase was given: from
+/// an unencrypted key they would mean corruption, not a missing secret.
+/// `sftp_test_keys` holds one encrypted key per format to pin this table.
+fn key_needs_passphrase(err: &russh::keys::Error, text: &str, passphrase_given: bool) -> bool {
+    use russh::keys::Error as E;
+    let pkcs8_encrypted = text
+        .trim_start()
+        .starts_with("-----BEGIN ENCRYPTED PRIVATE KEY-----");
+    match err {
+        E::KeyIsEncrypted => true,
+        E::SshKey(ssh_key::Error::Crypto) | E::Unpad(_) => passphrase_given,
+        E::Pkcs8(_) if pkcs8_encrypted => passphrase_given,
+        _ => pkcs8_encrypted && !passphrase_given,
+    }
+}
+
 impl SftpTransport {
     pub async fn connect(
         session: &Session,
@@ -508,22 +556,7 @@ impl SftpTransport {
             }
             AuthMethod::Key { path } => {
                 let passphrase = password.filter(|p| !p.is_empty());
-                let kp = match load_secret_key(path, passphrase) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        let msg = e.to_string().to_lowercase();
-                        if msg.contains("encrypted")
-                            || msg.contains("passphrase")
-                            || msg.contains("decrypt")
-                        {
-                            return Err(BlinkError::KeyNeedsPassphrase);
-                        }
-                        return Err(BlinkError::auth(format!(
-                            "load key {}: {e}",
-                            path.display()
-                        )));
-                    }
-                };
+                let kp = load_key(path, passphrase)?;
                 let hash_alg = rsa_hash_alg(&kp.algorithm());
                 let kp = PrivateKeyWithHashAlg::new(Arc::new(kp), hash_alg);
                 handle
@@ -1341,6 +1374,68 @@ impl Transport for SftpTransport {
             .disconnect(russh::Disconnect::ByApplication, "bye", "")
             .await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod key_passphrase_tests {
+    use super::super::sftp_test_keys::*;
+    use super::*;
+
+    /// Write `key` to a file of its own and load it.
+    fn load(key: &str, passphrase: Option<&str>) -> Result<russh::keys::PrivateKey> {
+        let home = crate::paths::test_home();
+        let path = home.path().join("id");
+        std::fs::write(&path, key).unwrap();
+        load_key(&path, passphrase)
+    }
+
+    const ENCRYPTED: [(&str, &str); 3] = [
+        ("OpenSSH", ED25519_KEY_ENCRYPTED),
+        ("legacy PEM", RSA_PEM_KEY_ENCRYPTED),
+        ("PKCS#8", ECDSA_PKCS8_KEY_ENCRYPTED),
+    ];
+
+    #[test]
+    fn an_encrypted_key_without_a_passphrase_asks_for_one() {
+        for (format, key) in ENCRYPTED {
+            assert!(
+                matches!(load(key, None), Err(BlinkError::KeyNeedsPassphrase)),
+                "{format}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrong_passphrase_asks_again() {
+        for (format, key) in ENCRYPTED {
+            assert!(
+                matches!(
+                    load(key, Some("wrong")),
+                    Err(BlinkError::KeyNeedsPassphrase)
+                ),
+                "{format}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_right_passphrase_loads_the_key() {
+        for (format, key) in ENCRYPTED {
+            assert!(load(key, Some(TEST_PASSPHRASE)).is_ok(), "{format}");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_key_is_a_load_error_not_a_passphrase_prompt() {
+        for passphrase in [None, Some("anything")] {
+            let err = load("not a key", passphrase).unwrap_err();
+            assert!(
+                !matches!(err, BlinkError::KeyNeedsPassphrase),
+                "{passphrase:?}"
+            );
+        }
+        assert!(load(ED25519_KEY, None).is_ok(), "a plain key needs nothing");
     }
 }
 
