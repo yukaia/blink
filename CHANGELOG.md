@@ -32,6 +32,11 @@ the git history for those.
   Session file names are now shortened the same way, the temp name is
   kept within the limit, and on Windows, control characters in a session
   name map to `_` in its file name.
+- **`blink checkpoints --clean` removes checkpoints of an edited session.**
+  Since 0.9.0 a checkpoint belongs to a session's name and server, so
+  changing a saved session's host, port or username leaves its old
+  checkpoints unoffered, but `--clean` kept them because the name still
+  existed. They now count as orphaned.
 
 ## [0.9.0] — 2026-11-04
 

@@ -292,7 +292,8 @@ blink checkpoints
 
 # Remove completed and orphaned checkpoint files
 blink checkpoints --clean
-# (a checkpoint counts as orphaned when no saved session bears its name. If
+# (a checkpoint counts as orphaned when no saved session has its name and
+#  server — its user, host and port — so editing those orphans it too. If
 #  the session list itself can't be read — an unreadable sessions directory,
 #  or a session file that won't parse — orphan detection is skipped and a
 #  warning is printed, so `--clean` removes only completed checkpoints

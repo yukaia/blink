@@ -883,11 +883,12 @@ fn disposition(pending: usize, orphaned: bool, clean: bool, force: bool) -> Disp
     Disposition::Keep { orphaned }
 }
 
-/// The saved-session names, plus whether that list is the whole story.
+/// The saved sessions, as the (name, origin) pairs checkpoints are keyed
+/// by, plus whether that list is the whole story.
 struct KnownSessions {
-    names: std::collections::HashSet<String>,
+    keys: std::collections::HashSet<(String, String)>,
     /// True only when every session on disk was read successfully. When
-    /// false, a name missing from `names` no longer proves the session is
+    /// false, a key missing from `keys` no longer proves the session is
     /// gone, so orphanhood cannot be judged.
     complete: bool,
     /// Why the list is incomplete, phrased for a warning. `None` when it is
@@ -911,13 +912,17 @@ fn known_sessions(listing: Result<crate::session::SessionListing>) -> KnownSessi
                 format!("{n} session {files} could not be read")
             });
             KnownSessions {
-                names: listing.sessions.into_iter().map(|s| s.name).collect(),
+                keys: listing
+                    .sessions
+                    .iter()
+                    .map(|s| (s.name.clone(), crate::transport::origin_of(s)))
+                    .collect(),
                 complete: why.is_none(),
                 why,
             }
         }
         Err(e) => KnownSessions {
-            names: std::collections::HashSet::new(),
+            keys: std::collections::HashSet::new(),
             complete: false,
             why: Some(format!("the session list could not be read ({e})")),
         },
@@ -926,11 +931,17 @@ fn known_sessions(listing: Result<crate::session::SessionListing>) -> KnownSessi
 
 /// Whether no connection can ever be offered `cp`.
 ///
-/// A name missing from a list we know to be partial proves nothing, so a
-/// missing session only counts when the list is complete. A file with no
-/// origin (from before version 4) is orphaned whatever the list says.
+/// A checkpoint is offered only to a session with its name *and* origin,
+/// so one left behind by a session whose host, port or username has since
+/// changed is as orphaned as one whose session was deleted. A key missing
+/// from a list we know to be partial proves nothing, so a missing session
+/// only counts when the list is complete. A file with no origin (from
+/// before version 4) is orphaned whatever the list says.
 fn is_orphaned(cp: &Checkpoint, known: &KnownSessions) -> bool {
-    cp.origin.is_none() || (known.complete && !known.names.contains(&cp.session))
+    let Some(origin) = &cp.origin else {
+        return true;
+    };
+    known.complete && !known.keys.contains(&(cp.session.clone(), origin.clone()))
 }
 
 /// The `blink checkpoints` column naming a checkpoint's server: two
@@ -1072,7 +1083,10 @@ mod policy_tests {
 
     fn every_session_known(names: &[&str]) -> KnownSessions {
         KnownSessions {
-            names: names.iter().map(|n| n.to_string()).collect(),
+            keys: names
+                .iter()
+                .map(|n| (n.to_string(), TEST_ORIGIN.to_string()))
+                .collect(),
             complete: true,
             why: None,
         }
@@ -1092,6 +1106,29 @@ mod policy_tests {
         assert!(
             is_orphaned(&cp, &partial),
             "an incomplete session list can't save it: no origin is never offered",
+        );
+    }
+
+    /// Editing a saved session's host, port or username moves it to a new
+    /// origin; its old checkpoints can never be offered again.
+    #[test]
+    fn a_checkpoint_of_an_edited_session_is_orphaned() {
+        let mut edited = session("prod");
+        edited.host = "elsewhere".into();
+        let known = known_sessions(Ok(SessionListing {
+            sessions: vec![edited],
+            skipped: Vec::new(),
+        }));
+        let cp = Checkpoint::new("prod", TEST_ORIGIN, CheckpointKind::Upload, vec![]);
+        assert!(is_orphaned(&cp, &known));
+
+        let unchanged = known_sessions(Ok(SessionListing {
+            sessions: vec![session("prod")],
+            skipped: Vec::new(),
+        }));
+        assert!(
+            !is_orphaned(&cp, &unchanged),
+            "{TEST_ORIGIN} is session()'s origin"
         );
     }
 
@@ -1161,7 +1198,7 @@ mod policy_tests {
     fn a_listing_that_failed_outright_is_not_complete() {
         let known = known_sessions(Err(BlinkError::config("sessions dir unreadable")));
         assert!(!known.complete);
-        assert!(known.names.is_empty());
+        assert!(known.keys.is_empty());
     }
 
     #[test]
@@ -1174,7 +1211,9 @@ mod policy_tests {
         }));
         assert!(!known.complete);
         assert!(
-            known.names.contains("prod"),
+            known
+                .keys
+                .contains(&("prod".to_string(), TEST_ORIGIN.to_string())),
             "what did parse is still usable"
         );
     }
@@ -1186,7 +1225,7 @@ mod policy_tests {
             skipped: Vec::new(),
         }));
         assert!(known.complete);
-        assert_eq!(known.names.len(), 2);
+        assert_eq!(known.keys.len(), 2);
     }
 }
 

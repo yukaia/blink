@@ -55,7 +55,8 @@ enum Command {
     ///
     /// Pass --clean to remove checkpoints that are no longer useful:
     /// files whose batch fully completed, or that belong to a session
-    /// that no longer exists.  Pass --force to remove every checkpoint
+    /// that no longer exists or now points at another server.  Pass
+    /// --force to remove every checkpoint
     /// file regardless of state.
     Checkpoints {
         /// Remove stale checkpoints (fully completed or orphaned).

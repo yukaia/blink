@@ -24,21 +24,6 @@ RUSTSEC-2023-0071 names a patched version before dropping the ignore.
 Last checked 2026-11-06: russh 0.65.1 is still the latest (blink is on
 0.64.1) and still pins `rsa =0.10.0-rc.18` and `ssh-key =0.7.0-rc.11`.
 
-## Checkpoints of an edited session are never cleaned up
-
-Since checkpoints are keyed by origin (format 4), editing a saved
-session's host, port or username leaves its old checkpoints behind:
-they're never offered (wrong origin), but `is_orphaned`
-(`checkpoint.rs`) only asks whether the session *name* still exists, so
-`blink checkpoints --clean` keeps them. Only `--force` removes them, along
-with everything else.
-
-Fix: have `KnownSessions` hold (name, origin) pairs, built with
-`transport::origin_of`, and count a checkpoint as orphaned when no saved
-session has its name *and* origin. Ad-hoc sessions are unaffected:
-their names were never saved, so their checkpoints already count as
-orphaned.
-
 ## FTPS trust-on-first-use pins without showing the certificate
 
 With `accept_invalid_certs = true`, the first connect pins whatever leaf
