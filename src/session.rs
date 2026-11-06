@@ -185,21 +185,21 @@ impl Session {
     /// the suffix is derived from the raw name (no sanitisation), so it's
     /// stable per logical name across sanitisation collisions.
     fn name_to_filename(name: &str) -> String {
+        Self::name_to_filename_with(name, cfg!(windows))
+    }
+
+    /// [`Self::name_to_filename`] with the platform policy passed in, so
+    /// both branches are testable on any host. See
+    /// [`paths::hashed_file_name`]: the stem is cut to keep the name within
+    /// the 255-byte limit, and on Windows control characters map to `_`.
+    fn name_to_filename_with(name: &str, windows_rules: bool) -> String {
         use sha2::{Digest, Sha256};
-        let safe: String = name
-            .chars()
-            .map(|c| match c {
-                '\0' | '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' ' => '_',
-                c => c,
-            })
-            .collect();
-        let hash = Sha256::digest(name.as_bytes());
-        let mut suffix = String::with_capacity(8);
-        for b in &hash[..4] {
-            use std::fmt::Write as _;
-            let _ = write!(&mut suffix, "{b:02x}");
-        }
-        format!("{safe}-{suffix}.ini")
+        paths::hashed_file_name(
+            name,
+            &Sha256::digest(name.as_bytes()),
+            ".ini",
+            windows_rules,
+        )
     }
 
     /// Filename written by older blink versions (sanitized stem only, no
@@ -1094,6 +1094,49 @@ mod tests {
         let a = Session::name_to_filename("production");
         let b = Session::name_to_filename("production");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn name_to_filename_fits_any_name_within_the_limit() {
+        for windows in [false, true] {
+            for name in [
+                "x".repeat(300),
+                "é".repeat(200),
+                format!("{}é", "a".repeat(241)),
+            ] {
+                let file = Session::name_to_filename_with(&name, windows);
+                assert!(
+                    file.len() <= paths::MAX_FILE_NAME_BYTES,
+                    "{} bytes",
+                    file.len()
+                );
+                assert!(file.ends_with(".ini"));
+            }
+        }
+        // Cut names stay apart: the hash covers the whole name.
+        let a = format!("{}a", "x".repeat(300));
+        let b = format!("{}b", "x".repeat(300));
+        assert_ne!(
+            Session::name_to_filename_with(&a, false),
+            Session::name_to_filename_with(&b, false)
+        );
+    }
+
+    #[test]
+    fn name_to_filename_maps_control_characters_on_windows_only() {
+        assert!(Session::name_to_filename_with("a\tb", true).starts_with("a_b-"));
+        assert!(Session::name_to_filename_with("a\tb", false).starts_with("a\tb-"));
+    }
+
+    #[test]
+    fn a_session_with_a_long_name_saves_and_loads() {
+        let _home = paths::test_home();
+        let mut s = valid();
+        s.name = "n".repeat(400);
+        s.save().unwrap();
+        let loaded = Session::list_all().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, s.name);
     }
 
     // -- validate ----------------------------------------------------------

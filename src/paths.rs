@@ -387,6 +387,46 @@ pub fn sync_parent_dir(path: &Path) -> Result<()> {
     }
 }
 
+/// Longest file name every platform blink runs on accepts: 255 bytes on
+/// Linux and macOS, 255 UTF-16 units on Windows (never more than the UTF-8
+/// byte count).
+pub const MAX_FILE_NAME_BYTES: usize = 255;
+
+/// A file name for a user-chosen `name`: `{stem}-{hash8}{suffix}`, where
+/// `hash8` is the first four bytes of `hash` in hex.
+///
+/// The stem is `name` with path separators and shell-special characters
+/// mapped to `_`, plus control characters when `windows_rules` is set
+/// (Windows refuses them; elsewhere they're left alone so existing files
+/// keep their names). It is cut on a char boundary to keep the whole within
+/// [`MAX_FILE_NAME_BYTES`]. A longer name could never have been written, so
+/// cutting moves no existing file, and `hash`, taken over the full name,
+/// keeps cut names (and names that map to the same stem) apart.
+pub fn hashed_file_name(name: &str, hash: &[u8], suffix: &str, windows_rules: bool) -> String {
+    use std::fmt::Write as _;
+
+    let mut tail = String::from("-");
+    for b in &hash[..4] {
+        let _ = write!(&mut tail, "{b:02x}");
+    }
+    tail.push_str(suffix);
+
+    let budget = MAX_FILE_NAME_BYTES - tail.len();
+    let mut stem = String::with_capacity(name.len().min(budget));
+    for c in name.chars() {
+        let c = match c {
+            '\0' | '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' ' => '_',
+            '\u{1}'..='\u{1f}' if windows_rules => '_',
+            c => c,
+        };
+        if stem.len() + c.len_utf8() > budget {
+            break;
+        }
+        stem.push(c);
+    }
+    stem + &tail
+}
+
 /// Atomically and durably replace `path` with what `write` puts in a file:
 /// write a temp file beside it, `sync_all`, rename it over `path`, then
 /// [`sync_parent_dir`]. Without the syncs, a power loss between the rename
@@ -405,12 +445,21 @@ pub fn atomic_write(
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
+    // The temp name is `.{name}.{pid}.{n}.tmp`, with `name` cut so the whole
+    // stays within MAX_FILE_NAME_BYTES: a `path` whose own name is near the
+    // limit is still writable. The pid and counter keep cut names unique.
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = path.with_file_name(format!(
-        ".{name}.{}.{}.tmp",
+    let tail = format!(
+        ".{}.{}.tmp",
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
-    ));
+    );
+    let budget = MAX_FILE_NAME_BYTES - 1 - tail.len();
+    let mut cut = name.len().min(budget);
+    while !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let tmp = path.with_file_name(format!(".{}{tail}", &name[..cut]));
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -474,6 +523,26 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
         assert_eq!(names_in(&dir), ["f.ini"]);
+    }
+
+    /// The temp file's name grows the target's, so a target name near the
+    /// limit used to make every save fail with "file name too long".
+    #[test]
+    fn atomic_write_handles_a_name_at_the_length_limit() {
+        let _home = test_home();
+        let dir = root_dir().unwrap();
+        let name = format!("{}é", "a".repeat(MAX_FILE_NAME_BYTES - 2));
+        assert_eq!(name.len(), MAX_FILE_NAME_BYTES);
+        let path = dir.join(&name);
+
+        atomic_write(&path, |f| {
+            use std::io::Write as _;
+            f.write_all(b"new")
+        })
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(names_in(&dir), [name]);
     }
 
     #[test]

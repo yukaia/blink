@@ -665,23 +665,12 @@ impl Checkpoint {
     }
 }
 
-/// Longest file name every platform blink runs on accepts: 255 bytes on
-/// Linux and macOS, 255 UTF-16 units on Windows (never more than the UTF-8
-/// byte count).
-const MAX_FILE_NAME_BYTES: usize = 255;
-
 /// The body of [`Checkpoint::path_for`]: `{stem}-{hash8}-{kind}.json`, with
 /// the platform policy passed in so both branches are testable on any host.
-///
-/// The stem is cut, on a char boundary, to whatever keeps the whole name
-/// within [`MAX_FILE_NAME_BYTES`]; a longer name could never be written, so
-/// cutting it moves no existing checkpoint, and the hash (taken over the
-/// full session name) keeps cut names apart. On Windows, which refuses
-/// control characters in file names, those map to `_` as well; elsewhere
-/// they are left alone so existing checkpoints keep their names.
+/// See [`paths::hashed_file_name`]; the hash covers the origin as well as
+/// the session name.
 fn file_name_for(session: &str, origin: &str, kind: CheckpointKind, windows_rules: bool) -> String {
     use sha2::{Digest, Sha256};
-    use std::fmt::Write as _;
 
     // NUL can appear in neither a session name nor an origin, so the two
     // can't run together ambiguously.
@@ -690,27 +679,12 @@ fn file_name_for(session: &str, origin: &str, kind: CheckpointKind, windows_rule
         .chain_update([0])
         .chain_update(origin.as_bytes())
         .finalize();
-    let mut tail = String::from("-");
-    for b in &hash[..4] {
-        let _ = write!(&mut tail, "{b:02x}");
-    }
-    let _ = write!(&mut tail, "-{}.json", kind.as_str());
-
-    let budget = MAX_FILE_NAME_BYTES - tail.len();
-    let mut stem = String::with_capacity(session.len().min(budget));
-    for c in session.chars() {
-        let c = match c {
-            // Null byte plus all path-separator and shell-special chars.
-            '\0' | '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' ' => '_',
-            '\u{1}'..='\u{1f}' if windows_rules => '_',
-            c => c,
-        };
-        if stem.len() + c.len_utf8() > budget {
-            break;
-        }
-        stem.push(c);
-    }
-    stem + &tail
+    paths::hashed_file_name(
+        session,
+        &hash,
+        &format!("-{}.json", kind.as_str()),
+        windows_rules,
+    )
 }
 
 /// Summaries of every checkpoint for `session` that still has work left.
@@ -2004,11 +1978,29 @@ mod tests {
             ] {
                 for kind in [CheckpointKind::Download, CheckpointKind::Upload] {
                     let name = file_name_for(&session, TEST_ORIGIN, kind, windows);
-                    assert!(name.len() <= MAX_FILE_NAME_BYTES, "{} bytes", name.len());
+                    assert!(
+                        name.len() <= paths::MAX_FILE_NAME_BYTES,
+                        "{} bytes",
+                        name.len()
+                    );
                     assert!(name.ends_with(&format!("-{}.json", kind.as_str())));
                 }
             }
         }
+    }
+
+    /// The file name fits, but `atomic_write`'s temp name used to grow it
+    /// past the limit, so a long session's checkpoint still failed to save.
+    #[test]
+    fn a_long_session_name_checkpoints_and_loads() {
+        let _home = paths::test_home();
+        let name = "n".repeat(400);
+        let mut cp = Checkpoint::new(&name, TEST_ORIGIN, CheckpointKind::Upload, vec![]);
+        cp.flush().unwrap();
+        let loaded = Checkpoint::load(&name, TEST_ORIGIN, CheckpointKind::Upload)
+            .unwrap()
+            .expect("saved");
+        assert_eq!(loaded.session, name);
     }
 
     #[test]

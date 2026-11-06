@@ -25,6 +25,13 @@ the git history for those.
   were never drawn, and the selection could move onto them out of sight.
   The list now follows the cursor, and a click selects the session drawn
   under it.
+- **Sessions and checkpoints with long names save.** A session named past
+  about 240 bytes couldn't be saved. 0.9.0 shortened checkpoint file names
+  to fit, but every save also writes a temp file whose name adds about 20
+  bytes to the real one, so a long session's checkpoint still failed.
+  Session file names are now shortened the same way, the temp name is
+  kept within the limit, and on Windows, control characters in a session
+  name map to `_` in its file name.
 
 ## [0.9.0] — 2026-11-04
 

@@ -24,18 +24,6 @@ RUSTSEC-2023-0071 names a patched version before dropping the ignore.
 Last checked 2026-11-06: russh 0.65.1 is still the latest (blink is on
 0.64.1) and still pins `rsa =0.10.0-rc.18` and `ssh-key =0.7.0-rc.11`.
 
-## Session file names have no length cap
-
-`Session::name_to_filename` (`session.rs`) has the problem
-`checkpoint::file_name_for` had: it uses the whole name, so a session
-name past 242 bytes produces a file name over the 255-byte limit
-and `save` fails. Windows also refuses control characters, which the
-name may contain (only NUL, CR and LF are rejected). Apply the same fix:
-cut the stem on a char boundary to fit, and map control characters on
-Windows only. Names that are too long can't have been saved, so nothing on
-disk moves. The two functions then do the same thing, so they could share
-one helper in `paths.rs`, with the hash input and suffix passed in.
-
 ## Checkpoints of an edited session are never cleaned up
 
 Since checkpoints are keyed by origin (format 4), editing a saved
