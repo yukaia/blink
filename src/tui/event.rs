@@ -17,7 +17,7 @@ use tokio::time::{Interval, interval};
 
 use crate::error::Result;
 use crate::preview::FileViewKind;
-use crate::transfer::{Direction, TransferEvent};
+use crate::transfer::TransferEvent;
 use crate::transport::RemoteEntry;
 
 /// Top-level event consumed by the App run loop.
@@ -129,14 +129,14 @@ pub enum AppEvent {
         /// destination's listing could not be fully read. Always zero for a
         /// download walk.
         unverifiable_uploads: usize,
-        kind: Direction,
+        kind: crate::checkpoint::CheckpointKind,
     },
 
     /// A recursive walk on connection `connection` failed.
     WalkFailed {
         connection: u64,
         error: String,
-        kind: Direction,
+        kind: crate::checkpoint::CheckpointKind,
     },
 
     /// File contents fetched for viewer `viewer_id`.

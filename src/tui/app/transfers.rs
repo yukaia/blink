@@ -19,7 +19,7 @@
 
 use std::path::PathBuf;
 
-use crate::transfer::Direction;
+use crate::checkpoint::CheckpointKind;
 use crate::transport;
 use crate::tui::event::AppEvent;
 use crate::tui::plan::{
@@ -147,7 +147,7 @@ impl App {
                             let _ = tx.send(AppEvent::WalkFailed {
                                 connection,
                                 error: e.to_string(),
-                                kind: Direction::Upload,
+                                kind: CheckpointKind::Upload,
                             });
                             return;
                         }
@@ -170,7 +170,7 @@ impl App {
                     let _ = tx.send(AppEvent::WalkFailed {
                         connection,
                         error: e.to_string(),
-                        kind: Direction::Upload,
+                        kind: CheckpointKind::Upload,
                     });
                     return;
                 }
@@ -185,7 +185,7 @@ impl App {
                 unreadable_skipped: 0,
                 unsafe_skipped: 0,
                 unverifiable_uploads: conflicts.unverifiable,
-                kind: Direction::Upload,
+                kind: CheckpointKind::Upload,
             });
         });
     }
@@ -291,7 +291,7 @@ impl App {
                                 let _ = tx.send(AppEvent::WalkFailed {
                                     connection,
                                     error: e.to_string(),
-                                    kind: Direction::Download,
+                                    kind: CheckpointKind::Download,
                                 });
                                 return;
                             }
@@ -322,7 +322,7 @@ impl App {
                 unreadable_skipped,
                 unsafe_skipped,
                 unverifiable_uploads: 0,
-                kind: Direction::Download,
+                kind: CheckpointKind::Download,
             });
         });
     }
@@ -350,7 +350,7 @@ impl App {
                 } else {
                     plan
                 };
-                self.dispatch_plan(final_plan, Direction::Download);
+                self.dispatch_plan(final_plan, CheckpointKind::Download);
             }
             OverwritePending::UploadPlan {
                 plan,
@@ -361,7 +361,7 @@ impl App {
                 } else {
                     plan
                 };
-                self.dispatch_plan(final_plan, Direction::Upload);
+                self.dispatch_plan(final_plan, CheckpointKind::Upload);
             }
         }
     }

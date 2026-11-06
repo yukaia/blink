@@ -23,12 +23,3 @@ RUSTSEC-2023-0071 names a patched version before dropping the ignore.
 
 Last checked 2026-11-06: russh 0.65.1 is still the latest (blink is on
 0.64.1) and still pins `rsa =0.10.0-rc.18` and `ssh-key =0.7.0-rc.11`.
-
-## `Direction::CreateDir` reaches five `unreachable!()`s
-
-`transfer::Direction` carries `CreateDir` for planned mkdirs, so every
-match on a *batch's* direction (`checkpoint_glue.rs` ×3, `events.rs` ×2)
-has a `Direction::CreateDir => unreachable!()` arm. None can be reached
-today, but the type doesn't say so. Split out an upload/download enum for
-batches (it maps one-to-one onto `CheckpointKind`, which may do), and
-keep `CreateDir` only where jobs are executed.

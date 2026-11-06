@@ -1183,7 +1183,7 @@ mod tests {
     // gap. The key handlers need no terminal — only `run` does — so the state
     // machine can be driven directly.
 
-    use crate::transfer::{Direction, TransferEvent};
+    use crate::transfer::TransferEvent;
 
     fn app() -> App {
         App::new(Config::default(), Theme::load("dracula").unwrap())
@@ -1518,7 +1518,7 @@ mod tests {
             unreadable_skipped: 0,
             unsafe_skipped: 0,
             unverifiable_uploads: 0,
-            kind: Direction::Upload,
+            kind: CheckpointKind::Upload,
         }
     }
 
@@ -1932,11 +1932,11 @@ mod tests {
     async fn a_second_batch_joins_the_first_instead_of_replacing_it() {
         let (mut a, _cleanup) = checkpoint_app("merge");
 
-        a.dispatch_plan(vec![download(0), download(1)], Direction::Download);
+        a.dispatch_plan(vec![download(0), download(1)], CheckpointKind::Download);
         let first_ids: Vec<u64> = a.checkpoint_job_map.keys().copied().collect();
         assert_eq!(first_ids.len(), 2, "first batch tracked");
 
-        a.dispatch_plan(vec![download(2)], Direction::Download);
+        a.dispatch_plan(vec![download(2)], CheckpointKind::Download);
 
         let cp = a
             .active_checkpoints
@@ -1976,8 +1976,8 @@ mod tests {
     async fn a_file_already_queued_is_not_queued_again() {
         let (mut a, _cleanup) = checkpoint_app("dedupe");
 
-        a.dispatch_plan(vec![download(0), download(1)], Direction::Download);
-        a.dispatch_plan(vec![download(1), download(2)], Direction::Download);
+        a.dispatch_plan(vec![download(0), download(1)], CheckpointKind::Download);
+        a.dispatch_plan(vec![download(1), download(2)], CheckpointKind::Download);
 
         let (_, pending) = a.transfer_manager.as_ref().unwrap().queue_counts();
         assert_eq!(pending, 3, "download(1) must be queued once");
@@ -2003,7 +2003,7 @@ mod tests {
 
         a.dispatch_plan(
             vec![download(0), download(0), download(1)],
-            Direction::Download,
+            CheckpointKind::Download,
         );
 
         let (_, pending) = a.transfer_manager.as_ref().unwrap().queue_counts();
@@ -2021,8 +2021,8 @@ mod tests {
     async fn an_upload_already_queued_is_not_queued_again() {
         let (mut a, _cleanup) = checkpoint_app("dedupe-up");
 
-        a.dispatch_plan(vec![upload(0)], Direction::Upload);
-        a.dispatch_plan(vec![upload(0), upload(1)], Direction::Upload);
+        a.dispatch_plan(vec![upload(0)], CheckpointKind::Upload);
+        a.dispatch_plan(vec![upload(0), upload(1)], CheckpointKind::Upload);
 
         let (_, pending) = a.transfer_manager.as_ref().unwrap().queue_counts();
         assert_eq!(pending, 2);
@@ -2076,7 +2076,7 @@ mod tests {
                 download(3),
                 download(4),
             ],
-            Direction::Download,
+            CheckpointKind::Download,
         );
         assert_eq!(pending(&a), 2, "the queue takes what fits");
         assert!(
@@ -2102,7 +2102,7 @@ mod tests {
 
         a.dispatch_plan(
             vec![download(0), download(1), download(2)],
-            Direction::Download,
+            CheckpointKind::Download,
         );
         finish_next(
             &mut a,
@@ -2117,7 +2117,7 @@ mod tests {
 
         a.dispatch_plan(
             vec![download(0), download(1), download(2), download(3)],
-            Direction::Download,
+            CheckpointKind::Download,
         );
         // Job ids start at 1 in a fresh manager.
         let batch_id = a
@@ -2152,7 +2152,7 @@ mod tests {
 
         a.dispatch_plan(
             vec![download(0), download(1), download(2)],
-            Direction::Download,
+            CheckpointKind::Download,
         );
         // download(2) waits. Both queued jobs start, which makes room, and a
         // second Ctrl-D queues download(2) by hand in that room. When the
@@ -2187,12 +2187,12 @@ mod tests {
 
         a.dispatch_plan(
             vec![download(0), download(1), download(2)],
-            Direction::Download,
+            CheckpointKind::Download,
         );
         let m = a.transfer_manager.clone().unwrap();
         m.take_next_pending().unwrap(); // room for one now
 
-        a.dispatch_plan(vec![download(5)], Direction::Download);
+        a.dispatch_plan(vec![download(5)], CheckpointKind::Download);
         let queued: Vec<String> = (1..=10)
             .filter_map(|id| m.job(id))
             .filter(|j| j.state == crate::transfer::TransferState::Pending)
@@ -2212,7 +2212,7 @@ mod tests {
 
         a.dispatch_plan(
             vec![download(0), download(1), download(2)],
-            Direction::Download,
+            CheckpointKind::Download,
         );
         a.disconnect();
 
@@ -2228,7 +2228,7 @@ mod tests {
         // at 1. Leaving the old id map in place lets a new job's id collide
         // with a stale entry and mark the wrong checkpoint entry done.
         let (mut a, _cleanup) = checkpoint_app("disconnect");
-        a.dispatch_plan(vec![download(0), download(1)], Direction::Download);
+        a.dispatch_plan(vec![download(0), download(1)], CheckpointKind::Download);
         a.pending_offers = std::collections::VecDeque::from(vec![offer(CheckpointKind::Download)]);
         assert!(
             !a.active_checkpoints.is_empty(),
@@ -2286,7 +2286,7 @@ mod tests {
         let (mut a, _cleanup) = checkpoint_app("debounce");
         a.dispatch_plan(
             vec![download(0), download(1), download(2)],
-            Direction::Download,
+            CheckpointKind::Download,
         );
         // `dispatch_plan` persists the plan up front, so the checkpoint
         // starts clean and inside the debounce interval.
@@ -2315,7 +2315,7 @@ mod tests {
         let (mut a, _cleanup) = checkpoint_app("force");
         a.dispatch_plan(
             vec![download(0), download(1), download(2)],
-            Direction::Download,
+            CheckpointKind::Download,
         );
         let ids: Vec<u64> = a.checkpoint_job_map.keys().copied().collect();
 
@@ -2337,8 +2337,8 @@ mod tests {
         // batch, across directions as well as within one.
         let (mut a, _cleanup) = checkpoint_app("kinds");
 
-        a.dispatch_plan(vec![download(0), download(1)], Direction::Download);
-        a.dispatch_plan(vec![upload(0), upload(1)], Direction::Upload);
+        a.dispatch_plan(vec![download(0), download(1)], CheckpointKind::Download);
+        a.dispatch_plan(vec![upload(0), upload(1)], CheckpointKind::Upload);
 
         assert_eq!(
             a.active_checkpoints.len(),
@@ -2352,9 +2352,9 @@ mod tests {
     async fn cancelling_one_batch_leaves_the_other_direction_alone() {
         let (mut a, _cleanup) = checkpoint_app("cancel");
 
-        a.dispatch_plan(vec![download(0), download(1)], Direction::Download);
+        a.dispatch_plan(vec![download(0), download(1)], CheckpointKind::Download);
         let dl_ids: Vec<u64> = a.checkpoint_job_map.keys().copied().collect();
-        a.dispatch_plan(vec![upload(0)], Direction::Upload);
+        a.dispatch_plan(vec![upload(0)], CheckpointKind::Upload);
 
         a.cancel_batch_in_checkpoint(&dl_ids);
 
@@ -2909,7 +2909,7 @@ mod tests {
             unreadable_skipped: 0,
             unsafe_skipped: 0,
             unverifiable_uploads: 5,
-            kind: Direction::Upload,
+            kind: CheckpointKind::Upload,
         });
         assert!(
             logged(&a, "can't check 5 upload(s) for existing files"),
@@ -2939,7 +2939,7 @@ mod tests {
             unreadable_skipped: 0,
             unsafe_skipped: 0,
             unverifiable_uploads: 0,
-            kind: Direction::Upload,
+            kind: CheckpointKind::Upload,
         });
 
         assert!(a.transfer_manager.as_ref().unwrap().snapshot().is_empty());
@@ -2963,7 +2963,7 @@ mod tests {
             unreadable_skipped: 0,
             unsafe_skipped: 0,
             unverifiable_uploads: 0,
-            kind: Direction::Upload,
+            kind: CheckpointKind::Upload,
         });
 
         assert_eq!(a.screen, Screen::Main);
@@ -3016,7 +3016,7 @@ mod tests {
             unreadable_skipped: 0,
             unsafe_skipped: 2,
             unverifiable_uploads: 0,
-            kind: Direction::Download,
+            kind: CheckpointKind::Download,
         });
         assert!(logged(
             &a,
@@ -3115,7 +3115,7 @@ mod tests {
             unreadable_skipped: 12,
             unsafe_skipped: 0,
             unverifiable_uploads: 0,
-            kind: Direction::Download,
+            kind: CheckpointKind::Download,
         });
         assert!(logged(
             &a,

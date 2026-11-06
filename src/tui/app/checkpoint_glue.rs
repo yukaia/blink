@@ -117,7 +117,7 @@ impl App {
     /// Convert a [`PlannedJob`] sequence into queued transfer jobs.
     /// Mkdirs always lead so any file under them lands in an existing
     /// directory; file jobs follow.
-    pub(super) fn dispatch_plan(&mut self, plan: Vec<PlannedJob>, kind: Direction) {
+    pub(super) fn dispatch_plan(&mut self, plan: Vec<PlannedJob>, ck_kind: CheckpointKind) {
         let Some(manager) = self.transfer_manager.clone() else {
             return;
         };
@@ -155,11 +155,6 @@ impl App {
 
         // ---- checkpoint: write before first enqueue so the file exists
         // even if the app is killed on the first transfer. ---------------
-        let ck_kind = match kind {
-            Direction::Upload => CheckpointKind::Upload,
-            Direction::Download => CheckpointKind::Download,
-            Direction::CreateDir => unreachable!(),
-        };
         let (session_name, origin) = self.checkpoint_key();
 
         let ck_jobs: Vec<CheckpointJob> = plan
@@ -297,11 +292,7 @@ impl App {
                 }
             }
         }
-        let label = match kind {
-            Direction::Download => "downloads",
-            Direction::Upload => "uploads",
-            Direction::CreateDir => unreachable!(),
-        };
+        let label = ck_kind.plural();
         self.push_log(
             LogLevel::Info,
             format!("queued {label}: {files} file(s) + {dirs} folder(s)"),
@@ -468,12 +459,7 @@ impl App {
     ///
     /// Called from the `r` keybinding in the Transfers pane (or `--resume`
     /// at startup). Logs a message if there is nothing to resume.
-    pub fn resume_walk(&mut self, kind: Direction) {
-        let ck_kind = match kind {
-            Direction::Upload => CheckpointKind::Upload,
-            Direction::Download => CheckpointKind::Download,
-            Direction::CreateDir => unreachable!(),
-        };
+    pub fn resume_walk(&mut self, ck_kind: CheckpointKind) {
         let (session_name, origin) = self.checkpoint_key();
 
         // Refuse while a batch of this direction is still tracked: the file
@@ -554,7 +540,7 @@ impl App {
         // dispatch_plan overwrites the checkpoint with a fresh plan covering
         // only the re-queued jobs, all starting as `pending`. They will
         // transition through `in_progress` → `done` as they run.
-        self.dispatch_plan(resume_plan, kind);
+        self.dispatch_plan(resume_plan, ck_kind);
     }
 }
 

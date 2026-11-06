@@ -126,7 +126,12 @@ const MAX_CHECKPOINT_JOBS: usize = 1_000_000;
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Which direction a checkpointed walk is going.
+/// Which way a batch goes: a walk, the plan it produces, and the
+/// checkpoint that records it.
+///
+/// This, not [`crate::transfer::Direction`], is the type for a batch:
+/// `Direction` also has `CreateDir`, a step inside an upload batch that is
+/// never a batch of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CheckpointKind {
@@ -139,6 +144,14 @@ impl CheckpointKind {
         match self {
             Self::Upload => "upload",
             Self::Download => "download",
+        }
+    }
+
+    /// The batch's jobs, for log lines: "uploads" or "downloads".
+    pub fn plural(self) -> &'static str {
+        match self {
+            Self::Upload => "uploads",
+            Self::Download => "downloads",
         }
     }
 }

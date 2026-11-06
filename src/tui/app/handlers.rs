@@ -16,7 +16,6 @@ use zeroize::Zeroize;
 
 use crate::checkpoint::CheckpointKind;
 use crate::session::{AuthMethod, Session};
-use crate::transfer::Direction;
 use crate::transport;
 use crate::tui::state::{EditField, PendingCancel, PostConnectOffer, ViewerKind};
 
@@ -353,10 +352,10 @@ impl App {
             // haven't completed yet. 'r' resumes the download checkpoint,
             // 'R' resumes the upload checkpoint.
             KeyCode::Char('r') if self.active_pane == Pane::Transfers => {
-                self.resume_walk(Direction::Download);
+                self.resume_walk(CheckpointKind::Download);
             }
             KeyCode::Char('R') if self.active_pane == Pane::Transfers => {
-                self.resume_walk(Direction::Upload);
+                self.resume_walk(CheckpointKind::Upload);
             }
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.open_save_session();
@@ -747,15 +746,10 @@ impl App {
             return;
         };
 
-        let direction = match offer.kind {
-            CheckpointKind::Download => Direction::Download,
-            CheckpointKind::Upload => Direction::Upload,
-        };
-
         match key.code {
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 self.pending_offers.pop_front();
-                self.resume_walk(direction);
+                self.resume_walk(offer.kind);
                 self.show_next_offer();
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {

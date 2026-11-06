@@ -16,6 +16,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use zeroize::Zeroize;
 
+use crate::checkpoint::CheckpointKind;
 use crate::preview::{self, FileViewKind};
 use crate::transfer::{Direction, Dispatcher, TransferEvent, TransferManager, format_bytes};
 use crate::tui::event::{AppEvent, TrustSubject};
@@ -421,15 +422,14 @@ impl App {
                     self.dispatch_plan(plan, kind);
                 } else {
                     let pending = match kind {
-                        Direction::Download => OverwritePending::DownloadPlan {
+                        CheckpointKind::Download => OverwritePending::DownloadPlan {
                             plan,
                             conflict_indices,
                         },
-                        Direction::Upload => OverwritePending::UploadPlan {
+                        CheckpointKind::Upload => OverwritePending::UploadPlan {
                             plan,
                             conflict_indices,
                         },
-                        Direction::CreateDir => unreachable!(),
                     };
                     // Asked when the user is free to answer, after any
                     // question already asked: see `open_waiting_prompt`.
@@ -453,11 +453,7 @@ impl App {
                 if connection != self.connection {
                     return;
                 }
-                let label = match kind {
-                    Direction::Download => "downloads",
-                    Direction::Upload => "uploads",
-                    Direction::CreateDir => unreachable!(),
-                };
+                let label = kind.plural();
                 self.push_log(
                     LogLevel::Error,
                     format!("preparing {label} failed: {error}"),
