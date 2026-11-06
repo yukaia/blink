@@ -23,3 +23,16 @@ RUSTSEC-2023-0071 names a patched version before dropping the ignore.
 
 Last checked 2026-11-06: russh 0.65.1 is still the latest (blink is on
 0.64.1) and still pins `rsa =0.10.0-rc.18` and `ssh-key =0.7.0-rc.11`.
+
+## russh can't load an encrypted legacy-PEM ECDSA key
+
+Found while pinning the passphrase errors (`key_needs_passphrase` in
+`sftp.rs`): an ECDSA key written by `ssh-keygen -t ecdsa -m PEM` with a
+passphrase (`BEGIN EC PRIVATE KEY`, `Proc-Type: 4,ENCRYPTED`) fails to
+load even with the right passphrase. russh 0.64.1 decrypts it, then
+parses the result as PKCS#1 and reports "unexpected ASN.1 DER tag:
+expected INTEGER, got OCTET STRING". The user sees a load error, not a
+passphrase prompt. The same key in OpenSSH or PKCS#8 format loads fine,
+and `ssh-keygen -p -f <key>` converts it to OpenSSH. Upstream's bug: check
+whether a newer russh fixes it, and report it if not. There's nothing for
+blink to do beyond, at most, naming the workaround in the error.
