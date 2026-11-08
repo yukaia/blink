@@ -133,12 +133,23 @@ fn local_destination_key(path: &Path, fold_case: bool) -> String {
 pub struct TransferManager {
     inner: Arc<Mutex<Inner>>,
     events: mpsc::UnboundedSender<TransferEvent>,
+    /// Wakes the dispatcher when there may be something for it to do: a job
+    /// queued, a job ended, a worker slot freed, the queue resumed. It used
+    /// to poll every 100 ms instead, so a slot sat idle for half that on
+    /// average after each job, which capped batches of small files.
+    wake: Arc<tokio::sync::Notify>,
 }
 
 struct Inner {
     next_id: u64,
     next_batch_id: u64,
     jobs: Vec<TransferJob>,
+    /// No job before this index is Pending, so [`TransferManager::take_next_pending`]
+    /// starts looking here. Jobs only ever leave Pending, and new ones are
+    /// appended, so it only moves forward. Scanning from 0 instead passed
+    /// every finished job on each claim: quadratic over a batch, under the
+    /// lock the renderer takes every frame.
+    first_pending: usize,
     /// Number of jobs currently in `Pending` state. Kept in sync with `jobs`
     /// so `enqueue` can check the cap in O(1) instead of scanning the vec.
     pending_count: usize,
@@ -191,6 +202,7 @@ impl TransferManager {
             next_id: 1,
             next_batch_id: 1,
             jobs: Vec::new(),
+            first_pending: 0,
             pending_count: 0,
             job_index: HashMap::new(),
             in_flight: HashSet::new(),
@@ -199,7 +211,15 @@ impl TransferManager {
             paused: false,
             active: HashMap::new(),
         }));
-        (Self { inner, events: tx }, rx)
+        let wake = Arc::new(tokio::sync::Notify::new());
+        (
+            Self {
+                inner,
+                events: tx,
+                wake,
+            },
+            rx,
+        )
     }
 
     /// Adjust concurrency at runtime. New jobs honour the new limit; running
@@ -208,6 +228,18 @@ impl TransferManager {
     pub fn set_parallelism(&self, n: u8) {
         let n = n.clamp(1, crate::config::MAX_PARALLEL);
         self.inner.lock().parallelism = n;
+        self.wake();
+    }
+
+    /// Wake the dispatcher. A wake with no one waiting is kept for the next
+    /// wait, so none is lost between its check and its wait.
+    pub(crate) fn wake(&self) {
+        self.wake.notify_one();
+    }
+
+    /// Wait for [`Self::wake`].
+    pub(crate) async fn woken(&self) {
+        self.wake.notified().await;
     }
 
     /// Snapshot of every job the manager has ever tracked, terminal states
@@ -237,6 +269,7 @@ impl TransferManager {
 
     pub fn resume(&self) {
         self.inner.lock().paused = false;
+        self.wake();
         let _ = self.events.send(TransferEvent::Resumed);
     }
 
@@ -353,6 +386,8 @@ impl TransferManager {
         inner.jobs.push(job.clone());
         inner.job_index.insert(id, idx);
         inner.pending_count += 1;
+        drop(inner);
+        self.wake();
         let _ = self.events.send(TransferEvent::Queued(job));
         Ok(id)
     }
@@ -391,9 +426,11 @@ impl TransferManager {
                 let _ = self.events.send(TransferEvent::Started(id));
             }
             TransferState::Complete => {
+                self.wake();
                 let _ = self.events.send(TransferEvent::Complete(id));
             }
             TransferState::Failed(e) => {
+                self.wake();
                 let _ = self.events.send(TransferEvent::Failed { id, error: e });
             }
             _ => {}
@@ -520,10 +557,16 @@ impl TransferManager {
             let mut inner = self.inner.lock();
             // Find the index of the first pending job, then update state and
             // pending_count in separate steps to satisfy the borrow checker.
-            let idx = inner
-                .jobs
+            let from = inner.first_pending;
+            let found = inner.jobs[from..]
                 .iter()
-                .position(|j| j.state == TransferState::Pending)?;
+                .position(|j| j.state == TransferState::Pending)
+                .map(|i| from + i);
+            let Some(idx) = found else {
+                inner.first_pending = inner.jobs.len();
+                return None;
+            };
+            inner.first_pending = idx + 1;
             inner.jobs[idx].state = TransferState::Active;
             inner.pending_count = inner.pending_count.saturating_sub(1);
             inner.jobs[idx].clone()
@@ -622,6 +665,7 @@ impl Clone for TransferManager {
         Self {
             inner: Arc::clone(&self.inner),
             events: self.events.clone(),
+            wake: Arc::clone(&self.wake),
         }
     }
 }
@@ -664,6 +708,42 @@ pub fn format_eta(bytes_remaining: u64, bytes_per_sec: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `take_next_pending` resumes its search where the last one stopped;
+    /// it must still find every pending job, in order, and skip ones that
+    /// left Pending some other way.
+    #[test]
+    fn pending_jobs_are_claimed_in_order_past_cancelled_ones() {
+        let (m, _rx) = TransferManager::new(1);
+        let a = m.enqueue_mkdir("/a".into()).unwrap();
+        let b = m.enqueue_mkdir("/b".into()).unwrap();
+        let c = m.enqueue_mkdir("/c".into()).unwrap();
+        assert_eq!(m.take_next_pending().unwrap().id, a);
+        m.mark(b, TransferState::Failed("cancelled".into()));
+        assert_eq!(m.take_next_pending().unwrap().id, c);
+        assert!(m.take_next_pending().is_none());
+        let d = m.enqueue_mkdir("/d".into()).unwrap();
+        assert_eq!(m.take_next_pending().unwrap().id, d, "a job queued later");
+        assert!(m.take_next_pending().is_none());
+    }
+
+    #[test]
+    fn cancel_all_cancels_running_and_queued_jobs_only() {
+        let (m, _rx) = TransferManager::new(1);
+        let done = m.enqueue_mkdir("/done".into()).unwrap();
+        let running = m.enqueue_mkdir("/running".into()).unwrap();
+        let queued = m.enqueue_mkdir("/queued".into()).unwrap();
+        m.take_next_pending();
+        m.mark(done, TransferState::Complete);
+        m.take_next_pending();
+        assert_eq!(m.job(running).unwrap().state, TransferState::Active);
+        assert_eq!(m.cancel_all(), (1, 1));
+        assert_eq!(m.job(done).unwrap().state, TransferState::Complete);
+        assert_eq!(
+            m.job(queued).unwrap().state,
+            TransferState::Failed("cancelled".into())
+        );
+    }
 
     fn manager() -> TransferManager {
         // The event receiver is dropped; every `send` then fails silently,

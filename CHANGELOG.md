@@ -48,6 +48,11 @@ the git history for those.
   time limit: a server that accepted the connection and then said nothing
   held every remote action behind it. The reconnect now gets the same 30
   seconds as the first connect.
+- **Batches of small files no longer wait between jobs.** With every
+  transfer slot busy, blink checked for a free one only every 100 ms, so
+  each slot sat idle for about 50 ms after every job: two minutes over
+  10,000 small files on four slots. A finished job now starts the next one
+  at once. Picking the next job also no longer rescans every finished one.
 - **The session list scrolls.** Sessions past the bottom of the terminal
   were never drawn, and the selection could move onto them out of sight.
   The list now follows the cursor, and a click selects the session drawn

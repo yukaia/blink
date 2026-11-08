@@ -32,7 +32,9 @@ use crate::session::Session;
 use crate::transfer::{Direction, TransferJob, TransferManager, TransferState};
 use crate::transport::{self, ProgressUpdate, Transport};
 
-/// How often the dispatcher loop wakes when there's nothing to do.
+/// How often the dispatcher loop checks its shutdown flag while it waits.
+/// Work wakes it at once (see [`TransferManager::woken`]); this only bounds
+/// how long a shutdown takes to notice.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Minimum interval between bytes-per-second recalculations, in ms.
@@ -98,6 +100,19 @@ impl Dispatcher {
         app_event_tx: mpsc::UnboundedSender<crate::tui::event::AppEvent>,
         trust: crate::known_hosts::SessionTrust,
     ) -> Self {
+        Self::spawn_with_pool(manager, session, password, app_event_tx, trust, Pool::new())
+    }
+
+    /// [`Self::spawn`] with the connection pool given, so a test can seed it
+    /// with connections that need no server.
+    fn spawn_with_pool(
+        manager: TransferManager,
+        session: Session,
+        password: Option<zeroize::Zeroizing<String>>,
+        app_event_tx: mpsc::UnboundedSender<crate::tui::event::AppEvent>,
+        trust: crate::known_hosts::SessionTrust,
+        pool: Pool,
+    ) -> Self {
         let shutdown = Arc::new(AtomicBool::new(false));
         let password = password.map(Arc::new);
         let join = tokio::spawn(run_loop(
@@ -107,6 +122,7 @@ impl Dispatcher {
             Arc::clone(&shutdown),
             app_event_tx,
             trust,
+            Arc::new(pool),
         ));
         Self {
             shutdown,
@@ -184,9 +200,19 @@ async fn run_loop(
     shutdown: Arc<AtomicBool>,
     app_event_tx: mpsc::UnboundedSender<crate::tui::event::AppEvent>,
     trust: crate::known_hosts::SessionTrust,
+    pool: Arc<Pool>,
 ) {
     let active = Arc::new(AtomicU8::new(0));
-    let pool = Arc::new(Pool::new());
+
+    // Wait until woken — a job queued or ended, a slot freed — or for the
+    // poll interval, whichever is first. The interval is only for noticing
+    // a shutdown.
+    let idle = || async {
+        tokio::select! {
+            () = manager.woken() => {}
+            () = tokio::time::sleep(POLL_INTERVAL) => {}
+        }
+    };
 
     loop {
         if shutdown.load(Ordering::Acquire) {
@@ -195,20 +221,20 @@ async fn run_loop(
 
         // Don't dispatch if paused or already at the concurrency limit.
         if manager.is_paused() || active.load(Ordering::Acquire) >= manager.parallelism() {
-            tokio::time::sleep(POLL_INTERVAL).await;
+            idle().await;
             continue;
         }
 
         let job = match manager.take_next_pending() {
             Some(j) => j,
             None => {
-                tokio::time::sleep(POLL_INTERVAL).await;
+                idle().await;
                 continue;
             }
         };
 
         active.fetch_add(1, Ordering::AcqRel);
-        let guard = ActiveGuard(Arc::clone(&active));
+        let guard = ActiveGuard(Arc::clone(&active), manager.clone());
         let job_id = job.id;
         let manager_w = manager.clone();
         let session_w = session.clone();
@@ -405,13 +431,19 @@ async fn run_one(
     }
 }
 
-/// Decrements the active-worker counter on drop. Catches panics inside the
-/// worker task in addition to the normal completion path.
-struct ActiveGuard(Arc<AtomicU8>);
+/// Decrements the active-worker counter on drop, and wakes the dispatcher
+/// to fill the freed slot. Catches panics inside the worker task in
+/// addition to the normal completion path.
+///
+/// The wake has to come from here, not only from the job's final mark: the
+/// mark lands while the slot is still counted, so a dispatcher woken by it
+/// alone could look, find no room, and wait out the poll interval.
+struct ActiveGuard(Arc<AtomicU8>, TransferManager);
 
 impl Drop for ActiveGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+        self.1.wake();
     }
 }
 
@@ -520,6 +552,44 @@ mod tests {
             drained.is_ok(),
             "loop still running after its handle was dropped",
         );
+    }
+
+    /// A freed slot is filled at once. The loop used to poll every 100 ms
+    /// when every slot was busy, so each job of a batch was followed by
+    /// half that, on average, of nothing. On a paused clock the old loop
+    /// took 100 ms of virtual time per job here.
+    #[tokio::test(start_paused = true)]
+    async fn a_freed_slot_is_filled_without_waiting_for_a_poll() {
+        let (manager, _events_rx) = TransferManager::new(1);
+        let pool = Pool::new();
+        pool.put(boxed(), 1);
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let dispatcher = Dispatcher::spawn_with_pool(
+            manager.clone(),
+            idle_session(),
+            None,
+            ev_tx,
+            crate::known_hosts::SessionTrust::new(),
+            pool,
+        );
+        let ids: Vec<u64> = (0..20)
+            .map(|i| manager.enqueue_mkdir(format!("/d{i}")).unwrap())
+            .collect();
+
+        let started = tokio::time::Instant::now();
+        while ids
+            .iter()
+            .any(|&id| manager.job(id).unwrap().state != TransferState::Complete)
+        {
+            // Lets the paused clock advance, so the old loop's polls showed.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            assert!(
+                started.elapsed() < POLL_INTERVAL,
+                "20 jobs took {:?} of virtual time",
+                started.elapsed()
+            );
+        }
+        dispatcher.shutdown().await;
     }
 
     /// `shutdown()` keeps its stronger guarantee: it returns only once the
