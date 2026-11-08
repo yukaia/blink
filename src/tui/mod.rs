@@ -31,8 +31,8 @@ pub type TuiTerminal = Terminal<CrosstermBackend<Stdout>>;
 /// Convenience tick interval for the event loop.
 pub const TICK_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Restore the terminal from inside a panic, then delegate to the hook that
-/// was installed before us.
+/// Restore the terminal from inside a panic on the UI thread, then delegate
+/// to the hook that was installed before us.
 ///
 /// [`restore`] only runs on the normal return path — a panic anywhere in the
 /// run loop (a render bug, an `unwrap` that turns out to be reachable)
@@ -41,13 +41,26 @@ pub const TICK_INTERVAL: Duration = Duration::from_millis(100);
 /// and no line editing, with the panic message painted onto the alternate
 /// screen they can no longer see.
 ///
+/// Only the UI thread's panics end the TUI, though. The run loop runs on
+/// the thread that calls [`setup`] (`main`'s, inside `block_on`); spawned
+/// tasks run on the runtime's worker threads, and a panic there is caught
+/// by tokio while the app carries on. Restoring the terminal for one of
+/// those, as this hook used to for every panic, left the still-running TUI
+/// drawing in cooked mode over the main screen, and the default hook's
+/// message landed in the middle of it. Those go to the log instead.
+///
 /// Idempotent: installing twice would nest the hooks, and both `run` and
 /// `run_with_session` call [`setup`].
 fn install_panic_hook() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
+        let ui_thread = std::thread::current().id();
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            if std::thread::current().id() != ui_thread {
+                tracing::error!("background task panicked: {info}");
+                return;
+            }
             // Best effort — we're already panicking, so a failure here has
             // nowhere useful to go. Order mirrors `restore`.
             let _ = disable_raw_mode();

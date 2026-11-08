@@ -53,6 +53,11 @@ the git history for those.
   each slot sat idle for about 50 ms after every job: two minutes over
   10,000 small files on four slots. A finished job now starts the next one
   at once. Picking the next job also no longer rescans every finished one.
+- **A crash in a background task no longer breaks the terminal.** blink's
+  crash handler put the terminal back to normal for a panic on any thread,
+  but a panic in a background task doesn't end blink, which kept running
+  in a terminal no longer set up for it. Only a crash of the interface
+  itself restores the terminal now; a background one goes to the log.
 - **The session list scrolls.** Sessions past the bottom of the terminal
   were never drawn, and the selection could move onto them out of sight.
   The list now follows the cursor, and a click selects the session drawn
