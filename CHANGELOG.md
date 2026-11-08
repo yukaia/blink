@@ -43,6 +43,11 @@ the git history for those.
   the server stopped reading, waited forever and held its transfer slot.
   Both now fail after 60 seconds with nothing moving, as the file viewer
   already did.
+- **An FTP reconnect can't freeze the remote pane.** After a dropped FTP or
+  FTPS connection, blink reconnects before the next remote action, with no
+  time limit: a server that accepted the connection and then said nothing
+  held every remote action behind it. The reconnect now gets the same 30
+  seconds as the first connect.
 - **The session list scrolls.** Sessions past the bottom of the terminal
   were never drawn, and the selection could move onto them out of sight.
   The list now follows the cursor, and a click selects the session drawn

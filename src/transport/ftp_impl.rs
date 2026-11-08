@@ -25,9 +25,23 @@ macro_rules! delegate_ftp_transport {
             /// Reconnect if the last call left the connection broken, then
             /// count it broken until the call about to run settles, so a
             /// call that never finishes leaves it broken too.
+            ///
+            /// The reconnect gets the connect deadline. Without one, a
+            /// server that accepted the connection and then went quiet held
+            /// the call — and with it the browsing connection's lock, which
+            /// every remote action waits on — until the OS gave up.
             async fn begin_call(&mut self) -> $crate::error::Result<()> {
                 if self.broken {
-                    self.reopen().await?;
+                    let limit = $crate::transport::ftp_impl::reconnect_timeout();
+                    match tokio::time::timeout(limit, self.reopen()).await {
+                        Ok(reopened) => reopened?,
+                        Err(_) => {
+                            return Err($crate::error::BlinkError::disconnected(format!(
+                                "reconnect: no answer in {}s",
+                                limit.as_secs(),
+                            )));
+                        }
+                    }
                 }
                 self.broken = true;
                 Ok(())
@@ -245,6 +259,25 @@ thread_local! {
 #[cfg(test)]
 fn op_timeout() -> Duration {
     OP_TIMEOUT.get()
+}
+
+/// How long [`delegate_ftp_transport!`]'s reconnect may take:
+/// [`crate::transport::CONNECT_TIMEOUT`], as the first connect gets, except
+/// where a test has shortened it for its own thread.
+#[cfg(not(test))]
+pub(crate) fn reconnect_timeout() -> Duration {
+    crate::transport::CONNECT_TIMEOUT
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static RECONNECT_TIMEOUT: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(crate::transport::CONNECT_TIMEOUT) };
+}
+
+#[cfg(test)]
+pub(crate) fn reconnect_timeout() -> Duration {
+    RECONNECT_TIMEOUT.get()
 }
 
 /// Refuse a remote path that would break out of one FTP command into another.
@@ -972,6 +1005,9 @@ mod integration {
         /// In STOR, accept the data connection and never read from it, so
         /// the client's writes stall once the socket buffers fill.
         pub stall_stor: bool,
+        /// While set to `n`, the `n`th connection and every later one is
+        /// accepted and then never greeted.
+        pub silent_from_connect: Arc<std::sync::Mutex<Option<usize>>>,
     }
 
     /// Length of the `oversized_greeting` fault's greeting: 32 times the
@@ -1059,11 +1095,20 @@ mod integration {
 
         tokio::spawn(async move {
             while let Ok((sock, _)) = listener.accept().await {
-                connects_l.fetch_add(1, Ordering::SeqCst);
+                let n = connects_l.fetch_add(1, Ordering::SeqCst) + 1;
                 let store = Arc::clone(&store);
                 let faults = faults.clone();
                 let log = Arc::clone(&log_l);
                 tokio::spawn(async move {
+                    let silent = faults
+                        .silent_from_connect
+                        .lock()
+                        .unwrap()
+                        .is_some_and(|from| n >= from);
+                    if silent {
+                        // Hold `sock` open, unanswered, for good.
+                        std::future::pending::<()>().await;
+                    }
                     let _ = handle_control(sock, store, faults, log).await;
                 });
             }
@@ -2584,6 +2629,38 @@ mod integration {
             matches!(err, crate::error::BlinkError::Disconnected(_)),
             "{err:?}"
         );
+    }
+
+    /// The reconnect a broken connection makes before its next call gets a
+    /// deadline, as the first connect does.
+    #[tokio::test]
+    async fn a_reconnect_to_a_silent_server_fails_instead_of_hanging() {
+        super::RECONNECT_TIMEOUT.set(std::time::Duration::from_millis(400));
+        let faults = Faults::default();
+        let silent = Arc::clone(&faults.silent_from_connect);
+        faults
+            .drop_on_next_retr
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (port, connects, _log) = start_server(reconnect_store().await, faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+        // Break the connection, then make the server go quiet.
+        assert!(transport.read_to_bytes("/small.txt").await.is_err());
+        *silent.lock().unwrap() = Some(2);
+
+        let err = with_timeout(transport.list("/"), "the reconnect")
+            .await
+            .expect_err("a server that never greets must fail the call");
+        assert!(
+            matches!(err, crate::error::BlinkError::Disconnected(_)),
+            "{err:?}"
+        );
+        assert_eq!(connects.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Still broken: the next call tries again, and succeeds once the
+        // server answers.
+        *silent.lock().unwrap() = None;
+        assert!(transport.list("/").await.is_ok());
     }
 
     #[tokio::test]
