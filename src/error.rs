@@ -146,17 +146,35 @@ impl BlinkError {
 /// is deliberate: it makes the difference *visible* rather than silently
 /// collapsing two distinct names onto one rendering.
 ///
+/// The rest of the list is other characters that draw as nothing, or as a
+/// blank, and so make the same aliasing possible: the remaining invisible
+/// format characters (soft hyphen, word joiner, the invisible operators,
+/// tags), and the Hangul fillers, which are letters but render empty.
+/// The tag block (U+E0000–E007F) can spell out a whole hidden string.
+///
 /// U+200D ZERO WIDTH JOINER is excluded on purpose. It joins rather than
 /// hides or reorders, so it can't spoof an extension, and stripping it would
-/// break legitimate emoji sequences in filenames into separate glyphs.
+/// break legitimate emoji sequences in filenames into separate glyphs. The
+/// variation selectors (U+FE00–FE0F) stay for the same reason: they pick an
+/// emoji's presentation.
 fn is_deceptive_format(ch: char) -> bool {
     matches!(ch,
-        '\u{061C}'                  // ARABIC LETTER MARK
+        '\u{00AD}'                  // SOFT HYPHEN
+        | '\u{061C}'                // ARABIC LETTER MARK
+        | '\u{115F}'..='\u{1160}'   // HANGUL CHOSEONG / JUNGSEONG FILLER
+        | '\u{180E}'                // MONGOLIAN VOWEL SEPARATOR
         | '\u{200B}'..='\u{200C}'   // ZERO WIDTH SPACE, NON-JOINER
         | '\u{200E}'..='\u{200F}'   // LEFT-TO-RIGHT / RIGHT-TO-LEFT MARK
         | '\u{202A}'..='\u{202E}'   // embeddings and overrides (LRO/RLO here)
+        | '\u{2060}'..='\u{2064}'   // WORD JOINER, invisible operators
         | '\u{2066}'..='\u{2069}'   // isolates (LRI, RLI, FSI, PDI)
+        | '\u{206A}'..='\u{206F}'   // deprecated formatting characters
+        | '\u{3164}'                // HANGUL FILLER
         | '\u{FEFF}'                // ZERO WIDTH NO-BREAK SPACE (BOM)
+        | '\u{FFA0}'                // HALFWIDTH HANGUL FILLER
+        | '\u{FFF9}'..='\u{FFFB}'   // interlinear annotation
+        | '\u{1D173}'..='\u{1D17A}' // musical symbol formatting
+        | '\u{E0000}'..='\u{E007F}' // tags
     )
 }
 
@@ -384,6 +402,40 @@ mod tests {
         for ch in ['\u{200B}', '\u{200C}', '\u{FEFF}'] {
             let out = sanitize(format!("a{ch}b"));
             assert_eq!(out, "a b", "U+{:04X} must be neutralised", ch as u32);
+        }
+    }
+
+    /// Other characters that draw as nothing let two names render alike
+    /// just as the zero-width ones do.
+    #[test]
+    fn sanitize_strips_the_other_invisible_characters() {
+        for ch in [
+            '\u{00AD}',
+            '\u{115F}',
+            '\u{1160}',
+            '\u{180E}',
+            '\u{2060}',
+            '\u{2064}',
+            '\u{206A}',
+            '\u{206F}',
+            '\u{3164}',
+            '\u{FFA0}',
+            '\u{FFF9}',
+            '\u{FFFB}',
+            '\u{1D173}',
+            '\u{E0001}',
+            '\u{E0041}',
+            '\u{E007F}',
+        ] {
+            let out = sanitize(format!("a{ch}b"));
+            assert_eq!(out, "a b", "U+{:04X} must be neutralised", ch as u32);
+        }
+    }
+
+    #[test]
+    fn sanitize_keeps_what_emoji_need() {
+        for s in ["👩\u{200D}💻", "❤\u{FE0F}"] {
+            assert_eq!(sanitize(s.to_string()), s);
         }
     }
 

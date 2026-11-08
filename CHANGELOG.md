@@ -10,6 +10,11 @@ the git history for those.
 
 ### Security
 
+- **More invisible characters show up in file names.** blink already shows
+  bidi overrides and zero-width spaces in server-supplied names as spaces,
+  so two names can't look identical. Soft hyphens, word joiners, invisible
+  operators, Unicode tag characters and the Hangul fillers slipped past
+  that and now get the same treatment.
 - **Downloads don't write through a symlink planted under the partial's
   name.** A `.blink-part` file and its `.meta` sidecar have predictable
   names, so anyone who could write to the download directory could plant
