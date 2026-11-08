@@ -329,11 +329,11 @@ Files live in platform-appropriate locations:
 
 | Path          | Linux                                                            | macOS                                                | Windows                                       |
 | ------------- | ---------------------------------------------------------------- | ---------------------------------------------------- | --------------------------------------------- |
-| Global config | `$XDG_CONFIG_HOME/blink/config.ini` (else `~/.config/blink/`) | `~/Library/Application Support/blink/config.ini`  | `%USERPROFILE%\Documents\blink\config.ini`   |
-| Sessions      | `~/.config/blink/sessions/`                                       | `~/Library/Application Support/blink/sessions/`       | `%USERPROFILE%\Documents\blink\sessions\`     |
-| Themes        | `~/.config/blink/themes/`                                         | `~/Library/Application Support/blink/themes/`         | `%USERPROFILE%\Documents\blink\themes\`       |
-| Known hosts   | `~/.config/blink/known_hosts`                                     | `~/Library/Application Support/blink/known_hosts`     | `%USERPROFILE%\Documents\blink\known_hosts`   |
-| Checkpoints   | `~/.config/blink/checkpoints/`                                    | `~/Library/Application Support/blink/checkpoints/`    | `%USERPROFILE%\Documents\blink\checkpoints\`  |
+| Global config | `$XDG_CONFIG_HOME/blink/config.ini` (else `~/.config/blink/`) | `~/Library/Application Support/blink/config.ini`  | `%APPDATA%\blink\config.ini` |
+| Sessions      | `~/.config/blink/sessions/`                                       | `~/Library/Application Support/blink/sessions/`       | `%APPDATA%\blink\sessions\` |
+| Themes        | `~/.config/blink/themes/`                                         | `~/Library/Application Support/blink/themes/`         | `%APPDATA%\blink\themes\` |
+| Known hosts   | `~/.config/blink/known_hosts`                                     | `~/Library/Application Support/blink/known_hosts`     | `%APPDATA%\blink\known_hosts` |
+| Checkpoints   | `~/.config/blink/checkpoints/`                                    | `~/Library/Application Support/blink/checkpoints/`    | `%APPDATA%\blink\checkpoints\` |
 
 macOS honours `XDG_CONFIG_HOME` if explicitly set; otherwise it follows the
 platform's `Library/Application Support` convention.

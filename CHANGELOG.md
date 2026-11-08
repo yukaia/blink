@@ -8,6 +8,14 @@ the git history for those.
 
 ## [Unreleased]
 
+### Changed
+
+- **On Windows, the config folder is now `%APPDATA%\blink`.** It was in
+  `Documents\blink`, a folder meant for your own files, and one that
+  OneDrive often syncs, taking your `known_hosts` and sessions with it.
+  Existing files are not moved: move `Documents\blink` to `%APPDATA%`
+  yourself to keep them.
+
 ### Security
 
 - **More invisible characters show up in file names.** blink already shows

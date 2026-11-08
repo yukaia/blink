@@ -3,7 +3,7 @@
 //! - Linux: `~/.config/blink/` (or `$XDG_CONFIG_HOME/blink/` if set)
 //! - macOS: `~/Library/Application Support/blink/` (or
 //!   `$XDG_CONFIG_HOME/blink/` if set)
-//! - Windows: `%USERPROFILE%\Documents\blink\`
+//! - Windows: `%APPDATA%\blink\`
 
 use std::path::{Path, PathBuf};
 use std::{env, fs};
@@ -297,19 +297,21 @@ fn real_base_dir() -> Result<PathBuf> {
     base_dir_from(xdg.as_deref(), home.as_deref())
 }
 
+/// `%APPDATA%\blink`: the roaming application-data folder, where Windows
+/// programs keep their settings. The config used to live in the user's
+/// Documents folder, which is for the user's own files, and which OneDrive
+/// often syncs, carrying `known_hosts` and session files with it.
 #[cfg(target_os = "windows")]
-fn base_dir_from(user_profile: Option<&str>) -> Result<PathBuf> {
-    let profile = user_profile.ok_or_else(|| BlinkError::config("%USERPROFILE% is not set"))?;
-    Ok(require_absolute(profile, "%USERPROFILE%")?
-        .join("Documents")
-        .join(APP_DIR_NAME))
+fn base_dir_from(app_data: Option<&str>) -> Result<PathBuf> {
+    let app_data = app_data.ok_or_else(|| BlinkError::config("%APPDATA% is not set"))?;
+    Ok(require_absolute(app_data, "%APPDATA%")?.join(APP_DIR_NAME))
 }
 
 #[cfg(target_os = "windows")]
 #[cfg_attr(test, allow(dead_code))]
 fn real_base_dir() -> Result<PathBuf> {
-    let user_profile = env::var("USERPROFILE").ok();
-    base_dir_from(user_profile.as_deref())
+    let app_data = env::var("APPDATA").ok();
+    base_dir_from(app_data.as_deref())
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
@@ -810,16 +812,16 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_puts_the_config_under_the_user_profile() {
-        let dir = base_dir_from(Some(r"C:\Users\u")).expect("valid");
-        assert_eq!(dir, PathBuf::from(r"C:\Users\u\Documents\blink"));
+    fn windows_puts_the_config_under_app_data() {
+        let dir = base_dir_from(Some(r"C:\Users\u\AppData\Roaming")).expect("valid");
+        assert_eq!(dir, PathBuf::from(r"C:\Users\u\AppData\Roaming\blink"));
     }
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn an_unset_user_profile_is_an_error() {
+    fn an_unset_app_data_is_an_error() {
         let err = base_dir_from(None).expect_err("nothing to resolve from");
-        assert!(err.to_string().contains("%USERPROFILE%"), "{err}");
+        assert!(err.to_string().contains("%APPDATA%"), "{err}");
     }
 
     /// Plants a symlink at `<base>/planted` pointing at a populated
