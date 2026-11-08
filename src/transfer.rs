@@ -703,8 +703,21 @@ impl TransferManager {
 
     /// Register an [`AbortHandle`] for a running worker so the manager can
     /// cancel it later. Called by the dispatcher immediately after spawning.
+    ///
+    /// A job cancelled between being claimed and this call has no worker
+    /// to keep: the handle is aborted instead, and since the worker waits
+    /// for registration before starting, it never runs.
     pub fn register_active(&self, id: u64, handle: AbortHandle) {
-        self.inner.lock().active.insert(id, handle);
+        let mut inner = self.inner.lock();
+        let still_active = inner
+            .index_of(id)
+            .is_some_and(|idx| inner.jobs[idx].state == TransferState::Active);
+        if still_active {
+            inner.active.insert(id, handle);
+        } else {
+            drop(inner);
+            handle.abort();
+        }
     }
 
     /// Remove a worker's entry from the active map. Returns `true` if the
@@ -723,25 +736,14 @@ impl TransferManager {
     /// Returns whether it cancelled anything: `false` when the job had
     /// already finished (the user may have confirmed after it did).
     pub fn cancel(&self, id: u64) -> bool {
-        let handle = self.inner.lock().active.remove(&id);
-        let Some(h) = handle else {
-            return false;
-        };
-        h.abort();
-        self.mark(id, TransferState::Failed("cancelled".into()));
-        true
+        self.cancel_matching(|j| j.id == id, false).0 > 0
     }
 
     /// Cancel every Active and Pending job sharing `batch_id`. Returns
-    /// `(active_cancelled, pending_cancelled)`.
-    ///
-    /// Active jobs go through the usual `cancel` path (AbortHandle + mark
-    /// failed). Pending jobs are marked failed in place — they would have
-    /// been claimed by the dispatcher's `take_next_pending` eventually, so
-    /// flipping their state is enough to skip them. Complete and previously-
+    /// `(active_cancelled, pending_cancelled)`. Complete and previously-
     /// failed jobs are ignored.
     pub fn cancel_batch(&self, batch_id: u64) -> (usize, usize) {
-        self.cancel_where(|j| j.batch_id == Some(batch_id))
+        self.cancel_matching(|j| j.batch_id == Some(batch_id), true)
     }
 
     /// Cancel every Active and Pending job, as [`Self::cancel_batch`] does
@@ -752,36 +754,68 @@ impl TransferManager {
     /// so without this they carried on after a disconnect the user was told
     /// would cancel them.
     pub fn cancel_all(&self) -> (usize, usize) {
-        self.cancel_where(|_| true)
+        self.cancel_matching(|_| true, true)
     }
 
-    /// Cancel the Active and Pending jobs `select` picks.
-    fn cancel_where(&self, select: impl Fn(&TransferJob) -> bool) -> (usize, usize) {
-        // Phase 1: collect ids while holding the lock briefly. We can't
-        // call `cancel` / `mark` with the lock held because they take it
-        // again internally.
-        let (active_ids, pending_ids): (Vec<u64>, Vec<u64>) = {
-            let inner = self.inner.lock();
-            let mut active = Vec::new();
-            let mut pending = Vec::new();
-            for j in inner.jobs.iter().filter(|j| select(j)) {
-                match j.state {
-                    TransferState::Active => active.push(j.id),
-                    TransferState::Pending => pending.push(j.id),
-                    _ => {}
+    /// Cancel the Active jobs `select` picks, and the Pending ones too when
+    /// `pending_too`. Returns `(active_cancelled, pending_cancelled)`.
+    ///
+    /// Every pick is marked under one hold of the lock. Collecting them
+    /// first and marking them afterwards, as this used to, let the
+    /// dispatcher start a job in between: it was then marked cancelled but
+    /// never stopped, its destination was freed for another job to write
+    /// while it still did, and it was reported twice, cancelled and then
+    /// finished. An Active job whose worker is not registered yet is marked
+    /// too; [`Self::register_active`] stops that worker before it starts.
+    fn cancel_matching(
+        &self,
+        select: impl Fn(&TransferJob) -> bool,
+        pending_too: bool,
+    ) -> (usize, usize) {
+        let cancelled = TransferState::Failed("cancelled".into());
+        let mut handles = Vec::new();
+        let mut ids = Vec::new();
+        let (mut active_n, mut pending_n) = (0, 0);
+        {
+            let mut inner = self.inner.lock();
+            let picked: Vec<usize> = inner
+                .jobs
+                .iter()
+                .enumerate()
+                .filter(|(_, j)| {
+                    let live = match j.state {
+                        TransferState::Active => true,
+                        TransferState::Pending => pending_too,
+                        _ => false,
+                    };
+                    live && select(j)
+                })
+                .map(|(idx, _)| idx)
+                .collect();
+            for idx in picked {
+                let id = inner.jobs[idx].id;
+                if inner.jobs[idx].state == TransferState::Active {
+                    active_n += 1;
+                    handles.extend(inner.active.remove(&id));
+                } else {
+                    pending_n += 1;
                 }
+                inner.set_state(idx, cancelled.clone());
+                ids.push(id);
             }
-            (active, pending)
-        };
-
-        let active_n = active_ids.len();
-        let pending_n = pending_ids.len();
-
-        for id in active_ids {
-            self.cancel(id);
+            inner.drop_old_finished();
         }
-        for id in pending_ids {
-            self.mark(id, TransferState::Failed("cancelled".into()));
+        for h in handles {
+            h.abort();
+        }
+        if !ids.is_empty() {
+            self.wake();
+        }
+        for id in ids {
+            let _ = self.events.send(TransferEvent::Failed {
+                id,
+                error: "cancelled".into(),
+            });
         }
         (active_n, pending_n)
     }
@@ -984,10 +1018,57 @@ mod tests {
         assert_eq!(m.job(running).unwrap().state, TransferState::Active);
         assert_eq!(m.cancel_all(), (1, 1));
         assert_eq!(m.job(done).unwrap().state, TransferState::Complete);
+        for id in [running, queued] {
+            assert_eq!(
+                m.job(id).unwrap().state,
+                TransferState::Failed("cancelled".into())
+            );
+        }
+    }
+
+    /// The dispatcher marks a job Active, then spawns its worker and
+    /// registers it. A cancel in between found no worker to stop: a single
+    /// cancel said the job "had already finished", and a batch cancel or a
+    /// disconnect left it running. It is now cancelled at once, and its
+    /// worker is stopped as it registers, before it does anything.
+    #[tokio::test]
+    async fn a_job_cancelled_before_its_worker_registers_never_runs() {
+        let (m, _rx) = TransferManager::new(1);
+        let id = m.enqueue_mkdir("/a".into()).unwrap();
+        m.take_next_pending();
+        assert!(m.cancel(id), "a started job can be cancelled");
         assert_eq!(
-            m.job(queued).unwrap().state,
+            m.job(id).unwrap().state,
             TransferState::Failed("cancelled".into())
         );
+
+        let worker = tokio::spawn(std::future::pending::<()>());
+        m.register_active(id, worker.abort_handle());
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert!(!m.deregister_active(id), "nothing is left registered");
+    }
+
+    /// Each cancelled job is reported once. A job that the dispatcher
+    /// claimed while a batch cancel was part way through used to be marked
+    /// cancelled while it kept running, and then reported again when it
+    /// finished.
+    #[test]
+    fn cancelling_reports_each_job_once() {
+        let (m, mut rx) = TransferManager::new(1);
+        for i in 0..3 {
+            m.enqueue_mkdir(format!("/d{i}")).unwrap();
+        }
+        m.take_next_pending();
+        while rx.try_recv().is_ok() {}
+        assert_eq!(m.cancel_all(), (1, 2));
+        let mut failed = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, TransferEvent::Failed { .. }) {
+                failed += 1;
+            }
+        }
+        assert_eq!(failed, 3);
+        assert!(m.take_next_pending().is_none(), "nothing left to start");
     }
 
     fn manager() -> TransferManager {

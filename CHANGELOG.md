@@ -51,6 +51,13 @@ the git history for those.
 
 ### Fixed
 
+- **Cancelling can't miss a transfer that is just starting.** Cancelling
+  a batch, or disconnecting, could catch a transfer the moment it started.
+  It was then marked cancelled but kept running, another transfer could be
+  queued onto the same file while it was still being written, and it was
+  reported twice. A transfer cancelled the instant it started was also
+  missed, and cancelling it said it "had already finished". All of these
+  are now stopped.
 - **Large batches can be resumed.** A batch of more than about 50,000
   files wrote a checkpoint bigger than blink would load, so neither the
   offer on connect nor `r` could resume it ("checkpoint file exceeds size
