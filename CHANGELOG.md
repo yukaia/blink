@@ -15,6 +15,11 @@ the git history for those.
   so two names can't look identical. Soft hyphens, word joiners, invisible
   operators, Unicode tag characters and the Hangul fillers slipped past
   that and now get the same treatment.
+- **Deleting a folder won't follow a symlink that replaced it.** A remote
+  folder you chose to delete, replaced by a symlink before you confirmed,
+  was emptied through the link: whatever it pointed at lost its files.
+  blink now checks the folder is still a real directory before deleting
+  it, and on SFTP every subfolder too, and stops with an error if not.
 - **Downloads don't write through a symlink planted under the partial's
   name.** A `.blink-part` file and its `.meta` sidecar have predictable
   names, so anyone who could write to the download directory could plant

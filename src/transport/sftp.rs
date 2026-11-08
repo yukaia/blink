@@ -742,6 +742,21 @@ impl SftpTransport {
             }
             match op {
                 Op::Visit(path) => {
+                    // Only descend into what is a directory *now*, by lstat.
+                    // The root's kind came from a listing the user may have
+                    // read minutes ago, and a subdirectory's from its
+                    // parent's listing; one swapped for a symlink since would
+                    // be followed by READDIR, emptying wherever it points.
+                    let attrs = self
+                        .sftp
+                        .symlink_metadata(&path)
+                        .await
+                        .map_err(|e| map_sftp("lstat", &path, e))?;
+                    if entry_kind(&attrs) != EntryKind::Directory {
+                        return Err(BlinkError::transport(format!(
+                            "{path} is no longer a directory — not deleted",
+                        )));
+                    }
                     let entries = self
                         .sftp
                         .read_dir(&path)
@@ -1814,6 +1829,13 @@ mod integration {
         (start.parse().unwrap()..end.parse().unwrap()).contains(&offset)
     }
 
+    /// Marks `path` as a symlink. The path's own entries (a `path/`
+    /// directory and what's under it) are what following the link finds;
+    /// only `lstat` sees the mark.
+    fn symlink_key(path: &str) -> String {
+        format!("\0symlink:{path}")
+    }
+
     fn ok_status(id: u32) -> Status {
         Status {
             id,
@@ -1979,6 +2001,24 @@ mod integration {
             }
             store.remove(&key);
             Ok(ok_status(id))
+        }
+
+        /// `stat` without following a symlink: a path marked with
+        /// [`symlink_key`] is a link, whatever `stat` makes of it.
+        async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+            if self.store.lock().await.contains_key(&symlink_key(&path)) {
+                return Ok(Attrs {
+                    id,
+                    attrs: FileAttributes {
+                        size: Some(0),
+                        permissions: Some(0o120_777),
+                        atime: Some(HARNESS_MTIME),
+                        mtime: Some(HARNESS_MTIME),
+                        ..Default::default()
+                    },
+                });
+            }
+            self.stat(id, path).await
         }
 
         async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
@@ -2291,6 +2331,25 @@ mod integration {
     /// behaviour is visible without a tree of `MAX_QUEUED_JOBS` entries;
     /// `a_recursive_delete_refuses_a_tree_wider_than_the_real_cap` pins that
     /// the production entry point supplies the real one.
+    #[tokio::test]
+    async fn a_recursive_delete_does_not_follow_a_directory_swapped_for_a_symlink() {
+        let store = tree_store().await;
+        store
+            .lock()
+            .await
+            .insert(symlink_key("/tree/sub"), Vec::new());
+        let (port, _) = start_server(Arc::clone(&store)).await;
+        let mut t = connect(port).await;
+
+        let err = t.delete_dir("/tree", true).await.unwrap_err();
+        assert!(err.to_string().contains("no longer a directory"), "{err}");
+        let files = store.lock().await;
+        assert!(
+            files.contains_key("/tree/sub/b.txt"),
+            "nothing behind the link is deleted"
+        );
+    }
+
     #[tokio::test]
     async fn a_recursive_delete_stops_once_pending_work_passes_the_cap() {
         let store = wide_store(4).await;

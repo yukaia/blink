@@ -648,6 +648,22 @@ pub async fn ftp_delete_dir_capped<T: TokioTlsStream + Send>(
         return timed_ftp("rmd", remote_path, stream.rmdir(remote_path)).await;
     }
 
+    // Only descend into what is a directory now. The user picked it from a
+    // listing that may be minutes old, and if it has since been swapped for
+    // a symlink, LIST would follow it and this would empty wherever it
+    // points. FTP has no lstat, so ask the parent's listing; doing that for
+    // every subdirectory too would double the LISTs, for a window of
+    // milliseconds between a directory's listing and its visit. A target
+    // the parent's listing can't show (the root, an unparsable line) is
+    // walked as before.
+    if let Some(entry) = ftp_metadata(stream, remote_path).await?
+        && entry.kind != EntryKind::Directory
+    {
+        return Err(BlinkError::transport(format!(
+            "{remote_path} is no longer a directory — not deleted",
+        )));
+    }
+
     enum Op {
         Visit(String),
         Remove(String),
@@ -1057,11 +1073,25 @@ mod integration {
             } else {
                 ("-rw-r--r--", bytes.len())
             };
+            // A marked path lists as a link; LIST of it still finds what's
+            // stored under it, as following a real link would.
+            if files.contains_key(&symlink_key(path.trim_end_matches('/'))) {
+                out.push_str(&format!(
+                    "lrwxrwxrwx 1 owner group {:>12} Nov 01 12:00 {trimmed} -> /elsewhere\r\n",
+                    10
+                ));
+                continue;
+            }
             out.push_str(&format!(
                 "{mode} 1 owner group {size:>12} Nov 01 12:00 {trimmed}\r\n"
             ));
         }
         out
+    }
+
+    /// Marks `path` as a symlink in the parent's listing. See `listing_for`.
+    fn symlink_key(path: &str) -> String {
+        format!("\0symlink:{path}")
     }
 
     fn test_session(port: u16) -> Session {
@@ -2088,6 +2118,19 @@ mod integration {
     /// exercised only `recursive: false`. The store shows *what* survived;
     /// only the log shows the order, and the order is the contract: `RMD` on
     /// a directory still holding entries draws a 550 from a real server.
+    #[tokio::test]
+    async fn a_recursive_delete_does_not_follow_a_directory_swapped_for_a_symlink() {
+        let store = tree_store().await;
+        store.lock().await.insert(symlink_key("/tree"), Vec::new());
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let err = transport.delete_dir("/tree", true).await.unwrap_err();
+        assert!(err.to_string().contains("no longer a directory"), "{err}");
+        assert!(store.lock().await.contains_key("/tree/sub/b.txt"));
+    }
+
     #[tokio::test]
     async fn a_recursive_delete_removes_a_nested_tree_bottom_up() {
         let store = tree_store().await;
