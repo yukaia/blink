@@ -546,10 +546,9 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
 
     // Only rename once the server confirmed the transfer; otherwise a
     // truncated response could leave a corrupted "complete" file in place.
-    tokio::fs::rename(&part, local_path)
+    super::finish_download(&part, local_path)
         .await
         .map_err(|e| BlinkError::transport(format!("rename {}: {e}", local_path.display())))?;
-    super::clear_part_meta(local_path).await;
 
     Ok(())
 }

@@ -76,7 +76,7 @@ fn part_name(name_bytes: &[u8], name: &str) -> String {
 /// - Resume code can identify the partial unambiguously (the bare final
 ///   filename never holds half a download).
 /// - On power loss after rename, the parent-directory fsync in
-///   [`crate::paths::sync_parent_dir`] guarantees the rename is durable.
+///   [`finish_download`] guarantees the rename is durable.
 pub(crate) fn part_path(local: &Path) -> PathBuf {
     let name = local.file_name().unwrap_or_default();
     local.with_file_name(part_name(name.as_encoded_bytes(), &name.to_string_lossy()))
@@ -339,6 +339,28 @@ async fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut raw = Vec::new();
     tokio::io::AsyncReadExt::read_to_end(&mut f, &mut raw).await?;
     Ok(raw)
+}
+
+/// Move a finished download's partial onto its final name, durably.
+///
+/// The partial is already fsynced; the rename is not durable until the
+/// folder holding it is synced too. Without that, a power cut could undo
+/// the rename after the checkpoint had recorded the job as done, and the
+/// resume would skip a file that never landed. A failed folder sync is
+/// logged rather than failing the job: the file is in place, and a retry
+/// would only fetch it again to the same state.
+pub(crate) async fn finish_download(part: &Path, local_path: &Path) -> std::io::Result<()> {
+    tokio::fs::rename(part, local_path).await?;
+    let synced_path = local_path.to_path_buf();
+    let synced =
+        tokio::task::spawn_blocking(move || crate::paths::sync_parent_dir(&synced_path)).await;
+    if !matches!(synced, Ok(Ok(()))) {
+        tracing::warn!(path = %local_path.display(), "could not sync the download's folder");
+    }
+    // The partial is gone; its provenance record has nothing left to
+    // describe.
+    clear_part_meta(local_path).await;
+    Ok(())
 }
 
 /// Drop the sidecar once the download has been renamed into place.

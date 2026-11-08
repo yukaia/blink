@@ -1315,10 +1315,7 @@ impl Transport for SftpTransport {
         local.flush().await?;
         local.sync_all().await?;
         drop(local);
-        tokio::fs::rename(&part, local_path).await?;
-        // The partial is gone; its provenance record has nothing left to
-        // describe.
-        super::clear_part_meta(local_path).await;
+        super::finish_download(&part, local_path).await?;
         Ok(())
     }
 

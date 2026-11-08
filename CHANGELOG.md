@@ -51,6 +51,10 @@ the git history for those.
 
 ### Fixed
 
+- **A finished download survives a power cut.** The file was renamed into
+  place without syncing its folder to disk, so a power cut could undo the
+  rename after the checkpoint had already recorded the file as done, and a
+  resume would skip it.
 - **Cancelling can't miss a transfer that is just starting.** Cancelling
   a batch, or disconnecting, could catch a transfer the moment it started.
   It was then marked cancelled but kept running, another transfer could be
