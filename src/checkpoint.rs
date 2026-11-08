@@ -370,12 +370,17 @@ impl Checkpoint {
         }
     }
 
+    /// Write any marks the debounce held back. For when the checkpoint is
+    /// about to be dropped: a held-back mark is otherwise written only by
+    /// the next mark, and after the last one there is none.
+    pub fn flush_if_dirty(&mut self) -> Result<()> {
+        if self.dirty { self.flush() } else { Ok(()) }
+    }
+
     /// Whether this checkpoint has changes that have not reached disk.
     ///
     /// Test-only: it exists so the debounce contract can be asserted — a
     /// coalesced mark leaves the checkpoint dirty, a written one does not.
-    /// Nothing in the running app needs to ask, so it isn't shipped; if a
-    /// use appears (an "unsaved" indicator, say), drop the `cfg`.
     #[cfg(test)]
     pub fn is_dirty(&self) -> bool {
         self.dirty

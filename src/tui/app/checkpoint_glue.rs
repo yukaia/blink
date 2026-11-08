@@ -74,6 +74,17 @@ impl App {
         }
     }
 
+    /// Write every checkpoint's held-back marks, before the checkpoints are
+    /// dropped (disconnect) or the process ends (quit). Without it, jobs
+    /// finished in the last debounce window were redone on resume.
+    pub(super) fn flush_checkpoints(&mut self) {
+        for cp in self.active_checkpoints.values_mut() {
+            if let Err(e) = cp.flush_if_dirty() {
+                tracing::warn!("checkpoint flush on exit failed: {e}");
+            }
+        }
+    }
+
     /// The session name and origin the connected session's checkpoints are
     /// keyed by — see [`crate::checkpoint`].
     fn checkpoint_key(&self) -> (String, String) {

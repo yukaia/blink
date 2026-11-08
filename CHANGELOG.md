@@ -79,6 +79,12 @@ the git history for those.
   but a panic in a background task doesn't end blink, which kept running
   in a terminal no longer set up for it. Only a crash of the interface
   itself restores the terminal now; a background one goes to the log.
+- **Quitting or disconnecting keeps the last moments of progress.**
+  Checkpoints are written at most every quarter second, and the last
+  write held back that way was dropped on quit or disconnect, so a resume
+  redid those files. It's written on the way out now.
+- **Cancelling a transfer that just finished says so**, instead of
+  logging that it was cancelled.
 - **The session list scrolls.** Sessions past the bottom of the terminal
   were never drawn, and the selection could move onto them out of sight.
   The list now follows the cursor, and a click selects the session drawn

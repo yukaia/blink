@@ -576,6 +576,7 @@ impl App {
         if let Some(d) = self.dispatcher.take() {
             d.shutdown().await;
         }
+        self.flush_checkpoints();
         self.pending_password = None;
 
         Ok(())
@@ -922,6 +923,7 @@ impl App {
         // `pending_offers` wholesale, so leaving a stale queue here is
         // harmless today, but clearing it removes the coupling on that
         // assignment always happening.
+        self.flush_checkpoints();
         self.active_checkpoints.clear();
         self.checkpoint_job_map.clear();
         // Their entries stay `pending` on disk, so the next connect offers to
@@ -1935,6 +1937,38 @@ mod tests {
         let mut a = app();
         a.show_next_offer();
         assert_eq!(a.screen, Screen::Main);
+    }
+
+    /// A mark the debounce held back reaches disk when the connection ends,
+    /// rather than being dropped with the in-memory checkpoint.
+    #[tokio::test]
+    async fn disconnecting_writes_marks_the_debounce_held_back() {
+        let (mut a, _cleanup) = checkpoint_app("flush-on-disconnect");
+        let name = a.current_session.as_ref().unwrap().name.clone();
+        let origin = crate::transport::origin_of(a.current_session.as_ref().unwrap());
+        let job = |path: &str| crate::checkpoint::CheckpointJob::Download {
+            remote_path: format!("/srv/{path}"),
+            local_path: std::path::PathBuf::from(format!("/tmp/blink-test-{path}")),
+            status: crate::checkpoint::JobStatus::Pending,
+        };
+        let mut cp = crate::checkpoint::Checkpoint::new(
+            &name,
+            &origin,
+            CheckpointKind::Download,
+            vec![job("a.bin"), job("b.bin")],
+        );
+        cp.flush().unwrap();
+        cp.mark_done(0);
+        cp.flush_if_due().unwrap();
+        assert!(cp.is_dirty(), "within the debounce window: held back");
+        a.active_checkpoints.insert(CheckpointKind::Download, cp);
+
+        a.disconnect();
+
+        let on_disk = crate::checkpoint::Checkpoint::load(&name, &origin, CheckpointKind::Download)
+            .unwrap()
+            .unwrap();
+        assert_eq!(on_disk.jobs[0].status(), crate::checkpoint::JobStatus::Done);
     }
 
     // -- answering the resume-checkpoint offer ------------------------------
