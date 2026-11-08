@@ -83,6 +83,24 @@ pub(crate) const MAX_QUEUED_JOBS: usize = 100_000;
 /// this many newer jobs could finish, so nothing still asks about one gone.
 const RETAINED_JOBS: usize = 4096;
 
+/// Pending jobs [`TransferManager::take_next_pending`] looks past when the
+/// ones ahead are waiting for a folder to be made. Bounds the scan, which
+/// runs under the lock the renderer takes every frame. The first pending job
+/// never waits on anything behind it, so a full window of waiting jobs only
+/// lowers parallelism until a mkdir finishes; it never stalls the queue.
+const CLAIM_LOOKAHEAD: usize = 256;
+
+/// `path` as a key for [`Inner::unfinished_dirs`]: without a trailing
+/// slash, and the root as `/`.
+fn dir_key(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() && path.starts_with('/') {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
 /// Why [`TransferManager`] refused to queue a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnqueueError {
@@ -174,6 +192,10 @@ struct Inner {
     /// [`MAX_QUEUED_JOBS`], except in tests of what happens past it.
     cap: usize,
     paused: bool,
+    /// Remote folders with a mkdir still Pending or Active, and the ids of
+    /// those jobs. A job that writes under one of them waits for every such
+    /// mkdir queued before it — see [`Inner::waits_on_mkdir`].
+    unfinished_dirs: HashMap<String, std::collections::BTreeSet<u64>>,
     /// Abort handles for currently-running worker tasks, keyed by job id.
     /// Populated by [`TransferManager::register_active`] (called from the
     /// dispatcher), removed on completion or cancellation.
@@ -185,6 +207,71 @@ impl Inner {
     fn index_of(&self, id: u64) -> Option<usize> {
         let idx = usize::try_from(id.checked_sub(self.first_id)?).ok()?;
         (idx < self.jobs.len()).then_some(idx)
+    }
+
+    /// Whether `job` writes under a remote folder whose mkdir, queued before
+    /// it, has not finished.
+    ///
+    /// A plan queues each folder's mkdir before what goes in it, but the
+    /// dispatcher starts jobs the moment a worker is free, so queue order
+    /// is only start order. An upload into a new folder ran alongside the
+    /// folder's mkdir on another connection and could reach the server
+    /// first; on SFTP it usually did, since mkdir takes two round trips to
+    /// the upload's one. Only mkdirs queued earlier count: one queued later
+    /// (another batch making the same folder) must not hold back work ahead
+    /// of it in the queue.
+    fn waits_on_mkdir(&self, job: &TransferJob) -> bool {
+        if job.direction == Direction::Download || self.unfinished_dirs.is_empty() {
+            return false;
+        }
+        let mut path = dir_key(&job.remote_path);
+        while let Some((parent, _)) = path.rsplit_once('/') {
+            let parent = if parent.is_empty() { "/" } else { parent };
+            if self
+                .unfinished_dirs
+                .get(parent)
+                .and_then(|ids| ids.first())
+                .is_some_and(|&first| first < job.id)
+            {
+                return true;
+            }
+            if parent == "/" {
+                break;
+            }
+            path = parent;
+        }
+        false
+    }
+
+    /// Move the job at `idx` to `state`, keeping the counts and sets that
+    /// follow job states in step. Every state change goes through here.
+    fn set_state(&mut self, idx: usize, state: TransferState) {
+        let j = &mut self.jobs[idx];
+        let was_pending = j.state == TransferState::Pending;
+        let was_live = matches!(j.state, TransferState::Pending | TransferState::Active);
+        let ends = matches!(state, TransferState::Complete | TransferState::Failed(_));
+        j.state = state;
+        let (id, direction) = (j.id, j.direction);
+        let key = destination_key(direction, &j.remote_path, &j.local_path);
+        let dir = dir_key(&j.remote_path).to_string();
+        if was_pending {
+            self.pending_count = self.pending_count.saturating_sub(1);
+        }
+        if was_live && ends {
+            // The job has stopped writing its destination; another may.
+            if let Some(key) = key {
+                self.in_flight.remove(&key);
+            }
+            // The folder is made, or failed to be: what waited on it may go.
+            if direction == Direction::CreateDir
+                && let Some(ids) = self.unfinished_dirs.get_mut(&dir)
+            {
+                ids.remove(&id);
+                if ids.is_empty() {
+                    self.unfinished_dirs.remove(&dir);
+                }
+            }
+        }
     }
 
     /// Drop finished jobs from the front past [`RETAINED_JOBS`]. Stops at
@@ -238,6 +325,7 @@ impl TransferManager {
             parallelism,
             cap,
             paused: false,
+            unfinished_dirs: HashMap::new(),
             active: HashMap::new(),
         }));
         let wake = Arc::new(tokio::sync::Notify::new());
@@ -400,6 +488,13 @@ impl TransferManager {
         }
         let id = inner.next_id;
         inner.next_id += 1;
+        if direction == Direction::CreateDir {
+            inner
+                .unfinished_dirs
+                .entry(dir_key(&remote_path).to_string())
+                .or_default()
+                .insert(id);
+        }
         let job = TransferJob {
             id,
             direction,
@@ -430,22 +525,8 @@ impl TransferManager {
         {
             let mut inner = self.inner.lock();
             if let Some(idx) = inner.index_of(id) {
-                let j = &mut inner.jobs[idx];
-                let was_pending = j.state == TransferState::Pending;
-                let was_live = matches!(j.state, TransferState::Pending | TransferState::Active);
                 let ends = matches!(state, TransferState::Complete | TransferState::Failed(_));
-                j.state = state.clone();
-                let key = destination_key(j.direction, &j.remote_path, &j.local_path);
-                if was_pending {
-                    inner.pending_count = inner.pending_count.saturating_sub(1);
-                }
-                // The job has stopped writing its destination; another may.
-                if was_live
-                    && ends
-                    && let Some(key) = key
-                {
-                    inner.in_flight.remove(&key);
-                }
+                inner.set_state(idx, state.clone());
                 if ends {
                     inner.drop_old_finished();
                 }
@@ -577,7 +658,9 @@ impl TransferManager {
 
     /// Atomically claim the first pending job for a worker: marks it `Active`,
     /// emits a `Started` event, and returns a clone. Returns `None` when the
-    /// queue holds nothing pending.
+    /// queue holds nothing pending, or nothing that can start yet: a job
+    /// waits while a folder it writes under is still being made (see
+    /// [`Inner::waits_on_mkdir`]).
     ///
     /// This is the single transition point from `Pending` → `Active`. Callers
     /// must NOT also call `mark(id, Active)` on the returned job — doing so
@@ -585,21 +668,33 @@ impl TransferManager {
     pub fn take_next_pending(&self) -> Option<TransferJob> {
         let cloned = {
             let mut inner = self.inner.lock();
-            // Find the index of the first pending job, then update state and
-            // pending_count in separate steps to satisfy the borrow checker.
-            let from = inner.first_pending;
-            let found = inner
-                .jobs
-                .range(from..)
-                .position(|j| j.state == TransferState::Pending)
-                .map(|i| from + i);
+            let mut first_seen = None;
+            let mut found = None;
+            let mut waiting = 0usize;
+            for (idx, j) in inner.jobs.iter().enumerate().skip(inner.first_pending) {
+                if j.state != TransferState::Pending {
+                    continue;
+                }
+                first_seen.get_or_insert(idx);
+                if !inner.waits_on_mkdir(j) {
+                    found = Some(idx);
+                    break;
+                }
+                waiting += 1;
+                if waiting >= CLAIM_LOOKAHEAD {
+                    break;
+                }
+            }
+            // The cursor stops at the first job still Pending, waiting or not.
             let Some(idx) = found else {
-                inner.first_pending = inner.jobs.len();
+                inner.first_pending = first_seen.unwrap_or(inner.jobs.len());
                 return None;
             };
-            inner.first_pending = idx + 1;
-            inner.jobs[idx].state = TransferState::Active;
-            inner.pending_count = inner.pending_count.saturating_sub(1);
+            inner.first_pending = match first_seen {
+                Some(first) if first < idx => first,
+                _ => idx + 1,
+            };
+            inner.set_state(idx, TransferState::Active);
             inner.jobs[idx].clone()
         };
         let _ = self.events.send(TransferEvent::Started(cloned.id));
@@ -760,6 +855,89 @@ mod tests {
         assert!(m.take_next_pending().is_none());
         let d = m.enqueue_mkdir("/d".into()).unwrap();
         assert_eq!(m.take_next_pending().unwrap().id, d, "a job queued later");
+        assert!(m.take_next_pending().is_none());
+    }
+
+    /// A recursive upload queues each folder's mkdir ahead of what goes in
+    /// it, but queue order is only start order: with two or more workers,
+    /// an upload into a folder ran alongside the folder's mkdir and could
+    /// reach the server first, failing with "no such file". It now waits.
+    #[test]
+    fn an_upload_waits_for_its_folders_mkdir() {
+        let (m, _rx) = TransferManager::new(2);
+        let dir = m.enqueue_mkdir("/up/a".into()).unwrap();
+        let file = m.enqueue_upload("/l/f".into(), "/up/a/f".into()).unwrap();
+        assert_eq!(m.take_next_pending().unwrap().id, dir);
+        assert!(
+            m.take_next_pending().is_none(),
+            "the upload must not start while its folder is being made"
+        );
+        m.mark(dir, TransferState::Complete);
+        assert_eq!(m.take_next_pending().unwrap().id, file);
+    }
+
+    /// Deeper folders wait for every folder above them, queued or running.
+    #[test]
+    fn a_folder_waits_for_the_folders_above_it() {
+        let (m, _rx) = TransferManager::new(3);
+        let top = m.enqueue_mkdir("/up".into()).unwrap();
+        let mid = m.enqueue_mkdir("/up/a".into()).unwrap();
+        let deep = m.enqueue_upload("/l/f".into(), "/up/a/b/f".into()).unwrap();
+        assert_eq!(m.take_next_pending().unwrap().id, top);
+        assert!(m.take_next_pending().is_none());
+        m.mark(top, TransferState::Complete);
+        assert_eq!(m.take_next_pending().unwrap().id, mid);
+        assert!(m.take_next_pending().is_none(), "/up/a is still being made");
+        // A failed mkdir releases what waits on it: the job then fails on
+        // its own, with the server's reason, rather than waiting forever.
+        m.mark(mid, TransferState::Failed("denied".into()));
+        assert_eq!(m.take_next_pending().unwrap().id, deep);
+    }
+
+    /// A second batch making the same folder queues its mkdir behind the
+    /// first batch's remaining files. They must not wait for it: past the
+    /// claim lookahead, nothing could reach that mkdir, and the queue would
+    /// stall for good.
+    #[test]
+    fn a_later_mkdir_of_the_same_folder_holds_nothing_back() {
+        let (m, _rx) = TransferManager::new(1);
+        let first = m.enqueue_mkdir("/up".into()).unwrap();
+        let files: Vec<u64> = (0..CLAIM_LOOKAHEAD + 1)
+            .map(|i| {
+                m.enqueue_upload(format!("/l/{i}").into(), format!("/up/{i}"))
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(m.take_next_pending().unwrap().id, first);
+        m.mark(first, TransferState::Complete);
+        let again = m.enqueue_mkdir("/up".into()).unwrap();
+        for id in files {
+            let j = m.take_next_pending().expect("the earlier files go first");
+            assert_eq!(j.id, id);
+            m.mark(id, TransferState::Complete);
+        }
+        assert_eq!(m.take_next_pending().unwrap().id, again);
+    }
+
+    /// Only jobs under an unfinished mkdir wait; the rest pass them, and
+    /// the waiting ones are still claimed, in order, once free.
+    #[test]
+    fn jobs_elsewhere_pass_the_ones_that_wait() {
+        let (m, _rx) = TransferManager::new(4);
+        let dir = m.enqueue_mkdir("/up/a".into()).unwrap();
+        let held = m.enqueue_upload("/l/1".into(), "/up/a/1".into()).unwrap();
+        let other = m.enqueue_upload("/l/2".into(), "/up/b/2".into()).unwrap();
+        let download = m.enqueue_download("/up/a/3".into(), "/l/3".into()).unwrap();
+        assert_eq!(m.take_next_pending().unwrap().id, dir);
+        assert_eq!(m.take_next_pending().unwrap().id, other);
+        assert_eq!(
+            m.take_next_pending().unwrap().id,
+            download,
+            "a download writes locally and waits for no remote mkdir",
+        );
+        assert!(m.take_next_pending().is_none());
+        m.mark(dir, TransferState::Complete);
+        assert_eq!(m.take_next_pending().unwrap().id, held);
         assert!(m.take_next_pending().is_none());
     }
 

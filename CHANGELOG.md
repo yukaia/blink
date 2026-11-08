@@ -51,6 +51,12 @@ the git history for those.
 
 ### Fixed
 
+- **Recursive uploads no longer fail on folders that aren't made yet.**
+  A folder's mkdir is queued before the files that go in it, but with two
+  or more parallel transfers (the default is two) they ran at the same
+  time on different connections, and an upload often reached the server
+  first and failed with "no such file". Nested folders could fail the same
+  way. Uploads and mkdirs now wait for the folders above them.
 - **Large SFTP batches no longer fail as lost connections on a slow
   link.** Each SFTP connection keeps 16 reads queued, and the SFTP library
   gives every read 10 seconds counted from when it is sent, including its
