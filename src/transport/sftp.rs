@@ -461,6 +461,65 @@ const CHANNEL_WINDOW: u32 = 16 * 1024 * 1024;
 const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 const KEEPALIVE_MAX: usize = 3;
 
+/// How long a transfer may go without a reply before it counts as lost: a
+/// minute, as FTP's data connection gets.
+///
+/// This measures silence, not how long one request takes. russh-sftp's own
+/// per-request limit starts its clock when a request is sent, and the
+/// pipeline keeps [`TRANSFER_CONCURRENCY`] of them queued. On a slow link a
+/// request can wait in line longer than any fixed limit while data arrives
+/// the whole time, so that limit is raised out of the way (see
+/// [`transfer_request_timeout`]) and this one guards every call instead.
+const SFTP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// [`SFTP_IDLE_TIMEOUT`], except where a test has shortened it for its own
+/// thread, as FTP's `op_timeout` does.
+#[cfg(not(test))]
+fn idle_timeout() -> std::time::Duration {
+    SFTP_IDLE_TIMEOUT
+}
+
+#[cfg(test)]
+thread_local! {
+    static IDLE_TIMEOUT: std::cell::Cell<std::time::Duration> =
+        const { std::cell::Cell::new(SFTP_IDLE_TIMEOUT) };
+}
+
+#[cfg(test)]
+fn idle_timeout() -> std::time::Duration {
+    IDLE_TIMEOUT.get()
+}
+
+/// russh-sftp's per-request limit for the transfer session, in seconds.
+///
+/// A request waits behind at most [`TRANSFER_CONCURRENCY`] others, and each
+/// of those finishes within [`idle_timeout`] of the one before or the
+/// transfer has already failed. So a request still waiting after that many
+/// idle periods is past anything a working connection does, and this limit
+/// never decides a live transfer.
+fn transfer_request_timeout() -> u64 {
+    let periods = TRANSFER_CONCURRENCY as u32 + 1;
+    (idle_timeout() * periods).as_secs().max(1)
+}
+
+/// Run one transfer request under [`idle_timeout`]. Silence past it reads as
+/// a lost connection, since the transfer's state is then unknown: the
+/// dispatcher closes the connection after a failed job rather than pooling
+/// it.
+async fn within_idle<T>(
+    op: &str,
+    path: &str,
+    fut: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let idle = idle_timeout();
+    tokio::time::timeout(idle, fut).await.unwrap_or_else(|_| {
+        Err(BlinkError::disconnected(format!(
+            "{op} {path}: no reply for {}s",
+            idle.as_secs_f32(),
+        )))
+    })
+}
+
 /// Load the private key at `path`, with `passphrase` if one was given.
 ///
 /// [`BlinkError::KeyNeedsPassphrase`] when the key is encrypted and either
@@ -693,6 +752,9 @@ impl SftpTransport {
                 }
                 raw.set_limits(limits);
             }
+            // Only once the session is up: until then the default limit
+            // bounds the handshake, which nothing else does.
+            raw.set_timeout(transfer_request_timeout());
 
             self.transfer = Some(Transfer {
                 raw: Arc::new(raw),
@@ -928,7 +990,9 @@ async fn pipelined_download(
             })
             .buffered(concurrency);
 
-        while let Some(chunk) = stream.next().await {
+        while let Some(chunk) =
+            within_idle("read", label, async { Ok(stream.next().await) }).await?
+        {
             let (off, data) = chunk?;
             if data.is_empty() {
                 break;
@@ -959,7 +1023,12 @@ async fn pipelined_download(
     // would otherwise be silently truncated, and this is the whole transfer
     // when the size was unknown. Usually a single read that returns EOF.
     loop {
-        let data = read_full(raw, handle, label, done, chunk as u32).await?;
+        let data = within_idle(
+            "read",
+            label,
+            read_full(raw, handle, label, done, chunk as u32),
+        )
+        .await?;
         if data.is_empty() {
             break;
         }
@@ -1015,6 +1084,21 @@ async fn read_local_full<R: tokio::io::AsyncRead + Unpin>(
 /// "old file present" or "old file gone, complete new file at `part`" —
 /// never a truncated file under the final name.
 async fn finalize_remote_rename(
+    raw: &RawSftpSession,
+    posix_rename: bool,
+    part: &str,
+    dest: &str,
+) -> Result<()> {
+    within_idle(
+        "rename",
+        dest,
+        finalize_remote_rename_unbounded(raw, posix_rename, part, dest),
+    )
+    .await
+}
+
+/// [`finalize_remote_rename`] without its deadline.
+async fn finalize_remote_rename_unbounded(
     raw: &RawSftpSession,
     posix_rename: bool,
     part: &str,
@@ -1094,7 +1178,7 @@ async fn pipelined_upload(
             });
         }
 
-        if let Some(res) = inflight.next().await {
+        if let Some(res) = within_idle("write", label, async { Ok(inflight.next().await) }).await? {
             done += res?;
             if let Some(tx) = progress {
                 let _ = tx.send(ProgressUpdate {
@@ -1162,18 +1246,24 @@ impl Transport for SftpTransport {
         let raw = Arc::clone(&xfer.raw);
         let read_chunk = xfer.read_chunk;
 
-        let remote_handle = raw
-            .open(remote_path, OpenFlags::READ, FileAttributes::default())
-            .await
-            .map_err(|e| map_sftp("open", remote_path, e))?
-            .handle;
+        let remote_handle = within_idle("open", remote_path, async {
+            raw.open(remote_path, OpenFlags::READ, FileAttributes::default())
+                .await
+                .map_err(|e| map_sftp("open", remote_path, e))
+        })
+        .await?
+        .handle;
 
         // Everything that can fail while the remote file is open runs in
         // here, so the handle is closed on every path out: a local error
         // (resolving the partial, creating the folder, opening the file)
         // used to return early and leave it open on the server.
         let result: Result<tokio::fs::File> = async {
-            let attrs = raw.fstat(&remote_handle).await.ok().map(|a| a.attrs);
+            let attrs = tokio::time::timeout(idle_timeout(), raw.fstat(&remote_handle))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .map(|a| a.attrs);
             let reported_size = attrs.as_ref().and_then(|a| a.size);
             let stamp = super::RemoteStamp {
                 size: reported_size,
@@ -1215,7 +1305,7 @@ impl Transport for SftpTransport {
             Ok(local)
         }
         .await;
-        let _ = raw.close(&remote_handle).await;
+        let _ = tokio::time::timeout(idle_timeout(), raw.close(&remote_handle)).await;
         let mut local = result?;
 
         // Flush + fsync the partial so its bytes are durable, then atomically
@@ -1253,15 +1343,17 @@ impl Transport for SftpTransport {
         // under the destination name.
         let part = super::remote_part_path(remote_path);
 
-        let remote_handle = raw
-            .open(
+        let remote_handle = within_idle("open", &part, async {
+            raw.open(
                 &part,
                 OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
                 FileAttributes::default(),
             )
             .await
-            .map_err(|e| map_sftp("open", &part, e))?
-            .handle;
+            .map_err(|e| map_sftp("open", &part, e))
+        })
+        .await?
+        .handle;
 
         let result = pipelined_upload(
             &raw,
@@ -1278,9 +1370,9 @@ impl Transport for SftpTransport {
         // Durably flush before closing, but only when the server advertised
         // fsync support — otherwise the extended request is just rejected.
         if result.is_ok() && do_fsync {
-            let _ = raw.fsync(&remote_handle).await;
+            let _ = tokio::time::timeout(idle_timeout(), raw.fsync(&remote_handle)).await;
         }
-        let _ = raw.close(&remote_handle).await;
+        let _ = tokio::time::timeout(idle_timeout(), raw.close(&remote_handle)).await;
 
         match result {
             Ok(()) => finalize_remote_rename(&raw, posix_rename, &part, remote_path).await,
@@ -1288,7 +1380,7 @@ impl Transport for SftpTransport {
                 // Uploads don't resume, so a partial has no future value —
                 // remove it best-effort so failed uploads don't litter the
                 // server. (Pointless on Disconnected, harmless to try.)
-                let _ = raw.remove(&part).await;
+                let _ = tokio::time::timeout(idle_timeout(), raw.remove(&part)).await;
                 Err(e)
             }
         }
@@ -1838,6 +1930,24 @@ mod integration {
         (start.parse().unwrap()..end.parse().unwrap()).contains(&offset)
     }
 
+    /// Fault: every read and write reply waits this many milliseconds,
+    /// stored as decimal text. The server answers one request at a time, so
+    /// requests queued behind others wait for all of theirs: a slow link,
+    /// as one connection of several sharing it sees. A huge value is a
+    /// server that has stopped answering.
+    const IO_DELAY_KEY: &str = "\0io-delay-ms";
+
+    async fn io_delay(store: &Store) {
+        let ms = store
+            .lock()
+            .await
+            .get(IO_DELAY_KEY)
+            .map(|v| String::from_utf8_lossy(v).parse::<u64>().unwrap());
+        if let Some(ms) = ms {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+    }
+
     /// Marks `path` as a symlink. The path's own entries (a `path/`
     /// directory and what's under it) are what following the link finds;
     /// only `lstat` sees the mark.
@@ -1908,6 +2018,7 @@ mod integration {
             offset: u64,
             len: u32,
         ) -> Result<Data, Self::Error> {
+            io_delay(&self.store).await;
             let store = self.store.lock().await;
             let content = store.get(&handle).ok_or(StatusCode::NoSuchFile)?;
             let off = offset as usize;
@@ -1930,6 +2041,7 @@ mod integration {
             offset: u64,
             data: Vec<u8>,
         ) -> Result<Status, Self::Error> {
+            io_delay(&self.store).await;
             let mut store = self.store.lock().await;
             let content = store.get_mut(&handle).ok_or(StatusCode::NoSuchFile)?;
             let off = offset as usize;
@@ -2750,6 +2862,119 @@ mod integration {
         assert!(
             !store.lock().await.contains_key(&open_handle_key("/f.bin")),
             "the remote handle must be closed"
+        );
+    }
+
+    /// A download on a slow connection completes when its reads wait in
+    /// line longer than the deadline, as long as one of them finishes inside
+    /// it.
+    ///
+    /// The pipeline keeps 16 reads queued, so the last one waits for the 15
+    /// ahead of it. With several downloads sharing a link, that wait passed
+    /// russh-sftp's 10 s per-request limit, which starts when a request is
+    /// sent. The read then failed as a lost connection, and the job failed
+    /// with its partial left on disk. Here each reply takes 100 ms, so the
+    /// last read of the first round waits about 1.6 s against a 1 s deadline.
+    #[tokio::test]
+    async fn a_slow_download_whose_reads_queue_past_the_deadline_completes() {
+        super::IDLE_TIMEOUT.set(std::time::Duration::from_secs(1));
+        let payload = pseudo_random(16 * SHORT_READ);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/slow.bin".to_string(), payload.clone());
+            files.insert(IO_DELAY_KEY.to_string(), b"100".to_vec());
+        }
+        let (port, _connects) = start_server(store).await;
+        let mut transport = connect(port).await;
+        let raw = Arc::clone(&transport.transfer_session().await.unwrap().raw);
+        let handle = raw
+            .open("/slow.bin", OpenFlags::READ, FileAttributes::default())
+            .await
+            .unwrap()
+            .handle;
+        let home = crate::paths::test_home();
+        let path = home.path().join("slow.bin");
+        let mut local = tokio::fs::File::create(&path).await.unwrap();
+
+        // One reply per read, so the queue is the 16 reads and nothing else.
+        with_timeout(
+            super::pipelined_download(
+                &raw,
+                &handle,
+                "/slow.bin",
+                0,
+                Some(payload.len() as u64),
+                SHORT_READ,
+                super::TRANSFER_CONCURRENCY,
+                &mut local,
+                payload.len() as u64,
+                &None,
+            ),
+            "slow download",
+        )
+        .await
+        .expect("reads waiting their turn are not a stalled connection");
+        drop(local);
+        assert!(std::fs::read(&path).unwrap() == payload, "bytes mismatch");
+    }
+
+    /// A server that stops answering fails the download after the idle
+    /// deadline, and fails it as a lost connection, so the dispatcher
+    /// closes it rather than pooling it.
+    #[tokio::test]
+    async fn a_download_from_a_server_that_stops_answering_fails() {
+        super::IDLE_TIMEOUT.set(std::time::Duration::from_millis(500));
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/f.bin".to_string(), pseudo_random(SHORT_READ));
+            files.insert(IO_DELAY_KEY.to_string(), b"3600000".to_vec());
+        }
+        let (port, _connects) = start_server(store).await;
+        let mut transport = connect(port).await;
+        let home = crate::paths::test_home();
+
+        // Well under russh-sftp's own 10 s limit, which is what ended a
+        // stall before.
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            transport.download("/f.bin", &home.path().join("f.bin"), None),
+        )
+        .await
+        .expect("a stalled download must fail after the idle deadline")
+        .expect_err("and must not succeed");
+        assert!(
+            matches!(err, crate::error::BlinkError::Disconnected(_)),
+            "{err:?}"
+        );
+    }
+
+    /// As above, for an upload.
+    #[tokio::test]
+    async fn an_upload_to_a_server_that_stops_answering_fails() {
+        super::IDLE_TIMEOUT.set(std::time::Duration::from_millis(500));
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert(IO_DELAY_KEY.to_string(), b"3600000".to_vec());
+        let (port, _connects) = start_server(store).await;
+        let mut transport = connect(port).await;
+        let home = crate::paths::test_home();
+        let src = home.path().join("up.bin");
+        std::fs::write(&src, pseudo_random(SHORT_READ)).unwrap();
+
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            transport.upload(&src, "/up.bin", None),
+        )
+        .await
+        .expect("a stalled upload must fail after the idle deadline")
+        .expect_err("and must not succeed");
+        assert!(
+            matches!(err, crate::error::BlinkError::Disconnected(_)),
+            "{err:?}"
         );
     }
 
