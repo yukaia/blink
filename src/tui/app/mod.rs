@@ -1715,6 +1715,36 @@ mod tests {
         assert!(!a.checkpoint_job_map.contains_key(&id), "this one is");
     }
 
+    /// A job can finish while its cancel confirmation is open; confirming
+    /// then cancels nothing, and must not say it did.
+    #[test]
+    fn confirming_a_cancel_after_the_job_finished_says_so() {
+        let mut a = app_with_manager();
+        let m = a.transfer_manager.as_ref().unwrap().clone();
+        let id = m
+            .enqueue_download("/r/a.bin".into(), "/l/a.bin".into())
+            .unwrap();
+        m.take_next_pending();
+        m.mark(id, crate::transfer::TransferState::Complete);
+        a.checkpoint_job_map
+            .insert(id, (CheckpointKind::Download, 0));
+        a.pending_cancel = Some(crate::tui::state::PendingCancel::Single {
+            id,
+            name: "a.bin".into(),
+        });
+        a.previous_screen = Screen::Main;
+        a.screen = Screen::ConfirmCancel;
+
+        a.handle_key(press(KeyCode::Char('y')));
+
+        assert!(logged(&a, "a.bin had already finished"));
+        assert!(!logged(&a, "cancelled: a.bin"));
+        assert!(
+            a.checkpoint_job_map.contains_key(&id),
+            "its events settle it"
+        );
+    }
+
     /// The disconnect confirmation says in-flight transfers are cancelled;
     /// shutting the dispatcher down alone left them running.
     #[tokio::test]

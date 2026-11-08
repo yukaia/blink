@@ -430,14 +430,23 @@ impl App {
                     if let Some(manager) = &self.transfer_manager {
                         match pc {
                             PendingCancel::Single { id, name } => {
-                                manager.cancel(id);
-                                self.push_log(LogLevel::Warn, format!("cancelled: {name}"));
-                                // Remove this job from the checkpoint map so a
-                                // subsequent resume re-queues it (it was never
-                                // completed, so it must not be skipped). The
-                                // checkpoint file itself is kept — the rest of
-                                // the batch can still complete and be tracked.
-                                self.checkpoint_job_map.remove(&id);
+                                // It may have finished while the question
+                                // was open; then there is nothing to cancel,
+                                // and its own events do the bookkeeping.
+                                if !manager.cancel(id) {
+                                    self.push_log(
+                                        LogLevel::Info,
+                                        format!("{name} had already finished"),
+                                    );
+                                } else {
+                                    self.push_log(LogLevel::Warn, format!("cancelled: {name}"));
+                                    // Remove this job from the checkpoint map so a
+                                    // subsequent resume re-queues it (it was never
+                                    // completed, so it must not be skipped). The
+                                    // checkpoint file itself is kept — the rest of
+                                    // the batch can still complete and be tracked.
+                                    self.checkpoint_job_map.remove(&id);
+                                }
                             }
                             PendingCancel::Batch { batch_id, .. } => {
                                 // Collect before cancelling: the ids are what

@@ -593,12 +593,17 @@ impl TransferManager {
     /// No-op if the id isn't currently running.
     ///
     /// Cancellation may leave a partial file on disk for downloads in flight.
-    pub fn cancel(&self, id: u64) {
+    ///
+    /// Returns whether it cancelled anything: `false` when the job had
+    /// already finished (the user may have confirmed after it did).
+    pub fn cancel(&self, id: u64) -> bool {
         let handle = self.inner.lock().active.remove(&id);
-        if let Some(h) = handle {
-            h.abort();
-            self.mark(id, TransferState::Failed("cancelled".into()));
-        }
+        let Some(h) = handle else {
+            return false;
+        };
+        h.abort();
+        self.mark(id, TransferState::Failed("cancelled".into()));
+        true
     }
 
     /// Cancel every Active and Pending job sharing `batch_id`. Returns
