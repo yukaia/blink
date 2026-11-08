@@ -288,6 +288,7 @@ dependencies = [
  "russh",
  "russh-sftp",
  "rust-ini",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.1",

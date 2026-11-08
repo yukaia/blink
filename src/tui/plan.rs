@@ -227,6 +227,18 @@ pub async fn walk_remote(
             )));
         }
 
+        // In a download directory other users can write to (`/tmp`, a
+        // shared drop folder), one of them could plant a symlink under the
+        // name of a folder this walk creates, and every file below it would
+        // land wherever it points. The user's own symlinks are left alone:
+        // pointing a folder at another disk is a reasonable thing to do.
+        if foreign_symlink(&local_dir).await {
+            return Err(BlinkError::transport(format!(
+                "{} is a symlink owned by another user — not downloading into it",
+                local_dir.display()
+            )));
+        }
+
         // Ensure the local dir exists ahead of file writes. (The download
         // worker also does create_dir_all on the parent, but doing it here
         // means an empty remote dir still produces a real local dir.)
@@ -317,6 +329,34 @@ pub async fn walk_remote(
         unencodable_skipped: 0,
         unsafe_skipped,
     })
+}
+
+/// Whether `path` is a symlink some other user owns. See [`walk_remote`].
+///
+/// Windows needs privilege to create symlinks, so there it is never one.
+async fn foreign_symlink(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        tokio::fs::symlink_metadata(path).await.is_ok_and(|m| {
+            owned_by_another(
+                m.file_type().is_symlink(),
+                m.uid(),
+                rustix::process::geteuid().as_raw(),
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// The rule [`foreign_symlink`] applies, apart from the lookups.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn owned_by_another(is_symlink: bool, owner: u32, me: u32) -> bool {
+    is_symlink && owner != me
 }
 
 /// Walk a local subtree rooted at `local_root` and produce a flat plan of
@@ -798,6 +838,54 @@ mod tests {
         assert_eq!(result.symlinks_skipped, 0);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn only_another_users_symlink_is_refused() {
+        assert!(owned_by_another(true, 1001, 1000));
+        assert!(!owned_by_another(true, 1000, 1000), "the user's own link");
+        assert!(!owned_by_another(false, 1001, 1000), "a real directory");
+    }
+
+    /// Pointing a folder at another disk is the user's call: a walk into
+    /// their own symlinked folder still works.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn walk_remote_downloads_into_the_users_own_symlinked_folder() {
+        let base = scratch("own-link");
+        let elsewhere = scratch("own-link-target");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let link = base.join("dest");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+
+        walk_remote(&shared(EmptyDirTree { fan_out: 0 }), "/", &link)
+            .await
+            .expect("the user's own link is theirs to use");
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    /// A symlink someone else owns is refused, before anything is written.
+    /// Uses a link root already owns (`/bin` → `usr/bin` on merged-/usr
+    /// systems), since a test can't make one for another user; skipped
+    /// where there is none, or when run as root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn walk_remote_refuses_another_users_symlinked_folder() {
+        use std::os::unix::fs::MetadataExt as _;
+        let link = Path::new("/bin");
+        let me = rustix::process::geteuid().as_raw();
+        match std::fs::symlink_metadata(link) {
+            Ok(m) if m.file_type().is_symlink() && m.uid() != me => {}
+            _ => return,
+        }
+
+        let err = walk_remote(&shared(EmptyDirTree { fan_out: 0 }), "/", link)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("owned by another user"), "{err}");
     }
 
     // -- raw vs. display names ---------------------------------------------

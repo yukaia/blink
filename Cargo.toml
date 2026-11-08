@@ -78,6 +78,9 @@ parking_lot = "0.12"
 # `O_NOFOLLOW` for opening partial downloads; see `transport::open_part`.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# A safe `geteuid`, for telling the user's own symlinks from planted ones;
+# see `plan::foreign_symlink`. Already in the graph through crossterm.
+rustix = { version = "1", default-features = false, features = ["process"] }
 
 [profile.release]
 lto = "thin"

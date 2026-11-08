@@ -20,6 +20,12 @@ the git history for those.
   was emptied through the link: whatever it pointed at lost its files.
   blink now checks the folder is still a real directory before deleting
   it, and on SFTP every subfolder too, and stops with an error if not.
+- **Folder downloads don't follow a symlink another user planted.** The
+  fix above for partial files didn't cover the folders a recursive
+  download creates: in a download directory other users can write to, a
+  symlink planted under a folder's name sent every file below it wherever
+  it pointed. blink now refuses to download into a symlinked folder that
+  another user owns. Your own symlinks still work.
 - **Downloads don't write through a symlink planted under the partial's
   name.** A `.blink-part` file and its `.meta` sidecar have predictable
   names, so anyone who could write to the download directory could plant
