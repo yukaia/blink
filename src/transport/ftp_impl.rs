@@ -305,6 +305,27 @@ where
     }
 }
 
+/// Run one data-connection read or write under the idle deadline: it fails
+/// only when nothing moves for [`op_timeout`], however long the whole
+/// transfer takes. A stall reads as a disconnect, since the transfer's
+/// state is then unknown; the dispatcher closes the connection after a
+/// failed job, and the browsing connection reopens before its next use.
+async fn data_io<T>(
+    op: &str,
+    path: &str,
+    fut: impl std::future::Future<Output = std::io::Result<T>>,
+) -> Result<T> {
+    let idle = op_timeout();
+    match tokio::time::timeout(idle, fut).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(BlinkError::transport(format!("{op} {path}: {e}"))),
+        Err(_) => Err(BlinkError::disconnected(format!(
+            "{op} {path}: no data for {}s",
+            idle.as_secs(),
+        ))),
+    }
+}
+
 pub async fn ftp_list<T: TokioTlsStream + Send>(
     stream: &mut ImplAsyncFtpStream<T>,
     remote_path: &str,
@@ -436,10 +457,9 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     let mut buf = vec![0u8; 64 * 1024];
     let mut done: u64 = offset;
     loop {
-        let n = reader
-            .read(&mut buf)
-            .await
-            .map_err(|e| BlinkError::transport(format!("read {remote_path}: {e}")))?;
+        // Idle deadline, as the preview has: without it a data connection
+        // that goes quiet without closing held this worker forever.
+        let n = data_io("read", remote_path, reader.read(&mut buf)).await?;
         if n == 0 {
             break;
         }
@@ -529,10 +549,9 @@ pub async fn ftp_upload<T: TokioTlsStream + Send>(
         if n == 0 {
             break;
         }
-        writer
-            .write_all(&buf[..n])
-            .await
-            .map_err(|e| BlinkError::transport(format!("write: {e}")))?;
+        // Idle deadline: a server that stops reading fills the socket
+        // buffers, and the write then waits for as long as it keeps quiet.
+        data_io("write", &part, writer.write_all(&buf[..n])).await?;
         done += n as u64;
         if let Some(tx) = &progress {
             let _ = tx.send(ProgressUpdate {
@@ -541,10 +560,7 @@ pub async fn ftp_upload<T: TokioTlsStream + Send>(
             });
         }
     }
-    writer
-        .flush()
-        .await
-        .map_err(|e| BlinkError::transport(format!("flush: {e}")))?;
+    data_io("flush", &part, writer.flush()).await?;
     // As in `ftp_download`: early returns above drop `writer` unfinished,
     // which is safe because a failed job's connection is never reused.
     timed_ftp("finalize put", &part, writer.finish()).await?;
@@ -775,22 +791,10 @@ pub async fn ftp_read_to_bytes<T: TokioTlsStream + Send + 'static>(
     // stall reads as a disconnect, since the transfer's state is then
     // unknown and the connection is reopened before its next use.
     let mut reader = timed_ftp("retr", remote_path, stream.retr_as_stream(remote_path)).await?;
-    let idle = op_timeout();
     let mut buf = Vec::new();
     let mut chunk = vec![0u8; 64 * 1024];
     loop {
-        let n = match tokio::time::timeout(idle, reader.read(&mut chunk)).await {
-            Ok(Ok(n)) => n,
-            Ok(Err(e)) => {
-                return Err(BlinkError::transport(format!("read {remote_path}: {e}")));
-            }
-            Err(_) => {
-                return Err(BlinkError::disconnected(format!(
-                    "retr {remote_path}: no data for {}s",
-                    idle.as_secs(),
-                )));
-            }
-        };
+        let n = data_io("read", remote_path, reader.read(&mut chunk)).await?;
         if n == 0 {
             break;
         }
@@ -965,6 +969,9 @@ mod integration {
         /// connection open and sends nothing more, and no reply. Taken as it
         /// fires, so a reconnect finds a working server.
         pub stall_next_data_after: Arc<std::sync::Mutex<Option<usize>>>,
+        /// In STOR, accept the data connection and never read from it, so
+        /// the client's writes stall once the socket buffers fill.
+        pub stall_stor: bool,
     }
 
     /// Length of the `oversized_greeting` fault's greeting: 32 times the
@@ -1279,6 +1286,10 @@ mod integration {
                     let (mut data, _) = data_listener.accept().await?;
                     if faults.abrupt_close {
                         return Ok(());
+                    }
+                    if faults.stall_stor {
+                        // Hold `data` open, unread, for good.
+                        std::future::pending::<()>().await;
                     }
                     let mut buf = Vec::new();
                     data.read_to_end(&mut buf).await?;
@@ -2529,6 +2540,52 @@ mod integration {
 
     /// Data that stops arriving still fails, one deadline after the last
     /// byte, and the connection reconnects for what comes next.
+    #[tokio::test]
+    async fn a_download_whose_data_stalls_fails_instead_of_hanging() {
+        super::OP_TIMEOUT.set(std::time::Duration::from_millis(400));
+        let faults = Faults::default();
+        *faults.stall_next_data_after.lock().unwrap() = Some(8);
+        let (port, _connects, _log) = start_server(reconnect_store().await, faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+        let local = tempdir_for_test("stalled-download").join("stall.bin");
+
+        let err = with_timeout(
+            transport.download("/stall.bin", &local, None),
+            "stalled data",
+        )
+        .await
+        .expect_err("data that stops must fail the download");
+        assert!(
+            matches!(err, crate::error::BlinkError::Disconnected(_)),
+            "{err:?}"
+        );
+        assert!(!local.exists());
+    }
+
+    #[tokio::test]
+    async fn an_upload_the_server_stops_reading_fails_instead_of_hanging() {
+        super::OP_TIMEOUT.set(std::time::Duration::from_millis(400));
+        let faults = Faults {
+            stall_stor: true,
+            ..Faults::default()
+        };
+        let (port, _connects, _log) = start_server(reconnect_store().await, faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+        // Well past what loopback socket buffers absorb, so writes block.
+        let local = tempdir_for_test("stalled-upload").join("big.bin");
+        std::fs::write(&local, vec![7u8; 32 << 20]).unwrap();
+
+        let err = with_timeout(transport.upload(&local, "/big.bin", None), "stalled upload")
+            .await
+            .expect_err("a server that stops reading must fail the upload");
+        assert!(
+            matches!(err, crate::error::BlinkError::Disconnected(_)),
+            "{err:?}"
+        );
+    }
+
     #[tokio::test]
     async fn a_preview_whose_data_stalls_fails_and_the_connection_recovers() {
         super::OP_TIMEOUT.set(std::time::Duration::from_millis(400));

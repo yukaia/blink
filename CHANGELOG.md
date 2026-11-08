@@ -38,6 +38,11 @@ the git history for those.
   its checkpoint, so a later resume skipped that file. Running and queued
   transfers are now cancelled on disconnect (their checkpoint entries stay
   resumable), and transfer events from an earlier connection are ignored.
+- **A stalled FTP transfer fails instead of hanging.** An FTP or FTPS
+  download whose data connection went quiet without closing, or an upload
+  the server stopped reading, waited forever and held its transfer slot.
+  Both now fail after 60 seconds with nothing moving, as the file viewer
+  already did.
 - **The session list scrolls.** Sessions past the bottom of the terminal
   were never drawn, and the selection could move onto them out of sight.
   The list now follows the cursor, and a click selects the session drawn
