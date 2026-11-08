@@ -27,8 +27,9 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   falling back to Pageant
 - **Host-key verification** for SFTP/SCP — unknown keys trigger an
   interactive prompt (accept & save / trust once / reject); changed keys are
-  hard-rejected with a clear warning. Keys are stored in
-  `~/.config/blink/known_hosts` in OpenSSH's line format: comma-separated
+  hard-rejected with a clear warning. Keys are stored in blink's own
+  `known_hosts` (see [Configuration](#configuration)) in OpenSSH's line
+  format: comma-separated
   host lists and `@revoked` lines are read, and a revoked key is refused
   for every host; hashed and wildcard host names are not. A server
   presenting an SSH *host certificate* is refused rather than pinned.
@@ -62,7 +63,7 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   chunk, so a single stream is bandwidth-bound rather than latency-bound
   (the way OpenSSH's own `sftp` client works). This stacks on top of the
   parallel slot dispatcher for high aggregate throughput
-- Live transfer strip with bytes, percentage, MB/s
+- Live transfer strip with bytes, percentage, MiB/s
 - **Pause / resume** all transfers (`p`)
 - **Cancel** individual in-flight transfers (`c`)
 - **Cancel whole batch** for recursive transfers (`C`) — aborts every
@@ -76,6 +77,13 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   into an FTP directory whose listing couldn't be fully read count as
   possible conflicts, since a file of that name may be among the unread
   lines; the log says so before the prompt
+- **Batches report how they ended.** A batch finishes with one log line:
+  how many files failed (and the key that retries them), or that all of
+  them completed. A failure's own `failed:` line can scroll out of the log
+  during a large batch; the summary comes last.
+- **Folders before their contents.** A recursive upload creates each remote
+  folder before anything is uploaded into it, even with several transfers
+  running in parallel.
 - **One job per destination.** A download is not queued while another
   queued or running download writes the same local file (compared ignoring
   case on Windows and macOS), and an upload likewise for its remote path —
@@ -95,27 +103,36 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   batch's checkpoint rather than overwriting it, and `r` / `R` refuses to
   resume while a batch of that direction is still in flight (finish or
   cancel it first).
+  Once a batch has finished, `r` / `R` re-queues just the files that failed,
+  without reconnecting.
   Connecting to a session that has an unfinished batch offers to resume it,
   with a summary of what is left. `[r]` resumes, `[d]` discards the
   checkpoint *and* the partial downloads it is the only record of, and
   `[esc]` defers — the offer returns on the next connect. Use `blink
   checkpoints` to inspect pending checkpoints from the command line.
-- **Checkpoint keying** — checkpoints are keyed by session *name*, not by
-  host. An ad-hoc `blink connect sftp://host` therefore matches a
-  checkpoint belonging to a saved session called `host`, and editing a
-  saved session's host leaves its old checkpoint in place. Check the paths
-  in the summary if that is a possibility.
-- **Checkpoint file format** is versioned (currently version 3, which adds
-  a `cancelled` job status); checkpoints written by older blink versions
-  (versions 1 and 2) still load and resume normally.
+- **Checkpoint keying** — checkpoints are keyed by session *name* and by
+  the server and account the session connects to (`user@host:port`). A
+  checkpoint is only offered to, resumed by, or extended by a connection
+  to the same account on the same server. An ad-hoc `blink connect
+  sftp://alice@host` shares one with a saved session called `host` only if
+  that session also connects as `alice` to the same host and port. Editing
+  a saved session's user, host or port leaves its old checkpoint behind:
+  it is no longer offered, and `blink checkpoints --clean` treats it as
+  orphaned.
+- **Checkpoint file format** is versioned (currently version 4, which
+  records the server and account each checkpoint belongs to). Files from
+  versions 1–3 record no server, so they are never offered for resume;
+  `blink checkpoints` still lists them, and `blink checkpoints --clean`
+  removes them as orphaned.
 - **Download resume is provenance-checked.** A partial download,
   `<dest>.<hash>.blink-part`, records bytes, not which remote file they came
   from, so blink writes a `<dest>.<hash>.blink-part.meta` sidecar alongside
   it naming the server and account (`user@host:port`), the remote path, and
-  the size the server reported. Resume only happens when the sidecar
-  identifies the same remote file on the same server at the same reported
-  size; anything unproven restarts from byte zero instead of risking a
-  silently corrupt file.
+  the size and modification time the server reported. Resume only happens
+  when the sidecar identifies the same remote file on the same server with
+  the same reported size and modification time; anything unproven,
+  including a server that doesn't report both, restarts from byte zero instead
+  of risking a silently corrupt file.
 - **Partial files have a name of their own.** In-flight transfers write
   `<name>.<hash>.blink-part`, locally for a download and on the server for
   an upload, where `<hash>` is 8 hex digits of the SHA-256 of `<name>`. So
@@ -344,8 +361,10 @@ blink maintains its own known-hosts file separate from `~/.ssh/known_hosts`.
 The on-disk format matches OpenSSH: one entry per line, `hostname key-type
 base64-key`. The hostname is stored as a bare lowercased host for the
 default SSH port and `[host]:port` for any other port — exactly as OpenSSH
-writes it. Hashed (`|1|salt|hash`) entries from `HashKnownHosts=yes` aren't
-supported; blink only reads files it wrote itself. Files written by older
+writes it. Comma-separated host lists and `@revoked` lines are read as
+OpenSSH reads them; hashed (`|1|salt|hash`) entries from
+`HashKnownHosts=yes` and wildcard host patterns are not, and
+`@cert-authority` lines are ignored. Files written by older
 blink versions in the `host:port` form are still accepted on lookup, so
 upgrades don't force re-verification.
 
@@ -621,7 +640,7 @@ src/
 ├── config.rs            global config.ini load / save (preserves unknown keys)
 ├── session.rs           per-session .ini load / save / list / URL parser
 ├── theme.rs             theme model + 7 built-ins + file loader
-├── checkpoint.rs        walk-plan checkpointing: persist, append, remove batch state; debounced fsync writes; version-3 format with v1/v2 migration
+├── checkpoint.rs        walk-plan checkpointing: persist, append, remove batch state; debounced fsync writes; version-4 format, origin-keyed, with v1 migration
 ├── known_hosts.rs       SSH host-key store: check / append / remove, OpenSSH-style matching, file lock, SessionTrust (per-session "trust once")
 ├── highlight.rs         syntax highlighter for the text viewer (single-pass, zero deps)
 ├── transport/           connection layer
@@ -640,6 +659,7 @@ src/
 └── tui/
     ├── mod.rs           terminal init / restore + top-level run wrappers
     ├── event.rs         keyboard / app-event multiplexer
+    ├── hit.rs           where clickable things were last drawn, for matching mouse events
     ├── plan.rs          recursive walk planner: PlannedJob, WalkResult, walk_remote / walk_local, conflict probes
     ├── state.rs         per-modal / per-pane / per-form state types (PaneState, Viewer, PendingHostKey, EditSessionForm, …)
     ├── views.rs         render functions per screen / overlay
@@ -653,6 +673,7 @@ src/
         ├── actions.rs   modal openers + submitters + async kickoffs (rename / mkdir / delete / edit-session / search / save-session)
         ├── panes.rs     pane navigation, cursor, refresh (refresh_local_pane runs on the blocking pool)
         ├── controls.rs  cancel / pause / theme controls + active_jobs snapshot
+        ├── mouse.rs     mouse handling: focus, clicks, double-clicks, wheel
         └── viewer.rs    file viewer (text + image), tokenisation cache, after_draw image-redraw hook
 ```
 
@@ -756,16 +777,22 @@ rendered. Two classes of character are replaced with spaces:
 
 - **Control characters** (U+0000–U+001F and U+007F–U+009F) — covers ESC and
   every ANSI sequence starter.
-- **Bidirectional and zero-width formatters** (U+061C, U+200B–U+200C,
-  U+200E–U+200F, U+202A–U+202E, U+2066–U+2069, U+FEFF). These are Unicode
-  category **Cf**, so a `is_control()` check alone misses them. A
-  RIGHT-TO-LEFT OVERRIDE lets a server name a file that *renders* as
-  `report.png` while the bytes end in `.exe`; zero-width characters let two
-  different names render identically. Replacing rather than deleting is
-  deliberate — it makes the difference visible instead of collapsing two
-  distinct names onto one rendering. U+200D ZERO WIDTH JOINER is
-  intentionally kept: it can't spoof an extension, and stripping it would
-  break emoji sequences in legitimate filenames.
+- **Bidirectional, zero-width and other invisible characters**: the soft
+  hyphen (U+00AD), U+061C, the Hangul fillers (U+115F–U+1160, U+3164,
+  U+FFA0), U+180E, U+200B–U+200C, U+200E–U+200F, U+202A–U+202E, the word
+  joiner and invisible operators (U+2060–U+2064), U+2066–U+2069, the
+  deprecated formatting characters (U+206A–U+206F), U+FEFF, the
+  interlinear annotation characters (U+FFF9–U+FFFB), the musical
+  formatting characters (U+1D173–U+1D17A) and the tag characters
+  (U+E0000–U+E007F). None of these are control characters, so an
+  `is_control()` check alone misses them. A RIGHT-TO-LEFT OVERRIDE lets a
+  server name a file that *renders* as `report.png` while the bytes end in
+  `.exe`; invisible characters let two different names render identically.
+  Replacing rather than deleting is deliberate — it makes the difference
+  visible instead of collapsing two distinct names onto one rendering.
+  U+200D ZERO WIDTH JOINER and the variation selectors are intentionally
+  kept: they can't spoof an extension, and stripping them would break
+  emoji sequences in legitimate filenames.
 
 Applied to:
 
@@ -824,7 +851,7 @@ Applied to:
 | Recursive walk plan | 100,000 entries — planned jobs *plus* directories visited and queued (bails before materialising the whole tree) |
 | Error string length | 512 characters |
 | Session / config / theme files | 64 KiB each |
-| Checkpoint files | 10 MiB |
+| Checkpoint files | 256 MiB |
 | Known-hosts file | 1 MiB |
 
 Transport-layer read caps are enforced independently of server-reported
@@ -874,15 +901,18 @@ RGBA buffer is already allocated.
   between rename and the filesystem journal commit can leave a
   zero-byte file or roll the rename back. (Unix only; on Windows the
   filesystem journals rename through its own ordering rules.)
-- Checkpoint writes during a hot transfer batch are debounced at 250 ms
-  so a 100k-job batch doesn't generate ~200k full plan rewrites. Any
-  lost mark on a crash just causes the affected job to be re-queued on
-  resume — never silently skipped.
+- Checkpoint writes during a hot transfer batch are debounced — at least
+  250 ms apart, and further apart for a large checkpoint, so that writing
+  takes no more than about a twentieth of the time — so a 100k-job batch
+  doesn't generate ~200k full plan rewrites. Any lost mark on a crash just
+  causes the affected job to be re-queued on resume — never silently
+  skipped.
 - Downloads write to a `<local>.<hash>.blink-part` sibling and rename onto the
   final name only after `flush` + `sync_all`. The user's existing file (if
   any) isn't truncated until the new download has fsynced cleanly. A
   `<local>.<hash>.blink-part.meta` sidecar is written alongside it, recording the
-  remote path and the size the server reported — the provenance a resume
+  server and account, the remote path, and the size and modification time
+  the server reported — the provenance a resume
   needs to tell "my interrupted download" from "an unrelated file that
   happens to share this local name" (see "download resume is
   provenance-checked" under Transfers).
@@ -964,15 +994,15 @@ A few things worth knowing before you use this in anger:
   cancelling only a specific subdirectory within a larger walk).
 - **Walk checkpoints survive a clean exit *and* most hard kills.** The
   initial plan is written with `flush()` (synchronous) before any job
-  runs. Per-job state changes are debounced at 250 ms — a crash within
+  runs. Per-job state changes are debounced (see above) — a crash within
   that window leaves the affected job in its previous state on resume,
   which is the same safe outcome as a crash mid-transfer (Pending →
   re-queued, InProgress → re-queued, Done → re-run). Partial downloads
   live at `<name>.<hash>.blink-part`; the final name is only created via rename
   after fsync. `mkdir` is idempotent on the remote side, so re-runs are
   safe across the board. A resumed partial is only trusted if its
-  `.blink-part.meta` sidecar names the same server, remote path and
-  reported size — one whose sidecar didn't survive the crash restarts
+  `.blink-part.meta` sidecar names the same server, remote path, reported
+  size and modification time — one whose sidecar didn't survive the crash restarts
   instead of risking a silently corrupted file.
 - **Transfers don't auto-refresh the local pane.** Use F5 to refresh after
   downloads complete.
@@ -1010,7 +1040,7 @@ and do not affect blink's MIT license except where noted.
 | [tokio-rustls](https://github.com/rustls/tokio-rustls) | rustls contributors | Async TLS via rustls (reached through `suppaftp`, which re-exports it) |
 | [serde](https://github.com/serde-rs/serde) | David Tolnay, Erick Tryzelaar | Serialisation framework |
 | [serde_json](https://github.com/serde-rs/json) | David Tolnay, Erick Tryzelaar | JSON serialisation (checkpoints) |
-| [directories](https://github.com/dirs-dev/directories-rs) | Simon Ochsenreither | Platform config-dir paths |
+| [directories](https://github.com/dirs-dev/directories-rs) | Simon Ochsenreither | Config-dir path on platforms other than Linux, macOS and Windows (those three are resolved directly) |
 | [clap](https://github.com/clap-rs/clap) | clap contributors | CLI argument parsing |
 | [thiserror](https://github.com/dtolnay/thiserror) | David Tolnay | Error derive macro |
 | [image](https://github.com/image-rs/image) | image-rs contributors | Image decoding (PNG, JPEG, GIF, WebP) |
@@ -1020,6 +1050,13 @@ and do not affect blink's MIT license except where noted.
 | [zeroize](https://github.com/RustCrypto/utils/tree/master/zeroize) | RustCrypto contributors | Wipe in-memory passwords on drop |
 | [icy_sixel](https://github.com/mkrueger/icy_sixel) | Mike Krüger | Sixel image encoding |
 | [parking_lot](https://github.com/Amanieu/parking_lot) | Amanieu d'Antras | Faster synchronisation primitives |
+| [libc](https://github.com/rust-lang/libc) | The Rust Project Developers | `O_NOFOLLOW` for opening partial downloads and their sidecars (Unix only) |
+
+### Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT
+
+| Crate | Author(s) | Use in blink |
+| ----- | --------- | ------------ |
+| [rustix](https://github.com/bytecodealliance/rustix) | Bytecode Alliance contributors | Safe `geteuid`, to tell your own symlinks from another user's (Unix only) |
 
 ### Apache-2.0
 
