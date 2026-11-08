@@ -4,7 +4,7 @@
 //! render. The [`dispatcher`] submodule pulls pending jobs and runs them
 //! against the [`crate::transport`] layer.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -76,6 +76,13 @@ pub enum TransferEvent {
 /// after.
 pub(crate) const MAX_QUEUED_JOBS: usize = 100_000;
 
+/// Finished jobs the manager keeps once it holds more than this many jobs.
+/// They are dropped oldest first. Keeping every job ever queued grew memory
+/// for the life of the session — a few hundred bytes a job, so tens of MB
+/// per [`MAX_QUEUED_JOBS`] batch. A job's events are handled well before
+/// this many newer jobs could finish, so nothing still asks about one gone.
+const RETAINED_JOBS: usize = 4096;
+
 /// Why [`TransferManager`] refused to queue a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnqueueError {
@@ -143,7 +150,11 @@ pub struct TransferManager {
 struct Inner {
     next_id: u64,
     next_batch_id: u64,
-    jobs: Vec<TransferJob>,
+    /// Jobs in id order, ids consecutive, so the job with id `id` sits at
+    /// `id - first_id`. Finished jobs leave the front; see [`RETAINED_JOBS`].
+    jobs: VecDeque<TransferJob>,
+    /// Id of `jobs[0]`, or of the next job when `jobs` is empty.
+    first_id: u64,
     /// No job before this index is Pending, so [`TransferManager::take_next_pending`]
     /// starts looking here. Jobs only ever leave Pending, and new ones are
     /// appended, so it only moves forward. Scanning from 0 instead passed
@@ -153,10 +164,6 @@ struct Inner {
     /// Number of jobs currently in `Pending` state. Kept in sync with `jobs`
     /// so `enqueue` can check the cap in O(1) instead of scanning the vec.
     pending_count: usize,
-    /// Maps job id → index in `jobs` for O(1) lookups by id in `mark` and
-    /// `update_progress`. Jobs are never removed from `jobs`, so indices are
-    /// stable for the lifetime of the manager.
-    job_index: HashMap<u64, usize>,
     /// Destinations of every Pending or Active job — see [`destination_key`].
     /// Kept in step with job states so an enqueue checks in O(1): a batch
     /// can be [`MAX_QUEUED_JOBS`] long, and scanning `jobs` per enqueue
@@ -171,6 +178,28 @@ struct Inner {
     /// Populated by [`TransferManager::register_active`] (called from the
     /// dispatcher), removed on completion or cancellation.
     active: HashMap<u64, AbortHandle>,
+}
+
+impl Inner {
+    /// Where the job with id `id` sits in `jobs`, if it's still there.
+    fn index_of(&self, id: u64) -> Option<usize> {
+        let idx = usize::try_from(id.checked_sub(self.first_id)?).ok()?;
+        (idx < self.jobs.len()).then_some(idx)
+    }
+
+    /// Drop finished jobs from the front past [`RETAINED_JOBS`]. Stops at
+    /// the first one still Pending or Active: ids must stay consecutive.
+    fn drop_old_finished(&mut self) {
+        while self.jobs.len() > RETAINED_JOBS
+            && self.jobs.front().is_some_and(|j| {
+                matches!(j.state, TransferState::Complete | TransferState::Failed(_))
+            })
+        {
+            self.jobs.pop_front();
+            self.first_id += 1;
+            self.first_pending = self.first_pending.saturating_sub(1);
+        }
+    }
 }
 
 impl TransferManager {
@@ -201,10 +230,10 @@ impl TransferManager {
         let inner = Arc::new(Mutex::new(Inner {
             next_id: 1,
             next_batch_id: 1,
-            jobs: Vec::new(),
+            jobs: VecDeque::new(),
+            first_id: 1,
             first_pending: 0,
             pending_count: 0,
-            job_index: HashMap::new(),
             in_flight: HashSet::new(),
             parallelism,
             cap,
@@ -251,7 +280,7 @@ impl TransferManager {
     /// need the whole list (to assert every job reached a terminal state).
     #[allow(dead_code)]
     pub fn snapshot(&self) -> Vec<TransferJob> {
-        self.inner.lock().jobs.clone()
+        self.inner.lock().jobs.iter().cloned().collect()
     }
 
     /// Look up a single job by id. O(1) via the id → index map — event
@@ -259,7 +288,7 @@ impl TransferManager {
     /// [`Self::snapshot`].
     pub fn job(&self, id: u64) -> Option<TransferJob> {
         let inner = self.inner.lock();
-        inner.job_index.get(&id).map(|&idx| inner.jobs[idx].clone())
+        inner.index_of(id).map(|idx| inner.jobs[idx].clone())
     }
 
     pub fn pause(&self) {
@@ -382,9 +411,7 @@ impl TransferManager {
             state: TransferState::Pending,
             batch_id,
         };
-        let idx = inner.jobs.len();
-        inner.jobs.push(job.clone());
-        inner.job_index.insert(id, idx);
+        inner.jobs.push_back(job.clone());
         inner.pending_count += 1;
         drop(inner);
         self.wake();
@@ -402,7 +429,7 @@ impl TransferManager {
     pub fn mark(&self, id: u64, state: TransferState) {
         {
             let mut inner = self.inner.lock();
-            if let Some(&idx) = inner.job_index.get(&id) {
+            if let Some(idx) = inner.index_of(id) {
                 let j = &mut inner.jobs[idx];
                 let was_pending = j.state == TransferState::Pending;
                 let was_live = matches!(j.state, TransferState::Pending | TransferState::Active);
@@ -418,6 +445,9 @@ impl TransferManager {
                     && let Some(key) = key
                 {
                     inner.in_flight.remove(&key);
+                }
+                if ends {
+                    inner.drop_old_finished();
                 }
             }
         }
@@ -450,7 +480,7 @@ impl TransferManager {
         };
         {
             let mut inner = self.inner.lock();
-            if let Some(&idx) = inner.job_index.get(&id) {
+            if let Some(idx) = inner.index_of(id) {
                 let j = &mut inner.jobs[idx];
                 j.bytes_done = bytes_done;
                 j.bytes_total = bytes_total;
@@ -473,9 +503,9 @@ impl TransferManager {
 
     /// Snapshot of only the jobs currently running.
     ///
-    /// The render path asks for this every frame. `jobs` retains every job
-    /// the manager has ever seen — indices have to stay stable for
-    /// `job_index` — so going through [`Self::snapshot`] and filtering
+    /// The render path asks for this every frame. `jobs` retains up to
+    /// [`RETAINED_JOBS`] finished jobs besides every live one, so going
+    /// through [`Self::snapshot`] and filtering
     /// afterwards clones the whole history to keep at most `parallelism`
     /// entries. After a batch of [`MAX_QUEUED_JOBS`] that is 100k structs
     /// (two heap `String`s apiece) copied per frame, at a frame rate the
@@ -558,8 +588,9 @@ impl TransferManager {
             // Find the index of the first pending job, then update state and
             // pending_count in separate steps to satisfy the borrow checker.
             let from = inner.first_pending;
-            let found = inner.jobs[from..]
-                .iter()
+            let found = inner
+                .jobs
+                .range(from..)
                 .position(|j| j.state == TransferState::Pending)
                 .map(|i| from + i);
             let Some(idx) = found else {
@@ -730,6 +761,37 @@ mod tests {
         let d = m.enqueue_mkdir("/d".into()).unwrap();
         assert_eq!(m.take_next_pending().unwrap().id, d, "a job queued later");
         assert!(m.take_next_pending().is_none());
+    }
+
+    /// Finished jobs are dropped past `RETAINED_JOBS`, oldest first, and
+    /// lookups by id keep working for the ones left.
+    #[test]
+    fn old_finished_jobs_are_dropped() {
+        let (m, _rx) = TransferManager::new(1);
+        let ids: Vec<u64> = (0..RETAINED_JOBS + 10)
+            .map(|i| m.enqueue_mkdir(format!("/d{i}")).unwrap())
+            .collect();
+        // A live job at the front holds everything behind it.
+        let first = m.take_next_pending().unwrap().id;
+        for _ in 1..ids.len() {
+            let j = m.take_next_pending().unwrap();
+            m.mark(j.id, TransferState::Complete);
+        }
+        assert_eq!(m.snapshot().len(), ids.len(), "nothing passes a live job");
+
+        m.mark(first, TransferState::Complete);
+        assert_eq!(m.snapshot().len(), RETAINED_JOBS);
+        assert!(m.job(ids[0]).is_none());
+        assert!(m.job(ids[10]).is_some());
+        assert_eq!(
+            m.job(*ids.last().unwrap()).unwrap().id,
+            *ids.last().unwrap()
+        );
+
+        let next = m.enqueue_mkdir("/later".into()).unwrap();
+        assert_eq!(m.take_next_pending().unwrap().id, next);
+        m.mark(next, TransferState::Complete);
+        assert_eq!(m.job(next).unwrap().state, TransferState::Complete);
     }
 
     #[test]
