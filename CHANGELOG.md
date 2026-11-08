@@ -26,6 +26,11 @@ the git history for those.
   symlink planted under a folder's name sent every file below it wherever
   it pointed. blink now refuses to download into a symlinked folder that
   another user owns. Your own symlinks still work.
+- **The debug log can't carry terminal escapes.** With `BLINK_LOG_FILE`
+  set, remote file names and server messages were written to the log as
+  they came, so one holding an escape sequence would run in the terminal of
+  whoever viewed the log. Control and bidi characters are now written as
+  spaces there, as everywhere else.
 - **Downloads don't write through a symlink planted under the partial's
   name.** A `.blink-part` file and its `.meta` sidecar have predictable
   names, so anyone who could write to the download directory could plant

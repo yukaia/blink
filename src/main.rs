@@ -196,8 +196,10 @@ fn init_tracing() {
 
             let _ = fmt()
                 .with_env_filter(filter)
+                // Server-supplied text reaches the log through tracing
+                // fields; see `SanitizedLog`.
                 .with_writer(move || match file.try_clone() {
-                    Ok(f) => Box::new(f) as Box<dyn std::io::Write>,
+                    Ok(f) => Box::new(crate::error::SanitizedLog(f)) as Box<dyn std::io::Write>,
                     // Out of file descriptors. Drop the line rather than
                     // panicking from inside a logging call.
                     Err(_) => Box::new(std::io::sink()),

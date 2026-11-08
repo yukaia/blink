@@ -269,11 +269,57 @@ pub(crate) fn sanitize_display(s: &str) -> Cow<'_, str> {
     }
 }
 
+/// [`sanitize_display`] for log output: the same characters are replaced,
+/// except the line breaks and tabs that lay a log file out.
+pub(crate) fn sanitize_log(s: &str) -> Cow<'_, str> {
+    let unsafe_here = |c: char| c != '\n' && c != '\t' && is_unsafe_for_display(c);
+    if !s.chars().any(unsafe_here) {
+        Cow::Borrowed(s)
+    } else {
+        Cow::Owned(
+            s.chars()
+                .map(|c| if unsafe_here(c) { ' ' } else { c })
+                .collect(),
+        )
+    }
+}
+
+/// A log writer that passes everything through [`sanitize_log`].
+///
+/// The debug log carries server-supplied text — remote paths, file names,
+/// error messages — in tracing fields that nothing else sanitizes, so a name
+/// holding an escape sequence reached the file intact and ran in the
+/// terminal of whoever `cat`s or `tail`s it. tracing-subscriber formats each
+/// event whole and writes it in one call, so a call never splits a
+/// character.
+pub(crate) struct SanitizedLog<W>(pub W);
+
+impl<W: io::Write> io::Write for SanitizedLog<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let text = String::from_utf8_lossy(buf);
+        self.0.write_all(sanitize_log(&text).as_bytes())?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
 pub type Result<T> = std::result::Result<T, BlinkError>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_log_writer_neutralises_escapes_and_keeps_its_layout() {
+        use std::io::Write as _;
+        let mut out = SanitizedLog(Vec::new());
+        out.write_all("remote=/a\x1b[2Jb\u{202E}c\tok\n".as_bytes())
+            .unwrap();
+        assert_eq!(String::from_utf8(out.0).unwrap(), "remote=/a [2Jb c\tok\n");
+    }
 
     #[test]
     fn sanitize_clean_string_unchanged() {
