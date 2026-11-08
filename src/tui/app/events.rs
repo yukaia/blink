@@ -132,11 +132,16 @@ impl App {
                 );
 
                 // Forwarder: drain the dispatcher's event stream into the App
-                // event channel as `AppEvent::Transfer(...)`.
+                // event channel, tagged with this connection so events from a
+                // manager outlived by a disconnect can be told apart.
                 let app_tx = self.app_event_tx.clone();
+                let connection = self.connection;
                 tokio::spawn(async move {
-                    while let Some(ev) = events_rx.recv().await {
-                        if app_tx.send(AppEvent::Transfer(ev)).is_err() {
+                    while let Some(event) = events_rx.recv().await {
+                        if app_tx
+                            .send(AppEvent::Transfer { connection, event })
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -541,7 +546,13 @@ impl App {
                 area,
                 result,
             } => self.image_rendered(viewer_id, area, result),
-            AppEvent::Transfer(ev) => self.handle_transfer_event(ev),
+            AppEvent::Transfer { connection, event } => {
+                // From a manager since disconnected: its job ids name this
+                // connection's jobs.
+                if connection == self.connection {
+                    self.handle_transfer_event(event);
+                }
+            }
             AppEvent::HostKeyUnknown {
                 subject,
                 host,

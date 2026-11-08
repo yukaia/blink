@@ -879,14 +879,25 @@ impl App {
     ///      deleted sessions while connected, and the selector should
     ///      reflect that on return.
     fn disconnect(&mut self) {
-        // 1. Dispatcher: shut down off-thread so we don't block the UI loop.
+        // 1. Cancel what's running and queued, as the confirmation said it
+        //    would. Shutting the dispatcher down only stops new jobs from
+        //    starting; running workers hold their own connections and would
+        //    carry on. Their checkpoint entries stay `in_progress` or
+        //    `pending` on disk (the in-memory checkpoints are dropped below
+        //    without seeing the cancellations), so the next connect offers to
+        //    resume them, and the `Failed` events this raises arrive tagged
+        //    with the connection number this disconnect retires.
+        if let Some(m) = &self.transfer_manager {
+            m.cancel_all();
+        }
+        // 2. Dispatcher: shut down off-thread so we don't block the UI loop.
         if let Some(d) = self.dispatcher.take() {
             tokio::spawn(async move {
                 d.shutdown().await;
             });
         }
 
-        // 2. Drop the transport. We don't `close().await` — that would
+        // 3. Drop the transport. We don't `close().await` — that would
         //    require holding the UI loop and the underlying connection
         //    will be cleaned up by Drop / runtime teardown when the last
         //    reference goes out of scope. The protocol-level QUIT is best
@@ -901,7 +912,7 @@ impl App {
             .map(|s| format!("{}@{}:{}", s.username, s.host, s.port))
             .unwrap_or_else(|| "session".to_string());
 
-        // 3. Clear connection-scoped state.
+        // 4. Clear connection-scoped state.
         // Checkpoint bookkeeping is scoped to the connection that created
         // it. The next connection gets a fresh TransferManager whose job
         // ids restart at 1, so a surviving map would alias new jobs onto
@@ -943,7 +954,7 @@ impl App {
         self.remote_listing = None;
         self.unreadable_warned = None;
 
-        // 4. Reset local pane focus and refresh the sessions list.
+        // 5. Reset local pane focus and refresh the sessions list.
         self.active_pane = Pane::Local;
         self.reload_sessions();
         if self.session_cursor >= self.sessions.len().max(1) {
@@ -1667,6 +1678,71 @@ mod tests {
 
     fn last_log(a: &App) -> String {
         a.log.back().map(|l| l.message.clone()).unwrap_or_default()
+    }
+
+    /// Job ids restart at 1 with each connection's manager, so an event
+    /// from one since disconnected names a job of the current one.
+    #[test]
+    fn a_transfer_event_from_a_retired_connection_is_ignored() {
+        let mut a = app_with_manager();
+        let id = a
+            .transfer_manager
+            .as_ref()
+            .unwrap()
+            .enqueue_download("/r/f.bin".into(), "/l/f.bin".into())
+            .unwrap();
+        a.checkpoint_job_map
+            .insert(id, (CheckpointKind::Download, 0));
+        a.connection = 2;
+
+        a.handle_app_event(AppEvent::Transfer {
+            connection: 1,
+            event: TransferEvent::Complete(id),
+        });
+        assert!(
+            a.checkpoint_job_map.contains_key(&id),
+            "not this connection's job"
+        );
+        assert!(!logged(&a, "complete:"));
+
+        a.handle_app_event(AppEvent::Transfer {
+            connection: 2,
+            event: TransferEvent::Failed {
+                id,
+                error: "x".into(),
+            },
+        });
+        assert!(!a.checkpoint_job_map.contains_key(&id), "this one is");
+    }
+
+    /// The disconnect confirmation says in-flight transfers are cancelled;
+    /// shutting the dispatcher down alone left them running.
+    #[tokio::test]
+    async fn disconnecting_cancels_running_and_queued_transfers() {
+        let mut a = app_with_manager();
+        let m = a.transfer_manager.as_ref().unwrap().clone();
+        let running = m
+            .enqueue_download("/r/a.bin".into(), "/l/a.bin".into())
+            .unwrap();
+        let queued = m
+            .enqueue_download("/r/b.bin".into(), "/l/b.bin".into())
+            .unwrap();
+        let worker = tokio::spawn(std::future::pending::<()>());
+        assert_eq!(m.take_next_pending().unwrap().id, running);
+        m.register_active(running, worker.abort_handle());
+
+        a.disconnect();
+
+        for id in [running, queued] {
+            assert_eq!(
+                m.job(id).unwrap().state,
+                crate::transfer::TransferState::Failed("cancelled".into())
+            );
+        }
+        assert!(
+            worker.await.unwrap_err().is_cancelled(),
+            "the worker is aborted"
+        );
     }
 
     #[test]

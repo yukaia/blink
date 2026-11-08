@@ -567,27 +567,36 @@ impl TransferManager {
     /// flipping their state is enough to skip them. Complete and previously-
     /// failed jobs are ignored.
     pub fn cancel_batch(&self, batch_id: u64) -> (usize, usize) {
+        self.cancel_where(|j| j.batch_id == Some(batch_id))
+    }
+
+    /// Cancel every Active and Pending job, as [`Self::cancel_batch`] does
+    /// one batch's. Returns `(active_cancelled, pending_cancelled)`.
+    ///
+    /// For ending a connection: shutting the dispatcher down only stops new
+    /// jobs from starting, and running workers hold their own connections,
+    /// so without this they carried on after a disconnect the user was told
+    /// would cancel them.
+    pub fn cancel_all(&self) -> (usize, usize) {
+        self.cancel_where(|_| true)
+    }
+
+    /// Cancel the Active and Pending jobs `select` picks.
+    fn cancel_where(&self, select: impl Fn(&TransferJob) -> bool) -> (usize, usize) {
         // Phase 1: collect ids while holding the lock briefly. We can't
         // call `cancel` / `mark` with the lock held because they take it
         // again internally.
         let (active_ids, pending_ids): (Vec<u64>, Vec<u64>) = {
             let inner = self.inner.lock();
-            let active: Vec<u64> = inner
-                .jobs
-                .iter()
-                .filter(|j| {
-                    j.batch_id == Some(batch_id) && matches!(j.state, TransferState::Active)
-                })
-                .map(|j| j.id)
-                .collect();
-            let pending: Vec<u64> = inner
-                .jobs
-                .iter()
-                .filter(|j| {
-                    j.batch_id == Some(batch_id) && matches!(j.state, TransferState::Pending)
-                })
-                .map(|j| j.id)
-                .collect();
+            let mut active = Vec::new();
+            let mut pending = Vec::new();
+            for j in inner.jobs.iter().filter(|j| select(j)) {
+                match j.state {
+                    TransferState::Active => active.push(j.id),
+                    TransferState::Pending => pending.push(j.id),
+                    _ => {}
+                }
+            }
             (active, pending)
         };
 

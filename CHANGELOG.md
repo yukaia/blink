@@ -30,6 +30,14 @@ the git history for those.
 
 ### Fixed
 
+- **Disconnecting cancels running transfers, as its confirmation says.**
+  It only stopped new jobs from starting: transfers already running carried
+  on in the background on their own connections. And because job numbers
+  restart with each connection, one of them finishing after you had
+  reconnected could mark an unrelated job of the new connection as done in
+  its checkpoint, so a later resume skipped that file. Running and queued
+  transfers are now cancelled on disconnect (their checkpoint entries stay
+  resumable), and transfer events from an earlier connection are ignored.
 - **The session list scrolls.** Sessions past the bottom of the terminal
   were never drawn, and the selection could move onto them out of sight.
   The list now follows the cursor, and a click selects the session drawn

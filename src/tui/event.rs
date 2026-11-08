@@ -220,9 +220,17 @@ pub enum AppEvent {
         fingerprint: String,
     },
 
-    /// Transfer dispatcher emitted an event. Reserved for the next wiring pass.
-    #[allow(dead_code)]
-    Transfer(TransferEvent),
+    /// The transfer manager of connection `connection` (see
+    /// `App::connection`) emitted an event.
+    ///
+    /// Tagged because job ids are per manager and restart at 1 with each
+    /// connection: an event from a manager since disconnected names a job of
+    /// the current one that has the same id, and acted on it would mark that
+    /// job's checkpoint entry done or failed.
+    Transfer {
+        connection: u64,
+        event: TransferEvent,
+    },
 }
 
 pub struct EventStream {
@@ -252,40 +260,43 @@ impl EventStream {
         }
         loop {
             tokio::select! {
-                // Bias the arms so keystrokes and app events drain before
-                // the tick. Without this, a burst of app events under
-                // sustained keypress can be starved by tokio's default
-                // pseudo-random arm selection — the symptom is laggy
-                // keyboard response while a recursive walk is feeding
-                // events. Ordering: key → app → tick.
-                biased;
-                ev = self.crossterm.next() => {
-                    match ev {
-                        Some(Ok(CrosstermEvent::Key(k))) => {
-                            // Filter out key-release / repeat events on Windows.
-                            if k.kind == KeyEventKind::Press {
-                                return Ok(Event::Key(k));
+                    // Bias the arms so keystrokes and app events drain before
+                    // the tick. Without this, a burst of app events under
+                    // sustained keypress can be starved by tokio's default
+                    // pseudo-random arm selection — the symptom is laggy
+                    // keyboard response while a recursive walk is feeding
+                    // events. Ordering: key → app → tick.
+                    biased;
+                    ev = self.crossterm.next() => {
+                        match ev {
+                            Some(Ok(CrosstermEvent::Key(k))) => {
+                                // Filter out key-release / repeat events on Windows.
+                                if k.kind == KeyEventKind::Press {
+                                    return Ok(Event::Key(k));
+                                }
                             }
+                            Some(Ok(CrosstermEvent::Resize(w, h))) => {
+                                return Ok(Event::Resize(w, h));
+                            }
+                            Some(Ok(CrosstermEvent::Mouse(m))) if wanted_mouse(&m) => {
+                                return Ok(Event::Mouse(m));
+                            }
+                            Some(Ok(_)) => continue,
+                            Some(Err(e)) => return Err(e.into()),
+                            None => return Ok(Event::Tick),
                         }
-                        Some(Ok(CrosstermEvent::Resize(w, h))) => {
-                            return Ok(Event::Resize(w, h));
-                        }
-                        Some(Ok(CrosstermEvent::Mouse(m))) if wanted_mouse(&m) => {
-                            return Ok(Event::Mouse(m));
-                        }
-                        Some(Ok(_)) => continue,
-                        Some(Err(e)) => return Err(e.into()),
-                        None => return Ok(Event::Tick),
                     }
-                }
-                Some(ev) = self.app.recv() => {
-                    if matches!(ev, AppEvent::Transfer(TransferEvent::Progress)) {
-                        self.deferred = drain_progress(&mut self.app);
+                    Some(ev) = self.app.recv() => {
+                        if matches!(ev, AppEvent::Transfer {
+                event: TransferEvent::Progress,
+                ..
+            }) {
+                            self.deferred = drain_progress(&mut self.app);
+                        }
+                        return Ok(Event::App(ev));
                     }
-                    return Ok(Event::App(ev));
+                    _ = self.tick.tick() => return Ok(Event::Tick),
                 }
-                _ = self.tick.tick() => return Ok(Event::Tick),
-            }
         }
     }
 }
@@ -323,7 +334,13 @@ fn wanted_mouse(m: &MouseEvent) -> bool {
 /// waiting for the next tick.
 fn drain_progress(app: &mut mpsc::UnboundedReceiver<AppEvent>) -> Option<AppEvent> {
     while let Ok(ev) = app.try_recv() {
-        if matches!(ev, AppEvent::Transfer(TransferEvent::Progress)) {
+        if matches!(
+            ev,
+            AppEvent::Transfer {
+                event: TransferEvent::Progress,
+                ..
+            }
+        ) {
             continue;
         }
         return Some(ev);
@@ -384,7 +401,10 @@ mod tests {
     }
 
     fn progress() -> AppEvent {
-        AppEvent::Transfer(TransferEvent::Progress)
+        AppEvent::Transfer {
+            connection: 0,
+            event: TransferEvent::Progress,
+        }
     }
 
     #[test]
@@ -414,7 +434,10 @@ mod tests {
         assert!(
             matches!(
                 rx.try_recv(),
-                Ok(AppEvent::Transfer(TransferEvent::Progress))
+                Ok(AppEvent::Transfer {
+                    event: TransferEvent::Progress,
+                    ..
+                })
             ),
             "events queued after the deferred one must survive",
         );
