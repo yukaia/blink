@@ -26,7 +26,7 @@ use crate::tui::state::{
 
 use super::checkpoint_glue::CheckpointFlush;
 
-use super::{App, LogLevel, Pane, Screen};
+use super::{App, BatchOutcome, LogLevel, Pane, Screen};
 
 impl App {
     pub(super) fn handle_app_event(&mut self, event: AppEvent) {
@@ -705,7 +705,7 @@ impl App {
             TransferEvent::Complete(id) => {
                 // Update in-memory state and either debounce-save (still more
                 // work pending) or delete the file (every job is done).
-                if let Some((kind, cp_idx)) = self.checkpoint_job_map.get(&id).copied() {
+                if let Some((kind, cp_idx)) = self.checkpoint_job_map.remove(&id) {
                     if let Some(cp) = self.active_checkpoints.get_mut(&kind) {
                         cp.mark_done(cp_idx);
                     }
@@ -743,6 +743,9 @@ impl App {
                         let path = self.remote.path.clone();
                         self.refresh_remote_pane(path);
                     }
+                    if let Some(b) = j.batch_id {
+                        self.tally_batch(b, BatchOutcome::Done);
+                    }
                 }
                 // A finished job leaves room in the queue for one waiting.
                 self.queue_waiting_jobs();
@@ -775,11 +778,21 @@ impl App {
                     tracing::warn!(id, "checkpoint flush after failure failed: {e}");
                 }
 
-                let label = self
-                    .job_lookup(id)
-                    .map(|j| j.remote_path)
+                let job = self.job_lookup(id);
+                let label = job
+                    .as_ref()
+                    .map(|j| j.remote_path.clone())
                     .unwrap_or_else(|| format!("id={id}"));
                 self.push_log(LogLevel::Error, format!("failed: {label}: {error}"));
+                if let Some(b) = job.and_then(|j| j.batch_id) {
+                    // The manager's own word for a job the user cancelled.
+                    let outcome = if error == "cancelled" {
+                        BatchOutcome::Cancelled
+                    } else {
+                        BatchOutcome::Failed
+                    };
+                    self.tally_batch(b, outcome);
+                }
                 // A finished job leaves room in the queue for one waiting.
                 self.queue_waiting_jobs();
             }

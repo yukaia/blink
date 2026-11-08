@@ -26,7 +26,7 @@ use crate::checkpoint::{Checkpoint, CheckpointJob, CheckpointKind, JobStatus};
 use crate::transfer::{Direction, EnqueueError, TransferManager, destination_key};
 use crate::tui::plan::PlannedJob;
 
-use super::{App, LogLevel, WaitingJob};
+use super::{App, BatchOutcome, BatchTally, LogLevel, WaitingJob};
 
 /// Whether [`App::settle_checkpoint`] should write immediately or let the
 /// debounce decide.
@@ -223,6 +223,19 @@ impl App {
         }
         // ---------------------------------------------------------------
 
+        if let Some(b) = batch_id {
+            self.batch_tallies.insert(
+                b,
+                BatchTally {
+                    kind: ck_kind,
+                    total: plan.len(),
+                    done: 0,
+                    failed: 0,
+                    cancelled: 0,
+                },
+            );
+        }
+
         let mut dirs = 0usize;
         let mut files = 0usize;
         let mut dropped = 0usize;
@@ -300,6 +313,9 @@ impl App {
                     if let Some(cp) = self.active_checkpoints.get_mut(&ck_kind) {
                         cp.mark_cancelled(base + cp_idx);
                     }
+                    if let Some(b) = batch_id {
+                        self.tally_batch(b, BatchOutcome::Cancelled);
+                    }
                 }
             }
         }
@@ -356,6 +372,9 @@ impl App {
                         if let Some(cp) = self.active_checkpoints.get_mut(&kind) {
                             cp.mark_cancelled(cp_idx);
                         }
+                        if let Some(b) = batch_id {
+                            self.tally_batch(b, BatchOutcome::Cancelled);
+                        }
                         cancelled = true;
                     }
                 }
@@ -375,6 +394,7 @@ impl App {
     /// after the rest of their batch was cancelled.
     pub(super) fn cancel_waiting_in_batch(&mut self, batch_id: u64) {
         let mut touched = Vec::new();
+        let mut dropped = 0usize;
         for (kind, queue) in self.waiting_jobs.iter_mut() {
             let before = queue.len();
             let mut kept = std::collections::VecDeque::with_capacity(before);
@@ -383,6 +403,7 @@ impl App {
                     if let Some(cp) = self.active_checkpoints.get_mut(kind) {
                         cp.mark_cancelled(w.cp_idx);
                     }
+                    dropped += 1;
                 } else {
                     kept.push_back(w);
                 }
@@ -392,9 +413,63 @@ impl App {
             }
             *queue = kept;
         }
+        for _ in 0..dropped {
+            self.tally_batch(batch_id, BatchOutcome::Cancelled);
+        }
         for kind in touched {
             self.settle_checkpoint(kind, CheckpointFlush::Force);
         }
+    }
+
+    /// Count how one job of batch `batch_id` ended, and report the batch
+    /// once all of its jobs have.
+    ///
+    /// Each job leaves a line as it ends, but in a large batch a `failed:`
+    /// line is pushed out of the log long before the batch is over, which
+    /// then ends on a run of `complete:` lines that read as success. This
+    /// line comes last and counts the failures.
+    pub(super) fn tally_batch(&mut self, batch_id: u64, outcome: BatchOutcome) {
+        let Some(t) = self.batch_tallies.get_mut(&batch_id) else {
+            return;
+        };
+        match outcome {
+            BatchOutcome::Done => t.done += 1,
+            BatchOutcome::Failed => t.failed += 1,
+            BatchOutcome::Cancelled => t.cancelled += 1,
+        }
+        if t.done + t.failed + t.cancelled < t.total {
+            return;
+        }
+        let Some(t) = self.batch_tallies.remove(&batch_id) else {
+            return;
+        };
+        let kind = t.kind.as_str();
+        if t.failed > 0 {
+            let key = match t.kind {
+                CheckpointKind::Download => "r",
+                CheckpointKind::Upload => "R",
+            };
+            self.push_log(
+                LogLevel::Error,
+                format!(
+                    "{kind} batch finished: {} of {} failed — press {key} in the \
+                     transfers pane to retry them",
+                    t.failed, t.total
+                ),
+            );
+        } else if t.done > 0 {
+            let message = if t.cancelled == 0 {
+                format!("{kind} batch finished: all {} complete", t.done)
+            } else {
+                format!(
+                    "{kind} batch finished: {} complete, {} cancelled",
+                    t.done, t.cancelled
+                )
+            };
+            self.push_log(LogLevel::Success, message);
+        }
+        // Nothing done and nothing failed: the user cancelled all of it,
+        // and the cancel already said so.
     }
 
     /// Remove plan entries whose destination another job already writes —
@@ -473,12 +548,18 @@ impl App {
     pub fn resume_walk(&mut self, ck_kind: CheckpointKind) {
         let (session_name, origin) = self.checkpoint_key();
 
-        // Refuse while a batch of this direction is still tracked: the file
-        // on disk *is* that batch's state, so re-queuing from it would
-        // duplicate jobs that are already in flight.
-        if let Some(active) = self.active_checkpoints.get(&ck_kind)
-            && active.pending_count() > 0
-        {
+        // Refuse while a job of this direction is still queued, running or
+        // waiting for room: the file on disk *is* that batch's state, so
+        // re-queuing from it would duplicate jobs that are already in
+        // flight. Not "while the checkpoint has entries left": a failed
+        // job's entry stays there to be retried, and counting it refused
+        // the retry until the next connect.
+        let in_flight = self.checkpoint_job_map.values().any(|(k, _)| *k == ck_kind)
+            || self
+                .waiting_jobs
+                .get(&ck_kind)
+                .is_some_and(|q| !q.is_empty());
+        if in_flight {
             self.push_log(
                 LogLevel::Warn,
                 format!(
@@ -487,6 +568,16 @@ impl App {
                 ),
             );
             return;
+        }
+
+        // A finished batch with failures is still tracked. Write its
+        // held-back marks, so the jobs that did finish are not redone, and
+        // stop tracking it: the retry below starts its own record, and
+        // appending to this one would list the failed jobs twice.
+        if let Some(mut finished) = self.active_checkpoints.remove(&ck_kind)
+            && let Err(e) = finished.flush_if_dirty()
+        {
+            tracing::warn!("checkpoint flush before a retry failed: {e}");
         }
 
         let checkpoint = match Checkpoint::load(&session_name, &origin, ck_kind) {

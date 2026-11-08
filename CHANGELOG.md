@@ -51,6 +51,24 @@ the git history for those.
 
 ### Fixed
 
+- **Large SFTP batches no longer fail as lost connections on a slow
+  link.** Each SFTP connection keeps 16 reads queued, and the SFTP library
+  gives every read 10 seconds counted from when it is sent, including its
+  time waiting in line. With several downloads sharing a link, the last
+  read in line waited longer than that while data was still arriving. The
+  read failed as a lost connection and the file was left as a
+  `.blink-part`. A transfer now fails only after a minute with no reply,
+  however long a read waits its turn. Uploads had the same problem and get
+  the same fix.
+- **A batch with failures says so when it ends.** Each failure left a
+  single `failed:` line, which a large batch pushed out of the log long
+  before it finished. The batch then ended on a run of `complete:` lines,
+  which looked like success. A batch now ends with a line counting its
+  failures, or confirming that every file completed.
+- **The failed files of a finished batch can be retried.** `r` (or `R`
+  for uploads) treated the failed entries still in the checkpoint as a
+  batch in progress, and refused until you reconnected. It now re-queues
+  just the failed files.
 - **Disconnecting cancels running transfers, as its confirmation says.**
   It only stopped new jobs from starting: transfers already running carried
   on in the background on their own connections. And because job numbers

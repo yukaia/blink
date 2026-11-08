@@ -156,6 +156,24 @@ struct WaitingJob {
     batch_id: Option<u64>,
 }
 
+/// How a batch's jobs have ended so far. The batch is over when every one
+/// of its `total` jobs is counted.
+struct BatchTally {
+    kind: CheckpointKind,
+    total: usize,
+    done: usize,
+    failed: usize,
+    cancelled: usize,
+}
+
+/// How one job of a batch ended.
+#[derive(Clone, Copy)]
+enum BatchOutcome {
+    Done,
+    Failed,
+    Cancelled,
+}
+
 /// A remote listing that has been started and not yet reported back.
 ///
 /// Requests to list the same directory while it is in flight set `again`
@@ -322,12 +340,16 @@ pub struct App {
     active_checkpoints: std::collections::HashMap<CheckpointKind, Checkpoint>,
     /// Maps dispatcher job-id → the checkpoint entry it corresponds to, as
     /// `(kind, index)`, so the transfer-event handler can mark the right
-    /// entry without a linear scan of the plan.
+    /// entry without a linear scan of the plan. Holds only jobs still queued
+    /// or running: an entry goes when its job ends.
     checkpoint_job_map: std::collections::HashMap<u64, (CheckpointKind, usize)>,
     /// Checkpoint entries that met a full queue, in the order they are owed,
     /// per direction. Queued as earlier jobs finish — see
     /// `App::queue_waiting_jobs`.
     waiting_jobs: std::collections::HashMap<CheckpointKind, std::collections::VecDeque<WaitingJob>>,
+    /// How each running batch's jobs have ended so far, by batch id, for
+    /// the line that reports the batch's end. See `App::tally_batch`.
+    batch_tallies: std::collections::HashMap<u64, BatchTally>,
 
     // Viewer
     pub viewer: Option<Viewer>,
@@ -453,6 +475,7 @@ impl App {
             active_checkpoints: std::collections::HashMap::new(),
             checkpoint_job_map: std::collections::HashMap::new(),
             waiting_jobs: std::collections::HashMap::new(),
+            batch_tallies: std::collections::HashMap::new(),
             viewer: None,
             hit: Default::default(),
             last_click: None,
@@ -929,6 +952,8 @@ impl App {
         // Their entries stay `pending` on disk, so the next connect offers to
         // resume them with the rest of their batch.
         self.waiting_jobs.clear();
+        // Their batches end unreported: the disconnect itself said so.
+        self.batch_tallies.clear();
         self.pending_offers.clear();
         self.transfer_manager = None;
         self.current_session = None;
@@ -2105,6 +2130,132 @@ mod tests {
 
     fn logged(a: &App, needle: &str) -> bool {
         a.log.iter().any(|l| l.message.contains(needle))
+    }
+
+    /// End job `id` as the dispatcher would: mark it in the manager, then
+    /// deliver the event the mark sends.
+    fn finish(a: &mut App, id: u64, failed: Option<&str>) {
+        let m = a.transfer_manager.clone().unwrap();
+        match failed {
+            None => {
+                m.mark(id, crate::transfer::TransferState::Complete);
+                a.handle_transfer_event(TransferEvent::Complete(id));
+            }
+            Some(error) => {
+                m.mark(id, crate::transfer::TransferState::Failed(error.into()));
+                a.handle_transfer_event(TransferEvent::Failed {
+                    id,
+                    error: error.into(),
+                });
+            }
+        }
+    }
+
+    fn batch_ids(a: &App) -> Vec<u64> {
+        let mut ids: Vec<u64> = a.checkpoint_job_map.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// A failure in a large batch used to leave one `failed:` line, which the
+    /// rest of the batch's lines pushed out of the log long before it ended.
+    /// The batch then finished on a run of `complete:` lines, which read as
+    /// complete success, with the failed files' partials still on disk.
+    #[tokio::test]
+    async fn a_batch_with_failures_ends_with_a_line_that_says_so() {
+        let (mut a, _cleanup) = checkpoint_app("summary-failed");
+        a.dispatch_plan(
+            vec![download(0), download(1), download(2)],
+            CheckpointKind::Download,
+        );
+        let ids = batch_ids(&a);
+
+        finish(&mut a, ids[0], Some("read /r/0: Timeout"));
+        finish(&mut a, ids[1], None);
+        assert!(!logged(&a, "batch finished"), "the batch is not over yet");
+        finish(&mut a, ids[2], None);
+
+        let last = a.log.back().unwrap();
+        assert_eq!(last.level, LogLevel::Error, "{}", last.message);
+        assert!(
+            last.message.contains("1 of 3 failed") && last.message.contains("press r"),
+            "{}",
+            last.message,
+        );
+    }
+
+    #[tokio::test]
+    async fn a_batch_that_succeeds_ends_with_a_line_that_says_so() {
+        let (mut a, _cleanup) = checkpoint_app("summary-ok");
+        a.dispatch_plan(vec![download(0), download(1)], CheckpointKind::Download);
+        for id in batch_ids(&a) {
+            finish(&mut a, id, None);
+        }
+        let last = a.log.back().unwrap();
+        assert_eq!(last.level, LogLevel::Success);
+        assert_eq!(last.message, "download batch finished: all 2 complete");
+    }
+
+    /// A cancelled job is not a failure: the user asked for it.
+    #[tokio::test]
+    async fn a_cancelled_job_is_not_counted_as_a_failure() {
+        let (mut a, _cleanup) = checkpoint_app("summary-cancel");
+        a.dispatch_plan(vec![download(0), download(1)], CheckpointKind::Download);
+        let ids = batch_ids(&a);
+        finish(&mut a, ids[0], Some("cancelled"));
+        finish(&mut a, ids[1], None);
+        assert_eq!(
+            last_log(&a),
+            "download batch finished: 1 complete, 1 cancelled"
+        );
+    }
+
+    /// The failed jobs of a finished batch stay in its checkpoint, to be
+    /// resumed. `r` took those entries for a batch still running and
+    /// refused, so they could not be retried until the next connect.
+    #[tokio::test]
+    async fn the_failed_jobs_of_a_finished_batch_can_be_retried() {
+        let (mut a, _cleanup) = checkpoint_app("retry-failed");
+        a.dispatch_plan(
+            vec![download(0), download(1), download(2)],
+            CheckpointKind::Download,
+        );
+        let ids = batch_ids(&a);
+        finish(&mut a, ids[0], Some("read /r/0: Timeout"));
+        // Completed after the failure, so their marks are still held back
+        // by the debounce when `r` reads the file.
+        finish(&mut a, ids[1], None);
+        finish(&mut a, ids[2], None);
+
+        a.resume_walk(CheckpointKind::Download);
+
+        assert!(!logged(&a, "still in flight"), "{}", last_log(&a));
+        let m = a.transfer_manager.as_ref().unwrap();
+        let queued: Vec<String> = m
+            .snapshot()
+            .into_iter()
+            .filter(|j| j.state == crate::transfer::TransferState::Pending)
+            .map(|j| j.remote_path)
+            .collect();
+        assert_eq!(queued, ["/r/0"], "only the failed download is retried");
+        assert_eq!(
+            a.active_checkpoints[&CheckpointKind::Download].jobs.len(),
+            1,
+            "the retry starts its own record rather than appending to the old one",
+        );
+    }
+
+    /// While a batch still has jobs queued or running, `r` is still refused.
+    #[tokio::test]
+    async fn retrying_waits_for_the_batch_to_finish() {
+        let (mut a, _cleanup) = checkpoint_app("retry-running");
+        a.dispatch_plan(vec![download(0), download(1)], CheckpointKind::Download);
+        let ids = batch_ids(&a);
+        finish(&mut a, ids[0], Some("read /r/0: Timeout"));
+
+        a.resume_walk(CheckpointKind::Download);
+
+        assert!(logged(&a, "still in flight"), "{}", last_log(&a));
     }
 
     /// Downloading a file again while its first download is still queued or
