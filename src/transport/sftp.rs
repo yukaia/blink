@@ -974,7 +974,7 @@ async fn pipelined_download(
     local: &mut tokio::fs::File,
     total: u64,
     progress: &Option<mpsc::UnboundedSender<ProgressUpdate>>,
-) -> Result<()> {
+) -> Result<u64> {
     let mut done = start;
 
     if let Some(end) = size {
@@ -1054,7 +1054,7 @@ async fn pipelined_download(
                  (expected {end} bytes, got {done})"
         )));
     }
-    Ok(())
+    Ok(done)
 }
 
 /// Fill `buf` from `src`, looping over short reads until full or EOF. Returns
@@ -1258,7 +1258,7 @@ impl Transport for SftpTransport {
         // here, so the handle is closed on every path out: a local error
         // (resolving the partial, creating the folder, opening the file)
         // used to return early and leave it open on the server.
-        let result: Result<tokio::fs::File> = async {
+        let result: Result<(tokio::fs::File, u64)> = async {
             let attrs = tokio::time::timeout(idle_timeout(), raw.fstat(&remote_handle))
                 .await
                 .ok()
@@ -1289,7 +1289,7 @@ impl Transport for SftpTransport {
             // than an anonymous one that the next attempt has to throw away.
             super::write_part_meta(local_path, remote_path, stamp, &origin).await;
 
-            pipelined_download(
+            let done = pipelined_download(
                 &raw,
                 &remote_handle,
                 remote_path,
@@ -1302,11 +1302,11 @@ impl Transport for SftpTransport {
                 &progress,
             )
             .await?;
-            Ok(local)
+            Ok((local, done))
         }
         .await;
         let _ = tokio::time::timeout(idle_timeout(), raw.close(&remote_handle)).await;
-        let mut local = result?;
+        let (mut local, done) = result?;
 
         // Flush + fsync the partial so its bytes are durable, then atomically
         // rename onto the final path. Drop the handle first; renaming an
@@ -1315,7 +1315,7 @@ impl Transport for SftpTransport {
         local.flush().await?;
         local.sync_all().await?;
         drop(local);
-        super::finish_download(&part, local_path).await?;
+        super::finish_download(&part, local_path, done).await?;
         Ok(())
     }
 

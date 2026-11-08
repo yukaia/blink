@@ -51,6 +51,12 @@ the git history for those.
 
 ### Fixed
 
+- **A download is checked on disk before it goes into place.** Each
+  protocol checked the bytes it counted, not the file. If a cancelled
+  attempt's last write landed after its retry had measured the partial
+  file, a longer, corrupt file was renamed into place. The partial's
+  length is now checked first. One of the wrong length is discarded, and
+  the download fails.
 - **A finished download survives a power cut.** The file was renamed into
   place without syncing its folder to disk, so a power cut could undo the
   rename after the checkpoint had already recorded the file as done, and a

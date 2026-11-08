@@ -341,7 +341,15 @@ async fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
     Ok(raw)
 }
 
-/// Move a finished download's partial onto its final name, durably.
+/// Move a finished download's partial onto its final name, durably, once
+/// it is checked to hold exactly the `counted` bytes the download reached
+/// (its resume offset plus what it received).
+///
+/// The protocols check their own count; this checks the file. Bytes can
+/// reach it some other way: a cancelled attempt's last write is handed to a
+/// background thread and can land after a retry has measured the partial,
+/// and the retry's bytes then follow it. A partial of any other length is
+/// removed, so the next attempt starts clean, and the job fails.
 ///
 /// The partial is already fsynced; the rename is not durable until the
 /// folder holding it is synced too. Without that, a power cut could undo
@@ -349,8 +357,23 @@ async fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
 /// resume would skip a file that never landed. A failed folder sync is
 /// logged rather than failing the job: the file is in place, and a retry
 /// would only fetch it again to the same state.
-pub(crate) async fn finish_download(part: &Path, local_path: &Path) -> std::io::Result<()> {
-    tokio::fs::rename(part, local_path).await?;
+pub(crate) async fn finish_download(
+    part: &Path,
+    local_path: &Path,
+    counted: u64,
+) -> crate::error::Result<()> {
+    let on_disk = tokio::fs::symlink_metadata(part).await?.len();
+    if on_disk != counted {
+        let _ = tokio::fs::remove_file(part).await;
+        clear_part_meta(local_path).await;
+        return Err(crate::error::BlinkError::transport(format!(
+            "{}: the partial holds {on_disk} bytes, but the download reached {counted}",
+            local_path.display()
+        )));
+    }
+    tokio::fs::rename(part, local_path).await.map_err(|e| {
+        crate::error::BlinkError::transport(format!("rename {}: {e}", local_path.display()))
+    })?;
     let synced_path = local_path.to_path_buf();
     let synced =
         tokio::task::spawn_blocking(move || crate::paths::sync_parent_dir(&synced_path)).await;
@@ -1005,6 +1028,30 @@ pub(crate) mod mock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rename checks the partial holds exactly the bytes the download
+    /// counted. Both protocols checked only their own count, so bytes that
+    /// reached the file some other way — the last write of a cancelled
+    /// attempt landing after its retry had measured the partial — went
+    /// into place as a longer, corrupt file.
+    #[tokio::test]
+    async fn a_partial_of_the_wrong_length_is_not_renamed_into_place() {
+        let home = crate::paths::test_home();
+        let local = home.path().join("f.bin");
+        let part = part_path(&local);
+        std::fs::write(&part, b"0123456789").unwrap();
+
+        let err = finish_download(&part, &local, 8)
+            .await
+            .expect_err("10 bytes on disk for 8 counted");
+        assert!(err.to_string().contains("10 bytes"), "{err}");
+        assert!(!local.exists(), "nothing goes into place");
+        assert!(!part.exists(), "and the partial can't be resumed from");
+
+        std::fs::write(&part, b"01234567").unwrap();
+        finish_download(&part, &local, 8).await.unwrap();
+        assert_eq!(std::fs::read(&local).unwrap(), b"01234567");
+    }
 
     // -- the connect deadline and the host-key prompt ----------------------
     //
