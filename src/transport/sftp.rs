@@ -1168,46 +1168,55 @@ impl Transport for SftpTransport {
             .map_err(|e| map_sftp("open", remote_path, e))?
             .handle;
 
-        let attrs = raw.fstat(&remote_handle).await.ok().map(|a| a.attrs);
-        let reported_size = attrs.as_ref().and_then(|a| a.size);
-        let stamp = super::RemoteStamp {
-            size: reported_size,
-            mtime: attrs.as_ref().and_then(|a| a.mtime).map(u64::from),
-        };
+        // Everything that can fail while the remote file is open runs in
+        // here, so the handle is closed on every path out: a local error
+        // (resolving the partial, creating the folder, opening the file)
+        // used to return early and leave it open on the server.
+        let result: Result<tokio::fs::File> = async {
+            let attrs = raw.fstat(&remote_handle).await.ok().map(|a| a.attrs);
+            let reported_size = attrs.as_ref().and_then(|a| a.size);
+            let stamp = super::RemoteStamp {
+                size: reported_size,
+                mtime: attrs.as_ref().and_then(|a| a.mtime).map(u64::from),
+            };
 
-        let total = reported_size.unwrap_or(0);
+            let total = reported_size.unwrap_or(0);
 
-        // Resume only a partial we can positively identify as this file —
-        // see `transport::decide_resume`. Anything unproven (a partial of a
-        // different remote file that shares this local name, one from an
-        // older blink, or one whose file has since been replaced) is
-        // discarded here so the create below starts from a clean state.
-        let offset = super::resume_offset(local_path, remote_path, stamp, &origin).await;
+            // Resume only a partial we can positively identify as this
+            // file — see `transport::decide_resume`. Anything unproven (a
+            // partial of a different remote file that shares this local
+            // name, one from an older blink, or one whose file has since
+            // been replaced) is discarded here so the create below starts
+            // from a clean state.
+            let offset = super::resume_offset(local_path, remote_path, stamp, &origin).await;
 
-        if let Some(parent) = local_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+            if let Some(parent) = local_path.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            let mut local = super::open_part(&part, offset).await?;
+            // Record what these bytes are before writing any, so an
+            // interrupt at any point leaves an identifiable partial rather
+            // than an anonymous one that the next attempt has to throw away.
+            super::write_part_meta(local_path, remote_path, stamp, &origin).await;
+
+            pipelined_download(
+                &raw,
+                &remote_handle,
+                remote_path,
+                offset,
+                reported_size,
+                read_chunk,
+                TRANSFER_CONCURRENCY,
+                &mut local,
+                total,
+                &progress,
+            )
+            .await?;
+            Ok(local)
         }
-        let mut local = super::open_part(&part, offset).await?;
-        // Record what these bytes are before writing any, so an interrupt at
-        // any point leaves an identifiable partial rather than an anonymous
-        // one that the next attempt has to throw away.
-        super::write_part_meta(local_path, remote_path, stamp, &origin).await;
-
-        let result = pipelined_download(
-            &raw,
-            &remote_handle,
-            remote_path,
-            offset,
-            reported_size,
-            read_chunk,
-            TRANSFER_CONCURRENCY,
-            &mut local,
-            total,
-            &progress,
-        )
         .await;
         let _ = raw.close(&remote_handle).await;
-        result?;
+        let mut local = result?;
 
         // Flush + fsync the partial so its bytes are durable, then atomically
         // rename onto the final path. Drop the handle first; renaming an
@@ -1836,6 +1845,12 @@ mod integration {
         format!("\0symlink:{path}")
     }
 
+    /// Present while a file handle on `path` is open: set by `open`, cleared
+    /// by `close`, so a test can see a handle left open.
+    fn open_handle_key(path: &str) -> String {
+        format!("\0open:{path}")
+    }
+
     fn ok_status(id: u32) -> Status {
         Status {
             id,
@@ -1874,13 +1889,15 @@ mod integration {
             } else if !store.contains_key(&filename) {
                 return Err(StatusCode::NoSuchFile);
             }
+            store.insert(open_handle_key(&filename), Vec::new());
             Ok(SftpHandle {
                 id,
                 handle: filename,
             })
         }
 
-        async fn close(&mut self, id: u32, _handle: String) -> Result<Status, Self::Error> {
+        async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
+            self.store.lock().await.remove(&open_handle_key(&handle));
             Ok(ok_status(id))
         }
 
@@ -2707,6 +2724,33 @@ mod integration {
                 .unwrap_or_else(|e| panic!("{tag}: close should be clean: {e}"));
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    #[tokio::test]
+    async fn a_download_that_fails_locally_still_closes_the_remote_file() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/f.bin".to_string(), b"data".to_vec());
+        let (port, _connects) = start_server(store.clone()).await;
+        let mut transport = connect(port).await;
+        // The local parent is a file, so creating it fails after the
+        // remote file is open.
+        let home = crate::paths::test_home();
+        let blocker = home.path().join("blocker");
+        std::fs::write(&blocker, b"").unwrap();
+
+        assert!(
+            transport
+                .download("/f.bin", &blocker.join("f.bin"), None)
+                .await
+                .is_err()
+        );
+        assert!(
+            !store.lock().await.contains_key(&open_handle_key("/f.bin")),
+            "the remote handle must be closed"
+        );
     }
 
     #[tokio::test]
