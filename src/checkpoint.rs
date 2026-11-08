@@ -116,8 +116,14 @@ const CHECKPOINT_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 ///       loads with no origin and is never offered (see the module docs).
 const FORMAT_VERSION: u32 = 4;
 
-/// Maximum checkpoint file size accepted on load (10 MiB).
-const MAX_CHECKPOINT_BYTES: u64 = 10 * 1024 * 1024;
+/// Maximum checkpoint file size accepted on load (256 MiB).
+///
+/// A guard against a corrupt file, so it has to clear anything blink itself
+/// writes. It was 10 MiB, which a batch of about 50,000 files passed: the
+/// checkpoint was saved and then refused on load. A job takes roughly 60
+/// bytes plus its two paths, so this fits [`MAX_CHECKPOINT_JOBS`] with
+/// paths averaging over 100 bytes each.
+const MAX_CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Maximum number of jobs accepted in a single checkpoint.
 const MAX_CHECKPOINT_JOBS: usize = 1_000_000;
@@ -280,6 +286,9 @@ pub struct Checkpoint {
     /// first save.
     #[serde(default, skip)]
     last_save: Option<Instant>,
+    /// How long the last write took. See [`flush_interval`].
+    #[serde(default, skip)]
+    last_cost: Duration,
 }
 
 impl Checkpoint {
@@ -299,6 +308,7 @@ impl Checkpoint {
             jobs,
             dirty: true,
             last_save: None,
+            last_cost: Duration::ZERO,
         }
     }
 
@@ -342,12 +352,17 @@ impl Checkpoint {
     /// completed, batch failed, app exiting) so the on-disk state is up to
     /// date before the in-memory checkpoint is dropped.
     pub fn flush(&mut self) -> Result<()> {
+        let started = Instant::now();
         let path = Self::path_for(&self.session, self.origin_key(), self.kind)?;
-        let json = serde_json::to_string_pretty(self)
+        // Compact: indentation doubled the size of a large checkpoint, and
+        // with it the time each write holds up the interface.
+        let json = serde_json::to_string(self)
             .map_err(|e| BlinkError::config(format!("checkpoint serialize: {e}")))?;
         Self::atomic_write(&path, &json)?;
         self.dirty = false;
-        self.last_save = Some(Instant::now());
+        let now = Instant::now();
+        self.last_save = Some(now);
+        self.last_cost = now.duration_since(started);
         Ok(())
     }
 
@@ -362,7 +377,7 @@ impl Checkpoint {
             self.dirty,
             self.last_save,
             Instant::now(),
-            CHECKPOINT_FLUSH_INTERVAL,
+            flush_interval(self.last_cost),
         ) {
             self.flush()
         } else {
@@ -785,6 +800,23 @@ fn write_due(dirty: bool, last_save: Option<Instant>, now: Instant, interval: Du
         None => true,
         Some(t) => now.duration_since(t) >= interval,
     }
+}
+
+/// The debounced write's interval stretches to this many times the cost of
+/// the last write, so writing takes at most about 1/20 of the time.
+const WRITE_COST_FACTOR: u32 = 20;
+
+/// How long [`Checkpoint::flush_if_due`] waits between writes, given what
+/// the last one cost.
+///
+/// Writes run on the interface's thread. A checkpoint of a large batch is
+/// tens of megabytes, serialized and fsynced whole every time, and at a
+/// fixed quarter-second the interface spent much of a large batch blocked
+/// on them. Stretching the interval keeps the share of time spent writing
+/// small; a write held back longer only means a few more jobs redone after
+/// a crash.
+fn flush_interval(last_cost: Duration) -> Duration {
+    CHECKPOINT_FLUSH_INTERVAL.max(last_cost * WRITE_COST_FACTOR)
 }
 
 /// What a checkpoint teardown removed, and what it could not.
@@ -1258,6 +1290,47 @@ mod debounce_tests {
     // recording. The cost of coalescing is bounded — a lost mark only means
     // that job re-runs on resume — so the policy is safe to keep loose, but
     // it is load-bearing for throughput and nothing else enforces it.
+
+    /// The largest batch blink will plan must still be resumable. Written
+    /// pretty-printed, a checkpoint took about 200 bytes a job against a
+    /// 10 MiB load limit, so a batch past about 50,000 files was saved but
+    /// refused on load: neither the offer on connect nor `r` could resume it.
+    #[test]
+    fn a_checkpoint_of_the_largest_batch_still_loads() {
+        let _home = crate::paths::test_home();
+        let jobs: Vec<CheckpointJob> = (0..crate::transfer::MAX_QUEUED_JOBS)
+            .map(|i| CheckpointJob::Download {
+                remote_path: format!("/srv/media/photos/2024/holiday/IMG_{i:06}.jpg"),
+                local_path: PathBuf::from(format!(
+                    "/home/someone/Downloads/photos/2024/holiday/IMG_{i:06}.jpg"
+                )),
+                status: JobStatus::Pending,
+            })
+            .collect();
+        let mut cp = Checkpoint::new("big", TEST_ORIGIN, CheckpointKind::Download, jobs);
+        cp.flush().unwrap();
+        let loaded = Checkpoint::load("big", TEST_ORIGIN, CheckpointKind::Download)
+            .expect("a checkpoint blink wrote must load")
+            .expect("and be found");
+        assert_eq!(loaded.jobs.len(), crate::transfer::MAX_QUEUED_JOBS);
+    }
+
+    /// A debounced write of a large checkpoint takes long enough to stall
+    /// the interface, which runs it. The interval stretches with the cost
+    /// of the last write, so writing takes a small share of the time.
+    #[test]
+    fn the_write_interval_stretches_with_the_cost_of_a_write() {
+        assert_eq!(flush_interval(Duration::ZERO), CHECKPOINT_FLUSH_INTERVAL);
+        assert_eq!(
+            flush_interval(Duration::from_millis(5)),
+            CHECKPOINT_FLUSH_INTERVAL,
+            "a cheap write keeps the usual interval",
+        );
+        assert_eq!(
+            flush_interval(Duration::from_millis(100)),
+            Duration::from_millis(100) * WRITE_COST_FACTOR,
+        );
+    }
 
     #[test]
     fn a_clean_checkpoint_is_never_written() {

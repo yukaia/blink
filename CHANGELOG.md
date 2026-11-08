@@ -51,6 +51,15 @@ the git history for those.
 
 ### Fixed
 
+- **Large batches can be resumed.** A batch of more than about 50,000
+  files wrote a checkpoint bigger than blink would load, so neither the
+  offer on connect nor `r` could resume it ("checkpoint file exceeds size
+  limit"). Checkpoints are now written compactly, at about half the size,
+  and the load limit fits the largest batch blink will plan.
+- **Large batches no longer make the interface stutter.** The checkpoint
+  was rewritten in full up to four times a second on the interface's own
+  thread, tens of megabytes at a time for a large batch. Writes are now
+  spaced out in proportion to how long they take.
 - **Recursive uploads no longer fail on folders that aren't made yet.**
   A folder's mkdir is queued before the files that go in it, but with two
   or more parallel transfers (the default is two) they ran at the same
