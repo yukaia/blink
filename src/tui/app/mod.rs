@@ -350,6 +350,10 @@ pub struct App {
     /// How each running batch's jobs have ended so far, by batch id, for
     /// the line that reports the batch's end. See `App::tally_batch`.
     batch_tallies: std::collections::HashMap<u64, BatchTally>,
+    /// The batch of each queued or running job that has one, by job id.
+    /// Kept here because the manager drops old finished jobs, and may have
+    /// dropped one by the time its event is handled.
+    job_batches: std::collections::HashMap<u64, u64>,
 
     // Viewer
     pub viewer: Option<Viewer>,
@@ -476,6 +480,7 @@ impl App {
             checkpoint_job_map: std::collections::HashMap::new(),
             waiting_jobs: std::collections::HashMap::new(),
             batch_tallies: std::collections::HashMap::new(),
+            job_batches: std::collections::HashMap::new(),
             viewer: None,
             hit: Default::default(),
             last_click: None,
@@ -954,6 +959,7 @@ impl App {
         self.waiting_jobs.clear();
         // Their batches end unreported: the disconnect itself said so.
         self.batch_tallies.clear();
+        self.job_batches.clear();
         self.pending_offers.clear();
         self.transfer_manager = None;
         self.current_session = None;
@@ -2194,6 +2200,23 @@ mod tests {
         let last = a.log.back().unwrap();
         assert_eq!(last.level, LogLevel::Success);
         assert_eq!(last.message, "download batch finished: all 2 complete");
+    }
+
+    /// The manager keeps only the newest finished jobs, so by the time the
+    /// interface handles a job's event the manager may have dropped it.
+    /// The summary used to find the job's batch there, and then never came.
+    #[tokio::test]
+    async fn a_batch_is_reported_after_the_manager_forgets_its_jobs() {
+        let (mut a, _cleanup) = checkpoint_app("summary-forgotten");
+        a.dispatch_plan(vec![download(0), download(1)], CheckpointKind::Download);
+        let ids = batch_ids(&a);
+        a.transfer_manager = Some(TransferManager::new(1).0);
+        a.handle_transfer_event(TransferEvent::Failed {
+            id: ids[0],
+            error: "boom".into(),
+        });
+        a.handle_transfer_event(TransferEvent::Complete(ids[1]));
+        assert!(logged(&a, "1 of 2 failed"), "{}", last_log(&a));
     }
 
     /// A cancelled job is not a failure: the user asked for it.

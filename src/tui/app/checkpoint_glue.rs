@@ -287,6 +287,9 @@ impl App {
             match job_id {
                 Ok(id) => {
                     self.checkpoint_job_map.insert(id, (ck_kind, base + cp_idx));
+                    if let Some(b) = batch_id {
+                        self.job_batches.insert(id, b);
+                    }
                     if is_mkdir {
                         dirs += 1;
                     } else {
@@ -364,6 +367,9 @@ impl App {
                 match enqueue_checkpoint_job(&manager, &job, batch_id) {
                     Ok(id) => {
                         self.checkpoint_job_map.insert(id, (kind, cp_idx));
+                        if let Some(b) = batch_id {
+                            self.job_batches.insert(id, b);
+                        }
                     }
                     Err(EnqueueError::QueueFull) => break,
                     // Another job took this destination while it waited. The

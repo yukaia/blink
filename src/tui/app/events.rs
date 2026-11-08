@@ -743,9 +743,9 @@ impl App {
                         let path = self.remote.path.clone();
                         self.refresh_remote_pane(path);
                     }
-                    if let Some(b) = j.batch_id {
-                        self.tally_batch(b, BatchOutcome::Done);
-                    }
+                }
+                if let Some(b) = self.job_batches.remove(&id) {
+                    self.tally_batch(b, BatchOutcome::Done);
                 }
                 // A finished job leaves room in the queue for one waiting.
                 self.queue_waiting_jobs();
@@ -778,13 +778,12 @@ impl App {
                     tracing::warn!(id, "checkpoint flush after failure failed: {e}");
                 }
 
-                let job = self.job_lookup(id);
-                let label = job
-                    .as_ref()
-                    .map(|j| j.remote_path.clone())
+                let label = self
+                    .job_lookup(id)
+                    .map(|j| j.remote_path)
                     .unwrap_or_else(|| format!("id={id}"));
                 self.push_log(LogLevel::Error, format!("failed: {label}: {error}"));
-                if let Some(b) = job.and_then(|j| j.batch_id) {
+                if let Some(b) = self.job_batches.remove(&id) {
                     // The manager's own word for a job the user cancelled.
                     let outcome = if error == "cancelled" {
                         BatchOutcome::Cancelled
