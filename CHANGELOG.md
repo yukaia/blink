@@ -71,6 +71,10 @@ the git history for those.
 - **Loading a large checkpoint uses far less memory.** It held several
   copies of the file in memory at once, enough on a big batch to stall
   blink or run out of memory.
+- **Big queues stay responsive while an upload waits for its folder.**
+  Each new job blink started rescanned every job that had finished since
+  the upload began waiting. Starting a job now takes time in proportion to
+  what is waiting, not to the size of the batch.
 - **A retried or requeued download can't pick up a stray write.** A
   download that was cancelled, or failed partway, could still have its
   last write to the partial file in progress. Its retry, or a new job for

@@ -177,15 +177,12 @@ struct Inner {
     jobs: VecDeque<TransferJob>,
     /// Id of `jobs[0]`, or of the next job when `jobs` is empty.
     first_id: u64,
-    /// No job before this index is Pending, so [`TransferManager::take_next_pending`]
-    /// starts looking here. Jobs only ever leave Pending, and new ones are
-    /// appended, so it only moves forward. Scanning from 0 instead passed
-    /// every finished job on each claim: quadratic over a batch, under the
-    /// lock the renderer takes every frame.
-    first_pending: usize,
-    /// Number of jobs currently in `Pending` state. Kept in sync with `jobs`
-    /// so `enqueue` can check the cap in O(1) instead of scanning the vec.
-    pending_count: usize,
+    /// Ids of the jobs in `Pending` state, in queue order. A claim looks
+    /// only at these, so it never walks finished or Active jobs: scanning
+    /// `jobs` instead passed every one of them on each claim, quadratic
+    /// over a batch, under the lock the renderer takes every frame. Its
+    /// length is also what `enqueue` checks the cap against.
+    pending: std::collections::BTreeSet<u64>,
     /// Destinations of every Pending or Active job — see [`destination_key`].
     /// Kept in step with job states so an enqueue checks in O(1): a batch
     /// can be [`MAX_QUEUED_JOBS`] long, and scanning `jobs` per enqueue
@@ -204,6 +201,9 @@ struct Inner {
     /// Populated by [`TransferManager::register_active`] (called from the
     /// dispatcher), removed on completion or cancellation.
     active: HashMap<u64, AbortHandle>,
+    /// Jobs the last [`TransferManager::take_next_pending`] looked at.
+    #[cfg(test)]
+    scanned: usize,
 }
 
 impl Inner {
@@ -259,7 +259,7 @@ impl Inner {
         let key = destination_key(direction, &j.remote_path, &j.local_path);
         let dir = dir_key(&j.remote_path).to_string();
         if was_pending {
-            self.pending_count = self.pending_count.saturating_sub(1);
+            self.pending.remove(&id);
         }
         if was_live && ends {
             // The job has stopped writing its destination; another may.
@@ -288,7 +288,6 @@ impl Inner {
         {
             self.jobs.pop_front();
             self.first_id += 1;
-            self.first_pending = self.first_pending.saturating_sub(1);
         }
     }
 }
@@ -323,14 +322,15 @@ impl TransferManager {
             next_batch_id: 1,
             jobs: VecDeque::new(),
             first_id: 1,
-            first_pending: 0,
-            pending_count: 0,
+            pending: std::collections::BTreeSet::new(),
             in_flight: HashSet::new(),
             parallelism,
             cap,
             paused: false,
             unfinished_dirs: HashMap::new(),
             active: HashMap::new(),
+            #[cfg(test)]
+            scanned: 0,
         }));
         let wake = Arc::new(tokio::sync::Notify::new());
         (
@@ -478,7 +478,7 @@ impl TransferManager {
         let mut inner = self.inner.lock();
         // Cap the number of pending jobs so a large server directory listing
         // cannot grow the queue without bound and exhaust memory.
-        if inner.pending_count >= inner.cap {
+        if inner.pending.len() >= inner.cap {
             return Err(EnqueueError::QueueFull);
         }
         let key = destination_key(direction, &remote_path, &local_path);
@@ -511,7 +511,7 @@ impl TransferManager {
             batch_id,
         };
         inner.jobs.push_back(job.clone());
-        inner.pending_count += 1;
+        inner.pending.insert(id);
         drop(inner);
         self.wake();
         let _ = self.events.send(TransferEvent::Queued(job));
@@ -678,32 +678,30 @@ impl TransferManager {
     pub fn take_next_pending(&self) -> Option<TransferJob> {
         let cloned = {
             let mut inner = self.inner.lock();
-            let mut first_seen = None;
             let mut found = None;
-            let mut waiting = 0usize;
-            for (idx, j) in inner.jobs.iter().enumerate().skip(inner.first_pending) {
-                if j.state != TransferState::Pending {
-                    continue;
+            #[cfg(test)]
+            let mut scanned = 0;
+            for &id in inner.pending.iter().take(CLAIM_LOOKAHEAD) {
+                #[cfg(test)]
+                {
+                    scanned += 1;
                 }
-                first_seen.get_or_insert(idx);
-                if !inner.waits_on_mkdir(j) {
+                // A Pending job is never dropped: dropping stops at the
+                // first job that hasn't finished.
+                let Some(idx) = inner.index_of(id) else {
+                    debug_assert!(false, "pending job {id} is not in the queue");
+                    continue;
+                };
+                if !inner.waits_on_mkdir(&inner.jobs[idx]) {
                     found = Some(idx);
                     break;
                 }
-                waiting += 1;
-                if waiting >= CLAIM_LOOKAHEAD {
-                    break;
-                }
             }
-            // The cursor stops at the first job still Pending, waiting or not.
-            let Some(idx) = found else {
-                inner.first_pending = first_seen.unwrap_or(inner.jobs.len());
-                return None;
-            };
-            inner.first_pending = match first_seen {
-                Some(first) if first < idx => first,
-                _ => idx + 1,
-            };
+            #[cfg(test)]
+            {
+                inner.scanned = scanned;
+            }
+            let idx = found?;
             inner.set_state(idx, TransferState::Active);
             inner.jobs[idx].clone()
         };
@@ -961,6 +959,32 @@ mod tests {
             m.mark(id, TransferState::Complete);
         }
         assert_eq!(m.take_next_pending().unwrap().id, again);
+    }
+
+    /// A claim looks only at Pending jobs. With one waiting on a slow mkdir,
+    /// the cursor stayed on it while the jobs behind it ran, and every claim
+    /// walked past all of them again: quadratic over the batch, under the
+    /// lock the renderer takes every frame.
+    #[test]
+    fn a_claim_does_not_walk_the_jobs_finished_behind_a_waiting_one() {
+        let (m, _rx) = TransferManager::new(1);
+        let dir = m.enqueue_mkdir("/up".into()).unwrap();
+        assert_eq!(m.take_next_pending().unwrap().id, dir);
+        let held = m
+            .enqueue_upload("/l/held".into(), "/up/held".into())
+            .unwrap();
+        for i in 0..2000 {
+            let id = m
+                .enqueue_download(format!("/r/{i}"), format!("/l/{i}").into())
+                .unwrap();
+            assert_eq!(m.take_next_pending().unwrap().id, id);
+            m.mark(id, TransferState::Complete);
+        }
+        assert!(m.take_next_pending().is_none(), "the upload still waits");
+        let scanned = m.inner.lock().scanned;
+        assert!(scanned <= 2, "looked at {scanned} jobs for one Pending");
+        m.mark(dir, TransferState::Complete);
+        assert_eq!(m.take_next_pending().unwrap().id, held);
     }
 
     /// Only jobs under an unfinished mkdir wait; the rest pass them, and
