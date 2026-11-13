@@ -39,7 +39,7 @@ use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::rawsession::Limits;
 use russh_sftp::client::{RawSftpSession, SftpSession};
 use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, StatusCode};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{self, BlinkError, Result};
@@ -971,7 +971,7 @@ async fn pipelined_download(
     size: Option<u64>,
     chunk: usize,
     concurrency: usize,
-    local: &mut tokio::fs::File,
+    local: &mut super::PartFile,
     total: u64,
     progress: &Option<mpsc::UnboundedSender<ProgressUpdate>>,
 ) -> Result<u64> {
@@ -1240,6 +1240,8 @@ impl Transport for SftpTransport {
         // until the download is fully complete and fsynced, and isolates
         // partial bytes from a previous attempt under a recognisable suffix.
         let part = super::part_path(local_path);
+        // Before anything looks at the partial: see `transport::lease_part`.
+        let lease = super::lease_part(&part).await;
         let origin = self.origin.clone();
 
         let xfer = self.transfer_session().await?;
@@ -1258,7 +1260,7 @@ impl Transport for SftpTransport {
         // here, so the handle is closed on every path out: a local error
         // (resolving the partial, creating the folder, opening the file)
         // used to return early and leave it open on the server.
-        let result: Result<(tokio::fs::File, u64)> = async {
+        let result: Result<(super::PartFile, u64)> = async {
             let attrs = tokio::time::timeout(idle_timeout(), raw.fstat(&remote_handle))
                 .await
                 .ok()
@@ -1283,7 +1285,7 @@ impl Transport for SftpTransport {
             if let Some(parent) = local_path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-            let mut local = super::open_part(&part, offset).await?;
+            let mut local = super::open_part(&lease, &part, offset).await?;
             // Record what these bytes are before writing any, so an
             // interrupt at any point leaves an identifiable partial rather
             // than an anonymous one that the next attempt has to throw away.
@@ -1315,7 +1317,7 @@ impl Transport for SftpTransport {
         local.flush().await?;
         local.sync_all().await?;
         drop(local);
-        super::finish_download(&part, local_path, done).await?;
+        super::finish_download(&lease, &part, local_path, done).await?;
         Ok(())
     }
 
@@ -2892,7 +2894,8 @@ mod integration {
             .handle;
         let home = crate::paths::test_home();
         let path = home.path().join("slow.bin");
-        let mut local = tokio::fs::File::create(&path).await.unwrap();
+        let lease = crate::transport::lease_part(&path).await;
+        let mut local = crate::transport::open_part(&lease, &path, 0).await.unwrap();
 
         // One reply per read, so the queue is the 16 reads and nothing else.
         with_timeout(

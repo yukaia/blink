@@ -445,6 +445,8 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     // Stream into the partial and rename on success — see
     // [`crate::transport::part_path`] for the rationale.
     let part = super::part_path(local_path);
+    // Before anything looks at the partial: see `transport::lease_part`.
+    let lease = super::lease_part(&part).await;
 
     // Wrap size() in a timeout too — a server that hangs on SIZE would
     // pin the whole download here. On timeout / error the size is simply
@@ -483,7 +485,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
 
     let mut reader = timed_ftp("retr", remote_path, stream.retr_as_stream(remote_path)).await?;
 
-    let mut local = super::open_part(&part, offset).await?;
+    let mut local = super::open_part(&lease, &part, offset).await?;
     // Identify the partial before writing to it — see the SFTP path.
     super::write_part_meta(local_path, remote_path, stamp, origin).await;
 
@@ -546,7 +548,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
 
     // Only rename once the server confirmed the transfer; otherwise a
     // truncated response could leave a corrupted "complete" file in place.
-    super::finish_download(&part, local_path, done).await?;
+    super::finish_download(&lease, &part, local_path, done).await?;
 
     Ok(())
 }

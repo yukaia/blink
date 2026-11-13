@@ -317,7 +317,14 @@ pub(crate) async fn write_part_meta(
 /// - `offset > 0`: append, with `O_NOFOLLOW` on Unix so a symlink swapped
 ///   in after `resume_offset` looked fails the open. Windows needs
 ///   privilege to create symlinks, so it gets no equivalent.
-pub(crate) async fn open_part(part: &Path, offset: u64) -> std::io::Result<tokio::fs::File> {
+///
+/// Takes the partial's [`PartLease`], which every write through the
+/// returned [`PartFile`] holds until it lands.
+pub(crate) async fn open_part(
+    lease: &PartLease,
+    part: &Path,
+    offset: u64,
+) -> std::io::Result<PartFile> {
     let mut opts = tokio::fs::OpenOptions::new();
     if offset > 0 {
         opts.append(true);
@@ -326,7 +333,106 @@ pub(crate) async fn open_part(part: &Path, offset: u64) -> std::io::Result<tokio
     } else {
         opts.write(true).create_new(true);
     }
-    opts.open(part).await
+    let file = opts.open(part).await?.into_std().await;
+    Ok(PartFile {
+        file: std::sync::Arc::new(file),
+        lease: lease.clone(),
+        pending: None,
+    })
+}
+
+/// Exclusive use of one `.blink-part` path, from before a download measures
+/// it until after its rename. See [`lease_part`].
+///
+/// Clones share the hold: it ends when the last one drops, and each write a
+/// [`PartFile`] has in flight owns one.
+#[derive(Clone)]
+pub(crate) struct PartLease(#[allow(dead_code)] std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>);
+
+/// One lock per partial path with a lease held or waited for. Entries are
+/// weak, so a path no one is using drops out on the next lease.
+static PART_LOCKS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Wait for exclusive use of the partial at `part`, then take it.
+///
+/// A file write runs on a blocking thread, and ending the task that asked
+/// for it does not end the write: a cancelled job's abort, or an attempt
+/// that failed on the network, drops the file with its last write still
+/// going. The next attempt at the same partial, a retry or a requeued job,
+/// then measured the file before that write landed, and appended after
+/// it: the stray chunk ended up in the middle of the download. Each
+/// in-flight write holds the lease, so the next attempt waits for it here,
+/// before [`resume_offset`] looks at the file.
+pub(crate) async fn lease_part(part: &Path) -> PartLease {
+    let lock = {
+        let mut locks = PART_LOCKS.lock();
+        locks.retain(|_, l| l.strong_count() > 0);
+        match locks.get(part).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(part.to_path_buf(), std::sync::Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    PartLease(std::sync::Arc::new(lock.lock_owned().await))
+}
+
+/// A download's partial, open for appending.
+///
+/// Writes behave as `tokio::fs::File`'s do: each is handed to a blocking
+/// thread and the call returns, so the disk write overlaps the next read
+/// from the network, and its error surfaces on the next call. The
+/// difference is that the blocking write owns a [`PartLease`], so the
+/// partial stays leased until the write lands, even when this handle and
+/// the task that held it are long gone.
+pub(crate) struct PartFile {
+    file: std::sync::Arc<std::fs::File>,
+    lease: PartLease,
+    pending: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
+}
+
+impl PartFile {
+    /// Wait for the write in flight, if any, and return its result.
+    async fn settle(&mut self) -> std::io::Result<()> {
+        match self.pending.take() {
+            Some(write) => write.await.map_err(std::io::Error::other)?,
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.settle().await?;
+        let (file, lease, data) = (
+            std::sync::Arc::clone(&self.file),
+            self.lease.clone(),
+            data.to_vec(),
+        );
+        self.pending = Some(tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            std::io::Write::write_all(&mut &*file, &data)
+        }));
+        Ok(())
+    }
+
+    /// Wait until every write so far has reached the file.
+    pub(crate) async fn flush(&mut self) -> std::io::Result<()> {
+        self.settle().await
+    }
+
+    pub(crate) async fn sync_all(&mut self) -> std::io::Result<()> {
+        self.settle().await?;
+        let (file, lease) = (std::sync::Arc::clone(&self.file), self.lease.clone());
+        tokio::task::spawn_blocking(move || {
+            let _lease = lease;
+            file.sync_all()
+        })
+        .await
+        .map_err(std::io::Error::other)?
+    }
 }
 
 /// Read a file, refusing to follow a symlink at `path` on Unix.
@@ -345,10 +451,10 @@ async fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
 /// it is checked to hold exactly the `counted` bytes the download reached
 /// (its resume offset plus what it received).
 ///
-/// The protocols check their own count; this checks the file. Bytes can
-/// reach it some other way: a cancelled attempt's last write is handed to a
-/// background thread and can land after a retry has measured the partial,
-/// and the retry's bytes then follow it. A partial of any other length is
+/// The protocols check their own count; this checks the file, in case bytes
+/// reached it some other way. Within blink, `lease` rules that out: no
+/// earlier attempt's write can still land, and none can start before the
+/// rename. This check is the backstop. A partial of any other length is
 /// removed, so the next attempt starts clean, and the job fails.
 ///
 /// The partial is already fsynced; the rename is not durable until the
@@ -358,6 +464,7 @@ async fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
 /// logged rather than failing the job: the file is in place, and a retry
 /// would only fetch it again to the same state.
 pub(crate) async fn finish_download(
+    _lease: &PartLease,
     part: &Path,
     local_path: &Path,
     counted: u64,
@@ -1041,7 +1148,8 @@ mod tests {
         let part = part_path(&local);
         std::fs::write(&part, b"0123456789").unwrap();
 
-        let err = finish_download(&part, &local, 8)
+        let lease = lease_part(&part).await;
+        let err = finish_download(&lease, &part, &local, 8)
             .await
             .expect_err("10 bytes on disk for 8 counted");
         assert!(err.to_string().contains("10 bytes"), "{err}");
@@ -1049,8 +1157,65 @@ mod tests {
         assert!(!part.exists(), "and the partial can't be resumed from");
 
         std::fs::write(&part, b"01234567").unwrap();
-        finish_download(&part, &local, 8).await.unwrap();
+        finish_download(&lease, &part, &local, 8).await.unwrap();
         assert_eq!(std::fs::read(&local).unwrap(), b"01234567");
+    }
+
+    /// A write handed to the blocking pool outlives the file handle that
+    /// made it, and the task that held it. The next attempt at the same
+    /// partial must not start until it has landed, or it measures and
+    /// appends to a file that is still growing.
+    ///
+    /// The partial is a FIFO no one reads yet, so the first attempt's write
+    /// stalls on its blocking thread for as long as the test wants.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_attempts_write_lands_before_the_next_attempt_starts() {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::time::Duration;
+
+        let home = crate::paths::test_home();
+        let part = part_path(&home.path().join("f.bin"));
+        let c = std::ffi::CString::new(part.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let mut reader = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&part)
+            .unwrap();
+
+        const LEN: usize = 1 << 20; // well past the pipe's buffer
+        let lease = lease_part(&part).await;
+        let mut first = open_part(&lease, &part, 1).await.unwrap();
+        first.write_all(&vec![7u8; LEN]).await.unwrap();
+        // As an abort or a failed attempt drops them.
+        drop(first);
+        drop(lease);
+
+        let next = tokio::time::timeout(Duration::from_millis(200), lease_part(&part)).await;
+        assert!(
+            next.is_err(),
+            "the next attempt started with a write still in flight"
+        );
+
+        let drained = tokio::task::spawn_blocking(move || {
+            let (mut got, mut buf) = (0, vec![0u8; 64 * 1024]);
+            while got < LEN {
+                match reader.read(&mut buf) {
+                    Ok(n) => got += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(1))
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            }
+            reader
+        });
+        let _reader = drained.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), lease_part(&part))
+            .await
+            .expect("the next attempt starts once the write has landed");
     }
 
     // -- the connect deadline and the host-key prompt ----------------------
@@ -1477,7 +1642,8 @@ mod tests {
             assert_eq!(resume_offset(&local, "/r/foo", stamp(), "origin").await, 0);
             assert!(std::fs::symlink_metadata(part_path(&local)).is_err());
             symlink(&victim, part_path(&local)).unwrap();
-            assert!(open_part(&part_path(&local), 0).await.is_err());
+            let lease = lease_part(&part_path(&local)).await;
+            assert!(open_part(&lease, &part_path(&local), 0).await.is_err());
             assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
         }
 
@@ -1489,7 +1655,8 @@ mod tests {
             std::fs::write(&victim, b"precious").unwrap();
             symlink(&victim, part_path(&local)).unwrap();
 
-            assert!(open_part(&part_path(&local), 4).await.is_err());
+            let lease = lease_part(&part_path(&local)).await;
+            assert!(open_part(&lease, &part_path(&local), 4).await.is_err());
             assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
         }
 
