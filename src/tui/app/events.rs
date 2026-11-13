@@ -654,18 +654,13 @@ impl App {
         }
     }
 
-    /// O(1) lookup of a single job by id. The manager retains jobs across
-    /// state changes, so this works for Started/Complete/Failed alike.
-    fn job_lookup(&self, id: u64) -> Option<crate::transfer::TransferJob> {
-        self.transfer_manager.as_ref().and_then(|m| m.job(id))
-    }
-
     pub(super) fn handle_transfer_event(&mut self, ev: TransferEvent) {
         match ev {
             TransferEvent::Queued(job) => {
                 self.push_log(LogLevel::Info, format!("queued: {}", job.remote_path));
             }
-            TransferEvent::Started(id) => {
+            TransferEvent::Started(j) => {
+                let id = j.id;
                 // Flip the in-memory state to `in_progress`; the actual disk
                 // write is debounced. A crash before the next flush means the
                 // job is re-queued on resume (its file-on-disk state still
@@ -679,19 +674,15 @@ impl App {
                         tracing::warn!(id, cp_idx, "checkpoint in_progress flush failed: {e}");
                     }
                 }
-                if let Some(j) = self.job_lookup(id) {
-                    // Say what the job actually is: every started job used to
-                    // announce itself as a download, including uploads and
-                    // the mkdirs a recursive upload plans.
-                    let msg = match j.direction {
-                        Direction::Download => format!("downloading: {}", j.remote_path),
-                        Direction::Upload => format!("uploading: {}", j.remote_path),
-                        Direction::CreateDir => {
-                            format!("creating directory: {}", j.remote_path)
-                        }
-                    };
-                    self.push_log(LogLevel::Info, msg);
-                }
+                // Say what the job actually is: every started job used to
+                // announce itself as a download, including uploads and the
+                // mkdirs a recursive upload plans.
+                let msg = match j.direction {
+                    Direction::Download => format!("downloading: {}", j.remote_path),
+                    Direction::Upload => format!("uploading: {}", j.remote_path),
+                    Direction::CreateDir => format!("creating directory: {}", j.remote_path),
+                };
+                self.push_log(LogLevel::Info, msg);
             }
             TransferEvent::Progress => {
                 // Deliberately empty. Byte counts live in TransferManager and
@@ -702,7 +693,8 @@ impl App {
                 // anything added here would run once per drained burst, not
                 // once per update.
             }
-            TransferEvent::Complete(id) => {
+            TransferEvent::Complete(j) => {
+                let id = j.id;
                 // Update in-memory state and either debounce-save (still more
                 // work pending) or delete the file (every job is done).
                 if let Some((kind, cp_idx)) = self.checkpoint_job_map.remove(&id) {
@@ -717,32 +709,30 @@ impl App {
                     // running the other way keeps its own checkpoint.
                     self.settle_checkpoint(kind, CheckpointFlush::Debounced);
                 }
-                if let Some(j) = self.job_lookup(id) {
-                    // A directory creation has no byte count; "(0 B)" next to
-                    // it reads as a transfer that moved nothing.
-                    let msg = if j.direction == Direction::CreateDir {
-                        format!("created: {}", j.remote_path)
-                    } else {
-                        format!(
-                            "complete: {} ({})",
-                            j.remote_path,
-                            format_bytes(j.bytes_total)
-                        )
-                    };
-                    self.push_log(LogLevel::Success, msg);
-                    // Uploads land new files on the remote side; refresh the
-                    // pane so the user sees them — but only when one lands in
-                    // the directory shown or below it, where a new folder may
-                    // have appeared. Requests fold together while a listing
-                    // is in flight, so a batch costs a listing at a time, not
-                    // one per file. Skip for downloads — the local pane
-                    // doesn't auto-refresh on its own either.
-                    if j.direction == crate::transfer::Direction::Upload
-                        && lands_under(&j.remote_path, &self.remote.path)
-                    {
-                        let path = self.remote.path.clone();
-                        self.refresh_remote_pane(path);
-                    }
+                // A directory creation has no byte count; "(0 B)" next to it
+                // reads as a transfer that moved nothing.
+                let msg = if j.direction == Direction::CreateDir {
+                    format!("created: {}", j.remote_path)
+                } else {
+                    format!(
+                        "complete: {} ({})",
+                        j.remote_path,
+                        format_bytes(j.bytes_total)
+                    )
+                };
+                self.push_log(LogLevel::Success, msg);
+                // Uploads land new files on the remote side; refresh the pane
+                // so the user sees them — but only when one lands in the
+                // directory shown or below it, where a new folder may have
+                // appeared. Requests fold together while a listing is in
+                // flight, so a batch costs a listing at a time, not one per
+                // file. Skip for downloads — the local pane doesn't
+                // auto-refresh on its own either.
+                if j.direction == Direction::Upload
+                    && lands_under(&j.remote_path, &self.remote.path)
+                {
+                    let path = self.remote.path.clone();
+                    self.refresh_remote_pane(path);
                 }
                 if let Some(b) = self.job_batches.remove(&id) {
                     self.tally_batch(b, BatchOutcome::Done);
@@ -750,7 +740,8 @@ impl App {
                 // A finished job leaves room in the queue for one waiting.
                 self.queue_waiting_jobs();
             }
-            TransferEvent::Failed { id, error } => {
+            TransferEvent::Failed { job: j, error } => {
+                let id = j.id;
                 // Evict the job from the checkpoint map regardless of the
                 // failure reason. For a "cancelled" failure the single-cancel
                 // path already removed it above; this is a belt-and-suspenders
@@ -778,11 +769,10 @@ impl App {
                     tracing::warn!(id, "checkpoint flush after failure failed: {e}");
                 }
 
-                let label = self
-                    .job_lookup(id)
-                    .map(|j| j.remote_path)
-                    .unwrap_or_else(|| format!("id={id}"));
-                self.push_log(LogLevel::Error, format!("failed: {label}: {error}"));
+                self.push_log(
+                    LogLevel::Error,
+                    format!("failed: {}: {error}", j.remote_path),
+                );
                 if let Some(b) = self.job_batches.remove(&id) {
                     // The manager's own word for a job the user cancelled.
                     let outcome = if error == "cancelled" {

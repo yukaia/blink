@@ -59,6 +59,10 @@ the git history for those.
 
 ### Fixed
 
+- **Large batches no longer skip "complete" lines or the remote refresh.**
+  When the interface fell behind a fast batch of small files, some
+  finished jobs were logged without their file, or not at all, and an
+  upload into the folder on screen could leave the remote pane stale.
 - **A retried or requeued download can't pick up a stray write.** A
   download that was cancelled, or failed partway, could still have its
   last write to the partial file in progress. Its retry, or a new job for

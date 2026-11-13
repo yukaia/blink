@@ -1730,7 +1730,7 @@ mod tests {
 
         a.handle_app_event(AppEvent::Transfer {
             connection: 1,
-            event: TransferEvent::Complete(id),
+            event: TransferEvent::Complete(job_of(&a, id)),
         });
         assert!(
             a.checkpoint_job_map.contains_key(&id),
@@ -1741,7 +1741,7 @@ mod tests {
         a.handle_app_event(AppEvent::Transfer {
             connection: 2,
             event: TransferEvent::Failed {
-                id,
+                job: job_of(&a, id),
                 error: "x".into(),
             },
         });
@@ -1817,7 +1817,7 @@ mod tests {
             .unwrap()
             .enqueue_download("/r/f.bin".into(), "/l/f.bin".into())
             .unwrap();
-        a.handle_transfer_event(TransferEvent::Started(id));
+        a.handle_transfer_event(TransferEvent::Started(job_of(&a, id)));
         assert!(
             last_log(&a).starts_with("downloading: "),
             "{}",
@@ -1834,7 +1834,7 @@ mod tests {
             .unwrap()
             .enqueue_upload("/l/f.bin".into(), "/r/f.bin".into())
             .unwrap();
-        a.handle_transfer_event(TransferEvent::Started(id));
+        a.handle_transfer_event(TransferEvent::Started(job_of(&a, id)));
         let msg = last_log(&a);
         assert!(msg.starts_with("uploading: "), "{msg}");
     }
@@ -1848,7 +1848,7 @@ mod tests {
             .unwrap()
             .enqueue_mkdir("/r/newdir".into())
             .unwrap();
-        a.handle_transfer_event(TransferEvent::Started(id));
+        a.handle_transfer_event(TransferEvent::Started(job_of(&a, id)));
         let msg = last_log(&a);
         assert!(
             !msg.contains("downloading") && !msg.contains("uploading"),
@@ -1867,7 +1867,7 @@ mod tests {
             .unwrap()
             .enqueue_mkdir("/r/newdir".into())
             .unwrap();
-        a.handle_transfer_event(TransferEvent::Complete(id));
+        a.handle_transfer_event(TransferEvent::Complete(job_of(&a, id)));
         let msg = last_log(&a);
         assert!(!msg.contains(" B)"), "no size for a directory: {msg}");
     }
@@ -1880,7 +1880,7 @@ mod tests {
             .enqueue_download("/r/f.bin".into(), "/l/f.bin".into())
             .unwrap();
         m.update_progress(id, 2048, 2048, 0);
-        a.handle_transfer_event(TransferEvent::Complete(id));
+        a.handle_transfer_event(TransferEvent::Complete(job_of(&a, id)));
         let msg = last_log(&a);
         assert!(msg.contains("2 KiB"), "{msg}");
     }
@@ -2134,6 +2134,11 @@ mod tests {
         assert_eq!(idx.len(), 3, "checkpoint indices must be distinct");
     }
 
+    /// The manager's copy of job `id`, as the events about it carry.
+    fn job_of(a: &App, id: u64) -> crate::transfer::TransferJob {
+        a.transfer_manager.as_ref().unwrap().job(id).unwrap()
+    }
+
     fn logged(a: &App, needle: &str) -> bool {
         a.log.iter().any(|l| l.message.contains(needle))
     }
@@ -2145,12 +2150,12 @@ mod tests {
         match failed {
             None => {
                 m.mark(id, crate::transfer::TransferState::Complete);
-                a.handle_transfer_event(TransferEvent::Complete(id));
+                a.handle_transfer_event(TransferEvent::Complete(job_of(a, id)));
             }
             Some(error) => {
                 m.mark(id, crate::transfer::TransferState::Failed(error.into()));
                 a.handle_transfer_event(TransferEvent::Failed {
-                    id,
+                    job: job_of(a, id),
                     error: error.into(),
                 });
             }
@@ -2209,13 +2214,13 @@ mod tests {
     async fn a_batch_is_reported_after_the_manager_forgets_its_jobs() {
         let (mut a, _cleanup) = checkpoint_app("summary-forgotten");
         a.dispatch_plan(vec![download(0), download(1)], CheckpointKind::Download);
-        let ids = batch_ids(&a);
+        let jobs: Vec<_> = batch_ids(&a).into_iter().map(|id| job_of(&a, id)).collect();
         a.transfer_manager = Some(TransferManager::new(1).0);
         a.handle_transfer_event(TransferEvent::Failed {
-            id: ids[0],
+            job: jobs[0].clone(),
             error: "boom".into(),
         });
-        a.handle_transfer_event(TransferEvent::Complete(ids[1]));
+        a.handle_transfer_event(TransferEvent::Complete(jobs[1].clone()));
         assert!(logged(&a, "1 of 2 failed"), "{}", last_log(&a));
     }
 
@@ -2364,10 +2369,10 @@ mod tests {
         let job = m.take_next_pending()?;
         let event = match &state {
             crate::transfer::TransferState::Failed(e) => TransferEvent::Failed {
-                id: job.id,
+                job: job.clone(),
                 error: e.clone(),
             },
-            _ => TransferEvent::Complete(job.id),
+            _ => TransferEvent::Complete(job.clone()),
         };
         m.mark(job.id, state);
         a.handle_transfer_event(event);
@@ -2476,7 +2481,7 @@ mod tests {
         m.take_next_pending().unwrap();
         m.enqueue_download("/r/2".into(), "/l/2".into()).unwrap();
         m.mark(first.id, crate::transfer::TransferState::Complete);
-        a.handle_transfer_event(TransferEvent::Complete(first.id));
+        a.handle_transfer_event(TransferEvent::Complete(job_of(&a, first.id)));
         assert!(
             a.waiting_jobs
                 .get(&CheckpointKind::Download)
@@ -2610,7 +2615,7 @@ mod tests {
             "the initial plan write is unconditional",
         );
 
-        a.handle_transfer_event(TransferEvent::Complete(ids[0]));
+        a.handle_transfer_event(TransferEvent::Complete(job_of(&a, ids[0])));
 
         // Two jobs still pending, so this took the flush branch rather than
         // the drop-the-checkpoint branch. The mark must be held, not written.
@@ -2634,7 +2639,7 @@ mod tests {
         let ids: Vec<u64> = a.checkpoint_job_map.keys().copied().collect();
 
         // Dirty the checkpoint, then cancel one job of the batch.
-        a.handle_transfer_event(TransferEvent::Complete(ids[0]));
+        a.handle_transfer_event(TransferEvent::Complete(job_of(&a, ids[0])));
         assert!(a.active_checkpoints[&CheckpointKind::Download].is_dirty());
 
         a.cancel_batch_in_checkpoint(&ids[1..2]);
@@ -3619,7 +3624,29 @@ mod tests {
             .unwrap()
             .enqueue_upload("/l/x".into(), remote.into())
             .unwrap();
-        a.handle_transfer_event(TransferEvent::Complete(id));
+        a.handle_transfer_event(TransferEvent::Complete(job_of(a, id)));
+    }
+
+    /// The manager keeps only the newest finished jobs, so it may have
+    /// dropped one by the time the interface handles its completion. The
+    /// log line and the refresh both looked the job up there, and were
+    /// skipped.
+    #[tokio::test]
+    async fn an_upload_the_manager_forgot_still_logs_and_refreshes() {
+        let (mut a, l) = app_listing(false);
+        let id = a
+            .transfer_manager
+            .as_ref()
+            .unwrap()
+            .enqueue_upload("/l/x".into(), "/srv/x".into())
+            .unwrap();
+        let job = job_of(&a, id);
+        a.transfer_manager = Some(TransferManager::new(1).0);
+
+        a.handle_transfer_event(TransferEvent::Complete(job));
+        Listings::settle().await;
+        assert!(logged(&a, "complete: /srv/x"), "{}", last_log(&a));
+        assert_eq!(l.started(), 1, "the pane shows the new file");
     }
 
     #[tokio::test]

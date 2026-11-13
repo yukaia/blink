@@ -51,16 +51,20 @@ pub enum TransferState {
     Failed(String),
 }
 
+/// What happened to the queue. A job's events carry the job as it was at
+/// that moment, so a handler never has to ask the manager for it: the
+/// manager drops old finished jobs (see [`RETAINED_JOBS`]), and an
+/// interface that fell behind would find nothing there.
 #[derive(Debug, Clone)]
 pub enum TransferEvent {
     Queued(TransferJob),
-    Started(u64),
+    Started(TransferJob),
     /// Progress signal: a transfer made forward progress.
     /// The UI reads actual byte counts from [`TransferManager::snapshot`].
     Progress,
-    Complete(u64),
+    Complete(TransferJob),
     Failed {
-        id: u64,
+        job: TransferJob,
         error: String,
     },
     Paused,
@@ -371,9 +375,9 @@ impl TransferManager {
         self.inner.lock().jobs.iter().cloned().collect()
     }
 
-    /// Look up a single job by id. O(1) via the id → index map — event
-    /// handlers should prefer this over cloning the whole list with
-    /// [`Self::snapshot`].
+    /// Look up a single job by id, while the manager still holds it.
+    /// Event handlers take the job from the event instead.
+    #[cfg(test)]
     pub fn job(&self, id: u64) -> Option<TransferJob> {
         let inner = self.inner.lock();
         inner.index_of(id).map(|idx| inner.jobs[idx].clone())
@@ -521,28 +525,34 @@ impl TransferManager {
     }
 
     /// Mark a job's state. Used by the dispatcher (once it lands).
+    ///
+    /// An id the manager doesn't hold is ignored: there is no job to change
+    /// or report.
     pub fn mark(&self, id: u64, state: TransferState) {
-        {
+        let job = {
             let mut inner = self.inner.lock();
-            if let Some(idx) = inner.index_of(id) {
-                let ends = matches!(state, TransferState::Complete | TransferState::Failed(_));
-                inner.set_state(idx, state.clone());
-                if ends {
-                    inner.drop_old_finished();
-                }
+            let Some(idx) = inner.index_of(id) else {
+                return;
+            };
+            let ends = matches!(state, TransferState::Complete | TransferState::Failed(_));
+            inner.set_state(idx, state.clone());
+            let job = inner.jobs[idx].clone();
+            if ends {
+                inner.drop_old_finished();
             }
-        }
+            job
+        };
         match state {
             TransferState::Active => {
-                let _ = self.events.send(TransferEvent::Started(id));
+                let _ = self.events.send(TransferEvent::Started(job));
             }
             TransferState::Complete => {
                 self.wake();
-                let _ = self.events.send(TransferEvent::Complete(id));
+                let _ = self.events.send(TransferEvent::Complete(job));
             }
-            TransferState::Failed(e) => {
+            TransferState::Failed(error) => {
                 self.wake();
-                let _ = self.events.send(TransferEvent::Failed { id, error: e });
+                let _ = self.events.send(TransferEvent::Failed { job, error });
             }
             _ => {}
         }
@@ -697,7 +707,7 @@ impl TransferManager {
             inner.set_state(idx, TransferState::Active);
             inner.jobs[idx].clone()
         };
-        let _ = self.events.send(TransferEvent::Started(cloned.id));
+        let _ = self.events.send(TransferEvent::Started(cloned.clone()));
         Some(cloned)
     }
 
@@ -774,7 +784,7 @@ impl TransferManager {
     ) -> (usize, usize) {
         let cancelled = TransferState::Failed("cancelled".into());
         let mut handles = Vec::new();
-        let mut ids = Vec::new();
+        let mut ended = Vec::new();
         let (mut active_n, mut pending_n) = (0, 0);
         {
             let mut inner = self.inner.lock();
@@ -801,19 +811,19 @@ impl TransferManager {
                     pending_n += 1;
                 }
                 inner.set_state(idx, cancelled.clone());
-                ids.push(id);
+                ended.push(inner.jobs[idx].clone());
             }
             inner.drop_old_finished();
         }
         for h in handles {
             h.abort();
         }
-        if !ids.is_empty() {
+        if !ended.is_empty() {
             self.wake();
         }
-        for id in ids {
+        for job in ended {
             let _ = self.events.send(TransferEvent::Failed {
-                id,
+                job,
                 error: "cancelled".into(),
             });
         }
