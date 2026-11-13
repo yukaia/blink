@@ -9,17 +9,15 @@ spec in `docs/superpowers/specs/` instead.
 ## `ssh-key` and `rsa` reach a release
 
 Watch `russh` rather than `ssh-key` and `rsa` directly: it pins both with exact
-`=` requirements, so they move when it moves. Both are still pre-GA
-(`ssh-key 0.7.0-rc.11`, `rsa 0.10.0-rc.18`).
+`=` requirements, so they move when it moves. blink is on pre-releases of
+both (`ssh-key 0.7.0-rc.11`, `rsa 0.10.0-rc.18`).
 
-A release alone does not retire the RUSTSEC-2023-0071 ignore in
-`.cargo/audit.toml`: the advisory lists no patched version, and names
-rc.18 as affected. The fixes are RustCrypto/RSA#739 (blinding the default
+RUSTSEC-2023-0071 now lists `rsa >= 0.10.0` as patched and names rc.18 as
+affected. The fixes are RustCrypto/RSA#739 (blinding the default
 decryption paths) and #749 (implicit rejection), which replaced #702 and
-#680 and closed #626. Both merged 2026-11-01, and `rsa 0.10.0-rc.20`
-(published 2026-11-03) should carry them — confirm against its changelog.
-What's left is russh moving its pin to rc.20 or later; then check whether
-RUSTSEC-2023-0071 names a patched version before dropping the ignore.
+#680 and closed #626. So the ignore in `.cargo/audit.toml`, and the RSA
+caveat in the README, can go as soon as russh's pin reaches `rsa 0.10.0`
+or later — confirm with `cargo audit` after the bump.
 
 Last checked 2026-11-13: `rsa 0.10.0` is out as a full release and
 `ssh-key` is at `0.7.0-rc.12`, but russh 0.65.1, the latest and what blink

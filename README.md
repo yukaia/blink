@@ -15,11 +15,9 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
 
 - **SFTP** with password, SSH key, and encrypted-key (passphrase prompt) auth
 - **SCP** as transparent SFTP — matches OpenSSH 9.0+ behavior, full feature parity
-- **FTP** with anonymous and password auth — *unencrypted*: credentials,
-  file names and file contents all cross the network in the clear. blink
-  warns on every `ftp://` connect and colours the protocol tag as a
-  caution in the session selector. Prefer FTPS or SFTP where the server
-  offers them.
+- **FTP** with anonymous and password auth — *unencrypted*, and blink says
+  so on every connect (see [Security](#protocol)). Prefer FTPS or SFTP
+  where the server offers them.
 - **FTPS** with explicit TLS (RFC 4217) via rustls — pure Rust, no system
   TLS library needed
 - **ssh-agent** auth on Unix (uses `$SSH_AUTH_SOCK`); on Windows, the
@@ -28,12 +26,9 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
 - **Host-key verification** for SFTP/SCP — unknown keys trigger an
   interactive prompt (accept & save / trust once / reject); changed keys are
   hard-rejected with a clear warning. Keys are stored in blink's own
-  `known_hosts` (see [Configuration](#configuration)) in OpenSSH's line
-  format: comma-separated
-  host lists and `@revoked` lines are read, and a revoked key is refused
-  for every host; hashed and wildcard host names are not. A server
-  presenting an SSH *host certificate* is refused rather than pinned.
-- Disconnect back to the session selector without quitting
+  `known_hosts`, in OpenSSH's line format; see
+  [`known_hosts`](#known_hosts--ssh-host-key-store) for what is and isn't
+  read from it.
 
 ### Browsing & file operations
 
@@ -44,9 +39,10 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   made while filtered survive clearing or narrowing the filter too; the
   footer's selection count and size cover the whole selection, including
   entries the filter is currently hiding
-- **Refresh** active pane (F5) — refreshing in place no longer blanks the
-  pane while the new listing is fetched
-- **Disconnect** and return to the session selector (`Ctrl-X`, then confirm)
+- **Refresh** active pane (`F5`) — the current listing stays on screen
+  while the new one is fetched
+- **Disconnect** and return to the session selector without quitting
+  (`Ctrl-X`, then confirm)
 - **View** text files inline (scrollable, line-numbered, syntax-highlighted) —
   control and ANSI escape characters are stripped before display to prevent
   terminal injection; see [Supported viewer formats](#supported-viewer-formats)
@@ -70,7 +66,7 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   active and queued job from the same `Ctrl-D` / `Ctrl-U`
 - **Overwrite confirmation** with three choices — overwrite all / skip
   conflicts / cancel — for both downloads and uploads, single-file or
-  recursive. Preparing an upload now fails outright if its destination
+  recursive. Preparing an upload fails outright if its destination
   directory can't be listed for any reason other than "doesn't exist yet" —
   a server that refuses `LIST` on a writable directory is surfaced as an
   error rather than silently treated as conflict-free. Likewise, uploads
@@ -117,41 +113,43 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   sftp://alice@host` shares one with a saved session called `host` only if
   that session also connects as `alice` to the same host and port. Editing
   a saved session's user, host or port leaves its old checkpoint behind:
-  it is no longer offered, and `blink checkpoints --clean` treats it as
-  orphaned.
+  it is no longer offered, and `blink checkpoints --clean` removes it as
+  orphaned (see [Run](#run)).
 - **Checkpoint file format** is versioned (currently version 4, which
   records the server and account each checkpoint belongs to). Files from
   versions 1–3 record no server, so they are never offered for resume;
-  `blink checkpoints` still lists them, and `blink checkpoints --clean`
-  removes them as orphaned.
-- **Download resume is provenance-checked.** A partial download,
-  `<dest>.<hash>.blink-part`, records bytes, not which remote file they came
-  from, so blink writes a `<dest>.<hash>.blink-part.meta` sidecar alongside
-  it naming the server and account (`user@host:port`), the remote path, and
-  the size and modification time the server reported. Resume only happens
-  when the sidecar identifies the same remote file on the same server with
-  the same reported size and modification time; anything unproven,
-  including a server that doesn't report both, restarts from byte zero instead
-  of risking a silently corrupt file.
+  `blink checkpoints` still lists them, and `--clean` removes them too.
 - **Partial files have a name of their own.** In-flight transfers write
   `<name>.<hash>.blink-part`, locally for a download and on the server for
   an upload, where `<hash>` is 8 hex digits of the SHA-256 of `<name>`. So
   blink never touches a `<name>.part` that a browser or another tool left
   beside the file, nor a file that is itself called `<name>.blink-part`. A
   name too long to take the suffix within the usual 255-byte limit is
-  shortened in the partial's name only; the hash still tells it apart.
+  shortened in the partial's name only; the hash still tells it apart. The
+  final name appears only by rename once the transfer is complete; see
+  [Config and session file safety](#config-and-session-file-safety).
+- **Download resume is provenance-checked.** A partial download records
+  bytes, not which remote file they came from, so blink writes a
+  `<name>.<hash>.blink-part.meta` sidecar alongside it naming the server
+  and account (`user@host:port`), the remote path, and the size and
+  modification time the server reported. Resume only happens when the
+  sidecar identifies the same remote file on the same server with the same
+  reported size and modification time; anything unproven, including a
+  missing sidecar or a server that doesn't report both, restarts from byte
+  zero instead of risking a silently corrupt file.
 
 ### Sessions
 
 - Saved sessions in INI files; create, edit, delete from the selector
 - Per-session overrides for `local_dir` (with `~` expansion), `remote_dir`,
   `parallel_downloads`, `accept_invalid_certs`, theme
-- Passwords are never persisted; prompted at connect time
+- Passwords are never persisted; prompted at connect time (see
+  [Credential handling](#credential-handling))
 - Session URL parser (`sftp://user@host:port/path`) for ad-hoc connects
 - **`n` connects ad-hoc, it does not save.** Nothing is written to disk until
   you say so — which keeps throwaway connects cheap, but is easy to mistake
   for a failed save. Once the connection comes up blink offers to persist it;
-  decline and `ctrl+s` still saves at any point during the session (and
+  decline and `Ctrl-S` still saves at any point during the session (and
   snapshots your current remote/local directories while it's at it).
 
 ### Theming
@@ -175,7 +173,7 @@ the choice persisted to `config.ini` automatically.
   needs 1.89, where `File::lock` stabilised for atomic accept-and-save in
   `known_hosts`. But a declared `rust-version` only records what a crate
   claims, not what it compiles at, and nothing here has ever been built below
-  1.98. Advertising 1.90 was a promise with no evidence behind it.
+  1.98.
 
   If you need a lower floor, it is one `cargo +<version> check --all-targets`
   away from being real rather than assumed.
@@ -258,10 +256,10 @@ The first build downloads ~700 MB of SDK headers and libs into
 
 If you'd rather use the GNU toolchain (no Microsoft CRT), MinGW-w64
 works for blink because nothing in the dependency tree needs MSVC-only
-features, and nothing needs an external assembler either — `russh` is built
-against `ring` rather than its default `aws-lc-rs` precisely so that
-`aws-lc-sys` (which assembles its Windows objects with NASM) stays out of the
-graph. `mingw-w64` below is the only system package required.
+features, and nothing needs an external assembler either: `ring` is the
+only crypto backend (see [Security](#protocol)), which keeps `aws-lc-sys`
+and its NASM requirement out of the graph. `mingw-w64` below is the only
+system package required.
 
 ```sh
 # Debian / Ubuntu
@@ -310,7 +308,7 @@ blink checkpoints
 # Remove completed and orphaned checkpoint files
 blink checkpoints --clean
 # (a checkpoint counts as orphaned when no saved session has its name and
-#  server — its user, host and port — so editing those orphans it too. If
+#  server — its user, host and port. If
 #  the session list itself can't be read — an unreadable sessions directory,
 #  or a session file that won't parse — orphan detection is skipped and a
 #  warning is printed, so `--clean` removes only completed checkpoints
@@ -336,24 +334,42 @@ the Connection screen for key and agent auth.
 
 Omitting the port picks the protocol default: **22** for `sftp` / `scp`,
 **21** for `ftp` *and* `ftps`. FTPS defaults to 21 rather than 990 because
-blink speaks explicit FTPS (`AUTH TLS` on the standard FTP port); see
-[Honest caveats](#honest-caveats). Implicit-mode servers need `:990` spelled
-out, and blink cannot currently talk to them anyway.
+blink speaks explicit FTPS (`AUTH TLS` on the standard FTP port). Implicit
+FTPS on port 990 is not supported; see [Honest caveats](#honest-caveats).
+
+### Logging
+
+Logs are discarded unless `BLINK_LOG_FILE` names a file to append them to.
+`BLINK_LOG` sets the level (default `warn`) and takes `tracing` filter
+syntax:
+
+```sh
+BLINK_LOG_FILE=/tmp/blink.log BLINK_LOG=debug blink
+```
+
+At debug level the file records hostnames, usernames and remote paths. On
+Unix it is created with mode 0600; if it already exists with looser
+permissions blink warns rather than silently tightening a path you chose.
 
 ## Configuration
 
-Files live in platform-appropriate locations:
+Everything lives in one directory, in a platform-appropriate location:
 
-| Path          | Linux                                                            | macOS                                                | Windows                                       |
-| ------------- | ---------------------------------------------------------------- | ---------------------------------------------------- | --------------------------------------------- |
-| Global config | `$XDG_CONFIG_HOME/blink/config.ini` (else `~/.config/blink/`) | `~/Library/Application Support/blink/config.ini`  | `%APPDATA%\blink\config.ini` |
-| Sessions      | `~/.config/blink/sessions/`                                       | `~/Library/Application Support/blink/sessions/`       | `%APPDATA%\blink\sessions\` |
-| Themes        | `~/.config/blink/themes/`                                         | `~/Library/Application Support/blink/themes/`         | `%APPDATA%\blink\themes\` |
-| Known hosts   | `~/.config/blink/known_hosts`                                     | `~/Library/Application Support/blink/known_hosts`     | `%APPDATA%\blink\known_hosts` |
-| Checkpoints   | `~/.config/blink/checkpoints/`                                    | `~/Library/Application Support/blink/checkpoints/`    | `%APPDATA%\blink\checkpoints\` |
+| Platform | Config directory |
+| -------- | ---------------- |
+| Linux    | `$XDG_CONFIG_HOME/blink/`, else `~/.config/blink/` |
+| macOS    | `~/Library/Application Support/blink/` (`$XDG_CONFIG_HOME/blink/` if that variable is explicitly set) |
+| Windows  | `%APPDATA%\blink\` |
 
-macOS honours `XDG_CONFIG_HOME` if explicitly set; otherwise it follows the
-platform's `Library/Application Support` convention.
+Inside it:
+
+| Path           | Contents |
+| -------------- | -------- |
+| `config.ini`   | Global config |
+| `sessions/`    | Saved sessions, one `.ini` each |
+| `themes/`      | User themes, one `.ini` each |
+| `known_hosts`  | SSH host keys |
+| `checkpoints/` | Interrupted batch-transfer state |
 
 ### `known_hosts` — SSH host key store
 
@@ -362,9 +378,11 @@ The on-disk format matches OpenSSH: one entry per line, `hostname key-type
 base64-key`. The hostname is stored as a bare lowercased host for the
 default SSH port and `[host]:port` for any other port — exactly as OpenSSH
 writes it. Comma-separated host lists and `@revoked` lines are read as
-OpenSSH reads them; hashed (`|1|salt|hash`) entries from
-`HashKnownHosts=yes` and wildcard host patterns are not, and
-`@cert-authority` lines are ignored. Files written by older
+OpenSSH reads them, and a revoked key is refused for every host; hashed
+(`|1|salt|hash`) entries from `HashKnownHosts=yes` and wildcard host
+patterns are not, and `@cert-authority` lines are ignored — a server
+presenting an SSH host certificate is refused rather than pinned (see
+[Security](#protocol)). Files written by older
 blink versions in the `host:port` form are still accepted on lookup, so
 upgrades don't force re-verification.
 
@@ -402,12 +420,8 @@ down the connection — including a session that was already connected and
 transferring, since a worker's own connection can trip this mid-session —
 and returns to the session selector rather than leaving a live session
 whose peer just failed to prove its identity. The screen prints
-the exact command that clears the stored entry:
-
-```sh
-blink known-hosts remove host.example.com            # port 22
-blink known-hosts remove host.example.com --port 2222
-```
+the exact `blink known-hosts remove <host> [--port <port>]` command that
+clears the stored entry.
 
 That command is deliberately *not* a key on the warning screen. A key
 mismatch is what a legitimate key rotation and a man-in-the-middle look
@@ -483,10 +497,8 @@ parallel_downloads = 4
 theme = tokyo-night
 
 [tls]
-; FTPS only; default false. true switches from CA-chain validation to TOFU
-; pinning: the hostname is still verified, the handshake signature is still
-; verified, and on first connect blink shows the cert's SHA-256 and asks
-; before pinning it.
+; FTPS only; default false. true switches from CA-chain validation to
+; trust-on-first-use pinning (see Security).
 accept_invalid_certs = false
 ; With accept_invalid_certs = true, blink adds the pinned certificate's
 ; SHA-256 here when you accept it and choose to save, as
@@ -494,8 +506,7 @@ accept_invalid_certs = false
 ; edit it by hand; delete the line if the legitimate certificate rotates.
 ```
 
-Passwords are never written to disk; in-memory copies are wiped with
-`zeroize` when the connected session ends.
+There is no password key: passwords are never written to disk.
 
 ### `themes/<name>.ini` — user themes
 
@@ -532,21 +543,21 @@ The full list lives in the in-app help overlay (`?`). Highlights:
 
 | Key            | Action                                       |
 | -------------- | -------------------------------------------- |
-| `tab` / `S-tab`| cycle active pane (Local → Remote → Transfers → Log) |
+| `Tab` / `Shift-Tab` | cycle focus (Local → Remote → Transfers → Log; the last two are tabs of the bottom pane) |
 | `↑` / `↓`      | move cursor                                  |
 | `↵`            | enter directory                              |
 | `backspace`    | go up to parent directory                    |
 | `space`        | select / deselect                            |
-| `^d`           | download selected items                      |
-| `^u`           | upload selected items                        |
+| `Ctrl-D`       | download selected items                      |
+| `Ctrl-U`       | upload selected items                        |
 | `v`            | view image or text                           |
 | `/`            | filter current pane                          |
 | `F5`           | refresh active pane                          |
 | `F2`           | rename (remote pane)                         |
 | `F7`           | create new remote directory                  |
-| `S-del` / `D`  | delete file or folder (remote pane)          |
-| `^s`           | save current session                         |
-| `^x`           | disconnect (return to selector, with confirmation) |
+| `Shift-Del` / `D` | delete file or folder (remote pane)       |
+| `Ctrl-S`       | save current session                         |
+| `Ctrl-X`       | disconnect (return to selector, with confirmation) |
 | `t`            | cycle theme                                  |
 | `c`            | cancel selected transfer (Transfers pane)    |
 | `C`            | cancel whole batch (Transfers pane)          |
@@ -592,10 +603,8 @@ guessed by content sniffing.
 
 `.png`, `.jpg` / `.jpeg`, `.gif`, `.webp`
 
-Display caps at 25 MB. That bounds the fetch, not the decode: the decoder
-independently refuses anything over 4096 px per side or 128 MiB of
-allocation, checked from the image header before a pixel buffer is
-allocated, so a small file declaring huge dimensions is still rejected.
+Display caps at 25 MB. That bounds the fetch, not the decode, which has
+limits of its own; see [Resource limits](#resource-limits).
 
 ### Text
 
@@ -640,7 +649,7 @@ src/
 ├── config.rs            global config.ini load / save (preserves unknown keys)
 ├── session.rs           per-session .ini load / save / list / URL parser
 ├── theme.rs             theme model + 7 built-ins + file loader
-├── checkpoint.rs        walk-plan checkpointing: persist, append, remove batch state; debounced fsync writes; version-4 format, origin-keyed, with v1 migration
+├── checkpoint.rs        walk-plan checkpointing: persist, append, remove batch state; debounced fsync writes; version-4 format, origin-keyed
 ├── known_hosts.rs       SSH host-key store: check / append / remove, OpenSSH-style matching, file lock, SessionTrust (per-session "trust once")
 ├── highlight.rs         syntax highlighter for the text viewer (single-pass, zero deps)
 ├── transport/           connection layer
@@ -703,12 +712,11 @@ terminal. The following properties are enforced in the current codebase.
 
 - **SFTP / SCP host-key verification** — unknown keys trigger an interactive
   prompt; a changed key is a hard rejection with a warning screen that
-  only `Enter` / `Esc` / `q` dismisses. Keys are stored in OpenSSH format.
-  Matching follows OpenSSH `(host, keytype)` semantics: multi-algorithm
-  hosts (an ed25519 *and* an rsa entry) coexist normally, and the stored
-  keytypes are asked for first. "Changed key" fires when the same keytype
-  has a different blob, or when a known host presents only a keytype not on
-  file — so a man in the middle cannot pass a downgrade off as a new host.
+  only `Enter` / `Esc` / `q` dismisses. A known host presenting only a
+  keytype that isn't on file counts as changed too, so a man in the middle
+  cannot pass a downgrade off as a new host. The matching rules, the
+  prompt and how to forget a host are under
+  [`known_hosts`](#known_hosts--ssh-host-key-store).
 - **SSH host certificates are refused, fail-closed.** `known_hosts` maps a
   host to a literal key and blink has no `@cert-authority` support, so
   nothing here can check a certificate's CA signature, principals, or
@@ -730,9 +738,7 @@ terminal. The following properties are enforced in the current codebase.
   path can read or alter them. There is no protocol-level fix for this —
   it is what `ftp://` is — so blink does the one useful thing instead:
   a warning in the log on every connect, and the protocol tag coloured as a
-  caution in the session selector. FTPS no longer shares that colour, having
-  previously been shown with the same caution as plain FTP despite being
-  encrypted.
+  caution in the session selector. FTPS, being encrypted, is not flagged.
 - **FTP data connections go to the server, wherever PASV points.** A
   `227` reply names an address as well as a port, and the server chooses
   it — so a hostile one could aim the data connection at any host, such as
@@ -741,11 +747,13 @@ terminal. The following properties are enforced in the current codebase.
   does by default. Applies to FTP and FTPS alike.
 - **One crypto backend, not two.** `ring` serves both transports: rustls uses
   it for FTPS, and `russh` is built against it rather than its default
-  `aws-lc-rs`. Compiling two backends is how the FTPS transport once came to
-  panic on every connect — rustls refuses to choose between `ring` and
-  `aws-lc-rs` when both are enabled — so the manifest pins one and a test
-  fails if the other returns through feature unification.
-- **FTPS hostname + signature verification are mandatory.** Even when
+  `aws-lc-rs`. With both compiled in, rustls refuses to choose between them
+  and every FTPS connect panics, so the manifest pins one and a test fails
+  if the other returns through feature unification.
+- **FTPS hostname + signature verification are mandatory.** Trust anchors
+  are the embedded Mozilla bundle (`webpki-roots`), not the system store,
+  so self-signed and privately-rooted certificates aren't trusted by
+  default. Even when the per-session
   `accept_invalid_certs = true` bypasses CA-chain trust, the cert's SAN
   must still match the configured hostname and the handshake signature
   must still verify against the cert's public key. The flag also enables
@@ -799,8 +807,8 @@ Applied to:
 - Remote directory-entry names (`list()` in every transport)
 - SSH key-type strings and host-key fingerprints
 - Error messages from transport layers
-- Text file content in the viewer (tabs expanded to 8-column stops; no
-  length cap beyond the 25 MB transport read limit) — the bidi filter
+- Text file content in the viewer (tabs expanded to 8-column stops) — the
+  bidi filter
   matters as much here, since viewing remote source is exactly the
   "trojan source" setting
 - Session and checkpoint names printed by the CLI subcommands
@@ -809,7 +817,12 @@ Applied to:
 
 - **Remote-to-local path traversal** — entry names containing `/`, `\`, `\0`,
   or equal to `..` / `.` are rejected before `Path::join` in download paths
-  and recursive walks (`safe_local_name()`).
+  and recursive walks (`safe_local_name()`). Windows additionally rejects
+  `:` (a drive prefix like `C:evil` would otherwise *replace* the
+  destination path per `PathBuf::push` semantics, and `name:stream` opens
+  an alternate data stream), trailing dots and spaces (Windows strips
+  them, aliasing two names to one file), and reserved device names (`NUL`,
+  `COM1`, …).
 - **Remote path injection** — `join_remote()` strips leading `/` from
   server-supplied names and rejects any `..` component, preventing a server
   from escaping the working directory via path construction.
@@ -843,8 +856,8 @@ Applied to:
 
 | Resource | Limit |
 | -------- | ----- |
-| Text file preview read | 1 MB (at preview detection; 25 MB at transport) |
-| Image file preview read | 25 MB (at preview detection and transport) |
+| Text file preview read | 1 MB |
+| Image file preview read | 25 MB |
 | Image decoder pre-decode dimension cap | 4096 × 4096 px |
 | Image decoder max allocation | 128 MiB (enforced *before* full pixel-buffer alloc) |
 | Transfer job queue | 100,000 jobs |
@@ -854,11 +867,12 @@ Applied to:
 | Checkpoint files | 256 MiB |
 | Known-hosts file | 1 MiB |
 
-Transport-layer read caps are enforced independently of server-reported
-file sizes, so a server that lies in its directory listing cannot bypass
-them. The image decoder limit is set via `image::Limits` so the decoder
-refuses oversized declarations on the header rather than after the full
-RGBA buffer is already allocated.
+The preview limits are checked against the size the listing reports and
+again against the bytes that actually arrive, so a server that lies in its
+directory listing cannot bypass them. The image decoder limits are set via
+`image::Limits`, so the decoder refuses oversized declarations on the
+header rather than after the full RGBA buffer is allocated — a small file
+declaring huge dimensions is still rejected.
 
 ### Credential handling
 
@@ -876,25 +890,25 @@ RGBA buffer is already allocated.
   clearing it, stranding fragments that no later wipe can reach. Abandoning
   a prompt zeroizes the buffer rather than calling `clear()`, which would
   only reset the length and leave the bytes in place.
-- Each parallel worker slot opens its own authenticated connection. The
-  workers share one zeroized copy of the credential by reference rather
-  than each holding a copy of their own.
+- Each parallel worker slot opens its own authenticated connection, which
+  is why the credential has to outlive the first login. The workers share
+  one zeroized copy by reference rather than each holding their own; an
+  FTP/FTPS connection also keeps one to reconnect with after it breaks.
+- If holding a password in memory doesn't fit your threat model, use SSH
+  key auth or ssh-agent instead — the key file (or the agent's identity
+  store) stays put and no in-memory copy of the secret is needed.
 
 ### Config and session file safety
 
 - **A session is validated before it is written.** `Session::save` refuses
   anything `load_from` would reject — a relative `local_dir`, a relative
-  `key_path`, a field carrying a newline. Previously the edit-session form
-  applied no validation of its own, so typing a relative path into the Local
-  dir field saved successfully and produced a file the loader then skipped:
-  the session disappeared from the selector on the next launch, `.ini` still
-  on disk, with no way to reach it from the UI. Enforcing the invariant in
-  `save` means no form can reintroduce that.
+  `key_path`, a field carrying a newline — so no form can save a file the
+  loader would then skip, leaving a session on disk that the selector
+  can't show.
 - **Session files that fail to load are reported, not silently dropped.**
   `blink sessions` prints a `warning: skipped <file>: <reason>` line to
   stderr, and the TUI logs one per unreadable file at startup and on every
-  reload. The old `tracing::warn` went to a sink unless `BLINK_LOG_FILE`
-  was set, so the only symptom was a session quietly going missing.
+  reload.
 - Session, config, and checkpoint files are written with the full
   atomic-and-durable pattern: tempfile → `sync_all` → rename →
   `sync_all` on the parent directory. Without the syncs, a power loss
@@ -909,13 +923,9 @@ RGBA buffer is already allocated.
   skipped.
 - Downloads write to a `<local>.<hash>.blink-part` sibling and rename onto the
   final name only after `flush` + `sync_all`. The user's existing file (if
-  any) isn't truncated until the new download has fsynced cleanly. A
-  `<local>.<hash>.blink-part.meta` sidecar is written alongside it, recording the
-  server and account, the remote path, and the size and modification time
-  the server reported — the provenance a resume
-  needs to tell "my interrupted download" from "an unrelated file that
-  happens to share this local name" (see "download resume is
-  provenance-checked" under Transfers).
+  any) isn't truncated until the new download has fsynced cleanly. The
+  partial's name and the `.meta` sidecar that gates resume are described
+  under [Transfers](#transfers).
 - Uploads mirror this on the remote side: bytes stream into
   `<remote>.<hash>.blink-part` and the final name is only created by rename after
   the upload completes (and fsyncs, where the server supports
@@ -928,21 +938,11 @@ RGBA buffer is already allocated.
   can leave a stale `<remote>.<hash>.blink-part` behind; re-running the upload
   reuses (truncates) it.
 - Config directories are created with mode 0700 on Unix (not
-  world-readable). A `BLINK_LOG_FILE` is created with mode 0600, since at
-  debug level it records hostnames and remote paths; if the file already
-  exists with looser permissions blink warns rather than silently
-  tightening a path you chose.
+  world-readable). A log file gets mode 0600; see [Logging](#logging).
 - `Config::save` round-trips unknown INI keys, so hand-edited or
   forward-compat options aren't silently dropped on a theme cycle.
 - Path-traversal and null-byte validation is applied when loading
   session and theme names from disk.
-- Server-supplied filenames are validated before being joined onto a local
-  path. Beyond the universal `/`, `\`, `..` and null-byte rejections,
-  Windows additionally rejects `:` (a drive prefix like `C:evil` would
-  otherwise *replace* the destination path per `PathBuf::push` semantics,
-  and `name:stream` opens an alternate data stream), trailing dots and
-  spaces (Windows strips them, aliasing two names to one file), and
-  reserved device names (`NUL`, `COM1`, …).
 
 ## Honest caveats
 
@@ -958,52 +958,40 @@ A few things worth knowing before you use this in anger:
   pane says how many ("3 of 40 entries in /pub couldn't be read"), or that
   none could be, when the directory comes up empty for that reason. A
   recursive download that skipped entries this way says how many, so the
-  batch isn't mistaken for complete. The alternative — the library's
-  fallback parser, which accepts *any* line and names the file after it —
-  put entries in the pane that addressed nothing, which was worse.
+  batch isn't mistaken for complete. The library's fallback parser, which
+  accepts *any* line and names the file after it, is deliberately not
+  used: it would put entries in the pane that address nothing.
   Real-world dialect coverage is untested: the FTP test suite runs against
   an in-process server, not vsftpd or IIS.
-- **FTPS uses the embedded Mozilla CA bundle** (`webpki-roots`) for trust
-  anchors rather than the system trust store. Self-signed certs and
-  privately-rooted CAs aren't trusted by default. The per-session
-  `accept_invalid_certs` toggle (visible in the edit-session form)
-  switches from CA-chain trust to TOFU pinning: the first connect asks
-  you to accept the cert's fingerprint, which is then recorded, and
-  subsequent connects require an exact match. Hostname binding and handshake-signature verification stay on
-  in both modes. There is no option to add a custom CA root without
-  recompiling.
+- **No custom CA roots for FTPS.** Trust anchors are the embedded Mozilla
+  bundle, and there is no option to add a root without recompiling. For a
+  self-signed or privately-rooted server, the per-session
+  `accept_invalid_certs` toggle pins the certificate instead (see
+  [Security](#protocol)).
 - **RSA client keys carry a known timing-sidechannel risk.** The `rsa`
   crate reached transitively through `russh` is affected by
   [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071)
-  ("Marvin Attack") and has no fixed release. Exploiting it needs many
-  precisely-timed oracle queries against your private key, which a normal
-  interactive session does not provide — but if you want the risk gone,
-  use an Ed25519 key. The rationale is recorded in `.cargo/audit.toml`,
-  the ignore list used when running `cargo audit` against this tree.
+  ("Marvin Attack"). The fix shipped in `rsa` 0.10.0, but `russh` pins a
+  pre-release that predates it, so blink can't pick it up until `russh`
+  moves. Exploiting it needs many precisely-timed oracle queries against
+  your private key, which a normal interactive session does not provide —
+  but if you want the risk gone, use an Ed25519 key. The rationale is
+  recorded in `.cargo/audit.toml`, the ignore list used when running
+  `cargo audit` against this tree.
 - **Passwords are held in memory** for the duration of the connected
-  session, but the allocation is zeroised on drop. Each parallel
-  transfer slot opens its own connection, so the dispatcher needs
-  credentials to handshake each one, and an FTP/FTPS connection keeps a
-  copy to reconnect with after it breaks. If that's not acceptable for your
-  threat model, use SSH key auth or ssh-agent instead — the key file
-  (or the agent's identity store) stays put and no in-memory copy of
-  the secret is needed.
-- **Cancellation cascades at both the single-job and batch level.** `c`
-  cancels the selected transfer; `C` cancels every active and queued job
-  in the same recursive batch. There is no partial-tree cancel (e.g.
-  cancelling only a specific subdirectory within a larger walk).
+  session; see [Credential handling](#credential-handling) for why, and
+  for the alternative.
+- **No partial-tree cancel.** `c` cancels one transfer and `C` the whole
+  batch; there is no way to cancel only a subdirectory within a larger
+  walk.
 - **Walk checkpoints survive a clean exit *and* most hard kills.** The
   initial plan is written with `flush()` (synchronous) before any job
-  runs. Per-job state changes are debounced (see above) — a crash within
-  that window leaves the affected job in its previous state on resume,
-  which is the same safe outcome as a crash mid-transfer (Pending →
-  re-queued, InProgress → re-queued, Done → re-run). Partial downloads
-  live at `<name>.<hash>.blink-part`; the final name is only created via rename
-  after fsync. `mkdir` is idempotent on the remote side, so re-runs are
-  safe across the board. A resumed partial is only trusted if its
-  `.blink-part.meta` sidecar names the same server, remote path, reported
-  size and modification time — one whose sidecar didn't survive the crash restarts
-  instead of risking a silently corrupted file.
+  runs. Per-job state changes are debounced (see
+  [Config and session file safety](#config-and-session-file-safety)) — a
+  crash within that window leaves the affected job in its previous state
+  on resume, which is the same safe outcome as a crash mid-transfer
+  (Pending → re-queued, InProgress → re-queued, Done → re-run). `mkdir` is
+  idempotent on the remote side, so re-runs are safe across the board.
 - **Transfers don't auto-refresh the local pane.** Use F5 to refresh after
   downloads complete.
 
@@ -1046,7 +1034,7 @@ and do not affect blink's MIT license except where noted.
 | [image](https://github.com/image-rs/image) | image-rs contributors | Image decoding (PNG, JPEG, GIF, WebP) |
 | [base64](https://github.com/marshallpierce/rust-base64) | Marshall Pierce et al. | Base64 encoding for image preview |
 | [chrono](https://github.com/chronotope/chrono) | chronotope contributors | Date / time formatting |
-| [sha2](https://github.com/RustCrypto/hashes) | RustCrypto contributors | SHA-256 for known-hosts disambiguation and FTPS cert pins |
+| [sha2](https://github.com/RustCrypto/hashes) | RustCrypto contributors | SHA-256 for FTPS cert pins, partial-file names and session file names |
 | [zeroize](https://github.com/RustCrypto/utils/tree/master/zeroize) | RustCrypto contributors | Wipe in-memory passwords on drop |
 | [icy_sixel](https://github.com/mkrueger/icy_sixel) | Mike Krüger | Sixel image encoding |
 | [parking_lot](https://github.com/Amanieu/parking_lot) | Amanieu d'Antras | Faster synchronisation primitives |
@@ -1075,4 +1063,4 @@ and do not affect blink's MIT license except where noted.
 
 | Crate | Author(s) | Use in blink |
 | ----- | --------- | ------------ |
-| [ring](https://github.com/briansmith/ring) | Brian Smith et al. | Crypto primitives behind both transports — reached through `rustls` for FTPS and selected explicitly for `russh` (see `Cargo.toml`) so one backend serves both |
+| [ring](https://github.com/briansmith/ring) | Brian Smith et al. | Crypto backend for both SSH and TLS |
