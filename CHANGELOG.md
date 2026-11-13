@@ -68,6 +68,9 @@ the git history for those.
   will load, so the transfer was saved but couldn't be resumed. A batch
   that would take it past the limit is now refused with a message, and
   the transfers already queued carry on.
+- **Loading a large checkpoint uses far less memory.** It held several
+  copies of the file in memory at once, enough on a big batch to stall
+  blink or run out of memory.
 - **A retried or requeued download can't pick up a stray write.** A
   download that was cancelled, or failed partway, could still have its
   last write to the partial file in progress. Its retry, or a new job for

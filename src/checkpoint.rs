@@ -567,13 +567,18 @@ impl Checkpoint {
         }
 
         // Peek at the version before full deserialisation so we can apply
-        // migrations without fighting serde's strict field matching.
-        let version_probe: serde_json::Value = serde_json::from_str(&raw)
+        // migrations without fighting serde's strict field matching. Only
+        // `version` is kept; serde skips the rest. Parsing the whole file
+        // into a `Value` here held a tree several times the file's size
+        // alongside it, and a checkpoint can be 256 MiB.
+        #[derive(Deserialize)]
+        struct VersionProbe {
+            #[serde(default)]
+            version: Option<serde_json::Value>,
+        }
+        let probe: VersionProbe = serde_json::from_str(&raw)
             .map_err(|e| BlinkError::config(format!("checkpoint parse: {e}")))?;
-        let version = version_probe
-            .get("version")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1) as u32;
+        let version = probe.version.and_then(|v| v.as_u64()).unwrap_or(1) as u32;
 
         if version > FORMAT_VERSION {
             return Err(BlinkError::config(format!(
@@ -587,7 +592,9 @@ impl Checkpoint {
         // a v1 file (the field didn't exist), so any job that had
         // `done: false` maps to `pending`.
         if version < 2 {
-            return Self::migrate_v1(path, version_probe);
+            let doc = serde_json::from_str(&raw)
+                .map_err(|e| BlinkError::config(format!("checkpoint parse: {e}")))?;
+            return Self::migrate_v1(path, doc);
         }
 
         let cp: Self = serde_json::from_str(&raw)
@@ -2185,6 +2192,41 @@ mod merge_tests {
         assert_eq!(cp.pending_count(), 1);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Version 1 had no `version` field and a boolean `done` per job.
+    #[test]
+    fn a_version_1_document_is_migrated() {
+        let home = crate::paths::test_home();
+        let path = home.path().join("v1.json");
+        std::fs::write(
+            &path,
+            r#"{"session":"s","kind":"download","jobs":[
+                 {"type":"download","remote_path":"/r/0","local_path":"/l/0","done":true},
+                 {"type":"download","remote_path":"/r/1","local_path":"/l/1","done":false}
+               ]}"#,
+        )
+        .unwrap();
+
+        let cp = Checkpoint::load_from(&path).unwrap().expect("file exists");
+        assert_eq!(cp.done_count(), 1);
+        assert_eq!(cp.pending_count(), 1);
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(rewritten.contains(r#""version": 2"#), "{rewritten}");
+    }
+
+    #[test]
+    fn a_document_from_a_newer_blink_is_refused() {
+        let home = crate::paths::test_home();
+        let path = home.path().join("v99.json");
+        std::fs::write(
+            &path,
+            r#"{"version":99,"session":"s","kind":"download","jobs":[],"later":{"x":1}}"#,
+        )
+        .unwrap();
+
+        let err = Checkpoint::load_from(&path).unwrap_err();
+        assert!(err.to_string().contains("newer than supported"), "{err}");
     }
 }
 
