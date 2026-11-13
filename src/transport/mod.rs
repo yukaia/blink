@@ -257,8 +257,7 @@ pub(crate) async fn resume_offset(
                     "discarding a partial that cannot be identified as this file",
                 );
             }
-            let _ = tokio::fs::remove_file(&part).await;
-            let _ = tokio::fs::remove_file(&meta_path).await;
+            discard_partial(local_path).await;
             0
         }
     }
@@ -471,8 +470,7 @@ pub(crate) async fn finish_download(
 ) -> crate::error::Result<()> {
     let on_disk = tokio::fs::symlink_metadata(part).await?.len();
     if on_disk != counted {
-        let _ = tokio::fs::remove_file(part).await;
-        clear_part_meta(local_path).await;
+        discard_partial(local_path).await;
         return Err(crate::error::BlinkError::transport(format!(
             "{}: the partial holds {on_disk} bytes, but the download reached {counted}",
             local_path.display()
@@ -496,6 +494,14 @@ pub(crate) async fn finish_download(
 /// Drop the sidecar once the download has been renamed into place.
 pub(crate) async fn clear_part_meta(local_path: &Path) {
     let _ = tokio::fs::remove_file(part_meta_path(local_path)).await;
+}
+
+/// Remove the download's partial and its sidecar, so the next attempt
+/// starts from byte zero. Best-effort: a partial that is already gone is
+/// what this wants.
+pub(crate) async fn discard_partial(local_path: &Path) {
+    let _ = tokio::fs::remove_file(part_path(local_path)).await;
+    clear_part_meta(local_path).await;
 }
 
 pub(crate) mod error_map;

@@ -539,8 +539,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     if let Some(expected) = reported_size
         && done != expected
     {
-        let _ = tokio::fs::remove_file(&part).await;
-        super::clear_part_meta(local_path).await;
+        super::discard_partial(local_path).await;
         return Err(BlinkError::transport(format!(
             "retr {remote_path}: received {done} bytes, but the server reported {expected}"
         )));
