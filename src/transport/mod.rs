@@ -482,8 +482,17 @@ pub(crate) async fn finish_download(
     let synced_path = local_path.to_path_buf();
     let synced =
         tokio::task::spawn_blocking(move || crate::paths::sync_parent_dir(&synced_path)).await;
-    if !matches!(synced, Ok(Ok(()))) {
-        tracing::warn!(path = %local_path.display(), "could not sync the download's folder");
+    let failure = match synced {
+        Ok(Ok(())) => None,
+        Ok(Err(e)) => Some(e.to_string()),
+        Err(e) => Some(e.to_string()),
+    };
+    if let Some(error) = failure {
+        tracing::warn!(
+            path = %local_path.display(),
+            %error,
+            "could not sync the download's folder",
+        );
     }
     // The partial is gone; its provenance record has nothing left to
     // describe.
