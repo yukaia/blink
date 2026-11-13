@@ -1,7 +1,7 @@
 //! SFTP transport built on russh + russh-sftp.
 //!
 //! NOTE: russh and russh-sftp evolve their APIs across minor versions. The
-//! shape below targets `russh` 0.64.x and `russh-sftp` 3.0.x. If a `cargo build`
+//! shape below targets `russh` 0.65.x and `russh-sftp` 3.0.x. If a `cargo build`
 //! reports method-not-found errors here, check the exact constructor / method
 //! names against the version actually pulled in by `Cargo.lock`. The trait
 //! interface in `transport::Transport` is stable; only this file should need
@@ -24,6 +24,14 @@
 //! `legacy-ed25519-pkcs8-parser` feature, which blink never enabled, and
 //! added host-key rotation (`hostkeys-00@openssh.com`) support that blink
 //! does not use: `known_hosts` learns keys only through the prompt.
+//!
+//! The 0.64 → 0.65 jump touched only the test server: its
+//! `auth_publickey` receives a `server::VerifiedPublicKey` rather than a
+//! `&PublicKey`. On the client side `kex_done` now runs after
+//! `check_server_key` on the first key exchange, and a signer that fails
+//! (an agent declining to sign) no longer leaves the handle stuck. 0.65 also
+//! added agent session binding (`Handle::agent_session_binding`), which
+//! blink does not use.
 
 use crate::transfer::MAX_QUEUED_JOBS;
 use std::path::Path;
@@ -542,7 +550,7 @@ fn load_key(path: &Path, passphrase: Option<&str>) -> Result<russh::keys::Privat
 /// missing or wrong.
 ///
 /// By error variant rather than message text, which upstream can reword.
-/// The variants, per format, as russh 0.64 reports them:
+/// The variants, per format, as russh 0.65 reports them:
 ///
 /// | format                  | no passphrase        | wrong passphrase            |
 /// |-------------------------|----------------------|-----------------------------|
@@ -1816,7 +1824,7 @@ mod integration {
         async fn auth_publickey(
             &mut self,
             _user: &str,
-            _key: &russh::keys::ssh_key::PublicKey,
+            _key: russh::server::VerifiedPublicKey<'_>,
         ) -> Result<Auth, Self::Error> {
             if self.reject_publickeys {
                 return Ok(Auth::reject());

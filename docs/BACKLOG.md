@@ -21,8 +21,9 @@ decryption paths) and #749 (implicit rejection), which replaced #702 and
 What's left is russh moving its pin to rc.20 or later; then check whether
 RUSTSEC-2023-0071 names a patched version before dropping the ignore.
 
-Last checked 2026-11-06: russh 0.65.1 is still the latest (blink is on
-0.64.1) and still pins `rsa =0.10.0-rc.18` and `ssh-key =0.7.0-rc.11`.
+Last checked 2026-11-13: `rsa 0.10.0` is out as a full release and
+`ssh-key` is at `0.7.0-rc.12`, but russh 0.65.1, the latest and what blink
+is on, still pins `rsa =0.10.0-rc.18` and `ssh-key =0.7.0-rc.11`.
 
 ## russh can't load an encrypted legacy-PEM ECDSA key
 
@@ -33,6 +34,7 @@ load even with the right passphrase. russh 0.64.1 decrypts it, then
 parses the result as PKCS#1 and reports "unexpected ASN.1 DER tag:
 expected INTEGER, got OCTET STRING". The user sees a load error, not a
 passphrase prompt. The same key in OpenSSH or PKCS#8 format loads fine,
-and `ssh-keygen -p -f <key>` converts it to OpenSSH. Upstream's bug: check
-whether a newer russh fixes it, and report it if not. There's nothing for
-blink to do beyond, at most, naming the workaround in the error.
+and `ssh-keygen -p -f <key>` converts it to OpenSSH. The unencrypted
+form of the same key loads. Upstream's bug, still there in russh 0.65.1
+(checked 2026-11-13) and not yet reported. There's nothing for blink to do
+beyond, at most, naming the workaround in the error.

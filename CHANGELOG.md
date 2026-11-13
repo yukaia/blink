@@ -184,6 +184,16 @@ the git history for those.
   PKCS#8 key (`BEGIN ENCRYPTED PRIVATE KEY`) never asked at all. blink now
   tells these apart by russh's error type rather than its message text.
 
+### Dependencies
+
+- `russh` 0.64 -> 0.65, for RUSTSEC-2026-0495 (russh's agent server, which
+  blink does not run). No changes outside the test server. It still pins
+  `rsa` and `ssh-key` to the same release candidates.
+- Lockfile refresh (`cargo update`). `webpki-roots` 1.0.12 drops six trust
+  roots (Buypass Class 2 and Class 3, Certigna Root CA, DigiCert Trusted
+  Root G4, QuoVadis Root CA 1 G3 and 3 G3): an FTPS server whose
+  certificate chains to one of them is now refused unless it is pinned.
+
 ## [0.9.0] — 2026-11-04
 
 ### Security
