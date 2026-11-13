@@ -200,14 +200,29 @@ impl App {
         // its resumability with it and stranding the `.blink-part` files of its
         // unfinished downloads, since the checkpoint is the only record of
         // where those are.
-        let base = match self.active_checkpoints.get_mut(&ck_kind) {
-            Some(existing) => existing.append(ck_jobs),
-            None => {
-                self.active_checkpoints.insert(
-                    ck_kind,
-                    Checkpoint::new(&session_name, &origin, ck_kind, ck_jobs),
+        //
+        // A plan the checkpoint can't hold is refused outright: jobs past
+        // the queue cap wait in the checkpoint, so running the plan without
+        // it isn't possible, and saving it anyway would leave a file that
+        // won't load.
+        let cp = self
+            .active_checkpoints
+            .entry(ck_kind)
+            .or_insert_with(|| Checkpoint::new(&session_name, &origin, ck_kind, Vec::new()));
+        let base = match cp.append(ck_jobs) {
+            Ok(base) => base,
+            Err(e) => {
+                if cp.jobs.is_empty() {
+                    self.active_checkpoints.remove(&ck_kind);
+                }
+                self.push_log(
+                    LogLevel::Error,
+                    format!(
+                        "not queued: {e}. Let the transfers already queued finish, \
+                         then try again"
+                    ),
                 );
-                0
+                return;
             }
         };
         // Persist the whole plan before any I/O starts, so a kill during the

@@ -122,11 +122,16 @@ const FORMAT_VERSION: u32 = 4;
 /// writes. It was 10 MiB, which a batch of about 50,000 files passed: the
 /// checkpoint was saved and then refused on load. A job takes roughly 60
 /// bytes plus its two paths, so this fits [`MAX_CHECKPOINT_JOBS`] with
-/// paths averaging over 100 bytes each.
+/// paths averaging over 100 bytes each. [`Checkpoint::append`] refuses to
+/// grow a checkpoint past either limit.
 const MAX_CHECKPOINT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Maximum number of jobs accepted in a single checkpoint.
 const MAX_CHECKPOINT_JOBS: usize = 1_000_000;
+
+/// How many bytes longer a job's encoding can grow after it is added:
+/// `"in_progress"` against `"pending"`. See [`Checkpoint::append`].
+const STATUS_GROWTH: u64 = 4;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -433,11 +438,50 @@ impl Checkpoint {
     /// was still running, leaving it unresumable and its `.blink-part` files
     /// unfindable. Appending keeps both in one file; the caller offsets its
     /// job-id map by the returned base.
-    pub fn append(&mut self, jobs: Vec<CheckpointJob>) -> usize {
+    ///
+    /// Refuses, leaving the checkpoint as it was, when the result could
+    /// grow past what [`Self::load_from`] accepts: it would be saved, then
+    /// refused on load, and nothing in it could be resumed.
+    pub fn append(&mut self, jobs: Vec<CheckpointJob>) -> Result<usize> {
+        self.append_within(jobs, MAX_CHECKPOINT_JOBS, MAX_CHECKPOINT_BYTES)
+    }
+
+    /// [`Self::append`], against the given limits.
+    fn append_within(
+        &mut self,
+        jobs: Vec<CheckpointJob>,
+        max_jobs: usize,
+        max_bytes: u64,
+    ) -> Result<usize> {
+        let total = self.jobs.len() + jobs.len();
+        if total > max_jobs {
+            return Err(BlinkError::config(format!(
+                "a checkpoint holds at most {max_jobs} jobs, and this would make {total}"
+            )));
+        }
+        // The file as it would be written now, plus the new jobs and the
+        // comma before each, plus room for every status to grow:
+        // `in_progress`, the longest, is four bytes longer than `pending`.
+        fn encoded_len(v: &impl Serialize) -> Result<u64> {
+            serde_json::to_vec(v)
+                .map(|raw| raw.len() as u64)
+                .map_err(|e| BlinkError::config(format!("checkpoint serialize: {e}")))
+        }
+        let now = encoded_len(self)?;
+        let mut added = 0u64;
+        for job in &jobs {
+            added += 1 + encoded_len(job)?;
+        }
+        let bytes = now + added + STATUS_GROWTH * total as u64;
+        if bytes > max_bytes {
+            return Err(BlinkError::config(format!(
+                "a checkpoint holds at most {max_bytes} bytes, and this could make {bytes}"
+            )));
+        }
         let base = self.jobs.len();
         self.jobs.extend(jobs);
         self.dirty = true;
-        base
+        Ok(base)
     }
 
     /// Mark a job as cancelled in memory. See [`Self::mark_in_progress`].
@@ -2004,7 +2048,7 @@ mod merge_tests {
             CheckpointKind::Download,
             vec![dl(0), dl(1)],
         );
-        let base = cp.append(vec![dl(2), dl(3)]);
+        let base = cp.append(vec![dl(2), dl(3)]).unwrap();
         assert_eq!(base, 2, "the caller maps job ids from this offset");
         assert_eq!(cp.jobs.len(), 4);
     }
@@ -2020,7 +2064,7 @@ mod merge_tests {
         cp.mark_done(0);
         cp.mark_in_progress(1);
 
-        cp.append(vec![dl(2)]);
+        cp.append(vec![dl(2)]).unwrap();
 
         assert_eq!(cp.jobs[0].status(), JobStatus::Done);
         assert_eq!(cp.jobs[1].status(), JobStatus::InProgress);
@@ -2030,7 +2074,55 @@ mod merge_tests {
     #[test]
     fn append_into_an_empty_checkpoint_starts_at_zero() {
         let mut cp = Checkpoint::new("s", TEST_ORIGIN, CheckpointKind::Upload, Vec::new());
-        assert_eq!(cp.append(vec![dl(0)]), 0);
+        assert_eq!(cp.append(vec![dl(0)]).unwrap(), 0);
+    }
+
+    /// A checkpoint is refused on load past its limits, so appending can't
+    /// take it past them: it would be saved, then refused, and nothing in
+    /// it could be resumed.
+    #[test]
+    fn append_refuses_more_jobs_than_a_load_accepts() {
+        let mut cp = Checkpoint::new("s", TEST_ORIGIN, CheckpointKind::Download, vec![dl(0)]);
+        assert!(cp.append_within(vec![dl(1), dl(2)], 3, u64::MAX).is_ok());
+        let err = cp.append_within(vec![dl(3)], 3, u64::MAX).unwrap_err();
+        assert!(err.to_string().contains("at most 3 jobs"), "{err}");
+        assert_eq!(cp.jobs.len(), 3, "a refused append adds nothing");
+    }
+
+    #[test]
+    fn append_refuses_a_checkpoint_that_could_outgrow_the_load_limit() {
+        let mut cp = Checkpoint::new("s", TEST_ORIGIN, CheckpointKind::Download, vec![dl(0)]);
+        let limit = serde_json::to_vec(&cp).unwrap().len() as u64 + 50;
+        let err = cp
+            .append_within(vec![dl(1), dl(2)], usize::MAX, limit)
+            .unwrap_err();
+        assert!(err.to_string().contains("bytes"), "{err}");
+        assert_eq!(cp.jobs.len(), 1, "a refused append adds nothing");
+    }
+
+    /// The size an append allows for must cover the file however its jobs
+    /// end up, every one of them in progress included.
+    #[test]
+    fn appends_size_allows_for_every_status() {
+        let mut cp = Checkpoint::new("s", TEST_ORIGIN, CheckpointKind::Download, vec![dl(0)]);
+        let jobs: Vec<_> = (1..50).map(dl).collect();
+        let mut tight = 0;
+        for limit in 0.. {
+            let mut probe = cp.clone();
+            if probe.append_within(jobs.clone(), usize::MAX, limit).is_ok() {
+                tight = limit;
+                break;
+            }
+        }
+        cp.append_within(jobs, usize::MAX, tight).unwrap();
+        for i in 0..cp.jobs.len() {
+            cp.mark_in_progress(i);
+        }
+        let written = serde_json::to_vec(&cp).unwrap().len() as u64;
+        assert!(
+            written <= tight,
+            "{written} bytes written, {tight} allowed for"
+        );
     }
 
     // -- cancelled jobs ----------------------------------------------------
