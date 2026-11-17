@@ -30,6 +30,14 @@ use crate::tui::state::OverwritePending;
 
 use super::{App, LogLevel, Screen};
 
+/// One selected remote entry, about to be planned as a download.
+struct DownloadRoot {
+    remote: String,
+    local: PathBuf,
+    is_dir: bool,
+    is_link: bool,
+}
+
 impl App {
     /// Enqueue uploads for the selected items in the local pane. If
     /// nothing is selected, falls back to the cursor item.
@@ -185,6 +193,7 @@ impl App {
                 unreadable_skipped: 0,
                 unsafe_skipped: 0,
                 unverifiable_uploads: conflicts.unverifiable,
+                local_dirs: Vec::new(),
                 kind: CheckpointKind::Upload,
             });
         });
@@ -222,15 +231,27 @@ impl App {
         }
 
         let local_base = PathBuf::from(&self.local.path);
+        let links: std::collections::HashSet<&str> = self
+            .remote
+            .all_rows()
+            .iter()
+            .filter(|e| e.is_link)
+            .map(|e| e.raw_name.as_str())
+            .collect();
         // `safe_local_name` is what makes a server-supplied name safe to join
         // onto a local path; it must see the real name, not a sanitized one,
         // or two distinct remote files can land on the same local path.
-        let roots: Vec<(String, PathBuf, bool)> = selections
+        let roots: Vec<DownloadRoot> = selections
             .iter()
             .filter_map(|(name, is_dir)| {
                 let safe = safe_local_name(name)?;
                 let remote = transport::join_remote(&self.remote.path, name)?;
-                Some((remote, local_base.join(safe), *is_dir))
+                Some(DownloadRoot {
+                    remote,
+                    local: local_base.join(safe),
+                    is_dir: *is_dir,
+                    is_link: links.contains(name.as_str()),
+                })
             })
             .collect();
         // Said, as the walk says what it leaves out: the user picked these.
@@ -261,7 +282,7 @@ impl App {
     /// Spawn the download preparation task: walks every root (file or dir)
     /// into a flat plan, then probes each destination file path in the
     /// local FS to populate `conflict_indices`. Posts back as `WalkComplete`.
-    fn start_download_walk(&mut self, roots: Vec<(String, PathBuf, bool)>) {
+    fn start_download_walk(&mut self, roots: Vec<DownloadRoot>) {
         let Some(t) = self.transport.clone() else {
             return;
         };
@@ -276,8 +297,20 @@ impl App {
             let mut symlinks_skipped: usize = 0;
             let mut unreadable_skipped: usize = 0;
             let mut unsafe_skipped: usize = 0;
+            let mut local_dirs = Vec::new();
             {
-                for (remote, local, is_dir) in roots {
+                for root in roots {
+                    // A symlink the user picked is followed, as a pick of a
+                    // file it points at would be: a link to a folder is
+                    // walked as the folder. Where the server can't say what
+                    // it points at (FTP), it is fetched as a file.
+                    let is_dir = root.is_dir
+                        || (root.is_link
+                            && matches!(
+                                t.lock().await.metadata(&root.remote).await,
+                                Ok(Some(e)) if e.is_dir()
+                            ));
+                    let DownloadRoot { remote, local, .. } = root;
                     let chunk = if is_dir {
                         let walk = walk_remote(&t, &remote, &local).await;
                         match walk {
@@ -285,6 +318,7 @@ impl App {
                                 symlinks_skipped += r.symlinks_skipped;
                                 unreadable_skipped += r.unreadable_skipped;
                                 unsafe_skipped += r.unsafe_skipped;
+                                local_dirs.extend(r.local_dirs);
                                 r.plan
                             }
                             Err(e) => {
@@ -322,8 +356,27 @@ impl App {
                 unreadable_skipped,
                 unsafe_skipped,
                 unverifiable_uploads: 0,
+                local_dirs,
                 kind: CheckpointKind::Download,
             });
+        });
+    }
+
+    /// Create the local folders a download plan records, now that it is going
+    /// ahead; see [`crate::tui::plan::WalkResult::local_dirs`]. Off the
+    /// interface's thread: a large tree is thousands of folders. A folder
+    /// that can't be made is logged; a download into it fails with its own
+    /// error.
+    pub(super) fn create_local_dirs(&mut self, dirs: Vec<PathBuf>) {
+        if dirs.is_empty() {
+            return;
+        }
+        tokio::task::spawn_blocking(move || {
+            for dir in dirs {
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    tracing::warn!(dir = %dir.display(), "could not create local folder: {e}");
+                }
+            }
         });
     }
 
@@ -344,12 +397,14 @@ impl App {
             OverwritePending::DownloadPlan {
                 plan,
                 conflict_indices,
+                local_dirs,
             } => {
                 let final_plan = if skip_conflicts {
                     drop_conflicting(plan, &conflict_indices)
                 } else {
                     plan
                 };
+                self.create_local_dirs(local_dirs);
                 self.dispatch_plan(final_plan, CheckpointKind::Download);
             }
             OverwritePending::UploadPlan {

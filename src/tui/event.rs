@@ -129,6 +129,10 @@ pub enum AppEvent {
         /// destination's listing could not be fully read. Always zero for a
         /// download walk.
         unverifiable_uploads: usize,
+        /// Local folders to create when the plan is dispatched; see
+        /// [`crate::tui::plan::WalkResult::local_dirs`]. Always empty for an
+        /// upload walk.
+        local_dirs: Vec<std::path::PathBuf>,
         kind: crate::checkpoint::CheckpointKind,
     },
 

@@ -361,6 +361,7 @@ impl App {
                 unreadable_skipped,
                 unsafe_skipped,
                 unverifiable_uploads,
+                local_dirs,
                 kind,
             } => {
                 // The plan names paths on the server the walk ran on, and its
@@ -424,12 +425,14 @@ impl App {
                     );
                 }
                 if conflict_indices.is_empty() {
+                    self.create_local_dirs(local_dirs);
                     self.dispatch_plan(plan, kind);
                 } else {
                     let pending = match kind {
                         CheckpointKind::Download => OverwritePending::DownloadPlan {
                             plan,
                             conflict_indices,
+                            local_dirs,
                         },
                         CheckpointKind::Upload => OverwritePending::UploadPlan {
                             plan,

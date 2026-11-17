@@ -126,8 +126,10 @@ pub enum EnqueueError {
 ///
 /// Local paths fold case where the filesystem does (Windows, and macOS by
 /// default), so `README` and `readme` from one server directory count as
-/// one destination there. Remote paths never fold: whether the server's
-/// filesystem does is unknowable from here.
+/// one destination there. On macOS they also fold Unicode normalization:
+/// APFS treats the composed and decomposed spellings of `café` as one name,
+/// which a Linux server keeps as two files. Remote paths never fold:
+/// whether the server's filesystem does is unknowable from here.
 pub(crate) fn destination_key(
     direction: Direction,
     remote_path: &str,
@@ -136,23 +138,43 @@ pub(crate) fn destination_key(
     match direction {
         Direction::Download => Some((
             direction,
-            local_destination_key(local_path, cfg!(any(windows, target_os = "macos"))),
+            local_destination_key(local_path, LocalNames::HERE),
         )),
         Direction::Upload => Some((direction, remote_path.to_string())),
         Direction::CreateDir => None,
     }
 }
 
-/// The local half of [`destination_key`], with the case policy passed in so
-/// both branches are tested on any host. Lossy conversion is fine for a
-/// key: a path with undecodable bytes still maps to one string every time.
-fn local_destination_key(path: &Path, fold_case: bool) -> String {
-    let s = path.to_string_lossy();
-    if fold_case {
-        s.to_lowercase()
-    } else {
-        s.into_owned()
+/// Which spellings of a name the local filesystem treats as one file.
+#[derive(Debug, Clone, Copy)]
+struct LocalNames {
+    fold_case: bool,
+    /// Composed and decomposed Unicode name one file. APFS does; NTFS,
+    /// though case-insensitive, keeps them apart.
+    fold_normalization: bool,
+}
+
+impl LocalNames {
+    const HERE: Self = Self {
+        fold_case: cfg!(any(windows, target_os = "macos")),
+        fold_normalization: cfg!(target_os = "macos"),
+    };
+}
+
+/// The local half of [`destination_key`], with the filesystem's rules
+/// passed in so every branch is tested on any host. Lossy conversion is
+/// fine for a key: a path with undecodable bytes still maps to one string
+/// every time.
+fn local_destination_key(path: &Path, names: LocalNames) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+    let mut s = path.to_string_lossy().into_owned();
+    if names.fold_case {
+        s = s.to_lowercase();
     }
+    if names.fold_normalization {
+        s = s.nfc().collect();
+    }
+    s
 }
 
 /// Manages a queue of jobs and a configurable concurrency cap.
@@ -1278,19 +1300,54 @@ mod tests {
         assert!(!m.is_in_flight(&key));
     }
 
+    const LINUX: LocalNames = LocalNames {
+        fold_case: false,
+        fold_normalization: false,
+    };
+    const WINDOWS: LocalNames = LocalNames {
+        fold_case: true,
+        fold_normalization: false,
+    };
+    const MACOS: LocalNames = LocalNames {
+        fold_case: true,
+        fold_normalization: true,
+    };
+
     #[test]
     fn local_destinations_fold_case_only_where_the_filesystem_does() {
         let upper = Path::new("/tmp/README");
         let lower = Path::new("/tmp/readme");
         assert_ne!(
-            local_destination_key(upper, false),
-            local_destination_key(lower, false),
+            local_destination_key(upper, LINUX),
+            local_destination_key(lower, LINUX),
             "a case-sensitive filesystem holds both",
         );
         assert_eq!(
-            local_destination_key(upper, true),
-            local_destination_key(lower, true),
+            local_destination_key(upper, WINDOWS),
+            local_destination_key(lower, WINDOWS),
             "a case-insensitive one holds one file under both names",
+        );
+    }
+
+    /// `café` written composed (é as one code point) and decomposed (e plus
+    /// a combining accent) are two names to a Linux server and one to APFS,
+    /// so two downloads would land on one file and one would be lost.
+    #[test]
+    fn local_destinations_fold_unicode_normalization_only_on_macos() {
+        let composed = Path::new("/tmp/caf\u{e9}");
+        let decomposed = Path::new("/tmp/cafe\u{301}");
+        assert_eq!(
+            local_destination_key(composed, MACOS),
+            local_destination_key(decomposed, MACOS),
+        );
+        assert_ne!(
+            local_destination_key(composed, WINDOWS),
+            local_destination_key(decomposed, WINDOWS),
+            "NTFS keeps the two spellings apart",
+        );
+        assert_ne!(
+            local_destination_key(composed, LINUX),
+            local_destination_key(decomposed, LINUX),
         );
     }
 

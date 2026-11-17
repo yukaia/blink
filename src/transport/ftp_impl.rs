@@ -110,6 +110,30 @@ macro_rules! delegate_ftp_transport {
             }
 
             async fn rename(&mut self, from: &str, to: &str) -> $crate::error::Result<()> {
+                // RNTO replaces an existing target where the server permits
+                // overwriting (vsftpd does), but a plain rename is one the
+                // user did not confirm as an overwrite: a target that turned
+                // up since the listing must stop it, as SFTP's RENAME does.
+                // FTP has no rename that refuses, so ask first. The window
+                // between the two is a round trip, not the minutes since the
+                // listing.
+                $crate::transport::ftp_impl::check_ftp_path("rnto", to)?;
+                self.begin_call().await?;
+                let target = $crate::transport::ftp_impl::ftp_metadata(&mut self.stream, to).await;
+                match self.settle(target)? {
+                    Some(_) => Err($crate::error::BlinkError::transport(format!(
+                        "rename {from} -> {to}: {to} already exists"
+                    ))),
+                    None => self.rename_over(from, to).await,
+                }
+            }
+
+            async fn rename_over(&mut self, from: &str, to: &str) -> $crate::error::Result<()> {
+                // RNTO onto an existing name replaces it where the server
+                // permits overwriting (vsftpd does; ProFTPD only with
+                // `AllowOverwrite on`) and is refused otherwise. FTP has no
+                // replacing rename to fall back on, and deleting the target
+                // first would lose it if the rename were then refused.
                 $crate::transport::ftp_impl::check_ftp_path("rnfr", from)?;
                 $crate::transport::ftp_impl::check_ftp_path("rnto", to)?;
                 let label = format!("{from} -> {to}");
@@ -121,15 +145,6 @@ macro_rules! delegate_ftp_transport {
                 )
                 .await;
                 self.settle(result)
-            }
-
-            async fn rename_over(&mut self, from: &str, to: &str) -> $crate::error::Result<()> {
-                // RNTO onto an existing name replaces it where the server
-                // permits overwriting (vsftpd does; ProFTPD only with
-                // `AllowOverwrite on`) and is refused otherwise. FTP has no
-                // replacing rename to fall back on, and deleting the target
-                // first would lose it if the rename were then refused.
-                self.rename(from, to).await
             }
 
             async fn delete_file(&mut self, remote_path: &str) -> $crate::error::Result<()> {
@@ -477,13 +492,22 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     // doesn't answer SIZE skipped the staleness check entirely and resumed
     // whatever happened to be on disk. Now a server that doesn't answer
     // SIZE or MDTM restarts instead.
-    let offset = super::resume_offset(local_path, remote_path, stamp, origin).await;
+    let mut offset = super::resume_offset(local_path, remote_path, stamp, origin).await;
 
-    if offset > 0 {
-        timed_ftp("rest", remote_path, stream.resume_transfer(offset as usize)).await?;
-    }
-
-    let mut reader = timed_ftp("retr", remote_path, stream.retr_as_stream(remote_path)).await?;
+    // A server that won't restart (REST refused) can't continue the
+    // partial, so start over. Failing instead kept the partial, which the
+    // next attempt identified and tried to continue the same way: the file
+    // could not be downloaded until the partial was deleted by hand.
+    let mut reader = match open_retr(stream, remote_path, offset).await {
+        Ok(reader) => reader,
+        Err(e) if offset > 0 && !matches!(e, BlinkError::Disconnected(_)) => {
+            tracing::info!(remote = %remote_path, "could not resume, starting over: {e}");
+            super::discard_partial(local_path).await;
+            offset = 0;
+            open_retr(stream, remote_path, 0).await?
+        }
+        Err(e) => return Err(e),
+    };
 
     let mut local = super::open_part(&lease, &part, offset).await?;
     // Identify the partial before writing to it — see the SFTP path.
@@ -550,6 +574,19 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     super::finish_download(&lease, &part, local_path, done).await?;
 
     Ok(())
+}
+
+/// Open `remote_path` for reading from byte `offset`: REST when it isn't 0,
+/// then RETR.
+async fn open_retr<T: TokioTlsStream + Send + 'static>(
+    stream: &mut ImplAsyncFtpStream<T>,
+    remote_path: &str,
+    offset: u64,
+) -> Result<suppaftp::tokio::TransferStream<T>> {
+    if offset > 0 {
+        timed_ftp("rest", remote_path, stream.resume_transfer(offset as usize)).await?;
+    }
+    timed_ftp("retr", remote_path, stream.retr_as_stream(remote_path)).await
 }
 
 pub async fn ftp_upload<T: TokioTlsStream + Send>(
@@ -1047,6 +1084,8 @@ mod integration {
         /// Answer REST with `350` but send RETR from byte 0 regardless: a
         /// server that acknowledges a restart marker and ignores it.
         pub ignore_rest: bool,
+        /// Answer REST with `502`, as a server that can't restart does.
+        pub refuse_rest: bool,
         /// In RETR, send the body in chunks of this many bytes with this
         /// pause between them: a slow link that never stalls.
         pub trickle: Option<(usize, std::time::Duration)>,
@@ -1285,6 +1324,9 @@ mod integration {
                     data.shutdown().await?;
                     drop(data);
                     w.write_all(b"226 transfer complete\r\n").await?;
+                }
+                "REST" if faults.refuse_rest => {
+                    w.write_all(b"502 REST not implemented\r\n").await?;
                 }
                 "REST" => {
                     if !faults.ignore_rest {
@@ -1861,6 +1903,86 @@ mod integration {
             "the download must resume from the partial's length, not restart; \
              commands issued: {issued:?}",
         );
+    }
+
+    async fn serving_two_files() -> (Store, FtpTransport) {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/a.txt".to_string(), b"a".to_vec());
+            files.insert("/b.txt".to_string(), b"b".to_vec());
+        }
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let transport = FtpTransport::connect(&test_session(port), Some("pw"))
+            .await
+            .unwrap();
+        (store, transport)
+    }
+
+    /// A plain rename is for a target the user didn't confirm replacing; one
+    /// that turned up since the listing must stop it. RNTO replaces where
+    /// the server allows it, as this harness does by default, so it used to
+    /// go ahead and the file was lost.
+    #[tokio::test]
+    async fn a_plain_rename_onto_an_existing_file_fails_and_changes_nothing() {
+        let (store, mut transport) = serving_two_files().await;
+
+        let err = transport.rename("/a.txt", "/b.txt").await.unwrap_err();
+
+        assert!(err.to_string().contains("/b.txt"), "{err}");
+        let files = store.lock().await;
+        assert_eq!(files.get("/a.txt").map(Vec::as_slice), Some(&b"a"[..]));
+        assert_eq!(files.get("/b.txt").map(Vec::as_slice), Some(&b"b"[..]));
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_rename_replaces_the_existing_file() {
+        let (store, mut transport) = serving_two_files().await;
+
+        transport.rename_over("/a.txt", "/b.txt").await.unwrap();
+
+        let files = store.lock().await;
+        assert!(!files.contains_key("/a.txt"));
+        assert_eq!(files.get("/b.txt").map(Vec::as_slice), Some(&b"a"[..]));
+    }
+
+    /// A server that refuses REST can't continue a partial, so the download
+    /// starts over. It used to fail, keep the partial, and fail the same way
+    /// on every retry: the file could not be downloaded at all until the
+    /// partial was deleted by hand.
+    #[tokio::test]
+    async fn a_server_that_refuses_to_resume_gets_a_fresh_download() {
+        let payload = pseudo_random(100_000);
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/resume.bin".to_string(), payload.clone());
+        let dir = tempdir_for_test("refused-rest");
+        let local = dir.join("resume.bin");
+        let faults = Faults {
+            refuse_rest: true,
+            ..Faults::default()
+        };
+        let (port, _c, log) = start_server(Arc::clone(&store), faults).await;
+        let session = test_session(port);
+        std::fs::write(crate::transport::part_path(&local), &payload[..30_000]).unwrap();
+        crate::transport::write_part_meta(
+            &local,
+            "/resume.bin",
+            harness_stamp(payload.len()),
+            &crate::transport::origin_of(&session),
+        )
+        .await;
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let result = transport.download("/resume.bin", &local, None).await;
+
+        let issued = log.lock().await.clone();
+        result.unwrap_or_else(|e| panic!("{e}; commands: {issued:?}"));
+        assert_eq!(std::fs::read(&local).unwrap(), payload);
+        assert!(issued.iter().any(|c| c == "REST 30000"), "{issued:?}");
+        assert!(!crate::transport::part_path(&local).exists());
     }
 
     /// A partial of a file since replaced by another of the same size: the

@@ -1444,9 +1444,14 @@ impl Transport for SftpTransport {
     async fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
         // Without `posix-rename`, the rename below moves `to` aside to make
         // room, and back if it then fails. Asking first spares a source
-        // that has gone since the listing that round trip.
-        if self.metadata(from).await?.is_none() {
-            return Err(BlinkError::not_found(format!("rename {from}")));
+        // that has gone since the listing that round trip. By lstat: the
+        // source is renamed as itself, so a symlink whose target is gone
+        // is still there to rename.
+        if let Err(e) = self.sftp.symlink_metadata(from).await {
+            return Err(match map_sftp("lstat", from, e) {
+                BlinkError::NotFound(_) => BlinkError::not_found(format!("rename {from}")),
+                other => other,
+            });
         }
         let xfer = self.transfer_session().await?;
         let (raw, posix_rename) = (Arc::clone(&xfer.raw), xfer.posix_rename);
@@ -2277,8 +2282,16 @@ mod integration {
             // SFTP v3 semantics: RENAME fails when the target exists, file
             // or folder. This deliberately exercises the client's
             // move-aside-then-rename fallback for upload finalization.
-            if store.contains_key(&newpath) || store.contains_key(&format!("{newpath}/")) {
+            if store.contains_key(&newpath)
+                || store.contains_key(&format!("{newpath}/"))
+                || store.contains_key(&symlink_key(&newpath))
+            {
                 return Err(StatusCode::Failure);
+            }
+            // A symlink moves as the link, whatever it points at.
+            if let Some(link) = store.remove(&symlink_key(&oldpath)) {
+                store.insert(symlink_key(&newpath), link);
+                return Ok(ok_status(id));
             }
             if move_folder(&mut store, &oldpath, &newpath) {
                 return Ok(ok_status(id));
@@ -3623,6 +3636,53 @@ mod integration {
             files.keys()
         );
         drop(files);
+        let _ = transport.close().await;
+    }
+
+    /// A symlink whose target is gone is still there to rename. The check
+    /// that the source exists used to stat it, which follows the link, so
+    /// replacing a file with a dangling link failed as "not found".
+    #[tokio::test]
+    async fn a_dangling_symlink_can_be_renamed_over_a_file() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert(symlink_key("/link"), Vec::new());
+            files.insert("/b.txt".to_string(), b"b".to_vec());
+        }
+        let (port, _c) = start_server(Arc::clone(&store)).await;
+        let mut transport = connect(port).await;
+
+        transport.rename_over("/link", "/b.txt").await.unwrap();
+
+        let files = store.lock().await;
+        let mut keys: Vec<&String> = files.keys().collect();
+        keys.sort();
+        assert_eq!(keys, [&symlink_key("/b.txt")]);
+        drop(files);
+        let _ = transport.close().await;
+    }
+
+    #[tokio::test]
+    async fn renaming_over_from_a_source_that_is_gone_is_not_found() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/b.txt".to_string(), b"b".to_vec());
+        let (port, _c) = start_server(Arc::clone(&store)).await;
+        let mut transport = connect(port).await;
+
+        let err = transport.rename_over("/gone", "/b.txt").await.unwrap_err();
+
+        assert!(
+            matches!(err, crate::error::BlinkError::NotFound(_)),
+            "{err}"
+        );
+        assert_eq!(
+            store.lock().await.get("/b.txt").map(Vec::as_slice),
+            Some(&b"b"[..])
+        );
         let _ = transport.close().await;
     }
 

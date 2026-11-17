@@ -64,6 +64,11 @@ pub struct WalkResult {
     /// [`safe_local_name`]) or joined onto their directory's path. Always
     /// zero for a local walk.
     pub unsafe_skipped: usize,
+    /// Local folders a download walk would create, parents first, so an
+    /// empty remote folder still arrives as one. Made when the plan is
+    /// dispatched, not by the walk: the user may yet decline it at the
+    /// overwrite prompt. Always empty for a local walk.
+    pub local_dirs: Vec<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +205,7 @@ pub async fn walk_remote(
     let mut unreadable_skipped: usize = 0;
     let mut unsafe_skipped: usize = 0;
     let mut dirs_visited: usize = 0;
+    let mut local_dirs: Vec<PathBuf> = Vec::new();
 
     // Iterative DFS. Stack holds (remote_path_to_visit, local_path_dest).
     let mut stack: Vec<(String, PathBuf)> =
@@ -239,15 +245,10 @@ pub async fn walk_remote(
             )));
         }
 
-        // Ensure the local dir exists ahead of file writes. (The download
-        // worker also does create_dir_all on the parent, but doing it here
-        // means an empty remote dir still produces a real local dir.)
-        if let Err(e) = tokio::fs::create_dir_all(&local_dir).await {
-            return Err(BlinkError::transport(format!(
-                "create local dir {}: {e}",
-                local_dir.display()
-            )));
-        }
+        // Recorded, not created: see `WalkResult::local_dirs`. (Each
+        // download also creates its own parent; this list is what makes an
+        // empty remote folder arrive as one.)
+        local_dirs.push(local_dir.clone());
 
         // Scoped: the guard is dropped before the entries are processed and
         // before the next iteration, so other work gets a turn.
@@ -328,6 +329,7 @@ pub async fn walk_remote(
         unreadable_skipped,
         unencodable_skipped: 0,
         unsafe_skipped,
+        local_dirs,
     })
 }
 
@@ -448,6 +450,7 @@ pub async fn walk_local(local_root: &Path, remote_root: &str) -> Result<WalkResu
         unreadable_skipped: 0,
         unencodable_skipped,
         unsafe_skipped: 0,
+        local_dirs: Vec::new(),
     })
 }
 
@@ -838,6 +841,34 @@ mod tests {
         assert_eq!(result.symlinks_skipped, 0);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Planning a download creates nothing locally: the user may still
+    /// decline at the overwrite prompt, which used to leave the whole folder
+    /// tree behind, empty. The folders are recorded instead, an empty remote
+    /// one included, for the dispatch to make.
+    #[tokio::test]
+    async fn walk_remote_creates_nothing_and_records_the_folders_to_make() {
+        let root = scratch("records-dirs");
+        let mut t = crate::transport::mock::MockTransport::new().with_file("/r/sub/a.txt", b"a");
+        t.mkdir("/r").await.unwrap();
+        t.mkdir("/r/empty").await.unwrap();
+
+        let result = walk_remote(&shared(t), "/r", &root).await.unwrap();
+
+        assert!(
+            !root.exists(),
+            "the walk must not create {}",
+            root.display()
+        );
+        assert_eq!(result.local_dirs.first(), Some(&root), "parents first");
+        let mut dirs = result.local_dirs.clone();
+        dirs.sort();
+        assert_eq!(dirs, [root.clone(), root.join("empty"), root.join("sub")]);
+        assert!(matches!(
+            result.plan.as_slice(),
+            [PlannedJob::Download { local_path, .. }] if *local_path == root.join("sub/a.txt")
+        ));
     }
 
     #[test]
