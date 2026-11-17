@@ -664,6 +664,15 @@ impl App {
                     self.save_session_error = Some("no active session".into());
                     return;
                 };
+                // Another saved session by this name would be overwritten
+                // without a word; the edit form refuses the same. This
+                // session's own file is the one to update.
+                let own_file = self.current_session_saved && current.name == name;
+                if !own_file && self.sessions.iter().any(|s| s.name == name) {
+                    self.save_session_error =
+                        Some(format!("a session named `{name}` already exists"));
+                    return;
+                }
 
                 // Snapshot the current navigation state into the saved session
                 // so reopening picks up where we left off.
@@ -679,6 +688,7 @@ impl App {
                 match to_save.save() {
                     Ok(()) => {
                         self.current_session = Some(to_save);
+                        self.current_session_saved = true;
                         // Refresh the sessions list so it reflects the new
                         // entry next time the user opens the selector.
                         self.reload_sessions();

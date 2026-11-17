@@ -268,6 +268,10 @@ pub struct App {
 
     // Main view
     pub current_session: Option<Session>,
+    /// Whether `current_session` is on disk under its name — loaded from
+    /// there, or saved since. Saving under a name another session already
+    /// has is refused; saving under this session's own name updates it.
+    current_session_saved: bool,
     pub transport: Option<SharedTransport>,
     pub local: PaneState,
     pub remote: PaneState,
@@ -473,6 +477,7 @@ impl App {
             help_scroll: 0,
             search_target: Pane::Local,
             current_session: None,
+            current_session_saved: false,
             transport: None,
             local,
             remote: PaneState::empty(),
@@ -824,6 +829,9 @@ impl App {
                 // Only explicit dismiss keys close this screen — `any key
                 // dismisses` lets a fast typist hammer past the MITM warning
                 // before they've read it. Make them stop and acknowledge.
+                if self.prompt_arming() {
+                    return;
+                }
                 match key.code {
                     KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                         self.host_key_changed_info = None;
@@ -893,6 +901,17 @@ impl App {
     ///
     /// The host-key prompt goes first: a connection is blocked on it.
     pub(super) fn open_waiting_prompt(&mut self) {
+        // A changed host key first of all: dismissing it ends the session.
+        if self.host_key_changed_info.is_some()
+            && matches!(
+                self.screen,
+                Screen::Main | Screen::Connection | Screen::SessionSelect
+            )
+        {
+            self.screen = Screen::HostKeyChanged;
+            self.prompt_ready_at = Some(Instant::now() + PROMPT_ARMING_DELAY);
+            return;
+        }
         if let Some(prompt) = self.pending_host_key.as_ref()
             && self.screen != Screen::ConfirmHostKey
             && matches!(
@@ -1008,7 +1027,24 @@ impl App {
         self.job_batches.clear();
         self.pending_offers.clear();
         self.transfer_manager = None;
+        // Back to the default theme, if the session had its own.
+        if self
+            .current_session
+            .as_ref()
+            .is_some_and(|s| s.theme.is_some())
+        {
+            match Theme::load(&self.config.general.theme) {
+                Ok(theme) => self.theme = theme,
+                Err(e) => self.push_log(
+                    LogLevel::Warn,
+                    format!("theme {} failed to load: {e}", self.config.general.theme),
+                ),
+            }
+        }
         self.current_session = None;
+        self.current_session_saved = false;
+        // A viewer left open behind a prompt, its image still drawn.
+        self.drop_viewer();
         self.pending_password = None;
         // Same class of leftover: a host-key prompt or "changed" modal
         // belongs to the connection attempt that raised it, not to whatever
@@ -4515,5 +4551,202 @@ mod tests {
 
         assert!(buf.is_empty(), "zeroize must empty the buffer");
         assert_eq!(buf.capacity(), capacity_before, "capacity must survive");
+    }
+}
+
+#[cfg(test)]
+mod session_and_prompt_tests {
+    use super::tests_support::app_on_main;
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn logged(a: &App, needle: &str) -> bool {
+        a.log.iter().any(|l| l.message.contains(needle))
+    }
+
+    fn connect(a: &mut App, s: Session, unsaved: bool) {
+        a.pending_session = Some(s);
+        a.pending_session_unsaved = unsaved;
+        a.handle_app_event(AppEvent::Connected(crate::transport::Connected {
+            transport: Box::new(crate::transport::mock::MockTransport::new()),
+            new_cert_pin: None,
+        }));
+    }
+
+    fn themed(theme: &str) -> Session {
+        let mut s = Session::from_url("sftp://me@h.example").unwrap();
+        s.name = "themed".into();
+        s.theme = Some(theme.into());
+        s
+    }
+
+    // -- per-session themes ------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_sessions_theme_applies_while_connected_and_not_after() {
+        let _home = crate::paths::test_home();
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        let global = a.theme.name.clone();
+        connect(&mut a, themed("nord"), false);
+        assert_eq!(a.theme.name, Theme::load("nord").unwrap().name);
+        assert_eq!(
+            a.config.general.theme, "dracula",
+            "not saved as the default"
+        );
+
+        a.disconnect();
+        assert_eq!(a.theme.name, global);
+    }
+
+    #[tokio::test]
+    async fn a_sessions_unknown_theme_is_reported_and_ignored() {
+        let _home = crate::paths::test_home();
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        let global = a.theme.name.clone();
+        connect(&mut a, themed("no-such-theme"), false);
+        assert_eq!(a.theme.name, global);
+        assert!(logged(&a, "no-such-theme"));
+    }
+
+    // -- saving the session --------------------------------------------------------
+
+    fn save_as(a: &mut App, name: &str) {
+        a.screen = Screen::SaveSession;
+        a.save_session_input = name.into();
+        a.dispatch_key(key(KeyCode::Enter));
+    }
+
+    fn saved_host(name: &str) -> String {
+        Session::list_all()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap()
+            .host
+    }
+
+    #[tokio::test]
+    async fn saving_over_another_saved_session_is_refused() {
+        let _home = crate::paths::test_home();
+        let mut other = Session::from_url("sftp://me@other.example").unwrap();
+        other.name = "work".into();
+        other.save().unwrap();
+
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        connect(
+            &mut a,
+            Session::from_url("sftp://me@adhoc.example").unwrap(),
+            true,
+        );
+        save_as(&mut a, "work");
+        assert_eq!(a.screen, Screen::SaveSession);
+        assert!(
+            a.save_session_error
+                .as_deref()
+                .unwrap()
+                .contains("already exists")
+        );
+        assert_eq!(saved_host("work"), "other.example");
+    }
+
+    #[tokio::test]
+    async fn a_saved_session_can_be_saved_again_under_its_own_name() {
+        let _home = crate::paths::test_home();
+        let mut s = Session::from_url("sftp://me@mine.example").unwrap();
+        s.name = "mine".into();
+        s.save().unwrap();
+
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        connect(&mut a, s, false);
+        save_as(&mut a, "mine");
+        assert_eq!(a.screen, Screen::Main, "{:?}", a.save_session_error);
+    }
+
+    #[tokio::test]
+    async fn an_adhoc_session_once_saved_can_be_saved_again() {
+        let _home = crate::paths::test_home();
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        connect(
+            &mut a,
+            Session::from_url("sftp://me@adhoc.example").unwrap(),
+            true,
+        );
+        while a.screen != Screen::Main {
+            a.dispatch_key(key(KeyCode::Esc));
+        }
+        save_as(&mut a, "adhoc");
+        assert_eq!(a.screen, Screen::Main, "{:?}", a.save_session_error);
+        save_as(&mut a, "adhoc");
+        assert_eq!(a.screen, Screen::Main, "{:?}", a.save_session_error);
+    }
+
+    // -- a changed host key from a worker -------------------------------------------
+
+    fn changed() -> AppEvent {
+        AppEvent::HostKeyChanged {
+            host: "h".into(),
+            lookup_host: "h".into(),
+            lookup_port: 22,
+            stored_key_type: "ssh-ed25519".into(),
+            presented_key_type: "ssh-ed25519".into(),
+            fingerprint: "SHA256:x".into(),
+            trusted_once: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_changed_host_key_waits_for_the_form_to_close() {
+        let _home = crate::paths::test_home();
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        connect(&mut a, Session::from_url("sftp://me@h").unwrap(), false);
+        a.screen = Screen::Rename;
+        a.rename_input = "re".into();
+
+        a.handle_app_event(changed());
+        assert_eq!(a.screen, Screen::Rename, "the form was taken away");
+        // A `q` meant for the form must not dismiss the warning unread.
+        a.handle_key(key(KeyCode::Char('q')));
+        assert_eq!(a.rename_input, "req");
+        assert!(a.transport.is_some());
+
+        a.handle_key(key(KeyCode::Esc));
+        assert_eq!(a.screen, Screen::HostKeyChanged);
+        // Keys already on their way are ignored as it opens.
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.screen, Screen::HostKeyChanged);
+
+        a.prompt_ready_at = None;
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.screen, Screen::SessionSelect);
+        assert!(a.transport.is_none());
+    }
+
+    #[test]
+    fn a_changed_host_key_during_connect_shows_at_once() {
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        a.pending_session = Some(Session::from_url("sftp://me@h").unwrap());
+        a.screen = Screen::Connection;
+        a.handle_app_event(changed());
+        assert_eq!(a.screen, Screen::HostKeyChanged);
+    }
+
+    #[test]
+    fn disconnecting_closes_the_viewer() {
+        let mut a = app_on_main(1);
+        a.viewer = Some(crate::tui::state::Viewer {
+            name: "i.png".into(),
+            kind: crate::tui::state::ViewerKind::Image {
+                bytes: bytes::Bytes::new(),
+                render: Default::default(),
+            },
+            id: 1,
+        });
+        a.disconnect();
+        assert!(a.viewer.is_none());
+        assert!(a.needs_terminal_clear, "the image is still on the terminal");
     }
 }

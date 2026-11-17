@@ -167,10 +167,13 @@ impl App {
                 // now that the connection has proven it works — waiting until
                 // the user goes looking for the session is how "it connected
                 // but didn't save" reads as a bug rather than a design.
-                if std::mem::take(&mut self.pending_session_unsaved) {
+                let unsaved = std::mem::take(&mut self.pending_session_unsaved);
+                if unsaved {
                     offers.push_back(PostConnectOffer::SaveSession);
                 }
+                self.current_session_saved = !unsaved;
                 self.pending_offers = offers;
+                self.apply_session_theme(&session);
                 self.current_session = Some(session);
                 self.show_next_offer();
                 self.active_pane = Pane::Remote;
@@ -625,7 +628,19 @@ impl App {
                     trusted_once,
                 });
                 self.pending_session = None;
-                self.screen = Screen::HostKeyChanged;
+                // Raised by a transfer worker, it waits for the user to be
+                // free, as the other prompts that arrive on their own do:
+                // over a form, a `q` or Enter being typed dismissed it
+                // unread, and dismissing it disconnects.
+                self.open_waiting_prompt();
+                if self.screen != Screen::HostKeyChanged {
+                    self.push_log(
+                        LogLevel::Warn,
+                        "a host-key warning is waiting; it opens once you're back \
+                         at the file list"
+                            .into(),
+                    );
+                }
             }
             AppEvent::HostCertificateRejected { host } => {
                 // No modal: unlike a changed key there is no recovery command
@@ -794,6 +809,26 @@ impl App {
             TransferEvent::Resumed => {
                 self.push_log(LogLevel::Info, "transfers resumed".into());
             }
+        }
+    }
+}
+
+impl App {
+    /// Switch to `session`'s own theme, if it names one. Not saved as the
+    /// default: [`App::disconnect`] goes back to that.
+    fn apply_session_theme(&mut self, session: &crate::session::Session) {
+        let Some(name) = session.theme.as_deref() else {
+            return;
+        };
+        match crate::theme::Theme::load(name) {
+            Ok(theme) => self.theme = theme,
+            Err(e) => self.push_log(
+                LogLevel::Warn,
+                format!(
+                    "session `{}` names theme `{name}`, which failed to load: {e}",
+                    session.name
+                ),
+            ),
         }
     }
 }
