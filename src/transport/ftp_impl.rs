@@ -1424,11 +1424,30 @@ mod integration {
                 }
                 "RNTO" => {
                     let mut files = store.lock().await;
-                    if (faults.refuse_rnto_onto_existing && files.contains_key(&arg))
+                    // No server renames onto a folder.
+                    let onto_folder = files.contains_key(&format!("{arg}/"));
+                    if onto_folder
+                        || (faults.refuse_rnto_onto_existing && files.contains_key(&arg))
                         || (faults.refuse_part_rnto && rename_from.ends_with(".blink-part"))
                     {
                         drop(files);
                         w.write_all(b"553 rename refused\r\n").await?;
+                        continue;
+                    }
+                    // A folder moves with everything under it.
+                    let from_dir = format!("{rename_from}/");
+                    if files.contains_key(&from_dir) {
+                        let under: Vec<String> = files
+                            .keys()
+                            .filter(|k| k.starts_with(&from_dir))
+                            .cloned()
+                            .collect();
+                        for key in under {
+                            let bytes = files.remove(&key).unwrap();
+                            files.insert(format!("{arg}/{}", &key[from_dir.len()..]), bytes);
+                        }
+                        drop(files);
+                        w.write_all(b"250 renamed\r\n").await?;
                         continue;
                     }
                     match files.remove(&rename_from) {
@@ -1713,6 +1732,64 @@ mod integration {
             "the old file is put back, not left aside: {:?}",
             files.keys()
         );
+    }
+
+    /// A folder where the upload is going is not the upload's to replace.
+    /// Moved aside like a file, it would stay there, since the fallback
+    /// removes what it moved aside with DELE.
+    #[tokio::test]
+    async fn an_upload_onto_a_folder_leaves_the_folder_alone() {
+        let local = std::env::temp_dir().join("blink-ftp-upload-onto-folder.bin");
+        std::fs::write(&local, b"new").unwrap();
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/up.bin/".to_string(), Vec::new());
+            files.insert("/up.bin/inner.txt".to_string(), b"mine".to_vec());
+        }
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let mut transport = FtpTransport::connect(&test_session(port), Some("pw"))
+            .await
+            .unwrap();
+
+        let result = transport.upload(&local, "/up.bin", None).await;
+        let _ = std::fs::remove_file(&local);
+
+        assert!(result.is_err());
+        let files = store.lock().await;
+        assert!(files.contains_key("/up.bin/"), "{:?}", files.keys());
+        assert_eq!(
+            files.get("/up.bin/inner.txt").map(Vec::as_slice),
+            Some(&b"mine"[..])
+        );
+        assert!(
+            !files.keys().any(|k| k.contains(".blink-old")),
+            "nothing is moved aside: {:?}",
+            files.keys()
+        );
+    }
+
+    /// The harness itself: it renames folders, so the test above shows the
+    /// guard, not the server, keeping the folder in place.
+    #[tokio::test]
+    async fn the_harness_renames_a_folder_with_its_contents() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/a/".to_string(), Vec::new());
+            files.insert("/a/f.txt".to_string(), b"f".to_vec());
+        }
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let mut transport = FtpTransport::connect(&test_session(port), Some("pw"))
+            .await
+            .unwrap();
+
+        transport.rename("/a", "/b").await.unwrap();
+
+        let files = store.lock().await;
+        let mut keys: Vec<&String> = files.keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["/b/", "/b/f.txt"]);
     }
 
     /// `ftp_metadata` resolves size from a LIST of the parent directory, not

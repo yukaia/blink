@@ -1856,6 +1856,25 @@ mod integration {
     /// Path -> file contents, shared by every SFTP channel on the connection.
     type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
+    /// Rename the folder `from`, and everything under it, to `to`; false
+    /// when there is no folder `from`.
+    fn move_folder(store: &mut HashMap<String, Vec<u8>>, from: &str, to: &str) -> bool {
+        let prefix = format!("{from}/");
+        if !store.contains_key(&prefix) {
+            return false;
+        }
+        let under: Vec<String> = store
+            .keys()
+            .filter(|k| k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in under {
+            let data = store.remove(&key).unwrap();
+            store.insert(format!("{to}/{}", &key[prefix.len()..]), data);
+        }
+        true
+    }
+
     /// Cap on bytes returned per read reply. Smaller than the transfer chunk so
     /// each chunk needs several reads, exercising the short-read handling.
     const SHORT_READ: usize = 60_000;
@@ -2255,11 +2274,14 @@ mod integration {
             newpath: String,
         ) -> Result<Status, Self::Error> {
             let mut store = self.store.lock().await;
-            // SFTP v3 semantics: RENAME fails when the target exists. This
-            // deliberately exercises the client's move-aside-then-rename
-            // fallback for upload finalization.
-            if store.contains_key(&newpath) {
+            // SFTP v3 semantics: RENAME fails when the target exists, file
+            // or folder. This deliberately exercises the client's
+            // move-aside-then-rename fallback for upload finalization.
+            if store.contains_key(&newpath) || store.contains_key(&format!("{newpath}/")) {
                 return Err(StatusCode::Failure);
+            }
+            if move_folder(&mut store, &oldpath, &newpath) {
+                return Ok(ok_status(id));
             }
             match store.remove(&oldpath) {
                 Some(data) => {
@@ -3600,6 +3622,64 @@ mod integration {
             "the old file is put back, not left aside: {:?}",
             files.keys()
         );
+        drop(files);
+        let _ = transport.close().await;
+    }
+
+    /// A folder where the upload is going is not the upload's to replace.
+    /// Moved aside like a file, it would stay there: the fallback removes
+    /// what it moved aside as a file, and a folder can't be.
+    #[tokio::test]
+    async fn an_upload_onto_a_folder_leaves_the_folder_alone() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/up.bin/".to_string(), Vec::new());
+            files.insert("/up.bin/inner.txt".to_string(), b"mine".to_vec());
+            files.insert("/up.bin.blink-part".to_string(), b"new".to_vec());
+        }
+        let (port, _c) = start_server(Arc::clone(&store)).await;
+        let mut transport = connect(port).await;
+        let raw = Arc::clone(&transport.transfer_session().await.unwrap().raw);
+
+        let replaced =
+            super::finalize_remote_rename(&raw, false, "/up.bin.blink-part", "/up.bin").await;
+
+        assert!(replaced.is_err());
+        let files = store.lock().await;
+        assert!(files.contains_key("/up.bin/"), "{:?}", files.keys());
+        assert_eq!(
+            files.get("/up.bin/inner.txt").map(Vec::as_slice),
+            Some(&b"mine"[..])
+        );
+        assert!(
+            !files.keys().any(|k| k.contains(".blink-old")),
+            "nothing is moved aside: {:?}",
+            files.keys()
+        );
+        drop(files);
+        let _ = transport.close().await;
+    }
+
+    /// The harness itself: it renames folders, so the test above shows the
+    /// guard, not the server, keeping the folder in place.
+    #[tokio::test]
+    async fn the_harness_renames_a_folder_with_its_contents() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/a/".to_string(), Vec::new());
+            files.insert("/a/f.txt".to_string(), b"f".to_vec());
+        }
+        let (port, _c) = start_server(Arc::clone(&store)).await;
+        let mut transport = connect(port).await;
+
+        transport.rename("/a", "/b").await.unwrap();
+
+        let files = store.lock().await;
+        let mut keys: Vec<&String> = files.keys().collect();
+        keys.sort();
+        assert_eq!(keys, ["/b/", "/b/f.txt"]);
         drop(files);
         let _ = transport.close().await;
     }
