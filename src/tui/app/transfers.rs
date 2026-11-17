@@ -119,7 +119,10 @@ impl App {
             })
             .collect();
 
-        let pending_count = entries.len();
+        if roots.is_empty() {
+            return;
+        }
+        let pending_count = roots.len();
         self.push_log(
             LogLevel::Info,
             format!("preparing {pending_count} upload(s)…"),
@@ -256,6 +259,9 @@ impl App {
             .collect();
         // Said, as the walk says what it leaves out: the user picked these.
         self.report_unsafe_names(selections.len() - roots.len());
+        if roots.is_empty() {
+            return;
+        }
 
         let pending_count = roots.len();
         self.push_log(

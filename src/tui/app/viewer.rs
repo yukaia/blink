@@ -142,22 +142,31 @@ impl App {
     }
 
     pub(super) fn viewer_scroll(&mut self, delta: isize) {
+        let rows = self.viewer_rows();
         if let Some(viewer) = self.viewer.as_mut()
             && let ViewerKind::Text { tokens, scroll } = &mut viewer.kind
         {
-            let max = tokens.len().saturating_sub(1);
-            let next = (*scroll as isize + delta).max(0) as usize;
-            *scroll = next.min(max);
+            *scroll = scroll
+                .saturating_add_signed(delta)
+                .min(text_scroll_limit(tokens.len(), rows));
         }
     }
 
     pub(super) fn viewer_scroll_to(&mut self, target: usize) {
+        let rows = self.viewer_rows();
         if let Some(viewer) = self.viewer.as_mut()
             && let ViewerKind::Text { tokens, scroll } = &mut viewer.kind
         {
-            let max = tokens.len().saturating_sub(1);
-            *scroll = target.min(max);
+            *scroll = target.min(text_scroll_limit(tokens.len(), rows));
         }
+    }
+
+    /// Lines of text the viewer showed when last drawn; one before then.
+    fn viewer_rows(&self) -> usize {
+        self.hit
+            .viewer_body
+            .get()
+            .map_or(1, |r| usize::from(r.height).max(1))
     }
 
     /// Called after each `terminal.draw` to emit graphics escape sequences
@@ -268,6 +277,12 @@ impl App {
             }
         }
     }
+}
+
+/// The furthest a text of `lines` lines scrolls in a viewer `rows` tall:
+/// its last line at the bottom, not the top. Shared with the renderer.
+pub(crate) fn text_scroll_limit(lines: usize, rows: usize) -> usize {
+    lines.saturating_sub(rows.max(1))
 }
 
 /// The cells an image is drawn into for a terminal of size `full`: the

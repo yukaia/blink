@@ -121,6 +121,11 @@ impl App {
         let Some(entry) = self.remote.entries.get(self.remote.cursor) else {
             return;
         };
+        if entry.is_link {
+            let name = entry.raw_name.clone();
+            self.open_link(name, false);
+            return;
+        }
         if !entry.is_dir {
             return;
         }
@@ -139,6 +144,41 @@ impl App {
             }
         };
         self.refresh_remote_pane(new_path);
+    }
+
+    /// Ask the server what the symlink `name` in the shown directory points
+    /// at; the answer arrives as `AppEvent::LinkResolved`. A listing can't
+    /// say, so a link is listed as not a folder — yet one to a folder should
+    /// open like one, as downloading it does. With `download`, a link to
+    /// anything else is downloaded, as a double-click on a file would be.
+    pub(super) fn open_link(&mut self, name: String, download: bool) {
+        let Some(t) = self.transport.clone() else {
+            return;
+        };
+        let dir = self.remote.path.clone();
+        let Some(path) = transport::join_remote(&dir, &name) else {
+            self.push_log(
+                LogLevel::Warn,
+                format!(
+                    "cannot open `{}`: unusable name",
+                    crate::error::sanitize(name)
+                ),
+            );
+            return;
+        };
+        let tx = self.app_event_tx.clone();
+        let connection = self.connection;
+        tokio::spawn(async move {
+            // Where the server can't say (FTP), it is not taken for a folder.
+            let is_dir = matches!(t.lock().await.metadata(&path).await, Ok(Some(e)) if e.is_dir());
+            let _ = tx.send(AppEvent::LinkResolved {
+                connection,
+                dir,
+                name,
+                is_dir,
+                download,
+            });
+        });
     }
 
     /// Kick off a remote `list` task. The result arrives as `AppEvent::Listed`.
@@ -223,9 +263,14 @@ impl App {
     /// runs on tokio's blocking pool and the UI keeps ticking.
     pub(super) fn refresh_local_pane(&mut self) {
         let path = self.local.path.clone();
-        // Show just `..` immediately so the user sees the navigation
-        // landed even before the read_dir finishes.
-        self.local.set_entries(vec![PaneEntry::parent()]);
+        // A new directory shows just `..` at once, so the user sees the
+        // navigation landed before the read_dir finishes. A refresh keeps
+        // the rows, and so the cursor, until the new ones arrive.
+        if path != self.local_listed {
+            self.local
+                .set_entries(parent_row(std::path::Path::new(&path)));
+            self.local_listed = path.clone();
+        }
 
         let tx = self.app_event_tx.clone();
         tokio::task::spawn_blocking(move || {
@@ -241,10 +286,20 @@ impl App {
     }
 }
 
+/// The `..` row, for a directory that has a parent. The root has none, as
+/// on the remote side.
+fn parent_row(dir: &std::path::Path) -> Vec<PaneEntry> {
+    if dir.parent().is_some() {
+        vec![PaneEntry::parent()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// The local pane's rows for `dir`: the parent row, then directories, then
 /// files, each group in name order.
 fn read_local_entries(dir: &std::path::Path) -> std::io::Result<Vec<PaneEntry>> {
-    let mut entries = vec![PaneEntry::parent()];
+    let mut entries = parent_row(dir);
     for entry in std::fs::read_dir(dir)?.flatten() {
         // Through a symlink, so a link to a folder is a folder. A link
         // whose target is gone is still listed, as the link itself.
@@ -316,5 +371,15 @@ mod tests {
         let entries = read_local_entries(home.path()).unwrap();
 
         assert!(entries.iter().any(|e| e.raw_name == "link" && !e.is_dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_root_has_no_parent_row() {
+        let entries = super::read_local_entries(std::path::Path::new("/")).unwrap();
+        assert!(
+            entries.iter().all(|e| !e.is_parent()),
+            "the remote pane shows none at /"
+        );
     }
 }

@@ -77,9 +77,10 @@ pub enum Screen {
     ConfirmOverwrite,
     /// Modal over Main: text or image viewer.
     Viewer,
-    /// Overlay; previous_screen is preserved so we know what to show behind.
+    /// Overlay over [`App::help_return`], which is what it draws behind it
+    /// and returns to.
     Help,
-    /// Overlay.
+    /// Overlay over [`App::quit_return`], likewise.
     ConfirmQuit,
     /// Overlay over Main: confirm cancellation of an in-flight transfer.
     ConfirmCancel,
@@ -192,6 +193,13 @@ pub struct App {
     pub theme: Theme,
     pub screen: Screen,
     pub previous_screen: Screen,
+    /// The screen help was opened over. Its own field, not
+    /// `previous_screen`: help opens over prompts that return to
+    /// `previous_screen`, and overwriting it made them return to themselves.
+    pub help_return: Screen,
+    /// The screen the quit prompt was opened over, kept apart for the same
+    /// reason. Ctrl+C opens the prompt from anywhere.
+    pub quit_return: Screen,
     pub active_pane: Pane,
 
     // Session selector
@@ -260,8 +268,16 @@ pub struct App {
 
     // Main view
     pub current_session: Option<Session>,
+    /// Whether `current_session` is on disk under its name — loaded from
+    /// there, or saved since. Saving under a name another session already
+    /// has is refused; saving under this session's own name updates it.
+    current_session_saved: bool,
     pub transport: Option<SharedTransport>,
     pub local: PaneState,
+    /// The directory the local pane's rows were listed from. A refresh of
+    /// that same directory keeps the rows up while it lists, as the remote
+    /// pane's does; a new one starts blank.
+    local_listed: String,
     pub remote: PaneState,
     pub log: std::collections::VecDeque<LogLine>,
     #[allow(dead_code)]
@@ -271,6 +287,12 @@ pub struct App {
     pub bottom_pane: BottomPane,
     /// Cursor within the active-jobs list when the Transfers pane is focused.
     pub transfer_cursor: usize,
+    /// The first job the transfer list showed when last drawn, as
+    /// [`PaneState::view_offset`] is for a file pane.
+    pub transfer_view_offset: std::cell::Cell<usize>,
+    /// Lines the log is scrolled back from its newest. Zero follows new
+    /// lines as they arrive; anything else holds the view where it is.
+    pub log_scroll: usize,
     /// Cancellation in progress: the user has pressed `c` and is being asked
     /// to confirm. Cleared on confirm/cancel.
     pub pending_cancel: Option<PendingCancel>,
@@ -417,6 +439,7 @@ mod mouse;
 mod panes;
 mod transfers;
 mod viewer;
+pub(crate) use viewer::text_scroll_limit;
 
 impl App {
     pub fn new(config: Config, theme: Theme) -> Self {
@@ -436,6 +459,8 @@ impl App {
             theme,
             screen: Screen::SessionSelect,
             previous_screen: Screen::SessionSelect,
+            help_return: Screen::SessionSelect,
+            quit_return: Screen::SessionSelect,
             active_pane: Pane::Local,
             sessions,
             session_cursor: 0,
@@ -457,13 +482,17 @@ impl App {
             help_scroll: 0,
             search_target: Pane::Local,
             current_session: None,
+            current_session_saved: false,
             transport: None,
             local,
+            local_listed: String::new(),
             remote: PaneState::empty(),
             log: std::collections::VecDeque::new(),
             transfers: Vec::new(),
             bottom_pane: BottomPane::Log,
             transfer_cursor: 0,
+            transfer_view_offset: std::cell::Cell::new(0),
+            log_scroll: 0,
             pending_cancel: None,
             rename_input: String::new(),
             rename_original: String::new(),
@@ -617,7 +646,16 @@ impl App {
 
     fn draw(&self, f: &mut Frame) {
         self.hit.clear();
-        match self.screen {
+        self.draw_screen(f, &self.screen);
+    }
+
+    /// Draw `screen`, and under a modal, what it was opened over.
+    ///
+    /// Help and the quit prompt draw the screen they return to, which can be
+    /// any other: neither can be opened over itself, nor help over the quit
+    /// prompt, so this always ends.
+    fn draw_screen(&self, f: &mut Frame, screen: &Screen) {
+        match screen {
             Screen::SessionSelect => crate::tui::views::session_select::render(f, self),
             Screen::NewSession => {
                 crate::tui::views::session_select::render(f, self);
@@ -713,15 +751,11 @@ impl App {
                 crate::tui::views::host_key_changed::render(f, self);
             }
             Screen::Help => {
-                crate::tui::views::main::render(f, self);
+                self.draw_screen(f, &self.help_return);
                 crate::tui::views::help::render(f, self);
             }
             Screen::ConfirmQuit => {
-                if self.previous_screen == Screen::Main {
-                    crate::tui::views::main::render(f, self);
-                } else {
-                    crate::tui::views::session_select::render(f, self);
-                }
+                self.draw_screen(f, &self.quit_return);
                 crate::tui::views::confirm_quit::render(f, self);
             }
         }
@@ -741,22 +775,43 @@ impl App {
         // A key between two clicks breaks the pair: what the second click
         // lands on may no longer be what the first one did.
         self.last_click = None;
-        // '?' toggles help from anywhere except inside Help itself or text-
-        // entry / viewer screens (where '?' should be treated normally).
+        // Ctrl+C quits from anywhere, through the quit prompt like `q`, and
+        // pressed again on that prompt, at once.
+        if key.code == KeyCode::Char('c') && is_ctrl_chord(key.modifiers) {
+            if self.screen == Screen::ConfirmQuit {
+                self.should_quit = true;
+                return;
+            }
+            // The viewer closes first: an image it drew sits outside
+            // ratatui's buffer, on top of anything drawn over it.
+            if self.screen == Screen::Viewer {
+                self.close_viewer();
+            }
+            self.request_quit(self.screen.clone());
+            return;
+        }
+        // '?' opens help, except where it is typed as text, where it would
+        // be skipped past unread, and over the quit prompt, which help would
+        // then have to draw beneath itself.
         if key.code == KeyCode::Char('?')
-            && self.screen != Screen::Help
-            && self.screen != Screen::PasswordPrompt
-            && self.screen != Screen::KeyPassphrasePrompt
-            && self.screen != Screen::NewSession
-            && self.screen != Screen::EditSession
-            && self.screen != Screen::SaveSession
-            && self.screen != Screen::Search
-            && self.screen != Screen::Rename
-            && self.screen != Screen::Viewer
-            && self.screen != Screen::ConfirmHostKey
-            && self.screen != Screen::HostKeyChanged
+            && !matches!(
+                self.screen,
+                Screen::Help
+                    | Screen::ConfirmQuit
+                    | Screen::PasswordPrompt
+                    | Screen::KeyPassphrasePrompt
+                    | Screen::NewSession
+                    | Screen::EditSession
+                    | Screen::SaveSession
+                    | Screen::Search
+                    | Screen::Rename
+                    | Screen::Mkdir
+                    | Screen::Viewer
+                    | Screen::ConfirmHostKey
+                    | Screen::HostKeyChanged
+            )
         {
-            self.previous_screen = self.screen.clone();
+            self.help_return = self.screen.clone();
             self.screen = Screen::Help;
             self.help_scroll = 0;
             return;
@@ -769,7 +824,7 @@ impl App {
                     self.should_quit = true;
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.screen = self.previous_screen.clone();
+                    self.screen = self.quit_return.clone();
                 }
                 _ => {}
             },
@@ -780,6 +835,9 @@ impl App {
                 // Only explicit dismiss keys close this screen — `any key
                 // dismisses` lets a fast typist hammer past the MITM warning
                 // before they've read it. Make them stop and acknowledge.
+                if self.prompt_arming() {
+                    return;
+                }
                 match key.code {
                     KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => {
                         self.host_key_changed_info = None;
@@ -849,6 +907,17 @@ impl App {
     ///
     /// The host-key prompt goes first: a connection is blocked on it.
     pub(super) fn open_waiting_prompt(&mut self) {
+        // A changed host key first of all: dismissing it ends the session.
+        if self.host_key_changed_info.is_some()
+            && matches!(
+                self.screen,
+                Screen::Main | Screen::Connection | Screen::SessionSelect
+            )
+        {
+            self.screen = Screen::HostKeyChanged;
+            self.prompt_ready_at = Some(Instant::now() + PROMPT_ARMING_DELAY);
+            return;
+        }
         if let Some(prompt) = self.pending_host_key.as_ref()
             && self.screen != Screen::ConfirmHostKey
             && matches!(
@@ -964,7 +1033,24 @@ impl App {
         self.job_batches.clear();
         self.pending_offers.clear();
         self.transfer_manager = None;
+        // Back to the default theme, if the session had its own.
+        if self
+            .current_session
+            .as_ref()
+            .is_some_and(|s| s.theme.is_some())
+        {
+            match Theme::load(&self.config.general.theme) {
+                Ok(theme) => self.theme = theme,
+                Err(e) => self.push_log(
+                    LogLevel::Warn,
+                    format!("theme {} failed to load: {e}", self.config.general.theme),
+                ),
+            }
+        }
         self.current_session = None;
+        self.current_session_saved = false;
+        // A viewer left open behind a prompt, its image still drawn.
+        self.drop_viewer();
         self.pending_password = None;
         // Same class of leftover: a host-key prompt or "changed" modal
         // belongs to the connection attempt that raised it, not to whatever
@@ -984,6 +1070,7 @@ impl App {
         self.prompt_ready_at = None;
         self.pending_delete = None;
         self.transfer_cursor = 0;
+        self.transfer_view_offset.set(0);
         self.bottom_pane = BottomPane::Log;
         self.remote = PaneState::empty();
         self.remote_listing = None;
@@ -1074,11 +1161,30 @@ impl App {
             level,
             message: crate::error::sanitize(message),
         });
+        // Scrolled back, the view stays on the lines it shows.
+        if self.log_scroll > 0 {
+            self.log_scroll = (self.log_scroll + 1).min(self.log.len() - 1);
+        }
         // VecDeque pop_front is O(1); the old Vec drain(0..n) shifted every
         // remaining element down by N on every overflow.
         while self.log.len() > 500 {
             self.log.pop_front();
         }
+    }
+
+    /// Scroll the log `delta` lines back (negative: toward the newest),
+    /// stopping with its first line at the top of the pane as last drawn.
+    pub(super) fn log_scroll_by(&mut self, delta: isize) {
+        let max = self.log.len().saturating_sub(self.log_rows());
+        self.log_scroll = self.log_scroll.saturating_add_signed(delta).min(max);
+    }
+
+    /// Lines of log the pane showed when last drawn; one before then.
+    pub(super) fn log_rows(&self) -> usize {
+        self.hit
+            .log_body
+            .get()
+            .map_or(1, |r| usize::from(r.height).max(1))
     }
 
     /// Show the next post-connect offer, or fall through to the main view.
@@ -1105,7 +1211,7 @@ impl App {
             .get()
             .map_or(1, |r| usize::from(r.height).max(1));
         match key.code {
-            KeyCode::Char('?') | KeyCode::Esc => self.screen = self.previous_screen.clone(),
+            KeyCode::Char('?') | KeyCode::Esc => self.screen = self.help_return.clone(),
             KeyCode::Up | KeyCode::Char('k') => self.help_scroll_by(-1),
             KeyCode::Down | KeyCode::Char('j') => self.help_scroll_by(1),
             KeyCode::PageUp => self.help_scroll_by(-(page as isize)),
@@ -1123,6 +1229,22 @@ impl App {
         let max = crate::tui::views::help::max_scroll(self);
         self.help_scroll = self.help_scroll.saturating_add_signed(delta).min(max);
     }
+}
+
+/// Whether `m` makes a key a Ctrl or an Alt chord — one the letter
+/// shortcuts and the text fields leave alone.
+///
+/// Ctrl and Alt together is not one: Windows reports AltGr that way, and
+/// AltGr is how many keyboard layouts type `@`, `\\`, `{` and the like.
+pub(super) fn is_chord(m: crossterm::event::KeyModifiers) -> bool {
+    use crossterm::event::KeyModifiers;
+    m.contains(KeyModifiers::CONTROL) != m.contains(KeyModifiers::ALT)
+}
+
+/// Whether `m` is Ctrl without Alt.
+fn is_ctrl_chord(m: crossterm::event::KeyModifiers) -> bool {
+    use crossterm::event::KeyModifiers;
+    m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT)
 }
 
 /// Build the visible entries for the remote pane, prepending `..` unless the
@@ -1660,7 +1782,7 @@ mod tests {
     fn a_host_key_prompt_waits_out_the_viewer() {
         let mut a = app();
         a.screen = Screen::Help;
-        a.previous_screen = Screen::Main;
+        a.help_return = Screen::Main;
         let (ev, _rx) = host_key_event();
         a.handle_app_event(ev);
         assert_eq!(a.screen, Screen::Help);
@@ -4435,5 +4557,428 @@ mod tests {
 
         assert!(buf.is_empty(), "zeroize must empty the buffer");
         assert_eq!(buf.capacity(), capacity_before, "capacity must survive");
+    }
+}
+
+#[cfg(test)]
+mod session_and_prompt_tests {
+    use super::tests_support::app_on_main;
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn logged(a: &App, needle: &str) -> bool {
+        a.log.iter().any(|l| l.message.contains(needle))
+    }
+
+    fn connect(a: &mut App, s: Session, unsaved: bool) {
+        a.pending_session = Some(s);
+        a.pending_session_unsaved = unsaved;
+        a.handle_app_event(AppEvent::Connected(crate::transport::Connected {
+            transport: Box::new(crate::transport::mock::MockTransport::new()),
+            new_cert_pin: None,
+        }));
+    }
+
+    fn themed(theme: &str) -> Session {
+        let mut s = Session::from_url("sftp://me@h.example").unwrap();
+        s.name = "themed".into();
+        s.theme = Some(theme.into());
+        s
+    }
+
+    // -- per-session themes ------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_sessions_theme_applies_while_connected_and_not_after() {
+        let _home = crate::paths::test_home();
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        let global = a.theme.name.clone();
+        connect(&mut a, themed("nord"), false);
+        assert_eq!(a.theme.name, Theme::load("nord").unwrap().name);
+        assert_eq!(
+            a.config.general.theme, "dracula",
+            "not saved as the default"
+        );
+
+        a.disconnect();
+        assert_eq!(a.theme.name, global);
+    }
+
+    #[tokio::test]
+    async fn a_sessions_unknown_theme_is_reported_and_ignored() {
+        let _home = crate::paths::test_home();
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        let global = a.theme.name.clone();
+        connect(&mut a, themed("no-such-theme"), false);
+        assert_eq!(a.theme.name, global);
+        assert!(logged(&a, "no-such-theme"));
+    }
+
+    // -- saving the session --------------------------------------------------------
+
+    fn save_as(a: &mut App, name: &str) {
+        a.screen = Screen::SaveSession;
+        a.save_session_input = name.into();
+        a.dispatch_key(key(KeyCode::Enter));
+    }
+
+    fn saved_host(name: &str) -> String {
+        Session::list_all()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == name)
+            .unwrap()
+            .host
+    }
+
+    #[tokio::test]
+    async fn saving_over_another_saved_session_is_refused() {
+        let _home = crate::paths::test_home();
+        let mut other = Session::from_url("sftp://me@other.example").unwrap();
+        other.name = "work".into();
+        other.save().unwrap();
+
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        connect(
+            &mut a,
+            Session::from_url("sftp://me@adhoc.example").unwrap(),
+            true,
+        );
+        save_as(&mut a, "work");
+        assert_eq!(a.screen, Screen::SaveSession);
+        assert!(
+            a.save_session_error
+                .as_deref()
+                .unwrap()
+                .contains("already exists")
+        );
+        assert_eq!(saved_host("work"), "other.example");
+    }
+
+    #[tokio::test]
+    async fn a_saved_session_can_be_saved_again_under_its_own_name() {
+        let _home = crate::paths::test_home();
+        let mut s = Session::from_url("sftp://me@mine.example").unwrap();
+        s.name = "mine".into();
+        s.save().unwrap();
+
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        connect(&mut a, s, false);
+        save_as(&mut a, "mine");
+        assert_eq!(a.screen, Screen::Main, "{:?}", a.save_session_error);
+    }
+
+    #[tokio::test]
+    async fn an_adhoc_session_once_saved_can_be_saved_again() {
+        let _home = crate::paths::test_home();
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        connect(
+            &mut a,
+            Session::from_url("sftp://me@adhoc.example").unwrap(),
+            true,
+        );
+        while a.screen != Screen::Main {
+            a.dispatch_key(key(KeyCode::Esc));
+        }
+        save_as(&mut a, "adhoc");
+        assert_eq!(a.screen, Screen::Main, "{:?}", a.save_session_error);
+        save_as(&mut a, "adhoc");
+        assert_eq!(a.screen, Screen::Main, "{:?}", a.save_session_error);
+    }
+
+    // -- a changed host key from a worker -------------------------------------------
+
+    fn changed() -> AppEvent {
+        AppEvent::HostKeyChanged {
+            host: "h".into(),
+            lookup_host: "h".into(),
+            lookup_port: 22,
+            stored_key_type: "ssh-ed25519".into(),
+            presented_key_type: "ssh-ed25519".into(),
+            fingerprint: "SHA256:x".into(),
+            trusted_once: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_changed_host_key_waits_for_the_form_to_close() {
+        let _home = crate::paths::test_home();
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        connect(&mut a, Session::from_url("sftp://me@h").unwrap(), false);
+        a.screen = Screen::Rename;
+        a.rename_input = "re".into();
+
+        a.handle_app_event(changed());
+        assert_eq!(a.screen, Screen::Rename, "the form was taken away");
+        // A `q` meant for the form must not dismiss the warning unread.
+        a.handle_key(key(KeyCode::Char('q')));
+        assert_eq!(a.rename_input, "req");
+        assert!(a.transport.is_some());
+
+        a.handle_key(key(KeyCode::Esc));
+        assert_eq!(a.screen, Screen::HostKeyChanged);
+        // Keys already on their way are ignored as it opens.
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.screen, Screen::HostKeyChanged);
+
+        a.prompt_ready_at = None;
+        a.handle_key(key(KeyCode::Enter));
+        assert_eq!(a.screen, Screen::SessionSelect);
+        assert!(a.transport.is_none());
+    }
+
+    #[test]
+    fn a_changed_host_key_during_connect_shows_at_once() {
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        a.pending_session = Some(Session::from_url("sftp://me@h").unwrap());
+        a.screen = Screen::Connection;
+        a.handle_app_event(changed());
+        assert_eq!(a.screen, Screen::HostKeyChanged);
+    }
+
+    #[test]
+    fn disconnecting_closes_the_viewer() {
+        let mut a = app_on_main(1);
+        a.viewer = Some(crate::tui::state::Viewer {
+            name: "i.png".into(),
+            kind: crate::tui::state::ViewerKind::Image {
+                bytes: bytes::Bytes::new(),
+                render: Default::default(),
+            },
+            id: 1,
+        });
+        a.disconnect();
+        assert!(a.viewer.is_none());
+        assert!(a.needs_terminal_clear, "the image is still on the terminal");
+    }
+}
+
+#[cfg(test)]
+mod pane_audit_tests {
+    use super::tests_support::{app_on_main, draw, draw_sized};
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn app() -> App {
+        App::new(Config::default(), Theme::load("dracula").unwrap())
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn text(buf: &ratatui::buffer::Buffer) -> String {
+        buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    fn logged(a: &App, needle: &str) -> bool {
+        a.log.iter().any(|l| l.message.contains(needle))
+    }
+
+    fn file(name: &str) -> PaneEntry {
+        PaneEntry::new(name.into(), false, 1)
+    }
+
+    fn link(name: &str) -> PaneEntry {
+        PaneEntry {
+            is_link: true,
+            ..PaneEntry::new(name.into(), false, 0)
+        }
+    }
+
+    fn with_remote(entries: Vec<PaneEntry>, mock: crate::transport::mock::MockTransport) -> App {
+        let mut a = app();
+        a.screen = Screen::Main;
+        a.active_pane = Pane::Remote;
+        a.remote.path = "/srv".into();
+        a.remote.set_entries(entries);
+        a.transport = Some(Arc::new(Mutex::new(Box::new(mock) as Box<dyn Transport>)));
+        a.transfer_manager = Some(TransferManager::new(1).0);
+        a
+    }
+
+    /// Hand `a` its own events until `done` holds.
+    async fn run_until(a: &mut App, done: impl Fn(&App) -> bool) {
+        let mut events = a.app_event_rx.take().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !done(a) {
+                let ev = events.recv().await.unwrap();
+                a.handle_app_event(ev);
+            }
+        })
+        .await
+        .expect("never got there");
+        a.app_event_rx = Some(events);
+    }
+
+    // -- rename ---------------------------------------------------------------
+
+    #[test]
+    fn renaming_onto_a_name_the_filter_hides_asks_to_overwrite() {
+        let mut a = with_remote(
+            vec![file("alpha.txt"), file("beta.txt")],
+            crate::transport::mock::MockTransport::new(),
+        );
+        a.remote.set_filter("alpha".into());
+        a.remote.cursor = 0;
+        a.open_rename();
+        a.rename_input = "beta.txt".into();
+        a.submit_rename();
+        assert_eq!(a.screen, Screen::ConfirmOverwrite);
+    }
+
+    #[test]
+    fn a_failed_rename_names_the_file_not_its_path() {
+        let mut a = app_on_main(0);
+        a.handle_app_event(AppEvent::RenameFailed {
+            from: "/srv/deep/old.txt".into(),
+            to: "/srv/deep/new.txt".into(),
+            error: "nope".into(),
+        });
+        assert!(logged(&a, "rename old.txt failed: nope"), "{:?}", a.log);
+    }
+
+    // -- symlinks ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn enter_on_a_link_to_a_folder_opens_the_folder() {
+        let mock = crate::transport::mock::MockTransport::new().with_file("/srv/link/a.txt", b"x");
+        let mut a = with_remote(vec![link("link")], mock);
+        a.remote_enter();
+        run_until(&mut a, |a| a.remote.path == "/srv/link").await;
+    }
+
+    #[tokio::test]
+    async fn a_double_click_on_a_link_to_a_folder_opens_it_rather_than_downloading() {
+        let mock = crate::transport::mock::MockTransport::new().with_file("/srv/link/a.txt", b"x");
+        let mut a = with_remote(vec![link("link")], mock);
+        a.open_or_transfer(Pane::Remote);
+        run_until(&mut a, |a| a.remote.path == "/srv/link").await;
+        assert!(!logged(&a, "preparing"), "{:?}", a.log);
+    }
+
+    #[tokio::test]
+    async fn a_double_click_on_a_link_to_a_file_downloads_it() {
+        let home = crate::paths::test_home();
+        let mock = crate::transport::mock::MockTransport::new().with_file("/srv/flink", b"x");
+        let mut a = with_remote(vec![link("flink")], mock);
+        a.local.path = home.path().display().to_string();
+        a.open_or_transfer(Pane::Remote);
+        run_until(&mut a, |a| logged(a, "preparing 1 download")).await;
+        assert_eq!(a.remote.path, "/srv");
+    }
+
+    #[test]
+    fn a_remote_link_is_marked_in_the_pane() {
+        let mut a = with_remote(
+            vec![link("lnk"), file("plain")],
+            crate::transport::mock::MockTransport::new(),
+        );
+        a.remote.cursor = 1;
+        let shown = text(&draw(&a));
+        assert!(shown.contains("↪ lnk"), "{shown}");
+    }
+
+    // -- the local pane -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn refreshing_the_local_pane_keeps_its_rows_and_cursor() {
+        let home = crate::paths::test_home();
+        let dir = home.path().join("three");
+        std::fs::create_dir(&dir).unwrap();
+        for n in ["a", "b", "c"] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        let mut a = app_on_main(0);
+        a.local.path = dir.display().to_string();
+        a.refresh_local_pane();
+        run_until(&mut a, |a| a.local.entries.len() == 4).await;
+
+        a.local.cursor = 2;
+        a.active_pane = Pane::Local;
+        a.handle_key(key(KeyCode::F(5)));
+        assert_eq!(a.local.entries.len(), 4, "the pane blanked while it listed");
+        assert_eq!(a.local.cursor, 2);
+        run_until(&mut a, |a| a.local.entries.len() == 4).await;
+        assert_eq!(a.local.cursor, 2);
+    }
+
+    #[test]
+    fn the_footer_does_not_count_the_parent_row() {
+        let mut a = app_on_main(0);
+        a.local
+            .set_entries(vec![PaneEntry::parent(), file("a"), file("b")]);
+        let shown = text(&draw(&a));
+        assert!(shown.contains(" 2 items"), "{shown}");
+    }
+
+    // -- the path line ---------------------------------------------------------------
+
+    #[test]
+    fn the_path_line_is_sanitized() {
+        let mut a = app_on_main(0);
+        a.remote.path = "/srv/re\u{202E}port".into();
+        let shown = text(&draw(&a));
+        assert!(!shown.contains('\u{202E}'), "{shown}");
+        assert!(shown.contains("/srv/re port"), "{shown}");
+    }
+
+    #[test]
+    fn a_long_path_keeps_its_end() {
+        let mut a = app_on_main(0);
+        a.remote.path = format!("/srv/{}/the-end", "x".repeat(200));
+        let shown = text(&draw_sized(&a, 80, 24));
+        assert!(shown.contains("the-end"), "{shown}");
+        assert!(shown.contains('…'), "{shown}");
+    }
+
+    // -- starting transfers ---------------------------------------------------------
+
+    #[test]
+    fn nothing_usable_to_download_prepares_nothing() {
+        assert!(crate::tui::plan::safe_local_name("..").is_none());
+        let mut a = with_remote(vec![], crate::transport::mock::MockTransport::new());
+        a.enqueue_downloads(vec![("..".into(), false)]);
+        assert!(!logged(&a, "preparing"), "{:?}", a.log);
+    }
+
+    // -- the overwrite prompt ---------------------------------------------------------
+
+    fn conflicts(paths: &[&str]) -> App {
+        let mut a = app_on_main(0);
+        let plan: Vec<crate::tui::plan::PlannedJob> = paths
+            .iter()
+            .map(|p| crate::tui::plan::PlannedJob::Download {
+                remote_path: (*p).into(),
+                local_path: format!("/l{p}").into(),
+            })
+            .collect();
+        a.pending_overwrite = Some(crate::tui::state::OverwritePending::DownloadPlan {
+            conflict_indices: (0..plan.len()).collect(),
+            plan,
+            local_dirs: vec![],
+        });
+        a.screen = Screen::ConfirmOverwrite;
+        a
+    }
+
+    #[test]
+    fn conflicts_in_different_folders_are_told_apart() {
+        let a = conflicts(&["/srv/x/a/readme.md", "/srv/x/b/readme.md"]);
+        let shown = text(&draw(&a));
+        assert!(shown.contains("a/readme.md"), "{shown}");
+        assert!(shown.contains("b/readme.md"), "{shown}");
+        assert!(!shown.contains("x/a/readme.md"), "{shown}");
+    }
+
+    #[test]
+    fn a_lone_conflict_shows_its_name() {
+        let a = conflicts(&["/srv/x/readme.md"]);
+        let shown = text(&draw(&a));
+        assert!(shown.contains("• readme.md"), "{shown}");
     }
 }

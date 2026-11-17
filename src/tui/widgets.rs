@@ -77,15 +77,26 @@ pub mod file_pane {
             ])
             .split(inner);
 
-        // Path line, with the active filter (if any) shown inline.
+        // Path line, with the active filter (if any) shown inline. A remote
+        // path is made of the server's names, so it is sanitized like they
+        // are; a long one loses its middle, not the end that says where
+        // the pane is.
+        let filter = state
+            .filter
+            .as_ref()
+            .map(|q| format!("  /{}", crate::error::sanitize(q.clone())));
+        let filter_w = filter.as_ref().map_or(0, |q| q.chars().count());
+        let path_room = usize::from(inner.width).saturating_sub(1 + filter_w);
         let mut path_spans = vec![Span::styled(
-            format!(" {}", state.path),
+            format!(
+                " {}",
+                truncate_middle(&crate::error::sanitize(state.path.clone()), path_room)
+            ),
             Style::default().fg(app.theme.dim),
         )];
-        if let Some(filter) = &state.filter {
-            path_spans.push(Span::raw("  "));
+        if let Some(filter) = filter {
             path_spans.push(Span::styled(
-                format!("/{filter}"),
+                filter,
                 Style::default()
                     .fg(app.theme.accent)
                     .add_modifier(Modifier::BOLD),
@@ -115,6 +126,9 @@ pub mod file_pane {
 
             let (icon, base_style) = if e.is_dir {
                 ("▸ ", Style::default().fg(app.theme.directory))
+            } else if e.is_link {
+                // What it points at is only known once it is opened.
+                ("↪ ", Style::default().fg(app.theme.fg))
             } else if e.previewable_image {
                 ("  ", Style::default().fg(app.theme.image))
             } else {
@@ -167,12 +181,14 @@ pub mod file_pane {
         // hiding — the footer should report what a transfer would act on.
         let selected_count = state.selected_count();
         let selected_size: u64 = state.selected_size();
+        // `..` is a way out, not an item.
+        let items = state.entries.iter().filter(|e| !e.is_parent()).count();
         let footer_text = if selected_count == 0 {
-            format!(" {} items", state.entries.len())
+            format!(" {items} items")
         } else {
             format!(
                 " {} items · {} selected ({})",
-                state.entries.len(),
+                items,
                 selected_count,
                 crate::transfer::format_bytes(selected_size),
             )
@@ -204,10 +220,22 @@ pub mod bottom_pane {
             app.theme.border_inactive
         };
 
-        let block = Block::default()
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color))
             .title(tab_title(app));
+        // Scrolled back, say so: new lines arrive out of sight.
+        let rows = usize::from(area.height.saturating_sub(2));
+        let newer = app.log_scroll.min(app.log.len().saturating_sub(rows));
+        if app.bottom_pane == BottomPane::Log && newer > 0 {
+            block = block.title_top(
+                Line::from(Span::styled(
+                    format!(" ↓ {newer} newer "),
+                    Style::default().fg(app.theme.accent),
+                ))
+                .right_aligned(),
+            );
+        }
         let inner = block.inner(area);
         f.render_widget(block, area);
 
@@ -288,8 +316,22 @@ pub mod bottom_pane {
             .map(|m| m.is_paused())
             .unwrap_or(false);
 
+        // Up to MAX_PARALLEL jobs run at once, more than the pane has rows:
+        // the list scrolls to keep the cursor, and what `c` cancels, in view.
+        let window = crate::tui::state::scrolled_window(
+            app.transfer_view_offset.get(),
+            cursor,
+            jobs.len(),
+            area.height as usize,
+        );
+        app.transfer_view_offset.set(window.start);
         let mut lines = Vec::with_capacity(area.height as usize);
-        for (i, job) in jobs.iter().enumerate().take(area.height as usize) {
+        for (i, job) in jobs
+            .iter()
+            .enumerate()
+            .skip(window.start)
+            .take(window.len())
+        {
             let is_cursor = i == cursor && focused;
             lines.push(render_transfer_line(
                 app,
@@ -362,10 +404,14 @@ pub mod bottom_pane {
         let filled = (BAR_WIDTH * percent as usize / 100).min(BAR_WIDTH);
         let empty = BAR_WIDTH - filled;
 
+        let arrow = match job.direction {
+            crate::transfer::Direction::Download => "↓ ",
+            crate::transfer::Direction::Upload | crate::transfer::Direction::CreateDir => "↑ ",
+        };
         let line = Line::from(vec![
             Span::raw(" "),
             Span::styled(
-                "↓ ",
+                arrow,
                 Style::default()
                     .fg(app.theme.directory)
                     .add_modifier(Modifier::BOLD),
@@ -396,12 +442,15 @@ pub mod bottom_pane {
     // ----- Log page -------------------------------------------------------
 
     fn render_log(f: &mut Frame, app: &App, area: Rect) {
+        app.hit.log_body.set(Some(area));
         let h = area.height as usize;
         let total = app.log.len();
-        let start = total.saturating_sub(h);
+        let scroll = app.log_scroll.min(total.saturating_sub(h));
+        let end = total - scroll;
+        let start = end.saturating_sub(h);
 
         let mut lines = Vec::with_capacity(area.height as usize);
-        for entry in app.log.range(start..) {
+        for entry in app.log.range(start..end) {
             let ts = entry.time.format("%H:%M:%S").to_string();
             let level_color = match entry.level {
                 LogLevel::Info => app.theme.dim,
@@ -470,8 +519,8 @@ pub mod bottom_pane {
         // remote names must not render identically in it.
         #[test]
         fn overwrite_modal_name_is_sanitized() {
-            use crate::tui::views::conflict_row_name;
-            let name = conflict_row_name("/srv/re\u{202E}port.txt");
+            use crate::tui::views::conflict_row_names;
+            let name = conflict_row_names(&["/srv/re\u{202E}port.txt"]).remove(0);
             assert!(
                 !name.contains('\u{202E}'),
                 "bidi override reached the modal: {name:?}",
@@ -481,15 +530,18 @@ pub mod bottom_pane {
 
         #[test]
         fn overwrite_modal_name_strips_escape_sequences() {
-            use crate::tui::views::conflict_row_name;
-            let name = conflict_row_name("/srv/a\u{1b}[31mb.txt");
+            use crate::tui::views::conflict_row_names;
+            let name = conflict_row_names(&["/srv/a\u{1b}[31mb.txt"]).remove(0);
             assert!(!name.contains('\u{1b}'), "ESC reached the modal: {name:?}");
         }
 
         #[test]
         fn ordinary_overwrite_modal_name_is_the_basename() {
-            use crate::tui::views::conflict_row_name;
-            assert_eq!(conflict_row_name("/srv/data/report.pdf"), "report.pdf");
+            use crate::tui::views::conflict_row_names;
+            assert_eq!(
+                conflict_row_names(&["/srv/data/report.pdf"]).remove(0),
+                "report.pdf"
+            );
         }
     }
 }

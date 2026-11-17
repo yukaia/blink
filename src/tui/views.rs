@@ -454,6 +454,7 @@ pub mod help {
             kv("  bksp      ", "go up to parent directory", key_s),
             kv("  tab       ", "switch active pane", key_s),
             kv("  ↑ ↓       ", "move cursor (pgup/pgdn for page)", key_s),
+            kv("            ", "in the log pane, scroll it", key_s),
             Line::from(""),
             Line::from(Span::styled("  FILES", acc_s)),
             kv("  space     ", "select / deselect", key_s),
@@ -477,6 +478,11 @@ pub mod help {
             kv("  F2        ", "rename file or folder (remote pane)", key_s),
             kv("  F7        ", "create new remote directory", key_s),
             kv("  shift+del ", "delete file or folder (remote pane)", key_s),
+            kv(
+                "  D         ",
+                "delete, where shift+del doesn't reach",
+                key_s,
+            ),
             Line::from(""),
             Line::from(Span::styled("  SESSION", acc_s)),
             kv("  ctrl+s    ", "save current session", key_s),
@@ -485,17 +491,34 @@ pub mod help {
                 "disconnect (return to session selector)",
                 key_s,
             ),
-            kv("  p         ", "pause / resume active downloads", key_s),
             kv("  t         ", "cycle to the next theme", key_s),
+            Line::from(""),
+            Line::from(Span::styled("  TRANSFERS", acc_s)),
+            kv("  p         ", "pause / resume all transfers", key_s),
             kv(
                 "  c         ",
                 "cancel selected transfer (Transfers pane)",
                 key_s,
             ),
             kv("  C         ", "cancel whole batch (Transfers pane)", key_s),
+            kv(
+                "  r · R     ",
+                "resume an interrupted download · upload batch",
+                key_s,
+            ),
+            Line::from(""),
+            Line::from(Span::styled("  VIEWER", acc_s)),
+            kv("  ↑ ↓ · j k ", "scroll a line", key_s),
+            kv("  pgup pgdn ", "scroll a page (space too)", key_s),
+            kv("  g · G     ", "top · bottom", key_s),
+            Line::from(""),
+            Line::from(Span::styled("  SESSION LIST", acc_s)),
+            kv("  ↵         ", "connect", key_s),
+            kv("  n · e · d ", "new · edit · delete", key_s),
             Line::from(""),
             Line::from(Span::styled("  APP", acc_s)),
             kv("  ?         ", "toggle this help", key_s),
+            kv("  ctrl+c    ", "quit, from anywhere", key_s),
             kv("  q · esc   ", "quit (with confirmation)", key_s),
         ]
     }
@@ -988,7 +1011,7 @@ pub mod viewer {
         }
 
         // One entry per line, so the token count is the line count.
-        let start = scroll.min(tokens.len().saturating_sub(1));
+        let start = scroll.min(crate::tui::app::text_scroll_limit(tokens.len(), h));
         let end = (start + h).min(tokens.len());
         let lineno_width = end.to_string().len();
 
@@ -1598,12 +1621,15 @@ pub mod confirm_overwrite {
         // Show up to ~6 conflict names. Beyond that, summarise.
         let max_show = 6;
         let shown: usize = n.min(max_show);
-        for &idx in conflict_indices.iter().take(max_show) {
-            let name = match &plan[idx] {
-                PlannedJob::Download { remote_path, .. } => conflict_row_name(remote_path),
-                PlannedJob::Upload { remote_path, .. } => conflict_row_name(remote_path),
-                PlannedJob::Mkdir { .. } => continue, // shouldn't appear
-            };
+        let paths: Vec<&str> = conflict_indices
+            .iter()
+            .filter_map(|&idx| match &plan[idx] {
+                PlannedJob::Download { remote_path, .. }
+                | PlannedJob::Upload { remote_path, .. } => Some(remote_path.as_str()),
+                PlannedJob::Mkdir { .. } => None, // shouldn't appear
+            })
+            .collect();
+        for name in conflict_row_names(&paths).into_iter().take(max_show) {
             lines.push(Line::from(vec![
                 Span::raw("  • "),
                 Span::styled(name, Style::default().fg(app.theme.fg)),
@@ -1637,8 +1663,10 @@ pub mod confirm_overwrite {
     }
 }
 
-/// The name shown for one conflicting file in the overwrite-confirmation
-/// modal.
+/// The names shown for conflicting files in the overwrite-confirmation
+/// modal: each path below the folder they all share, so two `readme.md` in
+/// different subfolders don't read as one file listed twice. A lone
+/// conflict is shown by its name.
 ///
 /// Sanitized, like every other site that renders a server-supplied name.
 /// `ratatui` would drop the deceptive formatters on its own — `Buffer::set_stringn`
@@ -1647,13 +1675,33 @@ pub mod confirm_overwrite {
 /// prompt `is_deceptive_format` was written for: two remote names that differ
 /// only by a bidi override must not render identically in the dialog the user
 /// clears them through.
-pub(crate) fn conflict_row_name(path: &str) -> String {
-    crate::error::sanitize(
-        path.rsplit('/')
-            .find(|s| !s.is_empty())
-            .unwrap_or(path)
-            .to_string(),
-    )
+pub(crate) fn conflict_row_names(paths: &[&str]) -> Vec<String> {
+    let parent = |p: &str| -> Vec<String> {
+        let mut parts: Vec<String> = p
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        parts.pop();
+        parts
+    };
+    let mut shared = paths.first().map(|p| parent(p)).unwrap_or_default();
+    for p in paths.iter().skip(1) {
+        let dir = parent(p);
+        let same = shared.iter().zip(&dir).take_while(|(a, b)| a == b).count();
+        shared.truncate(same);
+    }
+    paths
+        .iter()
+        .map(|p| {
+            let rest: Vec<&str> = p
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .skip(shared.len())
+                .collect();
+            crate::error::sanitize(rest.join("/"))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2364,7 +2412,8 @@ mod render_tests {
     /// An app on `screen`, over the session selector.
     fn over_selector(screen: Screen) -> App {
         let mut a = on(screen);
-        a.previous_screen = Screen::SessionSelect;
+        a.quit_return = Screen::SessionSelect;
+        a.help_return = Screen::SessionSelect;
         a
     }
 
@@ -2416,13 +2465,21 @@ mod render_tests {
 
     #[test]
     fn help_fits_whole_on_a_tall_terminal() {
-        let text = text_of(&draw_sized(&on(Screen::Help), 120, 50));
+        let text = text_of(&draw_sized(&on(Screen::Help), 120, 70));
         assert!(text.contains("HELP — keyboard shortcuts"), "{text}");
-        for wanted in ["NAVIGATION", "ctrl+d", "F7", "quit (with confirmation)"] {
+        for wanted in [
+            "NAVIGATION",
+            "ctrl+d",
+            "F7",
+            "r · R",
+            "SESSION LIST",
+            "ctrl+c",
+            "quit (with confirmation)",
+        ] {
             assert!(text.contains(wanted), "missing {wanted:?}:\n{text}");
         }
         assert!(text.contains("esc / ?  to close"), "{text}");
-        assert!(!text.contains("scroll"), "nothing to scroll:\n{text}");
+        assert!(!text.contains("[↑↓] scroll"), "nothing to scroll:\n{text}");
     }
 
     #[test]
@@ -2646,7 +2703,7 @@ mod render_tests {
     #[test]
     fn quit_with_queued_work_says_it_will_be_discarded() {
         let mut a = on(Screen::ConfirmQuit);
-        a.previous_screen = Screen::Main;
+        a.quit_return = Screen::Main;
         with_queued_downloads(&mut a, 2);
         let text = screen(&a);
         assert!(

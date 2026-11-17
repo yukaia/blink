@@ -279,9 +279,11 @@ impl App {
         // Collision check against the cached pane listing. If the user navigated
         // here recently the cache is fresh enough; in the rare case it's stale,
         // the server will reject the rename and we'll surface the error.
+        // Every row, not just those the filter shows: a hidden one is as
+        // much in the way.
         let collides = self
             .remote
-            .entries
+            .all_rows()
             .iter()
             .any(|e| !e.is_parent() && e.raw_name == new_name);
         if collides {

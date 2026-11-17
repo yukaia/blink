@@ -19,7 +19,7 @@ use crate::session::{AuthMethod, Session};
 use crate::transport;
 use crate::tui::state::{EditField, PendingCancel, PostConnectOffer, ViewerKind};
 
-use super::{App, LogLevel, Pane, Screen};
+use super::{App, LogLevel, Pane, Screen, is_chord};
 
 /// Apply a single text-editing keystroke to `buf` and report whether the
 /// buffer changed.
@@ -41,7 +41,7 @@ fn apply_text_edit(buf: &mut String, key: &KeyEvent) -> bool {
             buf.clear();
             true
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if !super::is_chord(key.modifiers) => {
             buf.push(c);
             true
         }
@@ -51,6 +51,9 @@ fn apply_text_edit(buf: &mut String, key: &KeyEvent) -> bool {
 
 impl App {
     pub(super) fn handle_session_select(&mut self, key: KeyEvent) {
+        if is_chord(key.modifiers) && matches!(key.code, KeyCode::Char(_)) {
+            return;
+        }
         match key.code {
             KeyCode::Up if self.session_cursor > 0 => {
                 self.session_cursor -= 1;
@@ -292,28 +295,35 @@ impl App {
     }
 
     pub(super) fn handle_main(&mut self, key: KeyEvent) {
+        // A Ctrl or Alt chord is one of the ctrl+ shortcuts or nothing: the
+        // letter arms below don't look at modifiers, and ctrl+c reaching
+        // `c` opened the cancel prompt.
+        let chord = is_chord(key.modifiers);
+        if chord && !matches!(key.code, KeyCode::Char('s' | 'd' | 'u' | 'x')) {
+            return;
+        }
         match key.code {
             KeyCode::Tab => self.cycle_pane(true),
             KeyCode::BackTab => self.cycle_pane(false),
             KeyCode::Up => match self.active_pane {
                 Pane::Local | Pane::Remote => self.active_pane_mut().unwrap().move_cursor(-1),
                 Pane::Transfers => self.move_transfer_cursor(-1),
-                Pane::Log => {}
+                Pane::Log => self.log_scroll_by(1),
             },
             KeyCode::Down => match self.active_pane {
                 Pane::Local | Pane::Remote => self.active_pane_mut().unwrap().move_cursor(1),
                 Pane::Transfers => self.move_transfer_cursor(1),
-                Pane::Log => {}
+                Pane::Log => self.log_scroll_by(-1),
             },
             KeyCode::PageUp => match self.active_pane {
                 Pane::Local | Pane::Remote => self.active_pane_mut().unwrap().move_cursor(-10),
                 Pane::Transfers => self.move_transfer_cursor(-10),
-                Pane::Log => {}
+                Pane::Log => self.log_scroll_by(self.log_rows() as isize),
             },
             KeyCode::PageDown => match self.active_pane {
                 Pane::Local | Pane::Remote => self.active_pane_mut().unwrap().move_cursor(10),
                 Pane::Transfers => self.move_transfer_cursor(10),
-                Pane::Log => {}
+                Pane::Log => self.log_scroll_by(-(self.log_rows() as isize)),
             },
             KeyCode::Enter => match self.active_pane {
                 Pane::Local => self.local_enter(),
@@ -357,13 +367,13 @@ impl App {
             KeyCode::Char('R') if self.active_pane == Pane::Transfers => {
                 self.resume_walk(CheckpointKind::Upload);
             }
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('s') if chord => {
                 self.open_save_session();
             }
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('d') if chord => {
                 self.enqueue_selected_downloads();
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('u') if chord => {
                 self.start_selected_uploads();
             }
             KeyCode::F(2) if self.active_pane == Pane::Remote => {
@@ -400,9 +410,7 @@ impl App {
             KeyCode::F(5) => {
                 self.refresh_active_pane();
             }
-            KeyCode::Char('x')
-                if key.modifiers.contains(KeyModifiers::CONTROL) && self.transport.is_some() =>
-            {
+            KeyCode::Char('x') if chord && self.transport.is_some() => {
                 self.screen = Screen::ConfirmDisconnect;
             }
             KeyCode::Char('q') | KeyCode::Esc => {
@@ -414,9 +422,9 @@ impl App {
 
     /// Quit via the confirmation modal, or immediately when the user has
     /// disabled it with `confirm_quit = false` in config.ini.
-    fn request_quit(&mut self, from: Screen) {
+    pub(super) fn request_quit(&mut self, from: Screen) {
         if self.config.general.confirm_quit {
-            self.previous_screen = from;
+            self.quit_return = from;
             self.screen = Screen::ConfirmQuit;
         } else {
             self.should_quit = true;
@@ -591,10 +599,14 @@ impl App {
                 // it's equivalent to "overwrite all conflicts".
                 self.confirm_overwrite_proceed(false);
             }
-            KeyCode::Char('s') | KeyCode::Char('S') => {
-                // Skip-conflicts only meaningful for plan variants; for
-                // the rename / single-file variants there's nothing to
-                // skip and we treat it as a no-op.
+            // Skip-conflicts is only offered for a plan. A rename has nothing
+            // to skip, and proceeding there meant replacing the file.
+            KeyCode::Char('s') | KeyCode::Char('S')
+                if !matches!(
+                    self.pending_overwrite,
+                    Some(crate::tui::state::OverwritePending::Rename { .. })
+                ) =>
+            {
                 self.confirm_overwrite_proceed(true);
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -652,6 +664,15 @@ impl App {
                     self.save_session_error = Some("no active session".into());
                     return;
                 };
+                // Another saved session by this name would be overwritten
+                // without a word; the edit form refuses the same. This
+                // session's own file is the one to update.
+                let own_file = self.current_session_saved && current.name == name;
+                if !own_file && self.sessions.iter().any(|s| s.name == name) {
+                    self.save_session_error =
+                        Some(format!("a session named `{name}` already exists"));
+                    return;
+                }
 
                 // Snapshot the current navigation state into the saved session
                 // so reopening picks up where we left off.
@@ -667,6 +688,7 @@ impl App {
                 match to_save.save() {
                     Ok(()) => {
                         self.current_session = Some(to_save);
+                        self.current_session_saved = true;
                         // Refresh the sessions list so it reflects the new
                         // entry next time the user opens the selector.
                         self.reload_sessions();
@@ -689,21 +711,7 @@ impl App {
 
     pub(super) fn handle_viewer(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                // If an image was on screen, force a full repaint after we
-                // close — sixel and kitty graphics aren't in ratatui's buffer
-                // and won't be cleaned up by the next diff'd draw.
-                let was_image = matches!(
-                    self.viewer.as_ref().map(|v| &v.kind),
-                    Some(ViewerKind::Image { .. })
-                );
-                self.viewer = None;
-                self.image_needs_redraw = false;
-                if was_image {
-                    self.needs_terminal_clear = true;
-                }
-                self.screen = self.previous_screen.clone();
-            }
+            KeyCode::Esc | KeyCode::Char('q') => self.close_viewer(),
             KeyCode::Up | KeyCode::Char('k') => self.viewer_scroll(-1),
             KeyCode::Down | KeyCode::Char('j') => self.viewer_scroll(1),
             KeyCode::PageUp => self.viewer_scroll(-20),
@@ -711,6 +719,27 @@ impl App {
             KeyCode::Home | KeyCode::Char('g') => self.viewer_scroll_to(0),
             KeyCode::End | KeyCode::Char('G') => self.viewer_scroll_to(usize::MAX),
             _ => {}
+        }
+    }
+
+    /// Close the viewer and go back to the screen it opened over.
+    pub(super) fn close_viewer(&mut self) {
+        self.drop_viewer();
+        self.screen = self.previous_screen.clone();
+    }
+
+    /// Drop the viewer, forcing a full repaint if it showed an image: sixel
+    /// and kitty graphics aren't in ratatui's buffer and won't be cleaned up
+    /// by the next diff'd draw.
+    pub(super) fn drop_viewer(&mut self) {
+        let was_image = matches!(
+            self.viewer.as_ref().map(|v| &v.kind),
+            Some(ViewerKind::Image { .. })
+        );
+        self.viewer = None;
+        self.image_needs_redraw = false;
+        if was_image {
+            self.needs_terminal_clear = true;
         }
     }
 
@@ -964,13 +993,13 @@ mod tests {
             let mut a = app();
             press(&mut a, code);
             assert_eq!(a.screen, Screen::ConfirmQuit);
-            assert_eq!(a.previous_screen, Screen::SessionSelect);
+            assert_eq!(a.quit_return, Screen::SessionSelect);
             assert!(!a.should_quit);
 
             let mut a = app_on_main(1);
             press(&mut a, code);
             assert_eq!(a.screen, Screen::ConfirmQuit);
-            assert_eq!(a.previous_screen, Screen::Main);
+            assert_eq!(a.quit_return, Screen::Main);
         }
     }
 
@@ -1664,6 +1693,21 @@ mod tests {
         }
     }
 
+    /// End used to put the last line at the top, leaving a page of one
+    /// line; it stops with the last line at the bottom, as help does.
+    #[test]
+    fn the_viewer_scrolls_no_further_than_its_last_full_page() {
+        let mut a = viewing(text_lines(100));
+        super::super::tests_support::draw(&a);
+        let rows = usize::from(a.hit.viewer_body.get().unwrap().height);
+        press(&mut a, KeyCode::End);
+        assert_eq!(scroll_of(&a), 100 - rows);
+        press(&mut a, KeyCode::Down);
+        assert_eq!(scroll_of(&a), 100 - rows);
+        press(&mut a, KeyCode::Up);
+        assert_eq!(scroll_of(&a), 99 - rows, "one line up moves at once");
+    }
+
     #[test]
     fn viewer_keys_scroll_and_stop_at_both_ends() {
         let mut a = viewing(text_lines(50));
@@ -1839,5 +1883,190 @@ mod tests {
         assert_eq!(a.screen, Screen::SessionSelect);
         assert!(a.current_session.is_none());
         assert!(a.transfer_manager.is_none());
+    }
+
+    // --- returning from overlays ---------------------------------------------
+
+    #[test]
+    fn help_over_the_cancel_prompt_returns_to_it_and_no_still_backs_out() {
+        let mut a = app_on_main(1);
+        a.pending_cancel = Some(PendingCancel::Single {
+            id: 1,
+            name: "f".into(),
+        });
+        a.previous_screen = Screen::Main;
+        a.screen = Screen::ConfirmCancel;
+
+        press(&mut a, KeyCode::Char('?'));
+        assert_eq!(a.screen, Screen::Help);
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.screen, Screen::ConfirmCancel);
+        press(&mut a, KeyCode::Char('n'));
+        assert_eq!(a.screen, Screen::Main, "the prompt returned to itself");
+    }
+
+    #[test]
+    fn the_quit_prompt_does_not_open_help_and_no_still_backs_out() {
+        let mut a = app_on_main(1);
+        press(&mut a, KeyCode::Char('q'));
+        press(&mut a, KeyCode::Char('?'));
+        assert_eq!(a.screen, Screen::ConfirmQuit);
+        press(&mut a, KeyCode::Char('n'));
+        assert_eq!(a.screen, Screen::Main);
+    }
+
+    #[test]
+    fn help_opened_from_the_selector_draws_the_selector_behind_it() {
+        let mut a = app();
+        press(&mut a, KeyCode::Char('?'));
+        // Tall enough that the selector's heading shows above the modal.
+        let buf = super::super::tests_support::draw_sized(&a, 120, 70);
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("terminal sftp / scp"), "{text}");
+        assert!(
+            !text.contains("not connected"),
+            "the main view's header: {text}"
+        );
+    }
+
+    // --- ctrl+c ---------------------------------------------------------------
+
+    #[test]
+    fn ctrl_c_asks_to_quit_from_the_main_view() {
+        let mut a = app_on_main(1);
+        a.active_pane = Pane::Transfers;
+        a.dispatch_key(ctrl('c'));
+        assert_eq!(a.screen, Screen::ConfirmQuit);
+        assert!(a.pending_cancel.is_none(), "ctrl+c is not `c`");
+        press(&mut a, KeyCode::Char('n'));
+        assert_eq!(a.screen, Screen::Main);
+    }
+
+    #[test]
+    fn ctrl_c_over_a_form_returns_to_the_form_on_no() {
+        let mut a = app_on_main(1);
+        a.screen = Screen::Mkdir;
+        typed(&mut a, "new");
+        a.dispatch_key(ctrl('c'));
+        assert_eq!(a.screen, Screen::ConfirmQuit);
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.screen, Screen::Mkdir);
+        assert_eq!(a.mkdir_input, "new");
+    }
+
+    #[test]
+    fn ctrl_c_on_the_quit_prompt_quits() {
+        let mut a = app();
+        a.dispatch_key(ctrl('c'));
+        assert!(!a.should_quit);
+        a.dispatch_key(ctrl('c'));
+        assert!(a.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_quits_at_once_with_the_confirmation_off() {
+        let mut a = app();
+        a.config.general.confirm_quit = false;
+        a.screen = Screen::PasswordPrompt;
+        a.dispatch_key(ctrl('c'));
+        assert!(a.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_on_help_then_no_returns_to_help_and_esc_to_main() {
+        let mut a = app_on_main(1);
+        press(&mut a, KeyCode::Char('?'));
+        a.dispatch_key(ctrl('c'));
+        press(&mut a, KeyCode::Char('n'));
+        assert_eq!(a.screen, Screen::Help);
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.screen, Screen::Main);
+    }
+
+    #[test]
+    fn ctrl_c_in_the_viewer_closes_it_before_asking() {
+        let mut a = app_on_main(1);
+        a.viewer = Some(Viewer {
+            name: "f".into(),
+            kind: ViewerKind::Loading,
+            id: 1,
+        });
+        a.previous_screen = Screen::Main;
+        a.screen = Screen::Viewer;
+        a.dispatch_key(ctrl('c'));
+        assert_eq!(a.screen, Screen::ConfirmQuit);
+        assert!(a.viewer.is_none());
+        press(&mut a, KeyCode::Char('n'));
+        assert_eq!(a.screen, Screen::Main);
+    }
+
+    // --- chords and text fields -------------------------------------------------
+
+    #[test]
+    fn a_question_mark_types_into_a_folder_name() {
+        let mut a = app_on_main(1);
+        a.screen = Screen::Mkdir;
+        typed(&mut a, "why?");
+        assert_eq!(a.screen, Screen::Mkdir);
+        assert_eq!(a.mkdir_input, "why?");
+    }
+
+    #[test]
+    fn ctrl_and_alt_chords_type_nothing() {
+        let mut a = app_on_main(1);
+        a.screen = Screen::Rename;
+        a.rename_input = "a".into();
+        a.dispatch_key(ctrl('w'));
+        a.dispatch_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT));
+        assert_eq!(a.rename_input, "a");
+
+        a.screen = Screen::PasswordPrompt;
+        a.pending_session = Some(session("sftp://me@h"));
+        a.dispatch_key(ctrl('w'));
+        assert!(a.password_input.is_empty());
+    }
+
+    #[test]
+    fn altgr_characters_still_type() {
+        // Windows reports AltGr as ctrl+alt.
+        let mut a = app_on_main(1);
+        a.screen = Screen::Mkdir;
+        a.dispatch_key(KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert_eq!(a.mkdir_input, "@");
+    }
+
+    #[test]
+    fn letter_shortcuts_ignore_ctrl_and_alt_chords() {
+        let mut a = app_on_main(1);
+        a.dispatch_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::ALT));
+        a.dispatch_key(ctrl('q'));
+        assert_eq!(a.screen, Screen::Main);
+        a.active_pane = Pane::Remote;
+        a.dispatch_key(ctrl('D'));
+        assert_eq!(a.screen, Screen::Main);
+
+        let mut a = app();
+        a.dispatch_key(ctrl('n'));
+        assert_eq!(a.screen, Screen::SessionSelect);
+    }
+
+    // --- overwrite prompt ---------------------------------------------------------
+
+    #[test]
+    fn s_on_the_rename_overwrite_prompt_does_nothing() {
+        let mut a = app_on_main(1);
+        a.pending_overwrite = Some(OverwritePending::Rename {
+            from: "/a".into(),
+            to: "/b".into(),
+            target_name: "b".into(),
+        });
+        a.screen = Screen::ConfirmOverwrite;
+        press(&mut a, KeyCode::Char('s'));
+        assert_eq!(a.screen, Screen::ConfirmOverwrite);
+        assert!(a.pending_overwrite.is_some());
+        assert!(!logged(&a, "not connected"), "a rename was attempted");
     }
 }

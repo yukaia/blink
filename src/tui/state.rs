@@ -227,10 +227,9 @@ impl PaneState {
         // *not* come through here.
         self.selected.clear();
         if let Some(query) = self.filter.clone() {
-            let lower = query.to_ascii_lowercase();
             let filtered: Vec<PaneEntry> = entries
                 .iter()
-                .filter(|e| e.is_parent() || e.display_name.to_ascii_lowercase().contains(&lower))
+                .filter(|e| passes_filter(e, &query))
                 .cloned()
                 .collect();
             self.all_entries = Some(entries);
@@ -251,11 +250,10 @@ impl PaneState {
         if self.all_entries.is_none() {
             self.all_entries = Some(self.entries.clone());
         }
-        let lower = query.to_ascii_lowercase();
         let all = self.all_entries.as_ref().unwrap();
         self.entries = all
             .iter()
-            .filter(|e| e.is_parent() || e.display_name.to_ascii_lowercase().contains(&lower))
+            .filter(|e| passes_filter(e, &query))
             .cloned()
             .collect();
         self.filter = Some(query);
@@ -277,6 +275,17 @@ impl PaneState {
             self.cursor = self.entries.len() - 1;
         }
     }
+}
+
+/// Whether `entry` stays in a pane filtered on `query`: the parent row
+/// always does, and any row whose name contains the query, ignoring case —
+/// in every script, not just ASCII.
+fn passes_filter(entry: &PaneEntry, query: &str) -> bool {
+    entry.is_parent()
+        || entry
+            .display_name
+            .to_lowercase()
+            .contains(&query.to_lowercase())
 }
 
 /// The entries a list `height` rows tall shows, given the first one it
@@ -317,6 +326,14 @@ mod pane_tests {
         let mut p = PaneState::empty();
         p.set_entries(entries);
         p
+    }
+
+    #[test]
+    fn the_filter_ignores_case_beyond_ascii() {
+        let mut p = pane(vec![file("Éclair.txt"), file("other.txt")]);
+        p.set_filter("éc".into());
+        assert_eq!(p.entries.len(), 1);
+        assert_eq!(p.entries[0].raw_name, "Éclair.txt");
     }
 
     #[test]
@@ -698,8 +715,8 @@ pub enum EditField {
     /// Parallel transfers override. Empty string = use the global default.
     Parallel,
     /// Toggle for `accept_invalid_certs` on the session. Toggled with Space
-    /// or Enter rather than text-typed; cycles through it like any other
-    /// field with Tab / Up / Down.
+    /// rather than typed into (Enter saves the form, as on every field);
+    /// reached like any other field with Tab / Up / Down.
     AcceptInvalidCerts,
 }
 
