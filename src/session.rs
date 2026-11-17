@@ -1384,6 +1384,94 @@ mod tests {
         loaded
     }
 
+    // --- delete ---
+
+    fn saved(url: &str, name: &str) -> Session {
+        let mut s = Session::from_url(url).unwrap();
+        s.name = name.to_string();
+        s.save().unwrap();
+        s
+    }
+
+    #[test]
+    fn deleting_a_session_removes_its_file_and_no_other() {
+        let _home = paths::test_home();
+        let a = saved("sftp://me@a.example", "a");
+        let b = saved("sftp://me@b.example", "b");
+
+        Session::delete("a").unwrap();
+
+        assert!(!a.path().unwrap().exists());
+        assert!(b.path().unwrap().exists());
+        let names: Vec<_> = Session::list_all()
+            .unwrap()
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, ["b"]);
+    }
+
+    #[test]
+    fn deleting_a_session_that_isnt_saved_says_so() {
+        let _home = paths::test_home();
+        saved("sftp://me@a.example", "a");
+
+        let err = Session::delete("missing").unwrap_err();
+
+        assert!(matches!(err, BlinkError::SessionNotFound(_)), "{err}");
+        assert_eq!(Session::list_all().unwrap().len(), 1);
+    }
+
+    /// Names that map to one file-name stem are told apart by what the
+    /// files say, not by where they are.
+    #[test]
+    fn deleting_one_of_two_sessions_with_alike_names_takes_the_right_one() {
+        let _home = paths::test_home();
+        saved("sftp://me@a.example", "my prod");
+        saved("sftp://me@b.example", "my_prod");
+
+        Session::delete("my prod").unwrap();
+
+        let left = Session::list_all().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].name, "my_prod");
+    }
+
+    /// A file the user named themselves holds a session all the same.
+    #[test]
+    fn deleting_finds_a_session_under_a_file_name_blink_didnt_choose() {
+        let _home = paths::test_home();
+        let hand_named = paths::sessions_dir().unwrap().join("work.ini");
+        std::fs::write(
+            &hand_named,
+            "[session]\nname = office\nprotocol = sftp\nhost = h\n",
+        )
+        .unwrap();
+
+        Session::delete("office").unwrap();
+
+        assert!(!hand_named.exists());
+    }
+
+    /// The file is named after the session; one holding another session
+    /// under that name is not the one asked for.
+    #[test]
+    fn deleting_leaves_a_file_that_holds_another_session() {
+        let _home = paths::test_home();
+        let squatter = paths::sessions_dir()
+            .unwrap()
+            .join(Session::name_to_filename("a"));
+        std::fs::write(
+            &squatter,
+            "[session]\nname = other\nprotocol = sftp\nhost = h\n",
+        )
+        .unwrap();
+
+        assert!(Session::delete("a").is_err());
+
+        assert!(squatter.exists());
+    }
+
     /// A port that isn't a number used to fall back to the protocol's
     /// default, so `port = 2222x` connected to 22 without a word, and the
     /// password prompt went to another service than the file names.
