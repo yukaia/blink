@@ -30,6 +30,61 @@ pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
         .split(popup[1])[1]
 }
 
+/// Where a modal goes in `area`: `percent_x` of its width, widened to fit
+/// `content_width` columns, and exactly tall enough for `content_height`
+/// rows, each plus a border and both clamped to `area`; centred.
+///
+/// The height used to be a percentage of the terminal too, whatever the
+/// modal held. On anything smaller than the size a modal was tuned on, the
+/// bottom rows were cut off, and the bottom row is where the key hint is.
+pub(crate) fn modal_rect(
+    percent_x: u16,
+    content_width: usize,
+    content_height: usize,
+    area: Rect,
+) -> Rect {
+    let border = |n: usize| u16::try_from(n.saturating_add(2)).unwrap_or(u16::MAX);
+    let wanted = u16::try_from(u32::from(area.width) * u32::from(percent_x) / 100).unwrap_or(0);
+    let width = wanted.max(border(content_width)).min(area.width);
+    let height = border(content_height).min(area.height);
+    Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// Draw `lines` in a bordered modal titled `title`, sized by [`modal_rect`].
+pub(crate) fn render_modal(
+    f: &mut Frame,
+    title: &str,
+    color: ratatui::style::Color,
+    percent_x: u16,
+    lines: Vec<Line>,
+) {
+    let width = lines
+        .iter()
+        .map(Line::width)
+        .chain(std::iter::once(title.chars().count()))
+        .max()
+        .unwrap_or(0);
+    // A column of space either side, so a line the modal widened to fit
+    // does not run into the border.
+    let modal = modal_rect(percent_x, width + 2, lines.len(), f.area());
+    f.render_widget(Clear, modal);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(color))
+        .title(Span::styled(
+            title.to_string(),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(modal);
+    f.render_widget(block, modal);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 // ---------------------------------------------------------------------------
 // Session select
 // ---------------------------------------------------------------------------
@@ -324,8 +379,11 @@ pub mod help {
     use super::*;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        let modal = super::centered_rect(70, 78, area);
+        let body = lines(app);
+        let width = body.iter().map(Line::width).max().unwrap_or(0);
+        // The body plus one footer row, which stays put while the body
+        // scrolls: help is taller than an 80x24 terminal.
+        let modal = super::modal_rect(70, width + 2, body.len() + 1, f.area());
 
         f.render_widget(Clear, modal);
         let block = Block::default()
@@ -340,7 +398,48 @@ pub mod help {
         let inner = block.inner(modal);
         f.render_widget(block, modal);
 
-        let dim_s = Style::default().fg(app.theme.dim);
+        let body_area = Rect {
+            height: inner.height.saturating_sub(1),
+            ..inner
+        };
+        let footer_area = Rect {
+            y: inner.y + body_area.height,
+            height: inner.height.min(1),
+            ..inner
+        };
+        app.hit.help_body.set(Some(body_area));
+
+        let max = scroll_limit(body.len(), body_area.height);
+        let scroll = u16::try_from(app.help_scroll.min(max)).unwrap_or(u16::MAX);
+        f.render_widget(Paragraph::new(body).scroll((scroll, 0)), body_area);
+
+        let footer = if max > 0 {
+            "[↑↓] scroll  ·  esc / ?  to close"
+        } else {
+            "esc / ?  to close"
+        };
+        f.render_widget(
+            Paragraph::new(
+                Line::from(Span::styled(footer, Style::default().fg(app.theme.dim)))
+                    .alignment(Alignment::Center),
+            ),
+            footer_area,
+        );
+    }
+
+    /// The furthest help can scroll, as last drawn. Zero before it has been.
+    pub(crate) fn max_scroll(app: &App) -> usize {
+        app.hit
+            .help_body
+            .get()
+            .map_or(0, |r| scroll_limit(lines(app).len(), r.height))
+    }
+
+    fn scroll_limit(lines: usize, rows: u16) -> usize {
+        lines.saturating_sub(usize::from(rows))
+    }
+
+    fn lines(app: &App) -> Vec<Line<'static>> {
         let key_s = Style::default()
             .fg(app.theme.border_active)
             .add_modifier(Modifier::BOLD);
@@ -348,7 +447,7 @@ pub mod help {
             .fg(app.theme.accent)
             .add_modifier(Modifier::BOLD);
 
-        let lines = vec![
+        vec![
             Line::from(""),
             Line::from(Span::styled("  NAVIGATION", acc_s)),
             kv("  ↵         ", "enter directory", key_s),
@@ -398,11 +497,7 @@ pub mod help {
             Line::from(Span::styled("  APP", acc_s)),
             kv("  ?         ", "toggle this help", key_s),
             kv("  q · esc   ", "quit (with confirmation)", key_s),
-            Line::from(""),
-            Line::from(Span::styled("  esc / ?  to close", dim_s)).alignment(Alignment::Center),
-        ];
-
-        f.render_widget(Paragraph::new(lines), inner);
+        ]
     }
 
     fn kv(key: &str, value: &str, key_style: Style) -> Line<'static> {
@@ -543,22 +638,6 @@ pub mod confirm_quit {
     use super::*;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        let modal = super::centered_rect(40, 18, area);
-        f.render_widget(Clear, modal);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.warning))
-            .title(Span::styled(
-                " quit blink? ",
-                Style::default()
-                    .fg(app.theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
-
         // Quit is reachable from the session selector too, where there is no
         // connection at all — so the warning is conditional. It used to be
         // unconditional, telling users their transfers would be cancelled
@@ -593,7 +672,7 @@ pub mod confirm_quit {
             ])
             .alignment(Alignment::Center),
         );
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(f, " quit blink? ", app.theme.warning, 40, lines);
     }
 }
 
@@ -606,12 +685,6 @@ pub mod confirm_cancel {
     use crate::tui::state::PendingCancel;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        // Batch modals carry more text; size for the worst case so neither
-        // shape gets clipped on small terminals.
-        let modal = super::centered_rect(60, 36, area);
-        f.render_widget(Clear, modal);
-
         let is_batch = matches!(
             app.pending_cancel.as_ref(),
             Some(PendingCancel::Batch { .. })
@@ -621,17 +694,6 @@ pub mod confirm_cancel {
         } else {
             " cancel transfer? "
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.warning))
-            .title(Span::styled(
-                title,
-                Style::default()
-                    .fg(app.theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
 
         let mut lines: Vec<Line> = vec![Line::from("")];
         match app.pending_cancel.as_ref() {
@@ -720,7 +782,7 @@ pub mod confirm_cancel {
             ])
             .alignment(Alignment::Center),
         );
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(f, title, app.theme.warning, 60, lines);
     }
 }
 
@@ -732,22 +794,6 @@ pub mod password_prompt {
     use super::*;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        let modal = super::centered_rect(50, 24, area);
-        f.render_widget(Clear, modal);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.border_active))
-            .title(Span::styled(
-                " password ",
-                Style::default()
-                    .fg(app.theme.border_active)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
-
         let target = app
             .pending_session
             .as_ref()
@@ -781,7 +827,7 @@ pub mod password_prompt {
                 Style::default().fg(app.theme.dim),
             )),
         ];
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(f, " password ", app.theme.border_active, 50, lines);
     }
 }
 
@@ -793,22 +839,6 @@ pub mod connection {
     use super::*;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        let modal = super::centered_rect(50, 18, area);
-        f.render_widget(Clear, modal);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.warning))
-            .title(Span::styled(
-                " connecting ",
-                Style::default()
-                    .fg(app.theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
-
         let target = app
             .pending_session
             .as_ref()
@@ -834,7 +864,7 @@ pub mod connection {
             ))
             .alignment(Alignment::Center),
         ];
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(f, " connecting ", app.theme.warning, 50, lines);
     }
 }
 
@@ -1004,22 +1034,6 @@ pub mod new_session {
     use super::*;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        let modal = super::centered_rect(64, 40, area);
-        f.render_widget(Clear, modal);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.border_active))
-            .title(Span::styled(
-                " new connection ",
-                Style::default()
-                    .fg(app.theme.border_active)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
-
         let dim = Style::default().fg(app.theme.dim);
         let mut lines = vec![
             Line::from(""),
@@ -1058,7 +1072,7 @@ pub mod new_session {
             dim,
         )));
 
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(f, " new connection ", app.theme.border_active, 64, lines);
     }
 }
 
@@ -1074,22 +1088,6 @@ pub mod offer_save_session {
     use super::*;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        let modal = super::centered_rect(56, 34, area);
-        f.render_widget(Clear, modal);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.accent))
-            .title(Span::styled(
-                " save this session? ",
-                Style::default()
-                    .fg(app.theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
-
         let dim = Style::default().fg(app.theme.dim);
         let fg = Style::default().fg(app.theme.fg);
 
@@ -1136,13 +1134,15 @@ pub mod offer_save_session {
             ])
             .alignment(Alignment::Center),
         ];
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(f, " save this session? ", app.theme.accent, 56, lines);
     }
 }
 
 pub mod offer_resume_checkpoint {
     use super::*;
     use crate::tui::state::PostConnectOffer;
+
+    const PERCENT_X: u16 = 60;
 
     /// Coarse, human-readable age. Precision past the unit is noise here —
     /// the question the user is answering is "is this batch still relevant".
@@ -1166,30 +1166,12 @@ pub mod offer_resume_checkpoint {
             return;
         };
 
-        let area = f.area();
-        // 56% leaves >=11 usable inner rows on an 80x24 terminal — the worst
-        // case for this panel's content (greeting + headline + up to three
-        // sample paths + "…and N more" + the `[r]/[d]/[esc]` hint line). At
-        // 42% only 8 rows were available, so the hint line — the only
-        // indication that `d` is destructive — was the first thing clipped.
-        let modal = super::centered_rect(60, 56, area);
-        f.render_widget(Clear, modal);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.accent))
-            .title(Span::styled(
-                " resume interrupted transfer? ",
-                Style::default()
-                    .fg(app.theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
-
         let dim = Style::default().fg(app.theme.dim);
         let fg = Style::default().fg(app.theme.fg);
-        let width = inner.width.saturating_sub(4) as usize;
+        // Sample paths are cut to the modal's usual width (less its border
+        // and indent) rather than widening it to the longest path.
+        let width =
+            usize::from(super::modal_rect(PERCENT_X, 0, 0, f.area()).width).saturating_sub(2 + 4);
 
         let mut lines = vec![
             Line::from(""),
@@ -1255,7 +1237,13 @@ pub mod offer_resume_checkpoint {
             .alignment(Alignment::Center),
         );
 
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(
+            f,
+            " resume interrupted transfer? ",
+            app.theme.accent,
+            PERCENT_X,
+            lines,
+        );
     }
 
     #[cfg(test)]
@@ -1295,22 +1283,6 @@ pub mod save_session {
     use super::*;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        let modal = super::centered_rect(60, 36, area);
-        f.render_widget(Clear, modal);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.border_active))
-            .title(Span::styled(
-                " save session ",
-                Style::default()
-                    .fg(app.theme.border_active)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
-
         let dim = Style::default().fg(app.theme.dim);
         let target = app
             .current_session
@@ -1367,7 +1339,7 @@ pub mod save_session {
             dim,
         )));
 
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(f, " save session ", app.theme.border_active, 60, lines);
     }
 }
 
@@ -1379,22 +1351,6 @@ pub mod rename {
     use super::*;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        let modal = super::centered_rect(60, 28, area);
-        f.render_widget(Clear, modal);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.border_active))
-            .title(Span::styled(
-                " rename ",
-                Style::default()
-                    .fg(app.theme.border_active)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
-
         let dim = Style::default().fg(app.theme.dim);
         let mut lines = vec![
             Line::from(""),
@@ -1424,7 +1380,7 @@ pub mod rename {
             dim,
         )));
 
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(f, " rename ", app.theme.border_active, 60, lines);
     }
 }
 
@@ -1436,22 +1392,6 @@ pub mod mkdir {
     use super::*;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        let modal = super::centered_rect(60, 24, area);
-        f.render_widget(Clear, modal);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.border_active))
-            .title(Span::styled(
-                " new directory ",
-                Style::default()
-                    .fg(app.theme.border_active)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
-
         let dim = Style::default().fg(app.theme.dim);
         let mut lines = vec![
             Line::from(""),
@@ -1488,7 +1428,7 @@ pub mod mkdir {
             dim,
         )));
 
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(f, " new directory ", app.theme.border_active, 60, lines);
     }
 }
 
@@ -1500,22 +1440,6 @@ pub mod confirm_delete {
     use super::*;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        let modal = super::centered_rect(50, 28, area);
-        f.render_widget(Clear, modal);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.error))
-            .title(Span::styled(
-                " delete? ",
-                Style::default()
-                    .fg(app.theme.error)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
-
         let (name, is_dir) = match app.pending_delete.as_ref() {
             Some(pd) => (pd.name.clone(), pd.is_dir),
             None => (String::new(), false),
@@ -1562,7 +1486,7 @@ pub mod confirm_delete {
             ])
             .alignment(Alignment::Center),
         ];
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(f, " delete? ", app.theme.error, 50, lines);
     }
 }
 
@@ -1576,22 +1500,6 @@ pub mod confirm_overwrite {
     use crate::tui::state::OverwritePending;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        let modal = super::centered_rect(60, 56, area);
-        f.render_widget(Clear, modal);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.warning))
-            .title(Span::styled(
-                " overwrite? ",
-                Style::default()
-                    .fg(app.theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
-
         let mut lines = vec![Line::from("")];
         let is_plan = matches!(
             app.pending_overwrite.as_ref(),
@@ -1651,7 +1559,7 @@ pub mod confirm_overwrite {
         hint_spans.push(Span::styled("[n/esc]", key_style(app.theme.accent)));
         hint_spans.push(Span::raw(" cancel "));
         lines.push(Line::from(hint_spans).alignment(Alignment::Center));
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(f, " overwrite? ", app.theme.warning, 60, lines);
     }
 
     enum PlanKind {
@@ -1756,22 +1664,6 @@ pub mod edit_session {
     use crate::tui::state::EditField;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        let modal = super::centered_rect(64, 70, area);
-        f.render_widget(Clear, modal);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.border_active))
-            .title(Span::styled(
-                " edit session ",
-                Style::default()
-                    .fg(app.theme.border_active)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
-
         let form = match app.edit_session_form.as_ref() {
             Some(f) => f,
             None => return,
@@ -1909,7 +1801,7 @@ pub mod edit_session {
             dim,
         )));
 
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(f, " edit session ", app.theme.border_active, 64, lines);
     }
 }
 
@@ -1921,22 +1813,6 @@ pub mod confirm_delete_session {
     use super::*;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        let modal = super::centered_rect(50, 32, area);
-        f.render_widget(Clear, modal);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.error))
-            .title(Span::styled(
-                " delete session? ",
-                Style::default()
-                    .fg(app.theme.error)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
-
         let dim = Style::default().fg(app.theme.dim);
         let fg = Style::default().fg(app.theme.fg);
         let mut lines = vec![Line::from("")];
@@ -1997,7 +1873,7 @@ pub mod confirm_delete_session {
             .alignment(Alignment::Center),
         );
 
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(f, " delete session? ", app.theme.error, 50, lines);
     }
 }
 
@@ -2009,22 +1885,6 @@ pub mod key_passphrase_prompt {
     use super::*;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        let modal = super::centered_rect(56, 32, area);
-        f.render_widget(Clear, modal);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.border_active))
-            .title(Span::styled(
-                " ssh key passphrase ",
-                Style::default()
-                    .fg(app.theme.border_active)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
-
         // Header line: which key file we're unlocking, where appropriate.
         let key_label = app
             .pending_session
@@ -2063,7 +1923,13 @@ pub mod key_passphrase_prompt {
             dim,
         )));
 
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(
+            f,
+            " ssh key passphrase ",
+            app.theme.border_active,
+            56,
+            lines,
+        );
     }
 }
 
@@ -2138,22 +2004,6 @@ pub mod confirm_disconnect {
     use super::*;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        let modal = super::centered_rect(50, 30, area);
-        f.render_widget(Clear, modal);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.warning))
-            .title(Span::styled(
-                " disconnect? ",
-                Style::default()
-                    .fg(app.theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
-
         let dim = Style::default().fg(app.theme.dim);
         let fg = Style::default().fg(app.theme.fg);
         let (active, pending) = app.queue_counts();
@@ -2211,7 +2061,7 @@ pub mod confirm_disconnect {
             ])
             .alignment(Alignment::Center),
         );
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(f, " disconnect? ", app.theme.warning, 50, lines);
     }
 }
 
@@ -2224,10 +2074,6 @@ pub mod confirm_host_key {
     use crate::tui::event::TrustSubject;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        let modal = super::centered_rect(66, 52, area);
-        f.render_widget(Clear, modal);
-
         let Some(phk) = app.pending_host_key.as_ref() else {
             return;
         };
@@ -2244,25 +2090,15 @@ pub mod confirm_host_key {
             ),
         };
 
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.warning))
-            .title(Span::styled(
-                title,
-                Style::default()
-                    .fg(app.theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
-
         let (host, key_type) = (phk.host.as_str(), phk.key_type.as_str());
 
         // A certificate's fingerprint, `AB:CD:…`, is 95 columns: wider than
         // the modal. Break it, between byte pairs, onto as many lines as it
         // takes rather than let the end be cut off.
         const LABEL: &str = "  Fingerprint: ";
-        let room = (inner.width as usize).saturating_sub(LABEL.len()).max(12);
+        let inner_width =
+            usize::from(super::modal_rect(66, 0, 0, f.area()).width).saturating_sub(2);
+        let room = inner_width.saturating_sub(LABEL.len()).max(12);
         let room = if phk.subject == TrustSubject::FtpsCertificate {
             // Whole `AB:` pairs, less the trailing colon: 3k - 1 columns.
             (room + 1) / 3 * 3 - 1
@@ -2344,7 +2180,7 @@ pub mod confirm_host_key {
             .alignment(Alignment::Center),
         ]);
 
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(f, title, app.theme.warning, 66, lines);
     }
 }
 
@@ -2356,22 +2192,6 @@ pub mod host_key_changed {
     use super::*;
 
     pub fn render(f: &mut Frame, app: &App) {
-        let area = f.area();
-        let modal = super::centered_rect(66, 52, area);
-        f.render_widget(Clear, modal);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(app.theme.error))
-            .title(Span::styled(
-                " host key mismatch ",
-                Style::default()
-                    .fg(app.theme.error)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        let inner = block.inner(modal);
-        f.render_widget(block, modal);
-
         let info = match app.host_key_changed_info.as_ref() {
             Some(i) => i,
             None => return,
@@ -2480,6 +2300,806 @@ pub mod host_key_changed {
             .alignment(Alignment::Center),
         ];
 
-        f.render_widget(Paragraph::new(lines), inner);
+        super::render_modal(f, " host key mismatch ", app.theme.error, 66, lines);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rendering smoke tests
+// ---------------------------------------------------------------------------
+//
+// Each modal drawn through `App::draw` into a TestBackend, checking that what
+// the user needs to decide is on screen: the title, the state it describes,
+// both arms of every conditional line, and the key hint. Secrets are checked
+// to stay masked.
+
+#[cfg(test)]
+mod render_tests {
+    use crate::checkpoint::{CheckpointKind, CheckpointOffer};
+    use crate::session::{AuthMethod, Session};
+    use crate::tui::app::tests_support::{app_on_main, draw, draw_sized, queue_offer};
+    use crate::tui::app::{App, Pane, Screen};
+    use crate::tui::plan::PlannedJob;
+    use crate::tui::state::{
+        EditField, EditSessionForm, OverwritePending, PaneEntry, PendingCancel, PendingDelete,
+        PostConnectOffer,
+    };
+
+    /// Every row of `buf`, right-trimmed and joined with newlines.
+    fn text_of(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area;
+        (area.y..area.bottom())
+            .map(|y| {
+                (area.x..area.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn screen(a: &App) -> String {
+        text_of(&draw(a))
+    }
+
+    /// `a` drawn on the smallest terminal blink is meant to be usable on.
+    fn small_screen(a: &App) -> String {
+        text_of(&draw_sized(a, 80, 24))
+    }
+
+    fn session(url: &str) -> Session {
+        Session::from_url(url).unwrap()
+    }
+
+    /// An app on `screen`, over the main view.
+    fn on(screen: Screen) -> App {
+        let mut a = app_on_main(3);
+        a.screen = screen;
+        a
+    }
+
+    /// An app on `screen`, over the session selector.
+    fn over_selector(screen: Screen) -> App {
+        let mut a = on(screen);
+        a.previous_screen = Screen::SessionSelect;
+        a
+    }
+
+    fn with_queued_downloads(a: &mut App, n: usize) {
+        let (m, _events) = crate::transfer::TransferManager::new(1);
+        for i in 0..n {
+            m.enqueue_download(format!("/r/f{i}"), format!("/l/f{i}").into())
+                .unwrap();
+        }
+        a.transfer_manager = Some(m);
+    }
+
+    // --- session selector and main view details ---
+
+    #[test]
+    fn the_selector_shows_a_sessions_local_dir_and_parallel_override() {
+        let mut a = over_selector(Screen::SessionSelect);
+        let mut s = session("sftp://me@h.example");
+        s.name = "work".into();
+        s.local_dir = Some("/home/me/dl".into());
+        s.parallel_downloads = Some(7);
+        a.sessions = vec![s];
+
+        let text = screen(&a);
+        assert!(text.contains("/home/me/dl"), "{text}");
+        assert!(text.contains("7 streams (override)"), "{text}");
+    }
+
+    #[test]
+    fn the_selector_falls_back_to_home_and_the_global_parallel_count() {
+        let mut a = over_selector(Screen::SessionSelect);
+        a.sessions = vec![session("sftp://me@h.example")];
+
+        let text = screen(&a);
+        assert!(text.contains("(home)"), "{text}");
+        let global = a.config.general.parallel_downloads;
+        assert!(text.contains(&format!("{global} (global)")), "{text}");
+    }
+
+    #[test]
+    fn the_status_bar_names_the_connected_session() {
+        let mut a = on(Screen::Main);
+        assert!(screen(&a).contains("not connected"));
+        a.current_session = Some(session("sftp://me@h.example:2222"));
+        assert!(screen(&a).contains("sftp · me@h.example:2222"));
+    }
+
+    // --- help ---
+
+    #[test]
+    fn help_fits_whole_on_a_tall_terminal() {
+        let text = text_of(&draw_sized(&on(Screen::Help), 120, 50));
+        assert!(text.contains("HELP — keyboard shortcuts"), "{text}");
+        for wanted in ["NAVIGATION", "ctrl+d", "F7", "quit (with confirmation)"] {
+            assert!(text.contains(wanted), "missing {wanted:?}:\n{text}");
+        }
+        assert!(text.contains("esc / ?  to close"), "{text}");
+        assert!(!text.contains("scroll"), "nothing to scroll:\n{text}");
+    }
+
+    #[test]
+    fn help_taller_than_the_terminal_says_it_scrolls() {
+        let text = small_screen(&on(Screen::Help));
+        assert!(text.contains("NAVIGATION"), "{text}");
+        assert!(!text.contains("quit (with confirmation)"), "{text}");
+        assert!(text.contains("[↑↓] scroll  ·  esc / ?  to close"), "{text}");
+    }
+
+    #[test]
+    fn help_drawn_scrolled_past_the_end_stops_at_the_last_line() {
+        let mut a = on(Screen::Help);
+        a.help_scroll = 1000;
+        let text = small_screen(&a);
+        assert!(text.contains("quit (with confirmation)"), "{text}");
+        assert!(!text.contains("NAVIGATION"), "{text}");
+    }
+
+    // --- every modal at 80x24 ---
+
+    /// Each modal with as much in it as it ever holds, and the text that
+    /// must stay on screen: its key hint, its last line.
+    fn fullest_modals() -> Vec<(&'static str, App, &'static str)> {
+        let mut cases = Vec::new();
+
+        let mut a = over_selector(Screen::ConfirmQuit);
+        with_queued_downloads(&mut a, 3);
+        cases.push(("quit", a, "[n/esc] no"));
+
+        let mut a = on(Screen::ConfirmDisconnect);
+        a.current_session = Some(session("sftp://someone@a-long-host.example.com:2222"));
+        with_queued_downloads(&mut a, 3);
+        cases.push(("disconnect", a, "[n/esc] no"));
+
+        let mut a = on(Screen::ConfirmCancel);
+        a.pending_cancel = Some(PendingCancel::Single {
+            id: 1,
+            name: "x".into(),
+        });
+        cases.push(("cancel one", a, "[n/esc] no"));
+
+        let mut a = on(Screen::ConfirmCancel);
+        a.pending_cancel = Some(PendingCancel::Batch {
+            batch_id: 1,
+            active: 1,
+            pending: 2,
+            cursor_name: "x".into(),
+        });
+        cases.push(("cancel batch", a, "[n/esc] no"));
+
+        let mut a = over_selector(Screen::PasswordPrompt);
+        a.pending_session = Some(session("sftp://me@h"));
+        cases.push(("password", a, "[^u] clear"));
+
+        let mut a = over_selector(Screen::KeyPassphrasePrompt);
+        a.passphrase_error = Some("wrong passphrase".into());
+        cases.push(("passphrase", a, "[^u] clear"));
+
+        cases.push((
+            "connecting",
+            on(Screen::Connection),
+            "press [esc] to cancel",
+        ));
+
+        let mut a = over_selector(Screen::NewSession);
+        a.new_session_error = Some("missing user".into());
+        cases.push(("new session", a, "[^u] clear"));
+
+        cases.push((
+            "offer save",
+            on(Screen::OfferSaveSession),
+            "[n/esc] not now",
+        ));
+
+        let mut a = on(Screen::OfferResumeCheckpoint);
+        queue_offer(
+            &mut a,
+            PostConnectOffer::ResumeCheckpoint(resume_offer(10, &["/r/a", "/r/b", "/r/c"])),
+        );
+        cases.push(("offer resume", a, "[esc] later"));
+
+        let mut a = on(Screen::SaveSession);
+        a.save_session_error = Some("name taken".into());
+        cases.push(("save session", a, "[^u] clear"));
+
+        let mut a = on(Screen::Rename);
+        a.rename_error = Some("bad name".into());
+        cases.push(("rename", a, "[^u] clear"));
+
+        let mut a = on(Screen::Mkdir);
+        a.mkdir_error = Some("exists".into());
+        cases.push(("mkdir", a, "[^u] clear"));
+
+        let mut a = on(Screen::ConfirmDelete);
+        a.pending_delete = Some(PendingDelete {
+            name: "x".into(),
+            is_dir: true,
+            remote_path: "/x".into(),
+        });
+        cases.push(("delete", a, "[n/esc] no"));
+
+        let mut a = on(Screen::ConfirmOverwrite);
+        a.pending_overwrite = Some(OverwritePending::Rename {
+            from: "a".into(),
+            to: "b".into(),
+            target_name: "b".into(),
+        });
+        cases.push(("overwrite on rename", a, "[n/esc] cancel"));
+
+        let mut a = on(Screen::ConfirmOverwrite);
+        a.pending_overwrite = Some(OverwritePending::DownloadPlan {
+            plan: downloads(10),
+            conflict_indices: (1..=8).collect(),
+        });
+        cases.push(("overwrite plan", a, "[n/esc] cancel"));
+
+        let mut a = over_selector(Screen::EditSession);
+        let form = edit_form(&mut a);
+        form.accept_invalid_certs = true;
+        form.error = Some("bad port".into());
+        cases.push(("edit session", a, "[esc] cancel"));
+
+        let mut a = over_selector(Screen::ConfirmDeleteSession);
+        a.pending_session_delete = Some(session("sftp://me@h"));
+        cases.push(("delete session", a, "[n/esc] no"));
+
+        // A certificate fingerprint is 95 columns and wraps.
+        let mut a = over_selector(Screen::ConfirmHostKey);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        a.pending_host_key = Some(crate::tui::state::PendingHostKey {
+            subject: crate::tui::event::TrustSubject::FtpsCertificate,
+            host: "h:21".into(),
+            key_type: "TLS certificate, SHA-256".into(),
+            fingerprint: vec!["AB"; 32].join(":"),
+            decision_tx: Some(tx),
+            opened_at: std::time::Instant::now(),
+        });
+        cases.push(("unknown host key", a, "[n/esc] reject"));
+
+        let mut a = over_selector(Screen::HostKeyChanged);
+        a.host_key_changed_info = Some(crate::tui::state::HostKeyChangedInfo {
+            host: "[h]:2222".into(),
+            lookup_host: "h".into(),
+            lookup_port: 2222,
+            stored_key_type: "ssh-ed25519".into(),
+            presented_key_type: "ssh-rsa".into(),
+            fingerprint: "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG".into(),
+            trusted_once: false,
+        });
+        cases.push(("host key changed", a, "[enter/esc/q] dismiss"));
+
+        cases.push(("help", on(Screen::Help), "esc / ?  to close"));
+        cases
+    }
+
+    /// Modals were sized as a percentage of the terminal, and on 80x24 all
+    /// but two cut off their bottom rows: the key hint, and any error.
+    #[test]
+    fn every_modal_shows_its_last_line_on_an_80x24_terminal() {
+        let clipped: Vec<String> = fullest_modals()
+            .into_iter()
+            .filter_map(|(name, a, last)| {
+                let text = small_screen(&a);
+                (!text.contains(last)).then(|| format!("{name}:\n{text}"))
+            })
+            .collect();
+        assert!(clipped.is_empty(), "{}", clipped.join("\n\n"));
+    }
+
+    #[test]
+    fn a_modal_widens_to_fit_its_longest_line() {
+        // 40% of 80 columns is narrower than this warning.
+        let mut a = over_selector(Screen::ConfirmQuit);
+        with_queued_downloads(&mut a, 3);
+        let text = small_screen(&a);
+        assert!(
+            text.contains("3 queued transfers will be discarded."),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_host_key_changed_modal_keeps_its_recovery_command_on_80x24() {
+        let (_, a, _) = fullest_modals()
+            .into_iter()
+            .find(|(name, ..)| *name == "host key changed")
+            .unwrap();
+        let text = small_screen(&a);
+        assert!(
+            text.contains("blink known-hosts remove h --port 2222"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_modal_never_outgrows_the_terminal() {
+        let r = super::modal_rect(60, 500, 500, ratatui::layout::Rect::new(3, 4, 40, 10));
+        assert_eq!(r, ratatui::layout::Rect::new(3, 4, 40, 10));
+    }
+
+    #[test]
+    fn a_modal_is_as_tall_as_its_content_and_centred() {
+        let area = ratatui::layout::Rect::new(0, 0, 100, 30);
+        let r = super::modal_rect(50, 10, 6, area);
+        assert_eq!((r.width, r.height), (50, 8));
+        assert_eq!((r.x, r.y), (25, 11));
+    }
+
+    // --- quit / disconnect ---
+
+    #[test]
+    fn quit_with_nothing_running_warns_of_nothing() {
+        let text = screen(&over_selector(Screen::ConfirmQuit));
+        assert!(text.contains("quit blink?"), "{text}");
+        assert!(text.contains("[y] yes"), "{text}");
+        assert!(!text.contains("will be"), "{text}");
+    }
+
+    #[test]
+    fn quit_with_queued_work_says_it_will_be_discarded() {
+        let mut a = on(Screen::ConfirmQuit);
+        a.previous_screen = Screen::Main;
+        with_queued_downloads(&mut a, 2);
+        let text = screen(&a);
+        assert!(
+            text.contains("2 queued transfers will be discarded."),
+            "{text}"
+        );
+        assert!(text.contains("[y] yes"), "{text}");
+    }
+
+    #[test]
+    fn disconnect_names_the_session_and_what_ending_it_does() {
+        let mut a = on(Screen::ConfirmDisconnect);
+        let text = screen(&a);
+        assert!(text.contains("this session"), "{text}");
+
+        a.current_session = Some(session("ftp://anon@ftp.example"));
+        let text = screen(&a);
+        assert!(text.contains("disconnect?"), "{text}");
+        assert!(text.contains("anon@ftp.example:21 (ftp)"), "{text}");
+        assert!(text.contains("the connection will be closed."), "{text}");
+
+        with_queued_downloads(&mut a, 1);
+        let text = screen(&a);
+        assert!(
+            text.contains("1 queued transfer will be discarded."),
+            "{text}"
+        );
+        assert!(!text.contains("the connection will be closed."), "{text}");
+    }
+
+    // --- cancel ---
+
+    #[test]
+    fn cancelling_one_transfer_names_it() {
+        let mut a = on(Screen::ConfirmCancel);
+        a.pending_cancel = Some(PendingCancel::Single {
+            id: 1,
+            name: "big.iso".into(),
+        });
+        let text = screen(&a);
+        assert!(text.contains("cancel transfer?"), "{text}");
+        assert!(text.contains("big.iso"), "{text}");
+        assert!(text.contains("any partial file is left on disk."), "{text}");
+    }
+
+    #[test]
+    fn cancelling_a_batch_counts_its_jobs() {
+        let mut a = on(Screen::ConfirmCancel);
+        a.pending_cancel = Some(PendingCancel::Batch {
+            batch_id: 1,
+            active: 1,
+            pending: 2,
+            cursor_name: "a.bin".into(),
+        });
+        let text = screen(&a);
+        assert!(text.contains("cancel batch?"), "{text}");
+        assert!(text.contains("cancel 3 transfers in this batch?"), "{text}");
+        assert!(text.contains("(includes a.bin)"), "{text}");
+        assert!(text.contains("1 active   2 queued"), "{text}");
+        assert!(text.contains("[y] yes"), "{text}");
+    }
+
+    // --- credentials ---
+
+    #[test]
+    fn the_password_prompt_masks_what_is_typed() {
+        let mut a = over_selector(Screen::PasswordPrompt);
+        a.pending_session = Some(session("sftp://me@h.example"));
+        a.password_input.push_str("hunter2");
+        let text = screen(&a);
+        assert!(text.contains("me@h.example:22 (sftp)"), "{text}");
+        assert!(text.contains("password: •••••••█"), "{text}");
+        assert!(!text.contains("hunter2"), "{text}");
+    }
+
+    #[test]
+    fn the_passphrase_prompt_names_the_key_and_masks_what_is_typed() {
+        let mut a = over_selector(Screen::KeyPassphrasePrompt);
+        let mut s = session("sftp://me@h.example");
+        s.auth = AuthMethod::Key {
+            path: "/home/me/.ssh/id_ed25519".into(),
+        };
+        a.pending_session = Some(s);
+        a.passphrase_input.push_str("sesame");
+        a.passphrase_error = Some("wrong passphrase".into());
+        let text = screen(&a);
+        assert!(text.contains("key: /home/me/.ssh/id_ed25519"), "{text}");
+        assert!(text.contains("passphrase: ••••••█"), "{text}");
+        assert!(!text.contains("sesame"), "{text}");
+        assert!(text.contains("✗ wrong passphrase"), "{text}");
+    }
+
+    #[test]
+    fn the_passphrase_prompt_without_a_key_path_says_key() {
+        let mut a = over_selector(Screen::KeyPassphrasePrompt);
+        a.pending_session = Some(session("sftp://me@h.example"));
+        let text = screen(&a);
+        assert!(text.contains("ssh key passphrase"), "{text}");
+        assert!(text.contains("  key\n") || text.contains(" key "), "{text}");
+        assert!(!text.contains("key: "), "{text}");
+    }
+
+    // --- connecting ---
+
+    #[test]
+    fn connecting_shows_the_target() {
+        let mut a = on(Screen::Connection);
+        assert!(screen(&a).contains("→ …"));
+        a.pending_session = Some(session("ftps://me@h.example"));
+        let text = screen(&a);
+        assert!(text.contains("connecting"), "{text}");
+        assert!(text.contains("→ me@h.example:21 via ftps"), "{text}");
+    }
+
+    #[test]
+    fn the_new_session_modal_echoes_input_and_shows_errors() {
+        let mut a = over_selector(Screen::NewSession);
+        a.new_session_input = "sftp://typed".into();
+        let text = screen(&a);
+        assert!(text.contains("new connection"), "{text}");
+        assert!(text.contains("sftp://typed█"), "{text}");
+        assert!(!text.contains('✗'), "{text}");
+
+        a.new_session_error = Some("missing user".into());
+        assert!(screen(&a).contains("✗ missing user"));
+    }
+
+    // --- post-connect offers ---
+
+    #[test]
+    fn the_save_offer_names_the_connection() {
+        let mut a = on(Screen::OfferSaveSession);
+        assert!(screen(&a).contains("this connection"));
+        a.current_session = Some(session("sftp://me@h.example:2200"));
+        let text = screen(&a);
+        assert!(text.contains("save this session?"), "{text}");
+        assert!(text.contains("me@h.example:2200"), "{text}");
+        assert!(text.contains("[y] save"), "{text}");
+    }
+
+    fn resume_offer(remaining: usize, samples: &[&str]) -> CheckpointOffer {
+        CheckpointOffer {
+            kind: CheckpointKind::Download,
+            session: "work".into(),
+            origin: "me@h.example:22".into(),
+            remaining,
+            total: remaining + 5,
+            age: Some(std::time::Duration::from_secs(2 * 3600)),
+            sample_paths: samples.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn the_resume_offer_summarises_the_batch() {
+        let mut a = on(Screen::OfferResumeCheckpoint);
+        queue_offer(
+            &mut a,
+            PostConnectOffer::ResumeCheckpoint(resume_offer(10, &["/r/a", "/r/b", "/r/c"])),
+        );
+        let text = screen(&a);
+        assert!(text.contains("resume interrupted transfer?"), "{text}");
+        assert!(
+            text.contains("an interrupted download batch was found"),
+            "{text}"
+        );
+        assert!(
+            text.contains("10 of 15 items remaining · 2 hours ago"),
+            "{text}"
+        );
+        for p in ["/r/a", "/r/b", "/r/c"] {
+            assert!(text.contains(p), "{text}");
+        }
+        assert!(text.contains("… and 7 more"), "{text}");
+    }
+
+    #[test]
+    fn the_resume_offer_omits_more_when_every_path_is_shown() {
+        let mut a = on(Screen::OfferResumeCheckpoint);
+        let mut offer = resume_offer(1, &["/r/only"]);
+        offer.age = None;
+        queue_offer(&mut a, PostConnectOffer::ResumeCheckpoint(offer));
+        let text = screen(&a);
+        assert!(
+            text.contains("1 of 6 items remaining\n") || !text.contains(" ago"),
+            "{text}"
+        );
+        assert!(!text.contains("more"), "{text}");
+    }
+
+    /// The panel's sizing comment promises this: the destructive `[d]` hint
+    /// is the line that clips first, and it must survive 80x24.
+    #[test]
+    fn the_resume_offers_discard_hint_fits_on_an_80x24_terminal() {
+        let mut a = on(Screen::OfferResumeCheckpoint);
+        queue_offer(
+            &mut a,
+            PostConnectOffer::ResumeCheckpoint(resume_offer(10, &["/r/a", "/r/b", "/r/c"])),
+        );
+        let text = small_screen(&a);
+        assert!(text.contains("[d] discard"), "{text}");
+    }
+
+    #[test]
+    fn the_resume_offer_draws_nothing_without_an_offer() {
+        let a = on(Screen::OfferResumeCheckpoint);
+        assert!(!screen(&a).contains("resume interrupted transfer?"));
+    }
+
+    // --- remote file operations ---
+
+    #[test]
+    fn save_session_shows_target_name_and_both_dirs() {
+        let mut a = on(Screen::SaveSession);
+        a.current_session = Some(session("sftp://me@h.example"));
+        a.save_session_input = "work".into();
+        a.remote.path = String::new();
+        let text = screen(&a);
+        assert!(text.contains("save session"), "{text}");
+        assert!(text.contains("me@h.example:22 (sftp)"), "{text}");
+        assert!(text.contains("name: work█"), "{text}");
+        assert!(text.contains("local: /l"), "{text}");
+        assert!(text.contains("remote: /"), "{text}");
+
+        a.remote.path = "/srv".into();
+        a.save_session_error = Some("name taken".into());
+        let text = screen(&a);
+        assert!(text.contains("remote: /srv"), "{text}");
+        assert!(text.contains("✗ name taken"), "{text}");
+    }
+
+    #[test]
+    fn rename_shows_from_and_to() {
+        let mut a = on(Screen::Rename);
+        a.rename_original = "old.txt".into();
+        a.rename_input = "new.txt".into();
+        let text = screen(&a);
+        assert!(text.contains("from: old.txt"), "{text}");
+        assert!(text.contains("to: new.txt█"), "{text}");
+
+        a.rename_error = Some("bad name".into());
+        assert!(screen(&a).contains("✗ bad name"));
+    }
+
+    #[test]
+    fn mkdir_shows_where_and_the_name() {
+        let mut a = on(Screen::Mkdir);
+        a.remote.path = String::new();
+        a.mkdir_input = "photos".into();
+        let text = screen(&a);
+        assert!(text.contains("new directory"), "{text}");
+        assert!(
+            text.contains("in: /\n") || text.contains("in: / "),
+            "{text}"
+        );
+        assert!(text.contains("name: photos█"), "{text}");
+
+        a.remote.path = "/srv/www".into();
+        a.mkdir_error = Some("exists".into());
+        let text = screen(&a);
+        assert!(text.contains("in: /srv/www"), "{text}");
+        assert!(text.contains("✗ exists"), "{text}");
+    }
+
+    #[test]
+    fn delete_says_whether_a_folder_takes_its_contents() {
+        let mut a = on(Screen::ConfirmDelete);
+        a.pending_delete = Some(PendingDelete {
+            name: "notes.txt".into(),
+            is_dir: false,
+            remote_path: "/r/notes.txt".into(),
+        });
+        let text = screen(&a);
+        assert!(text.contains("delete this file:"), "{text}");
+        assert!(text.contains("notes.txt"), "{text}");
+        assert!(text.contains("this cannot be undone."), "{text}");
+
+        a.pending_delete = Some(PendingDelete {
+            name: "photos".into(),
+            is_dir: true,
+            remote_path: "/r/photos".into(),
+        });
+        let text = screen(&a);
+        assert!(
+            text.contains("delete this folder and everything inside it:"),
+            "{text}"
+        );
+    }
+
+    // --- overwrite ---
+
+    #[test]
+    fn a_rename_overwrite_offers_no_skip() {
+        let mut a = on(Screen::ConfirmOverwrite);
+        a.pending_overwrite = Some(OverwritePending::Rename {
+            from: "/r/a".into(),
+            to: "/r/b".into(),
+            target_name: "b".into(),
+        });
+        let text = screen(&a);
+        assert!(text.contains("overwrite?"), "{text}");
+        assert!(
+            text.contains("a file or folder with this name already exists:"),
+            "{text}"
+        );
+        assert!(text.contains("renaming will replace it."), "{text}");
+        assert!(text.contains("[y] overwrite"), "{text}");
+        assert!(!text.contains("[s]"), "{text}");
+    }
+
+    fn downloads(n: usize) -> Vec<PlannedJob> {
+        let mut plan = vec![PlannedJob::Mkdir {
+            remote_path: "/r/d".into(),
+        }];
+        plan.extend((0..n).map(|i| PlannedJob::Download {
+            remote_path: format!("/r/d/f{i}.txt"),
+            local_path: format!("/l/d/f{i}.txt").into(),
+        }));
+        plan
+    }
+
+    #[test]
+    fn a_download_plan_lists_six_conflicts_and_counts_the_rest() {
+        let mut a = on(Screen::ConfirmOverwrite);
+        // Index 0 is the mkdir, which must not count toward the file total.
+        a.pending_overwrite = Some(OverwritePending::DownloadPlan {
+            plan: downloads(10),
+            conflict_indices: (1..=8).collect(),
+        });
+        let text = screen(&a);
+        assert!(
+            text.contains("8 of 10 target files already exist on the local side:"),
+            "{text}"
+        );
+        for i in 0..6 {
+            assert!(text.contains(&format!("• f{i}.txt")), "{text}");
+        }
+        assert!(!text.contains("f6.txt"), "{text}");
+        assert!(text.contains("+ 2 more"), "{text}");
+        assert!(
+            text.contains("replaces all conflicting files locally."),
+            "{text}"
+        );
+        assert!(text.contains("[s] skip conflicts"), "{text}");
+    }
+
+    #[test]
+    fn an_upload_plan_with_one_conflict_reads_in_the_singular() {
+        let mut a = on(Screen::ConfirmOverwrite);
+        a.pending_overwrite = Some(OverwritePending::UploadPlan {
+            plan: vec![
+                PlannedJob::Upload {
+                    local_path: "/l/a.txt".into(),
+                    remote_path: "/r/a.txt".into(),
+                },
+                PlannedJob::Upload {
+                    local_path: "/l/b.txt".into(),
+                    remote_path: "/r/b.txt".into(),
+                },
+            ],
+            conflict_indices: vec![1],
+        });
+        let text = screen(&a);
+        assert!(
+            text.contains("1 of 2 target file already exists on the remote side:"),
+            "{text}"
+        );
+        assert!(text.contains("• b.txt"), "{text}");
+        assert!(!text.contains("more"), "{text}");
+        assert!(text.contains("on the server."), "{text}");
+    }
+
+    // --- session editing ---
+
+    fn edit_form(a: &mut App) -> &mut EditSessionForm {
+        let mut s = session("ftps://me@h.example");
+        s.name = "work".into();
+        a.edit_session_form = Some(EditSessionForm::from_session(&s));
+        a.sessions = vec![s];
+        a.edit_session_form.as_mut().unwrap()
+    }
+
+    #[test]
+    fn edit_session_shows_every_field_and_the_fixed_ones() {
+        let mut a = over_selector(Screen::EditSession);
+        let form = edit_form(&mut a);
+        form.focused = EditField::Host;
+        form.parallel = String::new();
+        let global = a.config.general.parallel_downloads;
+
+        let text = screen(&a);
+        assert!(text.contains("edit session"), "{text}");
+        assert!(text.contains("name:       work "), "{text}");
+        assert!(text.contains("host:       h.example█"), "{text}");
+        assert!(text.contains("port:       21"), "{text}");
+        assert!(
+            text.contains(&format!("blank = use {global} (global)")),
+            "{text}"
+        );
+        assert!(text.contains("tls verify: [ ]"), "{text}");
+        assert!(!text.contains("disables TLS protections"), "{text}");
+        assert!(text.contains("protocol:   ftps"), "{text}");
+        assert!(text.contains("auth:       password"), "{text}");
+    }
+
+    #[test]
+    fn edit_session_warns_when_certificate_checks_are_off() {
+        let mut a = over_selector(Screen::EditSession);
+        let form = edit_form(&mut a);
+        form.accept_invalid_certs = true;
+        form.focused = EditField::AcceptInvalidCerts;
+        form.parallel = "3".into();
+        form.error = Some("bad port".into());
+
+        let text = screen(&a);
+        assert!(text.contains("tls verify: [x] ◀"), "{text}");
+        assert!(text.contains("this disables TLS protections"), "{text}");
+        assert!(text.contains("parallel:   3"), "{text}");
+        assert!(!text.contains("blank = use"), "{text}");
+        assert!(text.contains("✗ bad port"), "{text}");
+    }
+
+    #[test]
+    fn deleting_a_session_says_no_remote_files_are_touched() {
+        let mut a = over_selector(Screen::ConfirmDeleteSession);
+        let mut s = session("sftp://me@h.example");
+        s.name = "work".into();
+        a.pending_session_delete = Some(s);
+        let text = screen(&a);
+        assert!(text.contains("delete session?"), "{text}");
+        assert!(text.contains("work"), "{text}");
+        assert!(text.contains("me@h.example:22  [sftp]"), "{text}");
+        assert!(text.contains("no remote files are touched."), "{text}");
+    }
+
+    // --- search ---
+
+    #[test]
+    fn the_search_bar_counts_matches_without_the_parent_entry() {
+        let mut a = on(Screen::Search);
+        a.search_target = Pane::Local;
+        a.search_input = "file".into();
+        let mut entries = vec![PaneEntry::parent()];
+        entries.extend((0..3).map(|i| PaneEntry::new(format!("file{i}"), false, 1)));
+        a.local.set_entries(entries);
+        let text = screen(&a);
+        assert!(text.contains("/local: file█"), "{text}");
+        assert!(text.contains("3 matches"), "{text}");
+
+        a.search_target = Pane::Remote;
+        a.remote.set_entries(vec![
+            PaneEntry::parent(),
+            PaneEntry::new("x".into(), false, 1),
+        ]);
+        let text = screen(&a);
+        assert!(text.contains("/remote: file█"), "{text}");
+        assert!(text.contains("1 match "), "{text}");
     }
 }

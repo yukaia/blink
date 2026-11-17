@@ -66,6 +66,13 @@ the git history for those.
 
 ### Fixed
 
+- **Dialogs fit small terminals.** Each dialog was a fixed share of the
+  terminal's height, whatever it held, so on 80x24 nearly every one cut
+  off its last lines: the keys to answer it, and any error message. The
+  host-key mismatch warning lost its recovery command. Dialogs are now as
+  tall as what they show, and wide enough for their longest line. Help,
+  which is taller than 24 rows, scrolls with the arrow keys or the mouse
+  wheel.
 - **A session file with a bad port is refused.** A `port` that wasn't a
   number, such as `2222x`, fell back to the protocol's default without a
   word, so blink connected, and asked for the password, on another port
