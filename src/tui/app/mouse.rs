@@ -44,6 +44,7 @@ impl App {
         match self.screen {
             Screen::Main => self.mouse_main(m, now),
             Screen::Viewer => self.mouse_viewer(m),
+            Screen::Help => self.mouse_help(m),
             Screen::SessionSelect => self.mouse_session_select(m, now),
             _ => {}
         }
@@ -141,6 +142,17 @@ impl App {
         match m.kind {
             MouseEventKind::ScrollUp => self.viewer_scroll(-WHEEL_STEP),
             MouseEventKind::ScrollDown => self.viewer_scroll(WHEEL_STEP),
+            _ => {}
+        }
+    }
+
+    fn mouse_help(&mut self, m: MouseEvent) {
+        if row_in(self.hit.help_body.get(), m.column, m.row).is_none() {
+            return;
+        }
+        match m.kind {
+            MouseEventKind::ScrollUp => self.help_scroll_by(-WHEEL_STEP),
+            MouseEventKind::ScrollDown => self.help_scroll_by(WHEEL_STEP),
             _ => {}
         }
     }

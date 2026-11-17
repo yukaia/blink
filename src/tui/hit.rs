@@ -24,6 +24,8 @@ pub struct HitMap {
     /// The whole bottom pane, border included, for focus.
     pub bottom_pane: Cell<Option<Rect>>,
     pub viewer_body: Cell<Option<Rect>>,
+    /// The scrolling part of the help modal, without its footer.
+    pub help_body: Cell<Option<Rect>>,
     pub session_list: Cell<Option<Rect>>,
 }
 
@@ -39,6 +41,7 @@ impl HitMap {
             &self.transfer_list,
             &self.bottom_pane,
             &self.viewer_body,
+            &self.help_body,
             &self.session_list,
         ] {
             cell.set(None);

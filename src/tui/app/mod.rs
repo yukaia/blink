@@ -254,6 +254,10 @@ pub struct App {
     /// allow Tab inside search anyway.
     pub search_target: Pane,
 
+    /// Rows of the help modal scrolled past. It can be taller than the
+    /// terminal.
+    pub help_scroll: usize,
+
     // Main view
     pub current_session: Option<Session>,
     pub transport: Option<SharedTransport>,
@@ -450,6 +454,7 @@ impl App {
             save_session_input: String::new(),
             save_session_error: None,
             search_input: String::new(),
+            help_scroll: 0,
             search_target: Pane::Local,
             current_session: None,
             transport: None,
@@ -753,15 +758,12 @@ impl App {
         {
             self.previous_screen = self.screen.clone();
             self.screen = Screen::Help;
+            self.help_scroll = 0;
             return;
         }
 
         match self.screen {
-            Screen::Help => {
-                if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
-                    self.screen = self.previous_screen.clone();
-                }
-            }
+            Screen::Help => self.handle_help(key),
             Screen::ConfirmQuit => match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') => {
                     self.should_quit = true;
@@ -1095,6 +1097,32 @@ impl App {
     pub(crate) fn pending_offers_front(&self) -> Option<&PostConnectOffer> {
         self.pending_offers.front()
     }
+
+    fn handle_help(&mut self, key: KeyEvent) {
+        let page = self
+            .hit
+            .help_body
+            .get()
+            .map_or(1, |r| usize::from(r.height).max(1));
+        match key.code {
+            KeyCode::Char('?') | KeyCode::Esc => self.screen = self.previous_screen.clone(),
+            KeyCode::Up | KeyCode::Char('k') => self.help_scroll_by(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.help_scroll_by(1),
+            KeyCode::PageUp => self.help_scroll_by(-(page as isize)),
+            KeyCode::PageDown => self.help_scroll_by(page as isize),
+            KeyCode::Home | KeyCode::Char('g') => self.help_scroll = 0,
+            KeyCode::End | KeyCode::Char('G') => {
+                self.help_scroll = crate::tui::views::help::max_scroll(self);
+            }
+            _ => {}
+        }
+    }
+
+    /// Scroll help by `delta` rows, stopping at either end.
+    pub(super) fn help_scroll_by(&mut self, delta: isize) {
+        let max = crate::tui::views::help::max_scroll(self);
+        self.help_scroll = self.help_scroll.saturating_add_signed(delta).min(max);
+    }
 }
 
 /// Build the visible entries for the remote pane, prepending `..` unless the
@@ -1191,9 +1219,20 @@ pub(super) mod tests_support {
     /// Draw `a` into a 100x30 test terminal, filling its hit map, and hand
     /// back what was drawn.
     pub(crate) fn draw(a: &App) -> ratatui::buffer::Buffer {
-        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_sized(a, 100, 30)
+    }
+
+    /// [`draw`] into a terminal of the given size.
+    pub(crate) fn draw_sized(a: &App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut t = ratatui::Terminal::new(backend).unwrap();
         t.draw(|f| a.draw(f)).unwrap();
         t.backend().buffer().clone()
+    }
+
+    /// Put `offer` at the back of the post-connect offer queue.
+    pub(crate) fn queue_offer(a: &mut App, offer: PostConnectOffer) {
+        a.pending_offers.push_back(offer);
     }
 }
 
@@ -2709,6 +2748,132 @@ mod tests {
             1,
             "an in-place refresh must not blank the pane while it waits",
         );
+    }
+
+    // -- a session's local folder ----------------------------------------------
+
+    #[test]
+    fn a_local_dir_that_exists_is_used_as_is() {
+        let home = crate::paths::test_home();
+        assert_eq!(
+            resolve_local_dir(home.path()),
+            Some(home.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn a_local_dir_that_is_missing_or_a_file_is_not_used() {
+        let home = crate::paths::test_home();
+        assert_eq!(resolve_local_dir(&home.path().join("missing")), None);
+        let file = home.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(resolve_local_dir(&file), None);
+    }
+
+    #[test]
+    fn a_tilde_means_the_home_folder() {
+        let Some(user) = directories::UserDirs::new() else {
+            return;
+        };
+        let real_home = user.home_dir().to_path_buf();
+        let want = real_home.is_dir().then(|| real_home.clone());
+        assert_eq!(resolve_local_dir(std::path::Path::new("~")), want);
+        assert_eq!(
+            resolve_local_dir(std::path::Path::new("~/surely-not-a-folder-blink-made")),
+            None
+        );
+        // `~user` is not expanded: it names a folder called `~user`.
+        assert_eq!(resolve_local_dir(std::path::Path::new("~root")), None);
+    }
+
+    // -- help scrolling -------------------------------------------------------
+    //
+    // Help is taller than an 80x24 terminal, so it scrolls. The limit comes
+    // from where help was last drawn.
+
+    fn help_on_80x24() -> App {
+        let mut a = app_on_main(1);
+        a.dispatch_key(press(KeyCode::Char('?')));
+        assert_eq!(a.screen, Screen::Help);
+        super::tests_support::draw_sized(&a, 80, 24);
+        a
+    }
+
+    #[test]
+    fn help_scrolls_down_and_stops_at_the_end() {
+        let mut a = help_on_80x24();
+        let max = crate::tui::views::help::max_scroll(&a);
+        assert!(max > 0, "help should not fit 80x24");
+
+        a.dispatch_key(press(KeyCode::Down));
+        assert_eq!(a.help_scroll, 1);
+        a.dispatch_key(press(KeyCode::Char('j')));
+        assert_eq!(a.help_scroll, 2);
+        a.dispatch_key(press(KeyCode::Char('k')));
+        assert_eq!(a.help_scroll, 1);
+
+        a.dispatch_key(press(KeyCode::End));
+        assert_eq!(a.help_scroll, max);
+        a.dispatch_key(press(KeyCode::Down));
+        assert_eq!(a.help_scroll, max, "no scrolling past the end");
+
+        a.dispatch_key(press(KeyCode::Char('g')));
+        assert_eq!(a.help_scroll, 0);
+        a.dispatch_key(press(KeyCode::Up));
+        assert_eq!(a.help_scroll, 0, "no scrolling past the top");
+    }
+
+    #[test]
+    fn help_pages_by_its_visible_height() {
+        let mut a = help_on_80x24();
+        let page = usize::from(a.hit.help_body.get().unwrap().height);
+        let max = crate::tui::views::help::max_scroll(&a);
+
+        a.dispatch_key(press(KeyCode::PageDown));
+        assert_eq!(a.help_scroll, page.min(max));
+        a.dispatch_key(press(KeyCode::PageUp));
+        assert_eq!(a.help_scroll, 0);
+    }
+
+    #[test]
+    fn help_reopens_at_the_top() {
+        let mut a = help_on_80x24();
+        a.dispatch_key(press(KeyCode::End));
+        assert!(a.help_scroll > 0);
+        a.dispatch_key(press(KeyCode::Esc));
+        assert_eq!(a.screen, Screen::Main);
+
+        a.dispatch_key(press(KeyCode::Char('?')));
+        assert_eq!(a.help_scroll, 0);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_help_only_over_its_body() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut a = help_on_80x24();
+        let body = a.hit.help_body.get().unwrap();
+        let wheel = |column, row| MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        a.handle_mouse(wheel(0, 0));
+        assert_eq!(a.help_scroll, 0, "outside the modal");
+
+        a.handle_mouse(wheel(body.x, body.y));
+        assert!(a.help_scroll > 0);
+    }
+
+    #[test]
+    fn help_that_fits_does_not_scroll() {
+        let mut a = app_on_main(1);
+        a.dispatch_key(press(KeyCode::Char('?')));
+        super::tests_support::draw_sized(&a, 120, 50);
+        a.dispatch_key(press(KeyCode::Down));
+        a.dispatch_key(press(KeyCode::End));
+        assert_eq!(a.help_scroll, 0);
     }
 
     // -- the hit map -----------------------------------------------------------

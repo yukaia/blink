@@ -843,12 +843,12 @@ impl Clone for TransferManager {
     }
 }
 
-/// Format a byte rate for display (e.g. "3.2 MB/s").
+/// Format a byte rate for display (e.g. "3.2 MiB/s").
 pub fn format_bytes_per_sec(bytes: u64) -> String {
     format_bytes(bytes) + "/s"
 }
 
-/// Format a byte size for display ("1.2 MB", "234 KB").
+/// Format a byte size for display ("1.2 MiB", "234 KiB").
 pub fn format_bytes(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = 1024.0 * KB;
@@ -865,6 +865,8 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Time left at `bytes_per_sec`, as `m:ss`. Minutes don't roll over into
+/// hours; "—" when nothing is moving.
 pub fn format_eta(bytes_remaining: u64, bytes_per_sec: u64) -> String {
     if bytes_per_sec == 0 {
         return "—".into();
@@ -881,6 +883,36 @@ pub fn format_eta(bytes_remaining: u64, bytes_per_sec: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rate_reads_as_a_size_per_second() {
+        assert_eq!(format_bytes_per_sec(0), "0 B/s");
+        assert_eq!(format_bytes_per_sec(512), "512 B/s");
+        assert_eq!(format_bytes_per_sec(1536), "2 KiB/s");
+        assert_eq!(
+            format_bytes_per_sec(3 * 1024 * 1024 + 200 * 1024),
+            "3.2 MiB/s"
+        );
+        assert_eq!(format_bytes_per_sec(5 * 1024 * 1024 * 1024), "5.0 GiB/s");
+    }
+
+    #[test]
+    fn an_eta_reads_as_minutes_and_seconds() {
+        assert_eq!(format_eta(600, 10), "1:00");
+        assert_eq!(format_eta(59, 10), "0:05");
+        assert_eq!(format_eta(3 * 3600 * 10, 10), "180:00", "no hours");
+    }
+
+    #[test]
+    fn an_eta_with_nothing_moving_is_a_dash() {
+        assert_eq!(format_eta(1000, 0), "—");
+    }
+
+    #[test]
+    fn an_eta_under_a_second_rounds_up_to_one() {
+        assert_eq!(format_eta(5, 1000), "0:01");
+        assert_eq!(format_eta(0, 1000), "0:01");
+    }
 
     #[test]
     fn parallelism_can_be_changed_within_its_limits() {

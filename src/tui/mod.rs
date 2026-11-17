@@ -62,14 +62,9 @@ fn install_panic_hook() {
                 return;
             }
             // Best effort — we're already panicking, so a failure here has
-            // nowhere useful to go. Order mirrors `restore`.
+            // nowhere useful to go.
             let _ = disable_raw_mode();
-            let _ = execute!(
-                io::stdout(),
-                LeaveAlternateScreen,
-                DisableMouseCapture,
-                Show
-            );
+            let _ = leave_screen(&mut io::stdout());
             previous(info);
         }));
     });
@@ -84,10 +79,7 @@ pub fn setup(mouse: bool) -> Result<TuiTerminal> {
     install_panic_hook();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    if mouse {
-        execute!(stdout, EnableMouseCapture)?;
-    }
+    enter_screen(&mut stdout, mouse)?;
     let backend = CrosstermBackend::new(stdout);
     let terminal = Terminal::new(backend)?;
     Ok(terminal)
@@ -95,13 +87,26 @@ pub fn setup(mouse: bool) -> Result<TuiTerminal> {
 
 pub fn restore(terminal: &mut TuiTerminal) -> Result<()> {
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    leave_screen(terminal.backend_mut())?;
+    // Already shown by `leave_screen`; this keeps ratatui's own record of
+    // the cursor in step.
     terminal.show_cursor()?;
     Ok(())
+}
+
+/// Switch `out` to the alternate screen, capturing the mouse if `mouse`.
+fn enter_screen(out: &mut impl io::Write, mouse: bool) -> io::Result<()> {
+    execute!(out, EnterAlternateScreen)?;
+    if mouse {
+        execute!(out, EnableMouseCapture)?;
+    }
+    Ok(())
+}
+
+/// Undo [`enter_screen`] and show the cursor. Shared by [`restore`] and the
+/// panic hook, so the two ways out leave the terminal the same.
+fn leave_screen(out: &mut impl io::Write) -> io::Result<()> {
+    execute!(out, LeaveAlternateScreen, DisableMouseCapture, Show)
 }
 
 /// Run the TUI to completion. Always restores the terminal even on error.
@@ -129,4 +134,45 @@ pub async fn run_with_session(
         .await;
     let _ = restore(&mut terminal);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{enter_screen, leave_screen};
+
+    const ALT_SCREEN_ON: &str = "\x1b[?1049h";
+    const ALT_SCREEN_OFF: &str = "\x1b[?1049l";
+    const MOUSE_ON: &str = "\x1b[?1000h";
+    const MOUSE_OFF: &str = "\x1b[?1000l";
+    const SHOW_CURSOR: &str = "\x1b[?25h";
+
+    fn written(f: impl FnOnce(&mut Vec<u8>) -> std::io::Result<()>) -> String {
+        let mut out = Vec::new();
+        f(&mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn entering_switches_to_the_alternate_screen_without_the_mouse() {
+        let out = written(|o| enter_screen(o, false));
+        assert_eq!(out, ALT_SCREEN_ON);
+    }
+
+    #[test]
+    fn entering_with_the_mouse_on_captures_it_after_switching() {
+        let out = written(|o| enter_screen(o, true));
+        assert!(out.starts_with(ALT_SCREEN_ON), "{out:?}");
+        assert!(out.contains(MOUSE_ON), "{out:?}");
+    }
+
+    /// Mouse capture is released whether or not it was taken: leaving does
+    /// not know how the screen was entered, and releasing it twice is
+    /// harmless where leaving it on is not.
+    #[test]
+    fn leaving_restores_the_screen_releases_the_mouse_and_shows_the_cursor() {
+        let out = written(leave_screen);
+        assert!(out.starts_with(ALT_SCREEN_OFF), "{out:?}");
+        assert!(out.contains(MOUSE_OFF), "{out:?}");
+        assert!(out.ends_with(SHOW_CURSOR), "{out:?}");
+    }
 }
