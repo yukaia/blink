@@ -847,6 +847,8 @@ pub enum OverwritePending {
         plan: Vec<PlannedJob>,
         /// Indices into `plan` that would overwrite an existing local file.
         conflict_indices: Vec<usize>,
+        /// Folders to create if the user goes ahead.
+        local_dirs: Vec<std::path::PathBuf>,
     },
     /// A finalized upload plan with files that would clobber existing
     /// remote files. Same three-way choice.

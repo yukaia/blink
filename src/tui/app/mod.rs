@@ -1604,6 +1604,7 @@ mod tests {
             unreadable_skipped: 0,
             unsafe_skipped: 0,
             unverifiable_uploads: 0,
+            local_dirs: Vec::new(),
             kind: CheckpointKind::Upload,
         }
     }
@@ -2789,6 +2790,64 @@ mod tests {
         assert_eq!(resolve_local_dir(std::path::Path::new("~root")), None);
     }
 
+    // -- local folders of a download ------------------------------------------
+
+    /// An app whose download plan into `home` conflicts, waiting at the
+    /// overwrite prompt; returns the folder the plan would create.
+    fn at_download_overwrite_prompt(home: &crate::paths::TestHome) -> (App, std::path::PathBuf) {
+        let mut a = app_with_manager();
+        a.screen = Screen::Main;
+        let dir = home.path().join("tree").join("empty");
+        let existing = home.path().join("existing.txt");
+        std::fs::write(&existing, b"old").unwrap();
+        a.handle_app_event(AppEvent::WalkComplete {
+            connection: a.connection,
+            plan: vec![crate::tui::plan::PlannedJob::Download {
+                remote_path: "/r/existing.txt".into(),
+                local_path: existing,
+            }],
+            conflict_indices: vec![0],
+            symlinks_skipped: 0,
+            unencodable_skipped: 0,
+            unreadable_skipped: 0,
+            unsafe_skipped: 0,
+            unverifiable_uploads: 0,
+            local_dirs: vec![dir.clone()],
+            kind: CheckpointKind::Download,
+        });
+        assert_eq!(a.screen, Screen::ConfirmOverwrite);
+        // The prompt opened on its own, so it ignores keys for a moment;
+        // these tests answer it as a user would after reading it.
+        a.prompt_ready_at = None;
+        (a, dir)
+    }
+
+    #[tokio::test]
+    async fn declining_a_download_at_the_prompt_creates_no_folders() {
+        let home = crate::paths::test_home();
+        let (mut a, dir) = at_download_overwrite_prompt(&home);
+        a.dispatch_key(press(KeyCode::Esc));
+        assert_eq!(a.screen, Screen::Main, "the prompt was answered");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!dir.exists());
+        assert!(!dir.parent().unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn going_ahead_with_a_download_creates_its_folders() {
+        let home = crate::paths::test_home();
+        let (mut a, dir) = at_download_overwrite_prompt(&home);
+        a.dispatch_key(press(KeyCode::Char('s')));
+        assert_eq!(a.screen, Screen::Main, "the prompt was answered");
+        let made = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !dir.is_dir() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(made.is_ok(), "{} was not created", dir.display());
+    }
+
     // -- downloading a remote symlink ------------------------------------------
 
     /// Plan a download of the remote entry `name`, listed as a symlink in
@@ -3462,6 +3521,7 @@ mod tests {
             unreadable_skipped: 0,
             unsafe_skipped: 0,
             unverifiable_uploads: 5,
+            local_dirs: Vec::new(),
             kind: CheckpointKind::Upload,
         });
         assert!(
@@ -3492,6 +3552,7 @@ mod tests {
             unreadable_skipped: 0,
             unsafe_skipped: 0,
             unverifiable_uploads: 0,
+            local_dirs: Vec::new(),
             kind: CheckpointKind::Upload,
         });
 
@@ -3516,6 +3577,7 @@ mod tests {
             unreadable_skipped: 0,
             unsafe_skipped: 0,
             unverifiable_uploads: 0,
+            local_dirs: Vec::new(),
             kind: CheckpointKind::Upload,
         });
 
@@ -3569,6 +3631,7 @@ mod tests {
             unreadable_skipped: 0,
             unsafe_skipped: 2,
             unverifiable_uploads: 0,
+            local_dirs: Vec::new(),
             kind: CheckpointKind::Download,
         });
         assert!(logged(
@@ -3668,6 +3731,7 @@ mod tests {
             unreadable_skipped: 12,
             unsafe_skipped: 0,
             unverifiable_uploads: 0,
+            local_dirs: Vec::new(),
             kind: CheckpointKind::Download,
         });
         assert!(logged(

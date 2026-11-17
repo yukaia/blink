@@ -1532,6 +1532,7 @@ pub mod confirm_overwrite {
             Some(OverwritePending::DownloadPlan {
                 plan,
                 conflict_indices,
+                ..
             }) => {
                 render_plan_body(&mut lines, app, plan, conflict_indices, PlanKind::Download);
             }
@@ -2536,6 +2537,7 @@ mod render_tests {
         a.pending_overwrite = Some(OverwritePending::DownloadPlan {
             plan: downloads(10),
             conflict_indices: (1..=8).collect(),
+            local_dirs: Vec::new(),
         });
         cases.push(("overwrite plan", a, "[n/esc] cancel"));
 
@@ -2972,6 +2974,7 @@ mod render_tests {
         a.pending_overwrite = Some(OverwritePending::DownloadPlan {
             plan: downloads(10),
             conflict_indices: (1..=8).collect(),
+            local_dirs: Vec::new(),
         });
         let text = screen(&a);
         assert!(

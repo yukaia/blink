@@ -193,6 +193,7 @@ impl App {
                 unreadable_skipped: 0,
                 unsafe_skipped: 0,
                 unverifiable_uploads: conflicts.unverifiable,
+                local_dirs: Vec::new(),
                 kind: CheckpointKind::Upload,
             });
         });
@@ -296,6 +297,7 @@ impl App {
             let mut symlinks_skipped: usize = 0;
             let mut unreadable_skipped: usize = 0;
             let mut unsafe_skipped: usize = 0;
+            let mut local_dirs = Vec::new();
             {
                 for root in roots {
                     // A symlink the user picked is followed, as a pick of a
@@ -316,6 +318,7 @@ impl App {
                                 symlinks_skipped += r.symlinks_skipped;
                                 unreadable_skipped += r.unreadable_skipped;
                                 unsafe_skipped += r.unsafe_skipped;
+                                local_dirs.extend(r.local_dirs);
                                 r.plan
                             }
                             Err(e) => {
@@ -353,8 +356,27 @@ impl App {
                 unreadable_skipped,
                 unsafe_skipped,
                 unverifiable_uploads: 0,
+                local_dirs,
                 kind: CheckpointKind::Download,
             });
+        });
+    }
+
+    /// Create the local folders a download plan records, now that it is going
+    /// ahead; see [`crate::tui::plan::WalkResult::local_dirs`]. Off the
+    /// interface's thread: a large tree is thousands of folders. A folder
+    /// that can't be made is logged; a download into it fails with its own
+    /// error.
+    pub(super) fn create_local_dirs(&mut self, dirs: Vec<PathBuf>) {
+        if dirs.is_empty() {
+            return;
+        }
+        tokio::task::spawn_blocking(move || {
+            for dir in dirs {
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    tracing::warn!(dir = %dir.display(), "could not create local folder: {e}");
+                }
+            }
         });
     }
 
@@ -375,12 +397,14 @@ impl App {
             OverwritePending::DownloadPlan {
                 plan,
                 conflict_indices,
+                local_dirs,
             } => {
                 let final_plan = if skip_conflicts {
                     drop_conflicting(plan, &conflict_indices)
                 } else {
                     plan
                 };
+                self.create_local_dirs(local_dirs);
                 self.dispatch_plan(final_plan, CheckpointKind::Download);
             }
             OverwritePending::UploadPlan {
