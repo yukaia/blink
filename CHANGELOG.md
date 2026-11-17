@@ -8,6 +8,18 @@ the git history for those.
 
 ## [Unreleased]
 
+### Added
+
+- **Ctrl+C quits**, from any screen, through the usual quit prompt; a
+  second Ctrl+C on the prompt quits at once.
+- **The log scrolls.** Focus it and use the arrows or page keys, or the
+  wheel over it. Scrolled back, it holds its place as lines arrive and
+  shows how many are newer.
+- **Remote symlinks are marked ↪ and open like what they point at.** Enter
+  or a double-click on a link to a folder opens the folder; a
+  double-click on a link to a file downloads it. Over FTP, where the
+  server can't say, a link is treated as a file.
+
 ### Changed
 
 - **On Windows, the config folder is now `%APPDATA%\blink`.** It was in
@@ -65,6 +77,57 @@ the git history for those.
   before, they were accepted whatever they presented.
 
 ### Fixed
+
+- **Help no longer traps you in a prompt.** Opening help over the cancel
+  prompt, then closing it, left that prompt answering every key by
+  reopening itself. Help over the quit prompt did the same, leaving quit
+  the only way out. Help now always returns where it was opened, and isn't
+  offered on the quit prompt. Help opened from the session list also
+  shows the session list behind it, not the file view.
+- **`s` on a rename's overwrite prompt no longer replaces the file.** The
+  prompt only offers `y` and `n`; `s`, which skips conflicts in a
+  transfer's prompt, went ahead with the rename.
+- **Ctrl and Alt combinations no longer type letters.** Ctrl+W in a text
+  field typed `w`, and in the file view the letter shortcuts fired with
+  Ctrl or Alt held: Ctrl+C on the transfers pane opened the cancel prompt.
+  AltGr characters still type.
+- **`?` can be typed into a new folder's name.** It opened help instead.
+- **The transfer list scrolls.** Up to ten transfers run at once and the
+  pane shows eight; the cursor, and what `c` would cancel, could be on one
+  out of sight.
+- **Uploads show ↑ in the transfer list.** Every row showed ↓.
+- **A session's own theme applies.** `[appearance] theme` in a session file
+  was saved and documented but never used. It now applies while that
+  session is connected.
+- **Ctrl+S won't overwrite another saved session.** Saving under a name
+  another session already has is refused, as the edit form refuses it.
+- **A changed-host-key warning waits until you're free.** Raised by a
+  transfer mid-session, it took over at once: a form in progress was lost,
+  and a `q` or Enter being typed dismissed the warning unread, which
+  disconnects. It now opens once you're back at the file list, ignoring
+  keys briefly as it opens, as the other prompts that arrive on their own
+  do. Disconnecting also closes the viewer, so an image can't be redrawn
+  over the session list.
+- **The viewer's End and `G` show the last full page**, not the last line
+  alone at the top.
+- **The file panes agree with each other:**
+  - F5 on the local pane keeps its rows and cursor while it lists, as the
+    remote pane does, instead of blanking and jumping to the top.
+  - The local pane shows no `..` at `/`.
+  - The pane footer doesn't count `..` as an item.
+  - The filter ignores case for every letter, not just ASCII ones.
+  - The path line shows server names the way the file list does, and a
+    long path loses its middle rather than its end.
+- **A rename onto a name the filter hides asks to overwrite**, instead of
+  failing on the server.
+- **The overwrite prompt tells same-named files apart**, showing each below
+  the folder they share: `a/readme.md` and `b/readme.md`, not `readme.md`
+  twice.
+- **Smaller fixes:** help lists `r`/`R`, `D`, Ctrl+C and the viewer and
+  session-list keys, and says `p` pauses all transfers, not just
+  downloads; the missing-graphics message lists sixel; a failed rename is
+  logged by name, as a successful one is; and a selection with no usable
+  names no longer logs "preparing 0 download(s)".
 
 - **An FTP server that won't resume no longer blocks a download.** After
   an interrupted download, a server that refuses to resume (REST) failed

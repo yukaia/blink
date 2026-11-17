@@ -1693,6 +1693,21 @@ mod tests {
         }
     }
 
+    /// End used to put the last line at the top, leaving a page of one
+    /// line; it stops with the last line at the bottom, as help does.
+    #[test]
+    fn the_viewer_scrolls_no_further_than_its_last_full_page() {
+        let mut a = viewing(text_lines(100));
+        super::super::tests_support::draw(&a);
+        let rows = usize::from(a.hit.viewer_body.get().unwrap().height);
+        press(&mut a, KeyCode::End);
+        assert_eq!(scroll_of(&a), 100 - rows);
+        press(&mut a, KeyCode::Down);
+        assert_eq!(scroll_of(&a), 100 - rows);
+        press(&mut a, KeyCode::Up);
+        assert_eq!(scroll_of(&a), 99 - rows, "one line up moves at once");
+    }
+
     #[test]
     fn viewer_keys_scroll_and_stop_at_both_ends() {
         let mut a = viewing(text_lines(50));

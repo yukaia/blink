@@ -454,6 +454,7 @@ pub mod help {
             kv("  bksp      ", "go up to parent directory", key_s),
             kv("  tab       ", "switch active pane", key_s),
             kv("  ↑ ↓       ", "move cursor (pgup/pgdn for page)", key_s),
+            kv("            ", "in the log pane, scroll it", key_s),
             Line::from(""),
             Line::from(Span::styled("  FILES", acc_s)),
             kv("  space     ", "select / deselect", key_s),
@@ -477,6 +478,11 @@ pub mod help {
             kv("  F2        ", "rename file or folder (remote pane)", key_s),
             kv("  F7        ", "create new remote directory", key_s),
             kv("  shift+del ", "delete file or folder (remote pane)", key_s),
+            kv(
+                "  D         ",
+                "delete, where shift+del doesn't reach",
+                key_s,
+            ),
             Line::from(""),
             Line::from(Span::styled("  SESSION", acc_s)),
             kv("  ctrl+s    ", "save current session", key_s),
@@ -485,17 +491,34 @@ pub mod help {
                 "disconnect (return to session selector)",
                 key_s,
             ),
-            kv("  p         ", "pause / resume active downloads", key_s),
             kv("  t         ", "cycle to the next theme", key_s),
+            Line::from(""),
+            Line::from(Span::styled("  TRANSFERS", acc_s)),
+            kv("  p         ", "pause / resume all transfers", key_s),
             kv(
                 "  c         ",
                 "cancel selected transfer (Transfers pane)",
                 key_s,
             ),
             kv("  C         ", "cancel whole batch (Transfers pane)", key_s),
+            kv(
+                "  r · R     ",
+                "resume an interrupted download · upload batch",
+                key_s,
+            ),
+            Line::from(""),
+            Line::from(Span::styled("  VIEWER", acc_s)),
+            kv("  ↑ ↓ · j k ", "scroll a line", key_s),
+            kv("  pgup pgdn ", "scroll a page (space too)", key_s),
+            kv("  g · G     ", "top · bottom", key_s),
+            Line::from(""),
+            Line::from(Span::styled("  SESSION LIST", acc_s)),
+            kv("  ↵         ", "connect", key_s),
+            kv("  n · e · d ", "new · edit · delete", key_s),
             Line::from(""),
             Line::from(Span::styled("  APP", acc_s)),
             kv("  ?         ", "toggle this help", key_s),
+            kv("  ctrl+c    ", "quit, from anywhere", key_s),
             kv("  q · esc   ", "quit (with confirmation)", key_s),
         ]
     }
@@ -988,7 +1011,7 @@ pub mod viewer {
         }
 
         // One entry per line, so the token count is the line count.
-        let start = scroll.min(tokens.len().saturating_sub(1));
+        let start = scroll.min(crate::tui::app::text_scroll_limit(tokens.len(), h));
         let end = (start + h).min(tokens.len());
         let lineno_width = end.to_string().len();
 
@@ -2442,13 +2465,21 @@ mod render_tests {
 
     #[test]
     fn help_fits_whole_on_a_tall_terminal() {
-        let text = text_of(&draw_sized(&on(Screen::Help), 120, 50));
+        let text = text_of(&draw_sized(&on(Screen::Help), 120, 70));
         assert!(text.contains("HELP — keyboard shortcuts"), "{text}");
-        for wanted in ["NAVIGATION", "ctrl+d", "F7", "quit (with confirmation)"] {
+        for wanted in [
+            "NAVIGATION",
+            "ctrl+d",
+            "F7",
+            "r · R",
+            "SESSION LIST",
+            "ctrl+c",
+            "quit (with confirmation)",
+        ] {
             assert!(text.contains(wanted), "missing {wanted:?}:\n{text}");
         }
         assert!(text.contains("esc / ?  to close"), "{text}");
-        assert!(!text.contains("scroll"), "nothing to scroll:\n{text}");
+        assert!(!text.contains("[↑↓] scroll"), "nothing to scroll:\n{text}");
     }
 
     #[test]

@@ -544,8 +544,8 @@ The full list lives in the in-app help overlay (`?`). Highlights:
 | Key            | Action                                       |
 | -------------- | -------------------------------------------- |
 | `Tab` / `Shift-Tab` | cycle focus (Local → Remote → Transfers → Log; the last two are tabs of the bottom pane) |
-| `↑` / `↓`      | move cursor                                  |
-| `↵`            | enter directory                              |
+| `↑` / `↓`      | move cursor; in the Log pane, scroll the log (`PgUp` / `PgDn` a page) |
+| `↵`            | enter directory (or a remote symlink to one) |
 | `backspace`    | go up to parent directory                    |
 | `space`        | select / deselect                            |
 | `Ctrl-D`       | download selected items                      |
@@ -566,6 +566,7 @@ The full list lives in the in-app help overlay (`?`). Highlights:
 | `p`            | pause / resume all transfers                 |
 | `?`            | toggle help                                  |
 | `q` / `esc`    | quit (confirms unless `confirm_quit = false`) |
+| `Ctrl-C`       | quit from any screen, through the same prompt; again on the prompt to quit at once |
 
 In the session selector: `n` new, `e` edit, `d` delete, `t` cycle theme.
 
@@ -579,14 +580,14 @@ On by default; `mouse = false` under `[terminal]` in `config.ini` turns it
 off and leaves the terminal's own text selection alone.
 
 - **Click** a file pane to focus it; click a row to move the cursor there.
-- **Double-click** a directory (or `..`) to enter it; a remote file to
-  download it, or a local file to upload it — just that file, whatever
-  else is selected.
+- **Double-click** a directory (or `..`, or a remote symlink to a
+  directory) to enter it; a remote file to download it, or a local file to
+  upload it — just that file, whatever else is selected.
 - **Scroll wheel** moves the cursor in the pane under the mouse, the
-  transfer list, and the session list, and scrolls the viewer.
+  transfer list, and the session list, and scrolls the log and the viewer.
 - **Click** the TRANSFERS / LOG tabs to switch them, and a transfer to select
   it; a click anywhere else in the bottom pane focuses it, and so does the
-  wheel over the transfer list. In the session selector, click a session to
+  wheel over the transfer list or the log. In the session selector, click a session to
   select it and double-click to connect.
 
 Prompts and modals ignore the mouse, and so do clicks with Ctrl or Alt held.

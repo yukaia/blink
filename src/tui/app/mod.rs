@@ -439,6 +439,7 @@ mod mouse;
 mod panes;
 mod transfers;
 mod viewer;
+pub(crate) use viewer::text_scroll_limit;
 
 impl App {
     pub fn new(config: Config, theme: Theme) -> Self {

@@ -715,8 +715,8 @@ pub enum EditField {
     /// Parallel transfers override. Empty string = use the global default.
     Parallel,
     /// Toggle for `accept_invalid_certs` on the session. Toggled with Space
-    /// or Enter rather than text-typed; cycles through it like any other
-    /// field with Tab / Up / Down.
+    /// rather than typed into (Enter saves the form, as on every field);
+    /// reached like any other field with Tab / Up / Down.
     AcceptInvalidCerts,
 }
 

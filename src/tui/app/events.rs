@@ -538,7 +538,7 @@ impl App {
                                 ViewerKind::Unsupported(format!(
                                     "no supported graphics protocol \
                                          (TERM={term}). \
-                                         supported: kitty, ghostty, wezterm, iterm2"
+                                         supported: kitty, sixel, iterm2"
                                 ))
                             } else {
                                 needs_redraw = true;
