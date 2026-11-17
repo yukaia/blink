@@ -2653,6 +2653,94 @@ mod integration {
         }
     }
 
+    // --- scp:// ---
+    //
+    // SCP is SFTP under another name: every method of `ScpTransport` hands
+    // straight to an `SftpTransport`. These run each one against the server
+    // to show the hand-off reaches it.
+
+    async fn connect_scp(port: u16) -> crate::transport::scp::ScpTransport {
+        let mut session = test_session(port);
+        session.protocol = Protocol::Scp;
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let mut fut = Box::pin(crate::transport::scp::ScpTransport::connect(
+            &session,
+            Some("pw"),
+            ev_tx,
+            crate::known_hosts::SessionTrust::new(),
+            crate::transport::UserWait::new().0,
+        ));
+        loop {
+            tokio::select! {
+                res = &mut fut => return res.expect("connect should succeed"),
+                Some(ev) = ev_rx.recv() => {
+                    if let AppEvent::HostKeyUnknown { decision_tx, .. } = ev {
+                        let _ = decision_tx.send(HostKeyDecision::AcceptOnce);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scp_reports_itself_as_scp_and_does_everything_through_sftp() {
+        let home = crate::paths::test_home();
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let (port, _connects) = start_server(store.clone()).await;
+        let mut t = connect_scp(port).await;
+        assert_eq!(t.protocol(), Protocol::Scp);
+
+        t.mkdir("/d").await.unwrap();
+        assert!(store.lock().await.contains_key("/d/"));
+
+        let up = home.path().join("up.txt");
+        std::fs::write(&up, b"hello").unwrap();
+        t.upload(&up, "/d/a.txt", None).await.unwrap();
+        assert_eq!(
+            store.lock().await.get("/d/a.txt").map(Vec::as_slice),
+            Some(&b"hello"[..])
+        );
+
+        let listing = t.list("/d").await.unwrap();
+        let names: Vec<&str> = listing
+            .entries
+            .iter()
+            .map(|e| e.raw_name.as_str())
+            .collect();
+        assert!(names.contains(&"a.txt"), "{names:?}");
+
+        let meta = t.metadata("/d/a.txt").await.unwrap().expect("exists");
+        assert_eq!(meta.size, 5);
+        assert!(t.metadata("/d/none").await.unwrap().is_none());
+
+        assert_eq!(&t.read_to_bytes("/d/a.txt").await.unwrap()[..], b"hello");
+
+        let down = home.path().join("down.txt");
+        t.download("/d/a.txt", &down, None).await.unwrap();
+        assert_eq!(std::fs::read(&down).unwrap(), b"hello");
+
+        t.rename("/d/a.txt", "/d/b.txt").await.unwrap();
+        store
+            .lock()
+            .await
+            .insert("/d/c.txt".to_string(), b"old".to_vec());
+        t.rename_over("/d/b.txt", "/d/c.txt").await.unwrap();
+        assert_eq!(
+            store.lock().await.get("/d/c.txt").map(Vec::as_slice),
+            Some(&b"hello"[..])
+        );
+
+        t.delete_file("/d/c.txt").await.unwrap();
+        t.delete_dir("/d", false).await.unwrap();
+        assert!(
+            store.lock().await.is_empty(),
+            "{:?}",
+            store.lock().await.keys()
+        );
+
+        t.close().await.unwrap();
+    }
+
     /// Connect with `auth`, returning the transport and the host key type the
     /// TOFU prompt reported. The key type is the only place the negotiated
     /// host-key algorithm is observable from outside — `SessionTrust` keeps
