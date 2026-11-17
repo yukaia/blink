@@ -278,6 +278,45 @@ pub(crate) mod tests {
         cfg
     }
 
+    #[test]
+    fn the_first_load_writes_a_default_config_to_edit() {
+        let _home = crate::paths::test_home();
+        let path = crate::paths::config_file().unwrap();
+        assert!(!path.exists());
+
+        let cfg = Config::load().unwrap();
+
+        assert_eq!(cfg.general.theme, Config::default().general.theme);
+        assert!(path.exists(), "a default config.ini is written");
+        let again = Config::load().unwrap();
+        assert_eq!(again.general.theme, cfg.general.theme);
+    }
+
+    #[test]
+    fn load_reads_the_users_config() {
+        let _home = crate::paths::test_home();
+        std::fs::write(
+            crate::paths::config_file().unwrap(),
+            "[general]\ntheme = nord\nparallel_downloads = 3\n",
+        )
+        .unwrap();
+        let cfg = Config::load().unwrap();
+        assert_eq!(cfg.general.theme, "nord");
+        assert_eq!(cfg.general.parallel_downloads, 3);
+    }
+
+    #[test]
+    fn load_refuses_a_config_it_cannot_read() {
+        let _home = crate::paths::test_home();
+        std::fs::write(
+            crate::paths::config_file().unwrap(),
+            "[general]\nparallel_downloads = lots\n",
+        )
+        .unwrap();
+        let err = Config::load().unwrap_err();
+        assert!(err.to_string().contains("parallel_downloads"), "{err}");
+    }
+
     /// The first ```ini block after `heading` in the README.
     pub(crate) fn readme_ini_block(heading: &str) -> String {
         let readme = include_str!("../README.md");

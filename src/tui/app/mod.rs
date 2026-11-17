@@ -2750,6 +2750,42 @@ mod tests {
         );
     }
 
+    // -- a session's local folder ----------------------------------------------
+
+    #[test]
+    fn a_local_dir_that_exists_is_used_as_is() {
+        let home = crate::paths::test_home();
+        assert_eq!(
+            resolve_local_dir(home.path()),
+            Some(home.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn a_local_dir_that_is_missing_or_a_file_is_not_used() {
+        let home = crate::paths::test_home();
+        assert_eq!(resolve_local_dir(&home.path().join("missing")), None);
+        let file = home.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(resolve_local_dir(&file), None);
+    }
+
+    #[test]
+    fn a_tilde_means_the_home_folder() {
+        let Some(user) = directories::UserDirs::new() else {
+            return;
+        };
+        let real_home = user.home_dir().to_path_buf();
+        let want = real_home.is_dir().then(|| real_home.clone());
+        assert_eq!(resolve_local_dir(std::path::Path::new("~")), want);
+        assert_eq!(
+            resolve_local_dir(std::path::Path::new("~/surely-not-a-folder-blink-made")),
+            None
+        );
+        // `~user` is not expanded: it names a folder called `~user`.
+        assert_eq!(resolve_local_dir(std::path::Path::new("~root")), None);
+    }
+
     // -- help scrolling -------------------------------------------------------
     //
     // Help is taller than an 80x24 terminal, so it scrolls. The limit comes
