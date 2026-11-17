@@ -1,5 +1,7 @@
 //! blink — terminal SFTP/SCP/FTP/FTPS client.
 
+use std::io::Write;
+
 use clap::{Parser, Subcommand};
 
 mod checkpoint;
@@ -107,8 +109,10 @@ async fn main() -> Result<()> {
 
     match cli.command {
         None => tui::run(config, theme).await,
-        Some(Command::Sessions) => list_sessions(),
-        Some(Command::Themes) => list_themes(),
+        Some(Command::Sessions) => {
+            list_sessions(&mut std::io::stdout().lock(), &mut std::io::stderr().lock())
+        }
+        Some(Command::Themes) => list_themes(&mut std::io::stdout().lock()),
         Some(Command::Open { name }) => {
             let session = session::Session::list_all()?
                 .into_iter()
@@ -124,35 +128,43 @@ async fn main() -> Result<()> {
         }
         Some(Command::Checkpoints { clean, force }) => list_checkpoints(clean, force),
         Some(Command::KnownHosts { action }) => match action {
-            KnownHostsAction::Remove { host, port } => remove_known_host(&host, port),
+            KnownHostsAction::Remove { host, port } => {
+                remove_known_host(&mut std::io::stdout().lock(), &host, port)
+            }
         },
     }
 }
 
 /// Forget the stored host key(s) for `host` on `port`.
-fn remove_known_host(host: &str, port: u16) -> Result<()> {
+fn remove_known_host(out: &mut impl Write, host: &str, port: u16) -> Result<()> {
     let removed = known_hosts::remove_host(host, port)?;
     let shown = sanitize_display(host);
     if removed == 0 {
         // Almost always a host-form mismatch rather than a real absence, so
         // say what was searched for instead of just "not found".
-        println!("no stored key for {shown} port {port} — nothing removed");
-        println!(
+        writeln!(
+            out,
+            "no stored key for {shown} port {port} — nothing removed"
+        )?;
+        writeln!(
+            out,
             "entries are stored per host AND port; check `{}` if the host looks right",
             known_hosts::known_hosts_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| "the known_hosts file".to_string()),
-        );
+        )?;
         return Ok(());
     }
     let plural = if removed == 1 { "entry" } else { "entries" };
-    println!("removed {removed} {plural} for {shown} port {port}");
-    println!("the next connect will ask you to verify the server's key");
+    writeln!(out, "removed {removed} {plural} for {shown} port {port}")?;
+    writeln!(
+        out,
+        "the next connect will ask you to verify the server's key"
+    )?;
     Ok(())
 }
 
 fn init_tracing() {
-    use std::fs::OpenOptions;
     use tracing_subscriber::{EnvFilter, fmt};
 
     let filter = EnvFilter::try_from_env("BLINK_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
@@ -160,38 +172,9 @@ fn init_tracing() {
     // If BLINK_LOG_FILE is set, write logs there; otherwise discard them so
     // they don't smear the TUI. Example: BLINK_LOG_FILE=/tmp/blink.log BLINK_LOG=debug blink
     if let Ok(log_path) = std::env::var("BLINK_LOG_FILE") {
-        let mut opts = OpenOptions::new();
-        opts.create(true).append(true);
-
-        // At debug level this file carries hostnames, usernames, and remote
-        // paths. Unlike everything else blink writes, it lives at a
-        // user-chosen path rather than inside the 0700 config dir, so it
-        // needs its own restrictive mode instead of inheriting the umask
-        // default (typically 0644).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            opts.mode(0o600);
-        }
-
-        if let Ok(file) = opts.open(&log_path) {
-            // `mode` only applies when the file is created. A log file left
-            // over from an older blink (or created by another tool) keeps
-            // its original permissions, so say so rather than silently
-            // writing secrets into a world-readable file.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt as _;
-                if let Ok(meta) = file.metadata()
-                    && meta.mode() & 0o077 != 0
-                {
-                    eprintln!(
-                        "warning: {} is readable by other users (mode {:o}); \
-                         logs may contain hostnames and remote paths",
-                        sanitize_display(&log_path),
-                        meta.mode() & 0o7777,
-                    );
-                }
+        if let Ok((file, warning)) = open_log_file(&log_path) {
+            if let Some(warning) = warning {
+                eprintln!("{warning}");
             }
 
             let _ = fmt()
@@ -220,33 +203,310 @@ fn init_tracing() {
         .try_init();
 }
 
-fn list_sessions() -> Result<()> {
+/// Open (creating if needed) the file named by `BLINK_LOG_FILE`, plus a
+/// warning to print when other users can read it.
+fn open_log_file(log_path: &str) -> std::io::Result<(std::fs::File, Option<String>)> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+
+    // At debug level this file carries hostnames, usernames, and remote
+    // paths. Unlike everything else blink writes, it lives at a user-chosen
+    // path rather than inside the 0700 config dir, so it needs its own
+    // restrictive mode instead of inheriting the umask default (typically
+    // 0644).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+
+    let file = opts.open(log_path)?;
+
+    // `mode` only applies when the file is created. A log file left over
+    // from an older blink (or created by another tool) keeps its original
+    // permissions, so say so rather than silently writing secrets into a
+    // world-readable file.
+    #[cfg(unix)]
+    let warning = {
+        use std::os::unix::fs::MetadataExt as _;
+        file.metadata()
+            .ok()
+            .filter(|meta| meta.mode() & 0o077 != 0)
+            .map(|meta| {
+                format!(
+                    "warning: {} is readable by other users (mode {:o}); \
+                     logs may contain hostnames and remote paths",
+                    sanitize_display(log_path),
+                    meta.mode() & 0o7777,
+                )
+            })
+    };
+    #[cfg(not(unix))]
+    let warning = None;
+    Ok((file, warning))
+}
+
+fn list_sessions(out: &mut impl Write, err: &mut impl Write) -> Result<()> {
     let listing = session::Session::list_all_detailed()?;
     for s in &listing.sessions {
-        println!(
+        writeln!(
+            out,
             "{:<14}  {:<6}  {}@{}:{}",
             sanitize_display(&s.name),
             s.protocol.as_str(),
             sanitize_display(&s.username),
             sanitize_display(&s.host),
             s.port,
-        );
+        )?;
     }
     // A session file that won't load is otherwise invisible: it just doesn't
     // appear above. Say so, on stderr so the listing stays pipeable.
     for skip in &listing.skipped {
-        eprintln!("warning: skipped {}", sanitize_display(skip));
+        writeln!(err, "warning: skipped {}", sanitize_display(skip))?;
     }
     Ok(())
 }
 
-fn list_themes() -> Result<()> {
+fn list_themes(out: &mut impl Write) -> Result<()> {
     for name in Theme::list_builtin_names() {
-        println!("{name}");
+        writeln!(out, "{name}")?;
     }
     Ok(())
 }
 
 fn list_checkpoints(clean: bool, force: bool) -> Result<()> {
     crate::checkpoint::list_and_clean(clean, force)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(buf: Vec<u8>) -> String {
+        String::from_utf8(buf).unwrap()
+    }
+
+    // --- argument parsing ---
+
+    #[test]
+    fn both_version_flags_print_the_version() {
+        for flag in ["-v", "--version"] {
+            let err = Cli::try_parse_from(["blink", flag]).unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion, "{flag}");
+        }
+    }
+
+    #[test]
+    fn no_subcommand_opens_the_tui() {
+        assert!(Cli::try_parse_from(["blink"]).unwrap().command.is_none());
+    }
+
+    #[test]
+    fn known_hosts_remove_defaults_to_port_22() {
+        let cli = Cli::try_parse_from(["blink", "known-hosts", "remove", "h.example"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::KnownHosts {
+                action: KnownHostsAction::Remove { ref host, port: 22 }
+            }) if host == "h.example"
+        ));
+
+        let cli =
+            Cli::try_parse_from(["blink", "known-hosts", "remove", "h", "--port", "2222"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::KnownHosts {
+                action: KnownHostsAction::Remove { port: 2222, .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn checkpoints_flags_parse() {
+        let cli = Cli::try_parse_from(["blink", "checkpoints", "--clean", "--force"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Checkpoints {
+                clean: true,
+                force: true
+            })
+        ));
+    }
+
+    // --- `blink sessions` ---
+
+    #[test]
+    fn sessions_lists_each_saved_session_on_one_line() {
+        let _home = crate::paths::test_home();
+        let mut s = session::Session::from_url("sftp://alice@files.example:2222").unwrap();
+        s.name = "work".into();
+        s.save().unwrap();
+
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        list_sessions(&mut out, &mut err).unwrap();
+
+        assert_eq!(
+            text(out),
+            "work            sftp    alice@files.example:2222\n"
+        );
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn sessions_with_none_saved_prints_nothing() {
+        let _home = crate::paths::test_home();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        list_sessions(&mut out, &mut err).unwrap();
+        assert!(out.is_empty());
+        assert!(err.is_empty());
+    }
+
+    #[test]
+    fn sessions_warns_on_stderr_about_a_file_that_will_not_load() {
+        let _home = crate::paths::test_home();
+        let dir = crate::paths::sessions_dir().unwrap();
+        std::fs::write(dir.join("broken.ini"), "not an ini [[[").unwrap();
+
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        list_sessions(&mut out, &mut err).unwrap();
+
+        assert!(out.is_empty(), "the listing stays pipeable");
+        let err = text(err);
+        assert!(err.starts_with("warning: skipped broken.ini"), "{err}");
+    }
+
+    // --- `blink themes` ---
+
+    #[test]
+    fn themes_prints_every_builtin_one_per_line() {
+        let mut out = Vec::new();
+        list_themes(&mut out).unwrap();
+        let out = text(out);
+        let names: Vec<&str> = out.lines().collect();
+        assert_eq!(names, Theme::list_builtin_names());
+        assert!(names.contains(&"dracula"));
+    }
+
+    // --- `blink known-hosts remove` ---
+
+    #[test]
+    fn removing_a_stored_host_says_how_many_entries_went() {
+        let _home = crate::paths::test_home();
+        let path = known_hosts::known_hosts_path().unwrap();
+        std::fs::write(
+            &path,
+            "a.example ssh-ed25519 AAAA\na.example ssh-rsa BBBB\nb.example ssh-ed25519 CCCC\n",
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        remove_known_host(&mut out, "a.example", 22).unwrap();
+        assert_eq!(
+            text(out),
+            "removed 2 entries for a.example port 22\n\
+             the next connect will ask you to verify the server's key\n",
+        );
+
+        let mut out = Vec::new();
+        remove_known_host(&mut out, "b.example", 22).unwrap();
+        assert!(text(out).starts_with("removed 1 entry for b.example port 22\n"));
+    }
+
+    #[test]
+    fn removing_an_unknown_host_names_what_was_searched_and_the_file() {
+        let _home = crate::paths::test_home();
+        let path = known_hosts::known_hosts_path().unwrap();
+        std::fs::write(&path, "a.example ssh-ed25519 AAAA\n").unwrap();
+
+        let mut out = Vec::new();
+        remove_known_host(&mut out, "a.example", 2222).unwrap();
+        let out = text(out);
+        assert!(
+            out.starts_with("no stored key for a.example port 2222 — nothing removed\n"),
+            "{out}"
+        );
+        assert!(out.contains(&path.display().to_string()), "{out}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a.example ssh-ed25519 AAAA\n"
+        );
+    }
+
+    #[test]
+    fn the_removed_host_is_sanitized_before_printing() {
+        let _home = crate::paths::test_home();
+        let mut out = Vec::new();
+        remove_known_host(&mut out, "evil\x1b[2Jhost", 22).unwrap();
+        assert!(!text(out).contains('\x1b'));
+    }
+
+    // --- BLINK_LOG_FILE ---
+
+    #[cfg(unix)]
+    fn mode_of(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(path).unwrap().mode() & 0o7777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_log_file_is_private_to_the_user() {
+        let home = crate::paths::test_home();
+        let path = home.path().join("blink.log");
+
+        let (_file, warning) = open_log_file(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(mode_of(&path), 0o600);
+        assert_eq!(warning, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_world_readable_log_file_is_warned_about_and_left_as_is() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = crate::paths::test_home();
+        let path = home.path().join("blink.log");
+        std::fs::write(&path, "old line\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let (mut file, warning) = open_log_file(path.to_str().unwrap()).unwrap();
+
+        let warning = warning.expect("a 0644 log file is warned about");
+        assert!(
+            warning.contains("readable by other users (mode 644)"),
+            "{warning}"
+        );
+        assert_eq!(
+            mode_of(&path),
+            0o644,
+            "blink does not chmod the user's file"
+        );
+
+        // Appends rather than truncating.
+        file.write_all(b"new line\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "old line\nnew line\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_private_log_file_is_not_warned_about() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let home = crate::paths::test_home();
+        let path = home.path().join("blink.log");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let (_file, warning) = open_log_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(warning, None);
+    }
+
+    #[test]
+    fn a_log_file_in_a_missing_directory_is_an_error() {
+        let home = crate::paths::test_home();
+        let path = home.path().join("no-such-dir").join("blink.log");
+        assert!(open_log_file(path.to_str().unwrap()).is_err());
+    }
 }
