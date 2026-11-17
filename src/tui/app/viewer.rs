@@ -306,17 +306,70 @@ pub(super) fn tokenize_lines(
 
 /// Read at most `limit + 1` bytes of `path`: enough for the viewer to tell
 /// a file over its limit from one at it, however large the file has grown
-/// since it was listed — or if it never ends, like a FIFO.
+/// since it was listed.
+///
+/// Only a regular file is read. Opening a FIFO waits for a writer and
+/// reading a device may never end, so on Unix the open doesn't block, and
+/// anything that turns out not to be a file is refused.
 pub(super) async fn read_local_bounded(
     path: &std::path::Path,
     limit: u64,
 ) -> std::io::Result<Vec<u8>> {
     use tokio::io::AsyncReadExt as _;
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    opts.custom_flags(libc::O_NONBLOCK);
+    let file = opts.open(path).await?;
+    if !file.metadata().await?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
     let mut buf = Vec::new();
-    tokio::fs::File::open(path)
-        .await?
-        .take(limit + 1)
-        .read_to_end(&mut buf)
-        .await?;
+    file.take(limit + 1).read_to_end(&mut buf).await?;
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_local_bounded;
+
+    #[tokio::test]
+    async fn a_file_is_read_up_to_one_byte_past_the_limit() {
+        let home = crate::paths::test_home();
+        let path = home.path().join("f.txt");
+        std::fs::write(&path, b"0123456789").unwrap();
+        assert_eq!(read_local_bounded(&path, 4).await.unwrap(), b"01234");
+        assert_eq!(read_local_bounded(&path, 99).await.unwrap(), b"0123456789");
+    }
+
+    /// Opening a FIFO waits for a writer, so viewing one left the viewer on
+    /// "loading" and a blocking thread held for as long as none came.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_is_refused_rather_than_waited_on() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let home = crate::paths::test_home();
+        let path = home.path().join("pipe.txt");
+        let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_local_bounded(&path, 100),
+        )
+        .await;
+        // Release an open still waiting, so a failing run ends instead of
+        // hanging on the runtime's shutdown.
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path);
+
+        let err = read.expect("must not wait for a writer").unwrap_err();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
 }

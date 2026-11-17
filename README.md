@@ -931,10 +931,12 @@ declaring huge dimensions is still rejected.
   the upload completes (and fsyncs, where the server supports
   `fsync@openssh.com`). SFTP uses `posix-rename@openssh.com` for an
   atomic replace when the server offers it; otherwise (and on FTP/FTPS,
-  where overwrite-on-rename is server-dependent) the target is removed
-  and the rename retried — that window can expose "old file gone, new
-  file still at `.blink-part`", but never a truncated file under the
-  final name. An upload interrupted by a hard kill or dropped connection
+  where overwrite-on-rename is server-dependent) a file in the way is
+  moved aside to `<remote>.<hash>.blink-old`, the rename retried, and the
+  old file removed once it lands, or moved back if it doesn't — that
+  window can expose "old file at `.blink-old`, new file still at
+  `.blink-part`", but never a truncated file under the final name. An
+  upload interrupted by a hard kill or dropped connection
   can leave a stale `<remote>.<hash>.blink-part` behind; re-running the upload
   reuses (truncates) it.
 - Config directories are created with mode 0700 on Unix (not

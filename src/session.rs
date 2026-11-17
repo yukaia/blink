@@ -38,6 +38,9 @@ use crate::paths;
 /// Maximum session file size accepted on load (64 KiB).
 const MAX_SESSION_BYTES: u64 = 64 * 1024;
 
+/// What a port that can't be used is told.
+const PORT_RANGE: &str = "session.port must be a number from 1 to 65535";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Protocol {
     Sftp,
@@ -242,6 +245,9 @@ impl Session {
         if self.name.trim().is_empty() {
             return Err(BlinkError::config("session.name must not be empty"));
         }
+        if self.port == 0 {
+            return Err(BlinkError::config(PORT_RANGE));
+        }
         validate_network_field("name", &self.name)?;
         validate_network_field("host", &self.host)?;
         validate_network_field("username", &self.username)?;
@@ -427,10 +433,17 @@ impl Session {
             .to_string();
         validate_network_field("host", &host)?;
 
-        let port: u16 = s
-            .get("port")
-            .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| protocol.default_port());
+        // A missing or empty port is the protocol's default. One that is
+        // there and isn't a port is refused: falling back to the default
+        // connected, and sent the password, somewhere the file doesn't name.
+        let port: u16 = match s.get("port").map(str::trim).filter(|v| !v.is_empty()) {
+            None => protocol.default_port(),
+            Some(v) => v
+                .parse()
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or_else(|| BlinkError::config(PORT_RANGE))?,
+        };
 
         let username = s.get("username").unwrap_or("").to_string();
         validate_network_field("username", &username)?;
@@ -1369,6 +1382,39 @@ mod tests {
         let loaded = Session::load_from(&path);
         let _ = std::fs::remove_dir_all(&dir);
         loaded
+    }
+
+    /// A port that isn't a number used to fall back to the protocol's
+    /// default, so `port = 2222x` connected to 22 without a word, and the
+    /// password prompt went to another service than the file names.
+    #[test]
+    fn a_port_that_is_not_a_number_is_refused() {
+        let body = "[session]\nname = s\nprotocol = sftp\nhost = h\nport = 2222x\n";
+        let err = load_written("badport", body).unwrap_err();
+        assert!(err.to_string().contains("port"), "{err}");
+    }
+
+    #[test]
+    fn a_port_out_of_range_is_refused() {
+        for port in ["0", "65536", "-1"] {
+            let body = format!("[session]\nname = s\nprotocol = sftp\nhost = h\nport = {port}\n");
+            assert!(load_written("rangeport", &body).is_err(), "port {port}");
+        }
+    }
+
+    #[test]
+    fn a_missing_or_empty_port_is_the_protocols_default() {
+        for line in ["", "port =\n"] {
+            let body = format!("[session]\nname = s\nprotocol = ftps\nhost = h\n{line}");
+            assert_eq!(load_written("noport", &body).unwrap().port, 21, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn a_session_with_port_zero_is_not_saved() {
+        let mut s = Session::from_url("sftp://me@host").unwrap();
+        s.port = 0;
+        assert!(s.validate().is_err());
     }
 
     // `load_from` checked `host` and `username` for NUL, CR and LF, but not

@@ -32,10 +32,11 @@ use super::{App, LogLevel, Pane, Screen};
 /// rename the file onto its own parent directory and surfaced whatever opaque
 /// error came back, where the sibling modal gives a clear local one.
 ///
-/// Control characters are refused too: the name goes onto the wire as a path
-/// component, and a listing renders it back through `error::sanitize`, so one
-/// containing an escape sequence or a bidi override would display as something
-/// other than what was actually created.
+/// Control characters are refused too, and the invisible and reordering
+/// characters with them: the name goes onto the wire as a path component,
+/// and a listing renders it back through `error::sanitize`, so one
+/// containing an escape sequence or a bidi override would display as
+/// something other than what was actually created.
 fn remote_name_error(name: &str) -> Option<&'static str> {
     if name.is_empty() {
         return Some("name cannot be empty");
@@ -46,8 +47,10 @@ fn remote_name_error(name: &str) -> Option<&'static str> {
     if name == "." || name == ".." {
         return Some("invalid name");
     }
-    if name.chars().any(char::is_control) {
-        return Some("name cannot contain control characters");
+    // Whatever a listing would show as something else: control characters,
+    // and the invisible and reordering ones `error::sanitize` replaces.
+    if crate::error::sanitize_display(name) != name {
+        return Some("name cannot contain control or invisible characters");
     }
     None
 }
@@ -557,5 +560,13 @@ mod tests {
         assert!(remote_name_error("a\u{1b}[31mb").is_some());
         assert!(remote_name_error("a\0b").is_some());
         assert!(remote_name_error("a\nb").is_some());
+    }
+
+    /// Not control characters, but replaced in a listing all the same: a
+    /// name holding one would be shown as another name than was created.
+    #[test]
+    fn rejects_invisible_and_reordering_characters() {
+        assert!(remote_name_error("report\u{202e}gnp.exe").is_some());
+        assert!(remote_name_error("a\u{200b}b").is_some());
     }
 }

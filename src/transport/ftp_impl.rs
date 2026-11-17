@@ -598,31 +598,62 @@ pub async fn ftp_upload<T: TokioTlsStream + Send>(
 
     // Move the fully-stored `.blink-part` onto the final name. Whether RNTO
     // replaces an existing target is server-dependent: try the rename
-    // first, and when it's refused, delete the target and retry once.
-    if let Err(first_err) = timed_ftp(
-        "rename",
-        remote_path,
-        stream.rename(part.as_str(), remote_path),
-    )
-    .await
-    {
-        // A dead control channel won't recover by retrying.
-        if matches!(first_err, BlinkError::Disconnected(_)) {
-            return Err(first_err);
-        }
-        match timed_ftp("dele", remote_path, stream.rm(remote_path)).await {
-            Ok(()) => {}
-            Err(BlinkError::NotFound(_)) => {}
-            Err(e) => return Err(e),
-        }
-        timed_ftp(
-            "rename",
-            remote_path,
-            stream.rename(part.as_str(), remote_path),
-        )
-        .await?;
+    // first, and when it's refused, make room and retry once.
+    let Err(refused) = ftp_rename(stream, &part, remote_path).await else {
+        return Ok(());
+    };
+    // A dead control channel won't recover by retrying.
+    if matches!(refused, BlinkError::Disconnected(_)) {
+        return Err(refused);
     }
-    Ok(())
+    match ftp_metadata(stream, remote_path).await {
+        // A folder is not this upload's to replace.
+        Ok(Some(entry)) if entry.kind == EntryKind::Directory => Err(refused),
+        // A file in the way: move it aside rather than delete it, so it
+        // can be put back if the rename is refused again. See
+        // `transport::remote_aside_path`.
+        Ok(Some(_)) => {
+            let aside = super::remote_aside_path(remote_path);
+            if ftp_rename(stream, remote_path, &aside).await.is_err() {
+                return Err(refused);
+            }
+            match ftp_rename(stream, &part, remote_path).await {
+                Ok(()) => {
+                    if let Err(e) = timed_ftp("dele", &aside, stream.rm(&aside)).await {
+                        tracing::warn!(path = %aside, error = %e, "could not remove the replaced file");
+                    }
+                    Ok(())
+                }
+                Err(failed) => match ftp_rename(stream, &aside, remote_path).await {
+                    Ok(()) => Err(failed),
+                    Err(_) => Err(BlinkError::transport(format!(
+                        "{failed}; the file it was replacing is now at {aside}"
+                    ))),
+                },
+            }
+        }
+        // The listing can't say what is there (it lists nothing by that
+        // name, or couldn't be read), so there is nothing known to move.
+        // Delete what may be in the way, as before: DELE fails on a
+        // folder, and on nothing.
+        _ => {
+            match timed_ftp("dele", remote_path, stream.rm(remote_path)).await {
+                Ok(()) => {}
+                Err(BlinkError::NotFound(_)) => {}
+                Err(e) => return Err(e),
+            }
+            ftp_rename(stream, &part, remote_path).await
+        }
+    }
+}
+
+/// RNFR `from`, RNTO `to`, under the op deadline.
+async fn ftp_rename<T: TokioTlsStream + Send>(
+    stream: &mut ImplAsyncFtpStream<T>,
+    from: &str,
+    to: &str,
+) -> Result<()> {
+    timed_ftp("rename", to, stream.rename(from, to)).await
 }
 
 pub async fn ftp_delete_dir<T: TokioTlsStream + Send>(
@@ -965,7 +996,8 @@ mod integration {
     /// RETR and STOR/APPE alike, `hostile_listing_names` by LIST,
     /// `reset_data_after`, `stall_next_retr` and `drop_on_next_retr` by
     /// RETR, as are `trickle` and `stall_next_data_after`, `report_size` by
-    /// SIZE, `ignore_rest` by REST, and
+    /// SIZE, `ignore_rest` by REST, `refuse_rnto_onto_existing` and
+    /// `refuse_part_rnto` by RNTO, and
     /// `oversized_greeting` before any command.
     #[derive(Clone, Default)]
     pub(super) struct Faults {
@@ -1004,6 +1036,12 @@ mod integration {
         /// reply. Clears as it fires and is shared across connections, like
         /// `stall_next_retr`, so a reconnect finds a working server.
         pub drop_on_next_retr: Arc<std::sync::atomic::AtomicBool>,
+        /// Refuse RNTO onto a name that exists, as ProFTPD does without
+        /// `AllowOverwrite on`.
+        pub refuse_rnto_onto_existing: bool,
+        /// Refuse every RNTO of a `.blink-part` file: a server on which an
+        /// upload can be stored but never renamed into place.
+        pub refuse_part_rnto: bool,
         /// Answer SIZE with this instead of the stored file's length.
         pub report_size: Option<u64>,
         /// Answer REST with `350` but send RETR from byte 0 regardless: a
@@ -1386,6 +1424,13 @@ mod integration {
                 }
                 "RNTO" => {
                     let mut files = store.lock().await;
+                    if (faults.refuse_rnto_onto_existing && files.contains_key(&arg))
+                        || (faults.refuse_part_rnto && rename_from.ends_with(".blink-part"))
+                    {
+                        drop(files);
+                        w.write_all(b"553 rename refused\r\n").await?;
+                        continue;
+                    }
                     match files.remove(&rename_from) {
                         Some(bytes) => {
                             files.insert(arg.clone(), bytes);
@@ -1612,6 +1657,62 @@ mod integration {
 
         let files = store.lock().await;
         assert_eq!(files.get("/up.bin").map(Vec::as_slice), Some(&payload[..]));
+    }
+
+    /// Upload `new` over a stored `/up.bin` holding `old`, on a server with
+    /// `faults`. Returns the upload's result and the files left behind.
+    async fn upload_over_existing(
+        tag: &str,
+        faults: Faults,
+    ) -> (crate::error::Result<()>, HashMap<String, Vec<u8>>) {
+        let dir = tempdir_for_test(tag);
+        let local = dir.join("up.bin");
+        std::fs::write(&local, b"new").unwrap();
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/up.bin".to_string(), b"old".to_vec());
+        let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
+        let mut transport = FtpTransport::connect(&test_session(port), Some("pw"))
+            .await
+            .unwrap();
+
+        let result = transport.upload(&local, "/up.bin", None).await;
+        let files = store.lock().await.clone();
+        (result, files)
+    }
+
+    #[tokio::test]
+    async fn an_upload_replaces_a_file_the_server_wont_rename_over() {
+        let faults = Faults {
+            refuse_rnto_onto_existing: true,
+            ..Faults::default()
+        };
+        let (result, files) = upload_over_existing("replace", faults).await;
+
+        result.expect("upload should succeed");
+        assert_eq!(files.get("/up.bin").map(Vec::as_slice), Some(&b"new"[..]));
+        assert_eq!(files.len(), 1, "nothing else is left: {:?}", files.keys());
+    }
+
+    /// Replacing a file used to mean deleting it and renaming the upload
+    /// into place. When that rename was refused too, the old file was gone.
+    #[tokio::test]
+    async fn an_upload_that_cant_be_renamed_into_place_keeps_the_old_file() {
+        let faults = Faults {
+            refuse_part_rnto: true,
+            ..Faults::default()
+        };
+        let (result, files) = upload_over_existing("keepold", faults).await;
+
+        assert!(result.is_err());
+        assert_eq!(files.get("/up.bin").map(Vec::as_slice), Some(&b"old"[..]));
+        assert!(
+            !files.keys().any(|k| k.ends_with(".blink-old")),
+            "the old file is put back, not left aside: {:?}",
+            files.keys()
+        );
     }
 
     /// `ftp_metadata` resolves size from a LIST of the parent directory, not

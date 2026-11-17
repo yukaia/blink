@@ -370,16 +370,21 @@ pub fn append(host: &str, port: u16, key_type: &str, key_b64: &str) -> Result<()
             )));
         }
     }
-    // Spaces in the host or key_type would silently break the 3-field format
-    // when the line is re-parsed, potentially aliasing one entry to another.
-    if host.contains(' ') {
-        return Err(BlinkError::config(
-            "space not allowed in known_hosts field 'host'",
-        ));
+    // `parse_line` splits fields on any whitespace and drops a line with
+    // fewer than three, so whitespace in a field, or an empty one, writes a
+    // line that reads back as another entry or as none.
+    for (field, value) in [("host", host), ("key_type", key_type), ("key_b64", key_b64)] {
+        if value.is_empty() || value.contains(char::is_whitespace) {
+            return Err(BlinkError::config(format!(
+                "known_hosts field '{field}' must not be empty or contain whitespace"
+            )));
+        }
     }
-    if key_type.contains(' ') {
+    // A comma separates the names of a host list, so a host holding one
+    // would be stored as two hosts, neither of them this one.
+    if host.contains(',') {
         return Err(BlinkError::config(
-            "space not allowed in known_hosts field 'key_type'",
+            "comma not allowed in known_hosts field 'host'",
         ));
     }
 
@@ -1002,6 +1007,26 @@ mod tests {
     fn append_rejects_space_in_host() {
         let r = super::append("evil host", 22, "ssh-ed25519", "KEY");
         assert!(r.is_err());
+    }
+
+    /// The parser splits fields on any whitespace and host lists on commas,
+    /// so a host holding either would be written as a line that reads back
+    /// as something else.
+    #[test]
+    fn append_rejects_a_tab_or_comma_in_host() {
+        let _home = crate::paths::test_home();
+        for host in ["evil\thost", "a.example,b.example"] {
+            let r = super::append(host, 22, "ssh-ed25519", "KEY");
+            assert!(r.is_err(), "{host:?}");
+        }
+    }
+
+    #[test]
+    fn append_rejects_whitespace_in_the_key_fields() {
+        let _home = crate::paths::test_home();
+        assert!(super::append("h.example", 22, "ssh\ted25519", "KEY").is_err());
+        assert!(super::append("h.example", 22, "ssh-ed25519", "KEY extra").is_err());
+        assert!(super::append("h.example", 22, "ssh-ed25519", "").is_err());
     }
 
     #[test]
