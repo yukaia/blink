@@ -38,13 +38,6 @@ From `cargo llvm-cov` runs on 2026-11-17 (84% of lines, 88% of functions
 after the tests added that day). Re-run it before picking one up; `cargo llvm-cov --json` lists
 functions with a count of zero. In rough order of value:
 
-- **Host-key rejections in the TUI.** The `HostKeyChanged`,
-  `HostKeyRevoked` and `HostCertificateRejected` arms of
-  `handle_app_event`: what the user is told is unchecked.
-- **SFTP's own mkdir, delete_file and rename.** The TUI's mkdir, delete
-  and rename actions are tested against the mock transport;
-  `SftpTransport::mkdir`, `delete_file` and `rename` are never called
-  against the test server.
 - **The rest of the CLI.** `main.rs` has no tests: `sessions`, `themes`,
   `known-hosts remove`'s output, and `init_tracing` with its check of the
   log file's mode. (`known_hosts::remove_host` and
@@ -64,5 +57,4 @@ functions with a count of zero. In rough order of value:
   exercises it.
 - **Terminal lifecycle.** `tui/mod.rs`: setup, restore, the panic hook.
 - **Small helpers.** `format_bytes_per_sec`, `format_eta`,
-  `resolve_local_dir`, `Theme::list_all_names`, `Config::load`, and the
-  edit form's field navigation in `tui/state.rs`.
+  `resolve_local_dir` and `Config::load`.

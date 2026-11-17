@@ -2140,6 +2140,23 @@ mod integration {
             })
         }
 
+        async fn mkdir(
+            &mut self,
+            id: u32,
+            path: String,
+            _attrs: FileAttributes,
+        ) -> Result<Status, Self::Error> {
+            // A directory is a key ending in `/`. As a real server does,
+            // refuse a name already taken, by a directory or by a file.
+            let path = path.trim_end_matches('/').to_string();
+            let mut store = self.store.lock().await;
+            if store.contains_key(&path) || store.contains_key(&format!("{path}/")) {
+                return Err(StatusCode::Failure);
+            }
+            store.insert(format!("{path}/"), Vec::new());
+            Ok(ok_status(id))
+        }
+
         async fn opendir(&mut self, id: u32, path: String) -> Result<SftpHandle, Self::Error> {
             let key = format!("{}/", path.trim_end_matches('/'));
             if !self.store.lock().await.contains_key(&key) {
@@ -3337,6 +3354,136 @@ mod integration {
         assert_eq!(
             store.lock().await.get("/b.txt").map(Vec::as_slice),
             Some(&b"old b"[..])
+        );
+        let _ = transport.close().await;
+    }
+
+    // -- mkdir, delete_file and rename, against the server -----------------
+    //
+    // The TUI's tests run these against a mock; these are the calls
+    // themselves, and how the server's answers are read.
+
+    /// A server holding `/a.txt` and the folder `/dir`, and a connection.
+    async fn serving_a_file_and_a_folder() -> (Store, SftpTransport) {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/a.txt".to_string(), b"a".to_vec());
+            files.insert("/dir/".to_string(), Vec::new());
+        }
+        let (port, _c) = start_server(Arc::clone(&store)).await;
+        (store, connect(port).await)
+    }
+
+    #[tokio::test]
+    async fn mkdir_creates_the_folder() {
+        let (store, mut transport) = serving_a_file_and_a_folder().await;
+
+        transport.mkdir("/new").await.unwrap();
+
+        assert!(store.lock().await.contains_key("/new/"));
+        let made = transport.metadata("/new").await.unwrap().unwrap();
+        assert!(made.is_dir());
+        let _ = transport.close().await;
+    }
+
+    /// A recursive upload makes every folder on its way, most of which are
+    /// there already. That isn't a failure, and the server isn't asked.
+    #[tokio::test]
+    async fn mkdir_of_a_folder_that_exists_succeeds() {
+        let (_store, mut transport) = serving_a_file_and_a_folder().await;
+
+        transport.mkdir("/dir").await.unwrap();
+        transport.mkdir("/dir").await.unwrap();
+
+        let _ = transport.close().await;
+    }
+
+    #[tokio::test]
+    async fn mkdir_where_a_file_is_fails_and_leaves_the_file() {
+        let (store, mut transport) = serving_a_file_and_a_folder().await;
+
+        let err = transport.mkdir("/a.txt").await.unwrap_err();
+
+        assert!(err.to_string().contains("not a directory"), "{err}");
+        let files = store.lock().await;
+        assert_eq!(files.get("/a.txt").map(Vec::as_slice), Some(&b"a"[..]));
+        assert!(!files.contains_key("/a.txt/"));
+        drop(files);
+        let _ = transport.close().await;
+    }
+
+    #[tokio::test]
+    async fn delete_file_removes_the_file_and_nothing_else() {
+        let (store, mut transport) = serving_a_file_and_a_folder().await;
+
+        transport.delete_file("/a.txt").await.unwrap();
+
+        let files = store.lock().await;
+        assert!(!files.contains_key("/a.txt"));
+        assert!(files.contains_key("/dir/"));
+        drop(files);
+        let _ = transport.close().await;
+    }
+
+    /// Told apart from other failures, so a caller can treat "already
+    /// gone" as it sees fit.
+    #[tokio::test]
+    async fn delete_file_of_a_missing_file_is_not_found() {
+        let (_store, mut transport) = serving_a_file_and_a_folder().await;
+
+        let err = transport.delete_file("/gone.txt").await.unwrap_err();
+
+        assert!(
+            matches!(err, crate::error::BlinkError::NotFound(_)),
+            "{err}"
+        );
+        assert!(err.to_string().contains("/gone.txt"), "{err}");
+        let _ = transport.close().await;
+    }
+
+    #[tokio::test]
+    async fn rename_moves_the_file() {
+        let (store, mut transport) = serving_a_file_and_a_folder().await;
+
+        transport.rename("/a.txt", "/b.txt").await.unwrap();
+
+        let files = store.lock().await;
+        assert_eq!(files.get("/b.txt").map(Vec::as_slice), Some(&b"a"[..]));
+        assert!(!files.contains_key("/a.txt"));
+        drop(files);
+        let _ = transport.close().await;
+    }
+
+    /// Plain rename is the one for a rename the user did not confirm as an
+    /// overwrite: a target that turned up since the listing must stop it.
+    #[tokio::test]
+    async fn rename_onto_an_existing_file_fails_and_changes_nothing() {
+        let (store, mut transport) = serving_a_file_and_a_folder().await;
+        store
+            .lock()
+            .await
+            .insert("/b.txt".to_string(), b"b".to_vec());
+
+        let err = transport.rename("/a.txt", "/b.txt").await.unwrap_err();
+
+        assert!(err.to_string().contains("/a.txt -> /b.txt"), "{err}");
+        let files = store.lock().await;
+        assert_eq!(files.get("/a.txt").map(Vec::as_slice), Some(&b"a"[..]));
+        assert_eq!(files.get("/b.txt").map(Vec::as_slice), Some(&b"b"[..]));
+        drop(files);
+        let _ = transport.close().await;
+    }
+
+    #[tokio::test]
+    async fn rename_of_a_missing_file_is_not_found() {
+        let (_store, mut transport) = serving_a_file_and_a_folder().await;
+
+        let err = transport.rename("/gone.txt", "/b.txt").await.unwrap_err();
+
+        assert!(
+            matches!(err, crate::error::BlinkError::NotFound(_)),
+            "{err}"
         );
         let _ = transport.close().await;
     }
