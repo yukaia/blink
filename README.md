@@ -968,16 +968,6 @@ A few things worth knowing before you use this in anger:
   self-signed or privately-rooted server, the per-session
   `accept_invalid_certs` toggle pins the certificate instead (see
   [Security](#protocol)).
-- **RSA client keys carry a known timing-sidechannel risk.** The `rsa`
-  crate reached transitively through `russh` is affected by
-  [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071)
-  ("Marvin Attack"). The fix shipped in `rsa` 0.10.0, but `russh` pins a
-  pre-release that predates it, so blink can't pick it up until `russh`
-  moves. Exploiting it needs many precisely-timed oracle queries against
-  your private key, which a normal interactive session does not provide —
-  but if you want the risk gone, use an Ed25519 key. The rationale is
-  recorded in `.cargo/audit.toml`, the ignore list used when running
-  `cargo audit` against this tree.
 - **Passwords are held in memory** for the duration of the connected
   session; see [Credential handling](#credential-handling) for why, and
   for the alternative.

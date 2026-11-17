@@ -189,6 +189,12 @@ the git history for those.
 - `russh` 0.64 -> 0.65, for RUSTSEC-2026-0495 (russh's agent server, which
   blink does not run). No changes outside the test server. It still pins
   `rsa` and `ssh-key` to the same release candidates.
+- Lockfile refresh (`cargo update`). `russh` 0.65.2 drops its exact pin on
+  the `rsa` release candidate, so `rsa` moves to 0.10.0, the release that
+  fixes RUSTSEC-2023-0071 (the "Marvin Attack" timing sidechannel in RSA
+  private-key operations). The `cargo audit` ignore for it and the README
+  caveat about RSA client keys are removed. `ssh-key` is still a release
+  candidate (0.7.0-rc.12), pinned by russh.
 - Lockfile refresh (`cargo update`). `webpki-roots` 1.0.12 drops six trust
   roots (Buypass Class 2 and Class 3, Certigna Root CA, DigiCert Trusted
   Root G4, QuoVadis Root CA 1 G3 and 3 G3): an FTPS server whose

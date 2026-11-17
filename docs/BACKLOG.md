@@ -6,22 +6,17 @@ spec in `docs/superpowers/specs/` instead.
 
 ---
 
-## `ssh-key` and `rsa` reach a release
+## `ssh-key` reaches a release
 
-Watch `russh` rather than `ssh-key` and `rsa` directly: it pins both with exact
-`=` requirements, so they move when it moves. blink is on pre-releases of
-both (`ssh-key 0.7.0-rc.11`, `rsa 0.10.0-rc.18`).
+Watch `russh` rather than `ssh-key` directly: it pins it with an exact `=`
+requirement, so it moves when russh moves. blink is on a pre-release
+(`ssh-key 0.7.0-rc.12`).
 
-RUSTSEC-2023-0071 now lists `rsa >= 0.10.0` as patched and names rc.18 as
-affected. The fixes are RustCrypto/RSA#739 (blinding the default
-decryption paths) and #749 (implicit rejection), which replaced #702 and
-#680 and closed #626. So the ignore in `.cargo/audit.toml`, and the RSA
-caveat in the README, can go as soon as russh's pin reaches `rsa 0.10.0`
-or later — confirm with `cargo audit` after the bump.
+`rsa` is done: russh 0.65.2 relaxed its pin to `rsa 0.10`, the lockfile is on
+`rsa 0.10.0`, and the RUSTSEC-2023-0071 ignore and README caveat are gone.
 
-Last checked 2026-11-13: `rsa 0.10.0` is out as a full release and
-`ssh-key` is at `0.7.0-rc.12`, but russh 0.65.1, the latest and what blink
-is on, still pins `rsa =0.10.0-rc.18` and `ssh-key =0.7.0-rc.11`.
+Last checked 2026-11-17: russh 0.65.2, the latest and what blink is on, pins
+`ssh-key =0.7.0-rc.12`; no `ssh-key 0.7.0` release yet.
 
 ## russh can't load an encrypted legacy-PEM ECDSA key
 

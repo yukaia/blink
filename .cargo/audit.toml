@@ -11,25 +11,4 @@
 # justify should be a dependency bump instead.
 
 [advisories]
-ignore = [
-  # RUSTSEC-2023-0071 — "Marvin Attack" timing sidechannel in `rsa`.
-  #
-  # Reached transitively: blink -> russh -> rsa, and also
-  # blink -> russh -> ssh-key -> rsa. (Before russh 0.63 this ran through
-  # russh's `internal-russh-forked-ssh-key` fork; 0.63 dropped the fork for
-  # upstream `ssh-key`.) The advisory lists `rsa >= 0.10.0` as patched, but
-  # russh pins `rsa` with an exact `=0.10.0-rc.18` requirement, which the
-  # advisory names as affected. So this cannot be bumped from blink's side —
-  # it moves when russh moves — and the only other way out would be to drop
-  # RSA key support from the SSH client.
-  #
-  # Exposure: the attack recovers an RSA *private* key from timing variation in
-  # decryption/signing, and needs many precisely-timed oracle queries. blink
-  # performs RSA private-key operations only when the user authenticates with
-  # an RSA key, once per connection, against a server the user chose. That is
-  # not a practical oracle. Users who want this class of risk gone entirely can
-  # use an Ed25519 key, which blink prefers anyway.
-  #
-  # Drop this entry once russh's pin reaches `rsa` 0.10.0 or later.
-  "RUSTSEC-2023-0071",
-]
+ignore = []
