@@ -77,9 +77,10 @@ pub enum Screen {
     ConfirmOverwrite,
     /// Modal over Main: text or image viewer.
     Viewer,
-    /// Overlay; previous_screen is preserved so we know what to show behind.
+    /// Overlay over [`App::help_return`], which is what it draws behind it
+    /// and returns to.
     Help,
-    /// Overlay.
+    /// Overlay over [`App::quit_return`], likewise.
     ConfirmQuit,
     /// Overlay over Main: confirm cancellation of an in-flight transfer.
     ConfirmCancel,
@@ -192,6 +193,13 @@ pub struct App {
     pub theme: Theme,
     pub screen: Screen,
     pub previous_screen: Screen,
+    /// The screen help was opened over. Its own field, not
+    /// `previous_screen`: help opens over prompts that return to
+    /// `previous_screen`, and overwriting it made them return to themselves.
+    pub help_return: Screen,
+    /// The screen the quit prompt was opened over, kept apart for the same
+    /// reason. Ctrl+C opens the prompt from anywhere.
+    pub quit_return: Screen,
     pub active_pane: Pane,
 
     // Session selector
@@ -436,6 +444,8 @@ impl App {
             theme,
             screen: Screen::SessionSelect,
             previous_screen: Screen::SessionSelect,
+            help_return: Screen::SessionSelect,
+            quit_return: Screen::SessionSelect,
             active_pane: Pane::Local,
             sessions,
             session_cursor: 0,
@@ -617,7 +627,16 @@ impl App {
 
     fn draw(&self, f: &mut Frame) {
         self.hit.clear();
-        match self.screen {
+        self.draw_screen(f, &self.screen);
+    }
+
+    /// Draw `screen`, and under a modal, what it was opened over.
+    ///
+    /// Help and the quit prompt draw the screen they return to, which can be
+    /// any other: neither can be opened over itself, nor help over the quit
+    /// prompt, so this always ends.
+    fn draw_screen(&self, f: &mut Frame, screen: &Screen) {
+        match screen {
             Screen::SessionSelect => crate::tui::views::session_select::render(f, self),
             Screen::NewSession => {
                 crate::tui::views::session_select::render(f, self);
@@ -713,15 +732,11 @@ impl App {
                 crate::tui::views::host_key_changed::render(f, self);
             }
             Screen::Help => {
-                crate::tui::views::main::render(f, self);
+                self.draw_screen(f, &self.help_return);
                 crate::tui::views::help::render(f, self);
             }
             Screen::ConfirmQuit => {
-                if self.previous_screen == Screen::Main {
-                    crate::tui::views::main::render(f, self);
-                } else {
-                    crate::tui::views::session_select::render(f, self);
-                }
+                self.draw_screen(f, &self.quit_return);
                 crate::tui::views::confirm_quit::render(f, self);
             }
         }
@@ -741,22 +756,43 @@ impl App {
         // A key between two clicks breaks the pair: what the second click
         // lands on may no longer be what the first one did.
         self.last_click = None;
-        // '?' toggles help from anywhere except inside Help itself or text-
-        // entry / viewer screens (where '?' should be treated normally).
+        // Ctrl+C quits from anywhere, through the quit prompt like `q`, and
+        // pressed again on that prompt, at once.
+        if key.code == KeyCode::Char('c') && is_ctrl_chord(key.modifiers) {
+            if self.screen == Screen::ConfirmQuit {
+                self.should_quit = true;
+                return;
+            }
+            // The viewer closes first: an image it drew sits outside
+            // ratatui's buffer, on top of anything drawn over it.
+            if self.screen == Screen::Viewer {
+                self.close_viewer();
+            }
+            self.request_quit(self.screen.clone());
+            return;
+        }
+        // '?' opens help, except where it is typed as text, where it would
+        // be skipped past unread, and over the quit prompt, which help would
+        // then have to draw beneath itself.
         if key.code == KeyCode::Char('?')
-            && self.screen != Screen::Help
-            && self.screen != Screen::PasswordPrompt
-            && self.screen != Screen::KeyPassphrasePrompt
-            && self.screen != Screen::NewSession
-            && self.screen != Screen::EditSession
-            && self.screen != Screen::SaveSession
-            && self.screen != Screen::Search
-            && self.screen != Screen::Rename
-            && self.screen != Screen::Viewer
-            && self.screen != Screen::ConfirmHostKey
-            && self.screen != Screen::HostKeyChanged
+            && !matches!(
+                self.screen,
+                Screen::Help
+                    | Screen::ConfirmQuit
+                    | Screen::PasswordPrompt
+                    | Screen::KeyPassphrasePrompt
+                    | Screen::NewSession
+                    | Screen::EditSession
+                    | Screen::SaveSession
+                    | Screen::Search
+                    | Screen::Rename
+                    | Screen::Mkdir
+                    | Screen::Viewer
+                    | Screen::ConfirmHostKey
+                    | Screen::HostKeyChanged
+            )
         {
-            self.previous_screen = self.screen.clone();
+            self.help_return = self.screen.clone();
             self.screen = Screen::Help;
             self.help_scroll = 0;
             return;
@@ -769,7 +805,7 @@ impl App {
                     self.should_quit = true;
                 }
                 KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.screen = self.previous_screen.clone();
+                    self.screen = self.quit_return.clone();
                 }
                 _ => {}
             },
@@ -1105,7 +1141,7 @@ impl App {
             .get()
             .map_or(1, |r| usize::from(r.height).max(1));
         match key.code {
-            KeyCode::Char('?') | KeyCode::Esc => self.screen = self.previous_screen.clone(),
+            KeyCode::Char('?') | KeyCode::Esc => self.screen = self.help_return.clone(),
             KeyCode::Up | KeyCode::Char('k') => self.help_scroll_by(-1),
             KeyCode::Down | KeyCode::Char('j') => self.help_scroll_by(1),
             KeyCode::PageUp => self.help_scroll_by(-(page as isize)),
@@ -1123,6 +1159,22 @@ impl App {
         let max = crate::tui::views::help::max_scroll(self);
         self.help_scroll = self.help_scroll.saturating_add_signed(delta).min(max);
     }
+}
+
+/// Whether `m` makes a key a Ctrl or an Alt chord — one the letter
+/// shortcuts and the text fields leave alone.
+///
+/// Ctrl and Alt together is not one: Windows reports AltGr that way, and
+/// AltGr is how many keyboard layouts type `@`, `\\`, `{` and the like.
+pub(super) fn is_chord(m: crossterm::event::KeyModifiers) -> bool {
+    use crossterm::event::KeyModifiers;
+    m.contains(KeyModifiers::CONTROL) != m.contains(KeyModifiers::ALT)
+}
+
+/// Whether `m` is Ctrl without Alt.
+fn is_ctrl_chord(m: crossterm::event::KeyModifiers) -> bool {
+    use crossterm::event::KeyModifiers;
+    m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT)
 }
 
 /// Build the visible entries for the remote pane, prepending `..` unless the
@@ -1660,7 +1712,7 @@ mod tests {
     fn a_host_key_prompt_waits_out_the_viewer() {
         let mut a = app();
         a.screen = Screen::Help;
-        a.previous_screen = Screen::Main;
+        a.help_return = Screen::Main;
         let (ev, _rx) = host_key_event();
         a.handle_app_event(ev);
         assert_eq!(a.screen, Screen::Help);

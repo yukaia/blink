@@ -2364,7 +2364,8 @@ mod render_tests {
     /// An app on `screen`, over the session selector.
     fn over_selector(screen: Screen) -> App {
         let mut a = on(screen);
-        a.previous_screen = Screen::SessionSelect;
+        a.quit_return = Screen::SessionSelect;
+        a.help_return = Screen::SessionSelect;
         a
     }
 
@@ -2646,7 +2647,7 @@ mod render_tests {
     #[test]
     fn quit_with_queued_work_says_it_will_be_discarded() {
         let mut a = on(Screen::ConfirmQuit);
-        a.previous_screen = Screen::Main;
+        a.quit_return = Screen::Main;
         with_queued_downloads(&mut a, 2);
         let text = screen(&a);
         assert!(
