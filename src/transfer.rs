@@ -882,6 +882,19 @@ pub fn format_eta(bytes_remaining: u64, bytes_per_sec: u64) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn parallelism_can_be_changed_within_its_limits() {
+        let (m, _events) = TransferManager::new(2);
+        assert_eq!(m.parallelism(), 2);
+
+        m.set_parallelism(5);
+        assert_eq!(m.parallelism(), 5);
+        m.set_parallelism(0);
+        assert_eq!(m.parallelism(), 1, "never none at all");
+        m.set_parallelism(u8::MAX);
+        assert_eq!(m.parallelism(), crate::config::MAX_PARALLEL);
+    }
+
     /// `take_next_pending` resumes its search where the last one stopped;
     /// it must still find every pending job, in order, and skip ones that
     /// left Pending some other way.

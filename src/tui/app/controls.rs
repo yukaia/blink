@@ -174,3 +174,362 @@ impl App {
             .unwrap_or((0, 0))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    use crate::config::Config;
+    use crate::paths;
+    use crate::theme::Theme;
+    use crate::transfer::{TransferEvent, TransferManager, TransferState};
+    use crate::tui::app::{App, Pane, Screen};
+    use crate::tui::state::PendingCancel;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn logged(a: &App, needle: &str) -> bool {
+        a.log.iter().any(|l| l.message.contains(needle))
+    }
+
+    /// An app on the main screen with a transfer manager that runs up to
+    /// three jobs at once, and the manager's events.
+    fn connected() -> (App, UnboundedReceiver<TransferEvent>) {
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        let (manager, events) = TransferManager::new(3);
+        a.transfer_manager = Some(manager);
+        a.screen = Screen::Main;
+        a.active_pane = Pane::Transfers;
+        (a, events)
+    }
+
+    fn manager(a: &App) -> &TransferManager {
+        a.transfer_manager.as_ref().unwrap()
+    }
+
+    /// Queue a download of `/r/<name>`, in `batch` if given.
+    fn queue(a: &App, name: &str, batch: Option<u64>) -> u64 {
+        let (remote, local) = (format!("/r/{name}"), PathBuf::from(format!("/l/{name}")));
+        match batch {
+            Some(b) => manager(a).enqueue_download_batched(remote, local, b),
+            None => manager(a).enqueue_download(remote, local),
+        }
+        .unwrap()
+    }
+
+    /// Start the next queued job, as the dispatcher would.
+    fn start_one(a: &App) -> u64 {
+        manager(a).take_next_pending().expect("a job is queued").id
+    }
+
+    // -- cancel ---------------------------------------------------------------
+
+    #[test]
+    fn cancelling_with_nothing_running_asks_nothing() {
+        let (mut a, _events) = connected();
+        queue(&a, "waiting.bin", None);
+
+        a.request_cancel_selected_transfer();
+        a.request_cancel_selected_batch();
+
+        assert_eq!(a.screen, Screen::Main);
+        assert!(a.pending_cancel.is_none());
+    }
+
+    #[test]
+    fn cancelling_without_a_connection_asks_nothing() {
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        a.screen = Screen::Main;
+
+        a.request_cancel_selected_transfer();
+        a.request_cancel_selected_batch();
+
+        assert_eq!(a.screen, Screen::Main);
+    }
+
+    #[test]
+    fn c_asks_about_the_transfer_under_the_cursor() {
+        let (mut a, _events) = connected();
+        queue(&a, "one.bin", None);
+        queue(&a, "two.bin", None);
+        start_one(&a);
+        let second = start_one(&a);
+        a.transfer_cursor = 1;
+
+        a.handle_key(press(KeyCode::Char('c')));
+
+        assert_eq!(a.screen, Screen::ConfirmCancel);
+        assert_eq!(a.previous_screen, Screen::Main);
+        match a.pending_cancel.as_ref().unwrap() {
+            PendingCancel::Single { id, name } => {
+                assert_eq!((*id, name.as_str()), (second, "two.bin"));
+            }
+            other => panic!("expected a single cancel, got {other:?}"),
+        }
+    }
+
+    /// Jobs finish under the cursor; one left past the end means the last.
+    #[test]
+    fn a_cursor_past_the_last_transfer_means_the_last() {
+        let (mut a, _events) = connected();
+        queue(&a, "one.bin", None);
+        let only = start_one(&a);
+        a.transfer_cursor = 7;
+
+        a.request_cancel_selected_transfer();
+
+        assert!(matches!(
+            a.pending_cancel,
+            Some(PendingCancel::Single { id, .. }) if id == only
+        ));
+    }
+
+    #[test]
+    fn confirming_cancels_the_transfer() {
+        let (mut a, _events) = connected();
+        queue(&a, "one.bin", None);
+        let id = start_one(&a);
+        a.request_cancel_selected_transfer();
+
+        a.handle_confirm_cancel(press(KeyCode::Char('y')));
+
+        assert!(matches!(
+            manager(&a).job(id).unwrap().state,
+            TransferState::Failed(_)
+        ));
+        assert!(manager(&a).active_jobs().is_empty());
+        assert!(logged(&a, "cancelled: one.bin"));
+        assert!(a.pending_cancel.is_none());
+    }
+
+    #[test]
+    fn shift_c_asks_about_the_whole_batch_counting_what_is_queued() {
+        let (mut a, _events) = connected();
+        let batch = manager(&a).allocate_batch_id();
+        for name in ["a.bin", "b.bin", "c.bin", "d.bin"] {
+            queue(&a, name, Some(batch));
+        }
+        queue(&a, "unrelated.bin", None);
+        start_one(&a);
+
+        a.handle_key(press(KeyCode::Char('C')));
+
+        assert_eq!(a.screen, Screen::ConfirmCancel);
+        match a.pending_cancel.as_ref().unwrap() {
+            PendingCancel::Batch {
+                batch_id,
+                active,
+                pending,
+                cursor_name,
+            } => {
+                assert_eq!(*batch_id, batch);
+                assert_eq!((*active, *pending), (1, 3), "the other job isn't counted");
+                assert_eq!(cursor_name, "a.bin");
+            }
+            other => panic!("expected a batch cancel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn confirming_cancels_the_batch_and_leaves_other_jobs() {
+        let (mut a, _events) = connected();
+        let batch = manager(&a).allocate_batch_id();
+        let in_batch: Vec<u64> = ["a.bin", "b.bin", "c.bin"]
+            .iter()
+            .map(|n| queue(&a, n, Some(batch)))
+            .collect();
+        let other = queue(&a, "unrelated.bin", None);
+        start_one(&a);
+        a.request_cancel_selected_batch();
+
+        a.handle_confirm_cancel(press(KeyCode::Char('y')));
+
+        for id in in_batch {
+            assert!(
+                matches!(manager(&a).job(id).unwrap().state, TransferState::Failed(_)),
+                "job {id}"
+            );
+        }
+        assert_eq!(
+            manager(&a).job(other).unwrap().state,
+            TransferState::Pending
+        );
+        assert!(logged(&a, "cancelled batch: 1 active + 2 queued"));
+    }
+
+    /// A job that isn't part of a batch still gets cancelled by the batch
+    /// key, as itself.
+    #[test]
+    fn shift_c_on_a_lone_transfer_asks_about_just_that_one() {
+        let (mut a, _events) = connected();
+        queue(&a, "lone.bin", None);
+        let id = start_one(&a);
+
+        a.request_cancel_selected_batch();
+
+        assert!(matches!(
+            a.pending_cancel,
+            Some(PendingCancel::Single { id: asked, .. }) if asked == id
+        ));
+    }
+
+    /// `c` and `C` belong to the Transfers pane; elsewhere they are not
+    /// cancels.
+    #[test]
+    fn the_cancel_keys_do_nothing_off_the_transfers_pane() {
+        let (mut a, _events) = connected();
+        queue(&a, "one.bin", None);
+        start_one(&a);
+        a.active_pane = Pane::Local;
+
+        a.handle_key(press(KeyCode::Char('c')));
+        a.handle_key(press(KeyCode::Char('C')));
+
+        assert_eq!(a.screen, Screen::Main);
+        assert!(a.pending_cancel.is_none());
+    }
+
+    // -- pause ----------------------------------------------------------------
+
+    #[test]
+    fn p_pauses_and_p_again_resumes() {
+        let (mut a, mut events) = connected();
+
+        a.handle_key(press(KeyCode::Char('p')));
+        assert!(manager(&a).is_paused());
+        let ev = events.try_recv().expect("pausing is announced");
+        assert!(matches!(ev, TransferEvent::Paused));
+        a.handle_transfer_event(ev);
+        assert!(logged(&a, "transfers paused"));
+
+        a.handle_key(press(KeyCode::Char('p')));
+        assert!(!manager(&a).is_paused());
+        let ev = events.try_recv().expect("resuming is announced");
+        assert!(matches!(ev, TransferEvent::Resumed));
+        a.handle_transfer_event(ev);
+        assert!(logged(&a, "transfers resumed"));
+    }
+
+    #[test]
+    fn pausing_without_a_connection_says_so() {
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        a.screen = Screen::Main;
+
+        a.toggle_pause();
+
+        assert!(logged(&a, "not connected"));
+    }
+
+    // -- queue counts ---------------------------------------------------------
+
+    #[test]
+    fn queue_counts_are_running_then_waiting() {
+        let (a, _events) = connected();
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            queue(&a, name, None);
+        }
+        start_one(&a);
+
+        assert_eq!(a.queue_counts(), (1, 2));
+    }
+
+    #[test]
+    fn queue_counts_are_zero_without_a_connection() {
+        let a = App::new(Config::default(), Theme::load("dracula").unwrap());
+
+        assert_eq!(a.queue_counts(), (0, 0));
+    }
+
+    // -- theme cycling --------------------------------------------------------
+
+    /// The theme `config.ini` names, read back from disk.
+    fn saved_theme() -> String {
+        Config::load_from(&paths::config_file().unwrap())
+            .unwrap()
+            .general
+            .theme
+    }
+
+    fn app_with_theme(name: &str) -> App {
+        let mut config = Config::default();
+        config.general.theme = name.to_string();
+        App::new(config, Theme::load("dracula").unwrap())
+    }
+
+    #[test]
+    fn t_moves_to_the_next_theme_and_saves_the_choice() {
+        let _home = paths::test_home();
+        let names = Theme::list_all_names();
+        let mut a = app_with_theme(&names[0]);
+        a.screen = Screen::Main;
+
+        a.handle_key(press(KeyCode::Char('t')));
+
+        assert_eq!(a.config.general.theme, names[1]);
+        assert_eq!(a.theme.name, Theme::load(&names[1]).unwrap().name);
+        assert_eq!(saved_theme(), names[1]);
+        assert!(logged(
+            &a,
+            &format!("theme: {} (2/{})", names[1], names.len())
+        ));
+    }
+
+    #[test]
+    fn the_last_theme_is_followed_by_the_first() {
+        let _home = paths::test_home();
+        let names = Theme::list_all_names();
+        let mut a = app_with_theme(names.last().unwrap());
+
+        a.cycle_theme();
+
+        assert_eq!(a.config.general.theme, names[0]);
+    }
+
+    /// A config naming a theme that no longer exists starts over from the
+    /// first, and is put right on disk as it does.
+    #[test]
+    fn a_theme_that_no_longer_exists_cycles_to_the_first() {
+        let _home = paths::test_home();
+        let mut a = app_with_theme("long-gone");
+
+        a.cycle_theme();
+
+        assert_eq!(a.config.general.theme, Theme::list_all_names()[0]);
+        assert_eq!(saved_theme(), a.config.general.theme);
+    }
+
+    /// A user theme is known by its file name. Its `[theme] name` is only
+    /// a label: saved as the choice, it would name no theme at the next
+    /// launch.
+    #[test]
+    fn a_user_theme_is_cycled_onto_and_saved_by_its_file_name() {
+        let _home = paths::test_home();
+        std::fs::write(
+            paths::themes_dir().unwrap().join("aaa-mine.ini"),
+            "[theme]\nname = My Cool Theme\n\n[colors]\n\
+             bg=#000000\nfg=#ffffff\ndim=#888888\ncursor_bg=#111111\n\
+             border_active=#ff00ff\nborder_inactive=#222222\naccent=#ff0000\n\
+             directory=#00ffff\nimage=#ffff00\nselected=#00ff00\n\
+             success=#00ff00\nwarning=#ffaa00\nerror=#ff0000\n",
+        )
+        .unwrap();
+        let names = Theme::list_all_names();
+        assert_eq!(names[0], "aaa-mine", "sorts first, among the built-ins");
+        let mut a = app_with_theme(names.last().unwrap());
+
+        a.cycle_theme();
+        assert_eq!(a.theme.name, "My Cool Theme");
+        assert_eq!(saved_theme(), "aaa-mine");
+
+        a.cycle_theme();
+        assert_eq!(
+            a.config.general.theme, names[1],
+            "and the cycle moves on from it"
+        );
+    }
+}
