@@ -1130,7 +1130,10 @@ impl App {
 fn build_remote_pane_entries(remote_entries: &[RemoteEntry], path: &str) -> Vec<PaneEntry> {
     let mut entries: Vec<PaneEntry> = remote_entries
         .iter()
-        .map(|e| PaneEntry::new(e.raw_name.clone(), e.is_dir(), e.size))
+        .map(|e| PaneEntry {
+            is_link: e.kind == crate::transport::EntryKind::Symlink,
+            ..PaneEntry::new(e.raw_name.clone(), e.is_dir(), e.size)
+        })
         .collect();
     // Sort on what the user reads, so the pane is ordered the way it looks.
     entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
@@ -2784,6 +2787,72 @@ mod tests {
         );
         // `~user` is not expanded: it names a folder called `~user`.
         assert_eq!(resolve_local_dir(std::path::Path::new("~root")), None);
+    }
+
+    // -- downloading a remote symlink ------------------------------------------
+
+    /// Plan a download of the remote entry `name`, listed as a symlink in
+    /// `/srv`, from a server holding `files`; return the planned jobs.
+    async fn plan_download_of_link(
+        name: &str,
+        files: &[&str],
+    ) -> Vec<crate::tui::plan::PlannedJob> {
+        let home = crate::paths::test_home();
+        let mut mock = crate::transport::mock::MockTransport::new();
+        for f in files {
+            mock = mock.with_file(f, b"x");
+        }
+        let mut a = app();
+        a.local.path = home.path().display().to_string();
+        a.remote.path = "/srv".into();
+        a.remote.set_entries(vec![PaneEntry {
+            is_link: true,
+            ..PaneEntry::new(name.into(), false, 0)
+        }]);
+        a.transport = Some(Arc::new(Mutex::new(Box::new(mock) as Box<dyn Transport>)));
+        a.transfer_manager = Some(TransferManager::new(1).0);
+        let mut events = a.app_event_rx.take().unwrap();
+
+        a.enqueue_downloads(vec![(name.into(), false)]);
+
+        loop {
+            match events.recv().await.unwrap() {
+                AppEvent::WalkComplete { plan, .. } => return plan,
+                AppEvent::WalkFailed { error, .. } => panic!("{error}"),
+                _ => {}
+            }
+        }
+    }
+
+    /// A remote symlink lists as not a folder: its listing can't say what
+    /// it points at. Downloading a link to a folder used to fetch it as a
+    /// file, which the server refused.
+    #[tokio::test]
+    async fn downloading_a_link_to_a_folder_downloads_the_folder() {
+        let plan = plan_download_of_link("link", &["/srv/link/a.txt"]).await;
+        let remotes: Vec<&str> = plan
+            .iter()
+            .filter_map(|j| match j {
+                crate::tui::plan::PlannedJob::Download { remote_path, .. } => {
+                    Some(remote_path.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(remotes, ["/srv/link/a.txt"]);
+    }
+
+    #[tokio::test]
+    async fn downloading_a_link_to_a_file_downloads_the_file() {
+        let plan = plan_download_of_link("flink", &["/srv/flink"]).await;
+        assert!(
+            matches!(
+                plan.as_slice(),
+                [crate::tui::plan::PlannedJob::Download { remote_path, .. }]
+                    if remote_path == "/srv/flink"
+            ),
+            "{plan:?}"
+        );
     }
 
     // -- help scrolling -------------------------------------------------------

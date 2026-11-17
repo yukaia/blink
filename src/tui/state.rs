@@ -37,6 +37,9 @@ pub struct PaneEntry {
     /// A local name that is not valid UTF-8. `raw_name` is then a lossy
     /// decoding of it, which names no file, so nothing may address it.
     pub lossy_name: bool,
+    /// A remote symlink. Listed as not a folder, since its listing can't
+    /// say what it points at; a download asks the server.
+    pub is_link: bool,
 }
 
 impl PaneEntry {
@@ -50,6 +53,7 @@ impl PaneEntry {
             size,
             previewable_image,
             lossy_name: false,
+            is_link: false,
         }
     }
 
@@ -176,7 +180,7 @@ impl PaneState {
     }
 
     /// Every row in this directory, filter or no filter.
-    fn all_rows(&self) -> &[PaneEntry] {
+    pub(crate) fn all_rows(&self) -> &[PaneEntry] {
         self.all_entries.as_deref().unwrap_or(&self.entries)
     }
 
