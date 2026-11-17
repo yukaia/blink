@@ -274,6 +274,10 @@ pub struct App {
     current_session_saved: bool,
     pub transport: Option<SharedTransport>,
     pub local: PaneState,
+    /// The directory the local pane's rows were listed from. A refresh of
+    /// that same directory keeps the rows up while it lists, as the remote
+    /// pane's does; a new one starts blank.
+    local_listed: String,
     pub remote: PaneState,
     pub log: std::collections::VecDeque<LogLine>,
     #[allow(dead_code)]
@@ -480,6 +484,7 @@ impl App {
             current_session_saved: false,
             transport: None,
             local,
+            local_listed: String::new(),
             remote: PaneState::empty(),
             log: std::collections::VecDeque::new(),
             transfers: Vec::new(),
@@ -4748,5 +4753,231 @@ mod session_and_prompt_tests {
         a.disconnect();
         assert!(a.viewer.is_none());
         assert!(a.needs_terminal_clear, "the image is still on the terminal");
+    }
+}
+
+#[cfg(test)]
+mod pane_audit_tests {
+    use super::tests_support::{app_on_main, draw, draw_sized};
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn app() -> App {
+        App::new(Config::default(), Theme::load("dracula").unwrap())
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn text(buf: &ratatui::buffer::Buffer) -> String {
+        buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    fn logged(a: &App, needle: &str) -> bool {
+        a.log.iter().any(|l| l.message.contains(needle))
+    }
+
+    fn file(name: &str) -> PaneEntry {
+        PaneEntry::new(name.into(), false, 1)
+    }
+
+    fn link(name: &str) -> PaneEntry {
+        PaneEntry {
+            is_link: true,
+            ..PaneEntry::new(name.into(), false, 0)
+        }
+    }
+
+    fn with_remote(entries: Vec<PaneEntry>, mock: crate::transport::mock::MockTransport) -> App {
+        let mut a = app();
+        a.screen = Screen::Main;
+        a.active_pane = Pane::Remote;
+        a.remote.path = "/srv".into();
+        a.remote.set_entries(entries);
+        a.transport = Some(Arc::new(Mutex::new(Box::new(mock) as Box<dyn Transport>)));
+        a.transfer_manager = Some(TransferManager::new(1).0);
+        a
+    }
+
+    /// Hand `a` its own events until `done` holds.
+    async fn run_until(a: &mut App, done: impl Fn(&App) -> bool) {
+        let mut events = a.app_event_rx.take().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !done(a) {
+                let ev = events.recv().await.unwrap();
+                a.handle_app_event(ev);
+            }
+        })
+        .await
+        .expect("never got there");
+        a.app_event_rx = Some(events);
+    }
+
+    // -- rename ---------------------------------------------------------------
+
+    #[test]
+    fn renaming_onto_a_name_the_filter_hides_asks_to_overwrite() {
+        let mut a = with_remote(
+            vec![file("alpha.txt"), file("beta.txt")],
+            crate::transport::mock::MockTransport::new(),
+        );
+        a.remote.set_filter("alpha".into());
+        a.remote.cursor = 0;
+        a.open_rename();
+        a.rename_input = "beta.txt".into();
+        a.submit_rename();
+        assert_eq!(a.screen, Screen::ConfirmOverwrite);
+    }
+
+    #[test]
+    fn a_failed_rename_names_the_file_not_its_path() {
+        let mut a = app_on_main(0);
+        a.handle_app_event(AppEvent::RenameFailed {
+            from: "/srv/deep/old.txt".into(),
+            to: "/srv/deep/new.txt".into(),
+            error: "nope".into(),
+        });
+        assert!(logged(&a, "rename old.txt failed: nope"), "{:?}", a.log);
+    }
+
+    // -- symlinks ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn enter_on_a_link_to_a_folder_opens_the_folder() {
+        let mock = crate::transport::mock::MockTransport::new().with_file("/srv/link/a.txt", b"x");
+        let mut a = with_remote(vec![link("link")], mock);
+        a.remote_enter();
+        run_until(&mut a, |a| a.remote.path == "/srv/link").await;
+    }
+
+    #[tokio::test]
+    async fn a_double_click_on_a_link_to_a_folder_opens_it_rather_than_downloading() {
+        let mock = crate::transport::mock::MockTransport::new().with_file("/srv/link/a.txt", b"x");
+        let mut a = with_remote(vec![link("link")], mock);
+        a.open_or_transfer(Pane::Remote);
+        run_until(&mut a, |a| a.remote.path == "/srv/link").await;
+        assert!(!logged(&a, "preparing"), "{:?}", a.log);
+    }
+
+    #[tokio::test]
+    async fn a_double_click_on_a_link_to_a_file_downloads_it() {
+        let home = crate::paths::test_home();
+        let mock = crate::transport::mock::MockTransport::new().with_file("/srv/flink", b"x");
+        let mut a = with_remote(vec![link("flink")], mock);
+        a.local.path = home.path().display().to_string();
+        a.open_or_transfer(Pane::Remote);
+        run_until(&mut a, |a| logged(a, "preparing 1 download")).await;
+        assert_eq!(a.remote.path, "/srv");
+    }
+
+    #[test]
+    fn a_remote_link_is_marked_in_the_pane() {
+        let mut a = with_remote(
+            vec![link("lnk"), file("plain")],
+            crate::transport::mock::MockTransport::new(),
+        );
+        a.remote.cursor = 1;
+        let shown = text(&draw(&a));
+        assert!(shown.contains("↪ lnk"), "{shown}");
+    }
+
+    // -- the local pane -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn refreshing_the_local_pane_keeps_its_rows_and_cursor() {
+        let home = crate::paths::test_home();
+        let dir = home.path().join("three");
+        std::fs::create_dir(&dir).unwrap();
+        for n in ["a", "b", "c"] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        let mut a = app_on_main(0);
+        a.local.path = dir.display().to_string();
+        a.refresh_local_pane();
+        run_until(&mut a, |a| a.local.entries.len() == 4).await;
+
+        a.local.cursor = 2;
+        a.active_pane = Pane::Local;
+        a.handle_key(key(KeyCode::F(5)));
+        assert_eq!(a.local.entries.len(), 4, "the pane blanked while it listed");
+        assert_eq!(a.local.cursor, 2);
+        run_until(&mut a, |a| a.local.entries.len() == 4).await;
+        assert_eq!(a.local.cursor, 2);
+    }
+
+    #[test]
+    fn the_footer_does_not_count_the_parent_row() {
+        let mut a = app_on_main(0);
+        a.local
+            .set_entries(vec![PaneEntry::parent(), file("a"), file("b")]);
+        let shown = text(&draw(&a));
+        assert!(shown.contains(" 2 items"), "{shown}");
+    }
+
+    // -- the path line ---------------------------------------------------------------
+
+    #[test]
+    fn the_path_line_is_sanitized() {
+        let mut a = app_on_main(0);
+        a.remote.path = "/srv/re\u{202E}port".into();
+        let shown = text(&draw(&a));
+        assert!(!shown.contains('\u{202E}'), "{shown}");
+        assert!(shown.contains("/srv/re port"), "{shown}");
+    }
+
+    #[test]
+    fn a_long_path_keeps_its_end() {
+        let mut a = app_on_main(0);
+        a.remote.path = format!("/srv/{}/the-end", "x".repeat(200));
+        let shown = text(&draw_sized(&a, 80, 24));
+        assert!(shown.contains("the-end"), "{shown}");
+        assert!(shown.contains('…'), "{shown}");
+    }
+
+    // -- starting transfers ---------------------------------------------------------
+
+    #[test]
+    fn nothing_usable_to_download_prepares_nothing() {
+        assert!(crate::tui::plan::safe_local_name("..").is_none());
+        let mut a = with_remote(vec![], crate::transport::mock::MockTransport::new());
+        a.enqueue_downloads(vec![("..".into(), false)]);
+        assert!(!logged(&a, "preparing"), "{:?}", a.log);
+    }
+
+    // -- the overwrite prompt ---------------------------------------------------------
+
+    fn conflicts(paths: &[&str]) -> App {
+        let mut a = app_on_main(0);
+        let plan: Vec<crate::tui::plan::PlannedJob> = paths
+            .iter()
+            .map(|p| crate::tui::plan::PlannedJob::Download {
+                remote_path: (*p).into(),
+                local_path: format!("/l{p}").into(),
+            })
+            .collect();
+        a.pending_overwrite = Some(crate::tui::state::OverwritePending::DownloadPlan {
+            conflict_indices: (0..plan.len()).collect(),
+            plan,
+            local_dirs: vec![],
+        });
+        a.screen = Screen::ConfirmOverwrite;
+        a
+    }
+
+    #[test]
+    fn conflicts_in_different_folders_are_told_apart() {
+        let a = conflicts(&["/srv/x/a/readme.md", "/srv/x/b/readme.md"]);
+        let shown = text(&draw(&a));
+        assert!(shown.contains("a/readme.md"), "{shown}");
+        assert!(shown.contains("b/readme.md"), "{shown}");
+        assert!(!shown.contains("x/a/readme.md"), "{shown}");
+    }
+
+    #[test]
+    fn a_lone_conflict_shows_its_name() {
+        let a = conflicts(&["/srv/x/readme.md"]);
+        let shown = text(&draw(&a));
+        assert!(shown.contains("• readme.md"), "{shown}");
     }
 }

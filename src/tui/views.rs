@@ -1598,12 +1598,15 @@ pub mod confirm_overwrite {
         // Show up to ~6 conflict names. Beyond that, summarise.
         let max_show = 6;
         let shown: usize = n.min(max_show);
-        for &idx in conflict_indices.iter().take(max_show) {
-            let name = match &plan[idx] {
-                PlannedJob::Download { remote_path, .. } => conflict_row_name(remote_path),
-                PlannedJob::Upload { remote_path, .. } => conflict_row_name(remote_path),
-                PlannedJob::Mkdir { .. } => continue, // shouldn't appear
-            };
+        let paths: Vec<&str> = conflict_indices
+            .iter()
+            .filter_map(|&idx| match &plan[idx] {
+                PlannedJob::Download { remote_path, .. }
+                | PlannedJob::Upload { remote_path, .. } => Some(remote_path.as_str()),
+                PlannedJob::Mkdir { .. } => None, // shouldn't appear
+            })
+            .collect();
+        for name in conflict_row_names(&paths).into_iter().take(max_show) {
             lines.push(Line::from(vec![
                 Span::raw("  • "),
                 Span::styled(name, Style::default().fg(app.theme.fg)),
@@ -1637,8 +1640,10 @@ pub mod confirm_overwrite {
     }
 }
 
-/// The name shown for one conflicting file in the overwrite-confirmation
-/// modal.
+/// The names shown for conflicting files in the overwrite-confirmation
+/// modal: each path below the folder they all share, so two `readme.md` in
+/// different subfolders don't read as one file listed twice. A lone
+/// conflict is shown by its name.
 ///
 /// Sanitized, like every other site that renders a server-supplied name.
 /// `ratatui` would drop the deceptive formatters on its own — `Buffer::set_stringn`
@@ -1647,13 +1652,33 @@ pub mod confirm_overwrite {
 /// prompt `is_deceptive_format` was written for: two remote names that differ
 /// only by a bidi override must not render identically in the dialog the user
 /// clears them through.
-pub(crate) fn conflict_row_name(path: &str) -> String {
-    crate::error::sanitize(
-        path.rsplit('/')
-            .find(|s| !s.is_empty())
-            .unwrap_or(path)
-            .to_string(),
-    )
+pub(crate) fn conflict_row_names(paths: &[&str]) -> Vec<String> {
+    let parent = |p: &str| -> Vec<String> {
+        let mut parts: Vec<String> = p
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect();
+        parts.pop();
+        parts
+    };
+    let mut shared = paths.first().map(|p| parent(p)).unwrap_or_default();
+    for p in paths.iter().skip(1) {
+        let dir = parent(p);
+        let same = shared.iter().zip(&dir).take_while(|(a, b)| a == b).count();
+        shared.truncate(same);
+    }
+    paths
+        .iter()
+        .map(|p| {
+            let rest: Vec<&str> = p
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .skip(shared.len())
+                .collect();
+            crate::error::sanitize(rest.join("/"))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

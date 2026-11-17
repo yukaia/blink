@@ -296,6 +296,7 @@ impl App {
                     return;
                 }
                 self.local.set_entries(entries);
+                self.local_listed = path;
             }
             AppEvent::LocalListFailed { path, error } => {
                 // Stale guard same as above — don't blame the new path for
@@ -327,7 +328,29 @@ impl App {
                 self.refresh_remote_pane(path);
             }
             AppEvent::RenameFailed { from, to: _, error } => {
-                self.push_log(LogLevel::Error, format!("rename {from} failed: {error}"));
+                // By name, as the line that says it worked does.
+                let name = from.rsplit('/').find(|s| !s.is_empty()).unwrap_or(&from);
+                self.push_log(LogLevel::Error, format!("rename {name} failed: {error}"));
+            }
+            AppEvent::LinkResolved {
+                connection,
+                dir,
+                name,
+                is_dir,
+                download,
+            } => {
+                // Answers a question asked of another connection, or about a
+                // directory the user has since left.
+                if connection != self.connection || dir != self.remote.path {
+                    return;
+                }
+                if is_dir {
+                    if let Some(path) = crate::transport::join_remote(&dir, &name) {
+                        self.refresh_remote_pane(path);
+                    }
+                } else if download {
+                    self.enqueue_downloads(vec![(name, false)]);
+                }
             }
             AppEvent::MkdirDone { path } => {
                 let name = path

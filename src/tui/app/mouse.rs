@@ -236,6 +236,11 @@ impl App {
         let Some(entry) = state.entries.get(state.cursor) else {
             return;
         };
+        if entry.is_link && pane == Pane::Remote {
+            let name = entry.raw_name.clone();
+            self.open_link(name, true);
+            return;
+        }
         if entry.is_dir {
             match pane {
                 Pane::Local => self.local_enter(),

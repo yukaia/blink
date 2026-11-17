@@ -68,6 +68,18 @@ pub enum AppEvent {
         error: String,
     },
 
+    /// A remote symlink the user opened, in directory `dir`, was looked up
+    /// on connection `connection`: `is_dir` says whether it points at a
+    /// folder. See `App::open_link`.
+    LinkResolved {
+        connection: u64,
+        dir: String,
+        name: String,
+        is_dir: bool,
+        /// Download it if it is not a folder: it was double-clicked.
+        download: bool,
+    },
+
     /// A local directory enumeration completed successfully. Mirror of
     /// `Listed` for the local pane: read_dir + per-entry metadata is
     /// non-trivial on NFS/SMB mounts, so we run it on a worker task and
