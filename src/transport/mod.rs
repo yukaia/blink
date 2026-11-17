@@ -49,6 +49,16 @@ const MAX_NAME_BYTES: usize = 255;
 /// whole name, so two names alike up to the cut still differ. `name` is
 /// display only and may be lossy; only `name_bytes` decides the hash.
 fn part_name(name_bytes: &[u8], name: &str) -> String {
+    hashed_name(name_bytes, name, PART_SUFFIX)
+}
+
+/// Suffix of the name a remote file is moved to while an upload replaces
+/// it. See [`remote_aside_path`].
+const ASIDE_SUFFIX: &str = ".blink-old";
+
+/// `<name>.<hash><suffix>`, as [`part_name`] describes. `suffix` is no
+/// longer than [`PART_SUFFIX`], which the length budget allows for.
+fn hashed_name(name_bytes: &[u8], name: &str, suffix: &str) -> String {
     use sha2::{Digest, Sha256};
     use std::fmt::Write as _;
 
@@ -62,7 +72,7 @@ fn part_name(name_bytes: &[u8], name: &str) -> String {
     while !name.is_char_boundary(cut) {
         cut -= 1;
     }
-    format!("{}.{tag}{PART_SUFFIX}", &name[..cut])
+    format!("{}.{tag}{suffix}", &name[..cut])
 }
 
 /// The on-disk path a download writes to while it's in flight, beside
@@ -89,6 +99,21 @@ pub(crate) fn remote_part_path(remote: &str) -> String {
     match remote.rsplit_once('/') {
         Some((dir, name)) => format!("{dir}/{}", part_name(name.as_bytes(), name)),
         None => part_name(remote.as_bytes(), remote),
+    }
+}
+
+/// Where the file at `remote` waits while an upload is renamed onto its
+/// name, on a server whose rename won't replace it: beside it, named as
+/// [`remote_part_path`] names a partial but ending `.blink-old`.
+///
+/// The file used to be deleted to make room. When the rename then failed
+/// again, for whatever made it fail the first time, the old file was gone
+/// and the new one sat under its partial's name. Moved aside, it can be
+/// put back.
+pub(crate) fn remote_aside_path(remote: &str) -> String {
+    match remote.rsplit_once('/') {
+        Some((dir, name)) => format!("{dir}/{}", hashed_name(name.as_bytes(), name, ASIDE_SUFFIX)),
+        None => hashed_name(remote.as_bytes(), remote, ASIDE_SUFFIX),
     }
 }
 
@@ -517,6 +542,9 @@ pub(crate) mod error_map;
 pub mod ftp;
 pub(crate) mod ftp_impl;
 pub mod ftps;
+/// Throwaway TLS certificates used only by `ftps`'s integration tests.
+#[cfg(test)]
+mod ftps_test_certs;
 pub mod scp;
 pub mod sftp;
 /// Throwaway SSH keys used only by `sftp`'s integration tests.

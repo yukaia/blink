@@ -229,38 +229,92 @@ impl App {
 
         let tx = self.app_event_tx.clone();
         tokio::task::spawn_blocking(move || {
-            let pb = std::path::PathBuf::from(&path);
-            let mut entries = vec![PaneEntry::parent()];
-            let read = match std::fs::read_dir(&pb) {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.send(AppEvent::LocalListFailed {
-                        path,
-                        error: e.to_string(),
-                    });
-                    return;
-                }
+            let event = match read_local_entries(std::path::Path::new(&path)) {
+                Ok(entries) => AppEvent::LocalListed { path, entries },
+                Err(e) => AppEvent::LocalListFailed {
+                    path,
+                    error: e.to_string(),
+                },
             };
-            for entry in read.flatten() {
-                let meta = match entry.metadata() {
-                    Ok(m) => m,
-                    Err(_) => continue,
-                };
-                let is_dir = meta.is_dir();
-                entries.push(PaneEntry::local(
-                    &entry.file_name(),
-                    is_dir,
-                    if is_dir { 0 } else { meta.len() },
-                ));
-            }
-            // Directories first, then alpha within each group — ordered by
-            // what the user reads, matching the remote pane.
-            entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
-                (true, false) => std::cmp::Ordering::Less,
-                (false, true) => std::cmp::Ordering::Greater,
-                _ => a.display_name.cmp(&b.display_name),
-            });
-            let _ = tx.send(AppEvent::LocalListed { path, entries });
+            let _ = tx.send(event);
         });
+    }
+}
+
+/// The local pane's rows for `dir`: the parent row, then directories, then
+/// files, each group in name order.
+fn read_local_entries(dir: &std::path::Path) -> std::io::Result<Vec<PaneEntry>> {
+    let mut entries = vec![PaneEntry::parent()];
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        // Through a symlink, so a link to a folder is a folder. A link
+        // whose target is gone is still listed, as the link itself.
+        let meta = match std::fs::metadata(entry.path()).or_else(|_| entry.metadata()) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let is_dir = meta.is_dir();
+        entries.push(PaneEntry::local(
+            &entry.file_name(),
+            is_dir,
+            if is_dir { 0 } else { meta.len() },
+        ));
+    }
+    // Directories first, then alpha within each group — ordered by what
+    // the user reads, matching the remote pane.
+    entries.sort_by(|a, b| match (a.is_dir, b.is_dir) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => a.display_name.cmp(&b.display_name),
+    });
+    Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_local_entries;
+
+    /// `DirEntry::metadata` describes a symlink, not what it points at, so
+    /// a link to a folder was listed as a file a few bytes long: it could
+    /// not be entered, and uploading it tried to read a directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_folder_is_listed_as_a_folder() {
+        let home = crate::paths::test_home();
+        let target = home.path().join("real");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("inside.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(&target, home.path().join("link")).unwrap();
+
+        let entries = read_local_entries(home.path()).unwrap();
+
+        let link = entries.iter().find(|e| e.raw_name == "link").unwrap();
+        assert!(link.is_dir);
+    }
+
+    /// A link to a file reports the file's size, not the link's.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_to_a_file_reports_the_files_size() {
+        let home = crate::paths::test_home();
+        std::fs::write(home.path().join("real.bin"), vec![0u8; 5000]).unwrap();
+        std::os::unix::fs::symlink(home.path().join("real.bin"), home.path().join("link")).unwrap();
+
+        let entries = read_local_entries(home.path()).unwrap();
+
+        let link = entries.iter().find(|e| e.raw_name == "link").unwrap();
+        assert_eq!((link.is_dir, link.size), (false, 5000));
+    }
+
+    /// A link whose target is gone still shows, so it can be seen and
+    /// dealt with, as it did before links were followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_still_listed() {
+        let home = crate::paths::test_home();
+        std::os::unix::fs::symlink(home.path().join("gone"), home.path().join("link")).unwrap();
+
+        let entries = read_local_entries(home.path()).unwrap();
+
+        assert!(entries.iter().any(|e| e.raw_name == "link" && !e.is_dir));
     }
 }

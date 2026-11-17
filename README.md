@@ -931,10 +931,12 @@ declaring huge dimensions is still rejected.
   the upload completes (and fsyncs, where the server supports
   `fsync@openssh.com`). SFTP uses `posix-rename@openssh.com` for an
   atomic replace when the server offers it; otherwise (and on FTP/FTPS,
-  where overwrite-on-rename is server-dependent) the target is removed
-  and the rename retried — that window can expose "old file gone, new
-  file still at `.blink-part`", but never a truncated file under the
-  final name. An upload interrupted by a hard kill or dropped connection
+  where overwrite-on-rename is server-dependent) a file in the way is
+  moved aside to `<remote>.<hash>.blink-old`, the rename retried, and the
+  old file removed once it lands, or moved back if it doesn't — that
+  window can expose "old file at `.blink-old`, new file still at
+  `.blink-part`", but never a truncated file under the final name. An
+  upload interrupted by a hard kill or dropped connection
   can leave a stale `<remote>.<hash>.blink-part` behind; re-running the upload
   reuses (truncates) it.
 - Config directories are created with mode 0700 on Unix (not
@@ -968,16 +970,6 @@ A few things worth knowing before you use this in anger:
   self-signed or privately-rooted server, the per-session
   `accept_invalid_certs` toggle pins the certificate instead (see
   [Security](#protocol)).
-- **RSA client keys carry a known timing-sidechannel risk.** The `rsa`
-  crate reached transitively through `russh` is affected by
-  [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071)
-  ("Marvin Attack"). The fix shipped in `rsa` 0.10.0, but `russh` pins a
-  pre-release that predates it, so blink can't pick it up until `russh`
-  moves. Exploiting it needs many precisely-timed oracle queries against
-  your private key, which a normal interactive session does not provide —
-  but if you want the risk gone, use an Ed25519 key. The rationale is
-  recorded in `.cargo/audit.toml`, the ignore list used when running
-  `cargo audit` against this tree.
 - **Passwords are held in memory** for the duration of the connected
   session; see [Credential handling](#credential-handling) for why, and
   for the alternative.

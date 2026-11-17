@@ -172,10 +172,13 @@ impl Handler for KnownHostsHandler {
         // Sanitize before any use: a server claiming a non-standard algorithm
         // name could inject ANSI sequences into the host-key modal and log.
         let key_type = error::sanitize(server_public_key.algorithm().as_str().to_string());
-        let key_b64 = {
-            use base64::Engine as _;
-            let wire = server_public_key.to_bytes().unwrap_or_default();
-            base64::engine::general_purpose::STANDARD.encode(&wire)
+        // Fail closed, as the known-hosts read error below does.
+        let Some(key_b64) = host_key_b64(server_public_key.to_bytes()) else {
+            tracing::error!(
+                host = %self.display_host(),
+                "the server's host key could not be encoded — rejecting connection",
+            );
+            return Ok(false);
         };
 
         let fingerprint = error::sanitize(
@@ -309,6 +312,16 @@ impl Handler for KnownHostsHandler {
             HostKeyDecision::Reject => Ok(false),
         }
     }
+}
+
+/// A host key's wire encoding in base64, as `known_hosts` stores it, or
+/// `None` for a key that did not encode. Such a key has nothing to compare
+/// or store, and standing the empty string in for it would let the user
+/// trust a blob any other key that failed the same way matches.
+fn host_key_b64<E>(wire: std::result::Result<Vec<u8>, E>) -> Option<String> {
+    use base64::Engine as _;
+    let wire = wire.ok().filter(|w| !w.is_empty())?;
+    Some(base64::engine::general_purpose::STANDARD.encode(wire))
 }
 
 /// The host-key algorithms to offer, those of a type `known_hosts` already
@@ -1087,10 +1100,12 @@ async fn read_local_full<R: tokio::io::AsyncRead + Unpin>(
 /// Prefers the `posix-rename@openssh.com` extension, which replaces the
 /// target atomically. Without it, SFTP v3 `RENAME` fails on an existing
 /// target, so the fallback is: try the plain rename (covers the common
-/// no-target case), and when it's refused, remove the target and rename
-/// again. That fallback has a non-atomic window, but it only ever exposes
-/// "old file present" or "old file gone, complete new file at `part`" —
-/// never a truncated file under the final name.
+/// no-target case), and when it's refused, move the target aside (see
+/// [`super::remote_aside_path`]), rename again, and remove the old file
+/// only once that lands; if it doesn't, the old file is moved back. That
+/// fallback has a non-atomic window, but it only ever exposes "old file
+/// present" or "old file aside, complete new file at `part`" — never a
+/// truncated file under the final name, and never neither file.
 async fn finalize_remote_rename(
     raw: &RawSftpSession,
     posix_rename: bool,
@@ -1130,18 +1145,39 @@ async fn finalize_remote_rename_unbounded(
         };
     }
 
-    if raw.rename(part, dest).await.is_ok() {
-        return Ok(());
-    }
-    match raw.remove(dest).await {
-        Ok(_) => {}
-        Err(SftpError::Status(s)) if s.status_code == StatusCode::NoSuchFile => {}
-        Err(e) => return Err(map_sftp("remove", dest, e)),
-    }
-    raw.rename(part, dest)
+    let refused = match raw.rename(part, dest).await {
+        Ok(_) => return Ok(()),
+        Err(e) => map_sftp("rename", dest, e),
+    };
+    // Only a file in the way is moved. Nothing there means the rename
+    // failed for another reason, and a folder is not this rename's to
+    // replace: moved aside, it would stay there, since it can't be removed
+    // as a file is.
+    let in_the_way = raw
+        .lstat(dest)
         .await
-        .map(|_| ())
-        .map_err(|e| map_sftp("rename", dest, e))
+        .is_ok_and(|a| entry_kind(&a.attrs) != EntryKind::Directory);
+    let aside = super::remote_aside_path(dest);
+    if !in_the_way || raw.rename(dest, &aside).await.is_err() {
+        return Err(refused);
+    }
+    match raw.rename(part, dest).await {
+        Ok(_) => {
+            if let Err(e) = raw.remove(&aside).await {
+                tracing::warn!(path = %aside, error = %e, "could not remove the replaced file");
+            }
+            Ok(())
+        }
+        Err(e) => {
+            let failed = map_sftp("rename", dest, e);
+            match raw.rename(&aside, dest).await {
+                Ok(_) => Err(failed),
+                Err(_) => Err(BlinkError::transport(format!(
+                    "{failed}; the file it was replacing is now at {aside}"
+                ))),
+            }
+        }
+    }
 }
 
 /// Pipelined upload: read the local file in chunks and keep `concurrency`
@@ -1406,9 +1442,9 @@ impl Transport for SftpTransport {
     }
 
     async fn rename_over(&mut self, from: &str, to: &str) -> Result<()> {
-        // Making room for the rename, below, deletes `to` when the server
-        // has no `posix-rename`. Done for a source that has gone since the
-        // listing, that would destroy the target and then fail.
+        // Without `posix-rename`, the rename below moves `to` aside to make
+        // room, and back if it then fails. Asking first spares a source
+        // that has gone since the listing that round trip.
         if self.metadata(from).await?.is_none() {
             return Err(BlinkError::not_found(format!("rename {from}")));
         }
@@ -1497,6 +1533,32 @@ impl Transport for SftpTransport {
             .disconnect(russh::Disconnect::ByApplication, "bye", "")
             .await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod host_key_encoding_tests {
+    use super::host_key_b64;
+
+    #[test]
+    fn a_key_is_encoded_as_known_hosts_stores_it() {
+        assert_eq!(
+            host_key_b64(Ok::<_, ()>(b"abc".to_vec())).as_deref(),
+            Some("YWJj")
+        );
+    }
+
+    /// A key that would not encode used to become the empty string, which
+    /// the user could then be asked to trust, and which every other key
+    /// that failed the same way would match.
+    #[test]
+    fn a_key_that_fails_to_encode_has_no_blob() {
+        assert_eq!(host_key_b64(Err::<Vec<u8>, _>("no")), None);
+    }
+
+    #[test]
+    fn an_empty_encoding_has_no_blob() {
+        assert_eq!(host_key_b64(Ok::<_, ()>(Vec::new())), None);
     }
 }
 
@@ -2177,7 +2239,7 @@ mod integration {
         ) -> Result<Status, Self::Error> {
             let mut store = self.store.lock().await;
             // SFTP v3 semantics: RENAME fails when the target exists. This
-            // deliberately exercises the client's remove-then-rename
+            // deliberately exercises the client's move-aside-then-rename
             // fallback for upload finalization.
             if store.contains_key(&newpath) {
                 return Err(StatusCode::Failure);
@@ -3043,7 +3105,7 @@ mod integration {
 
         // ---- upload over an existing remote file ----
         // The test server enforces SFTP v3 rename semantics (fails when the
-        // target exists), so this exercises the remove-then-rename fallback
+        // target exists), so this exercises the move-aside-then-rename fallback
         // that finalizes an overwriting upload.
         let replacement = pseudo_random(3 * super::TRANSFER_CHUNK + 99);
         tokio::fs::write(&ul_src, &replacement).await.unwrap();
@@ -3248,6 +3310,11 @@ mod integration {
         let files = store.lock().await;
         assert_eq!(files.get("/b.txt").map(Vec::as_slice), Some(&b"from a"[..]));
         assert!(!files.contains_key("/a.txt"));
+        assert!(
+            !files.keys().any(|k| k.ends_with(".blink-old")),
+            "the replaced file is removed once the rename lands: {:?}",
+            files.keys()
+        );
         drop(files);
         let _ = transport.close().await;
     }
@@ -3271,6 +3338,34 @@ mod integration {
             store.lock().await.get("/b.txt").map(Vec::as_slice),
             Some(&b"old b"[..])
         );
+        let _ = transport.close().await;
+    }
+
+    /// Without `posix-rename`, replacing a file used to mean deleting it and
+    /// renaming the new one into place. When that rename failed too, for
+    /// whatever made the first one fail, the old file was already gone.
+    #[tokio::test]
+    async fn a_replacement_that_fails_keeps_the_old_file() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/b.txt".to_string(), b"old b".to_vec());
+        let (port, _c) = start_server(Arc::clone(&store)).await;
+        let mut transport = connect(port).await;
+        let raw = Arc::clone(&transport.transfer_session().await.unwrap().raw);
+
+        let replaced = super::finalize_remote_rename(&raw, false, "/gone.txt", "/b.txt").await;
+
+        assert!(replaced.is_err());
+        let files = store.lock().await;
+        assert_eq!(files.get("/b.txt").map(Vec::as_slice), Some(&b"old b"[..]));
+        assert!(
+            !files.keys().any(|k| k.ends_with(".blink-old")),
+            "the old file is put back, not left aside: {:?}",
+            files.keys()
+        );
+        drop(files);
         let _ = transport.close().await;
     }
 

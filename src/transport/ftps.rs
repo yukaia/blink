@@ -591,3 +591,477 @@ mod tests {
         assert!(answer_prompt(None).await.is_err());
     }
 }
+
+/// End-to-end tests against an in-process FTPS server: explicit TLS on the
+/// control connection, protected data connections, and just enough FTP to
+/// log in and list a directory. `ftp_impl`'s server speaks the rest of the
+/// protocol over plain TCP; what is FTPS's own is the certificate.
+#[cfg(test)]
+mod integration {
+    use std::net::Ipv4Addr;
+    use std::sync::Arc;
+
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+    use suppaftp::rustls::ServerConfig;
+    use suppaftp::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use suppaftp::tokio_rustls::TlsAcceptor;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::{Mutex, mpsc};
+
+    use super::super::ftps_test_certs as certs;
+    use super::{FtpsTransport, colon_hex};
+    use crate::session::{AuthMethod, Protocol, Session};
+    use crate::transport::sftp::HostKeyDecision;
+    use crate::transport::{NewCertPin, Transport, UserWait};
+    use crate::tui::event::{AppEvent, TrustSubject};
+
+    /// A certificate and its key, as base64 of their DER.
+    type Identity = (&'static str, &'static str);
+    const A: Identity = (certs::A_CERT, certs::A_KEY);
+    const B: Identity = (certs::B_CERT, certs::B_KEY);
+    const OTHER_NAME: Identity = (certs::OTHER_NAME_CERT, certs::OTHER_NAME_KEY);
+
+    fn der(b64: &str) -> Vec<u8> {
+        base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("fixture should be base64")
+    }
+
+    /// The pin of a certificate, as `cert_sha256` holds it.
+    fn pin_of(identity: Identity) -> String {
+        Sha256::digest(der(identity.0))
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    fn acceptor(identity: Identity) -> TlsAcceptor {
+        let cert = CertificateDer::from(der(identity.0));
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der(identity.1)));
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .expect("fixture certificate should load");
+        TlsAcceptor::from(Arc::new(config))
+    }
+
+    /// The certificates a server presents, changeable while it runs.
+    #[derive(Clone)]
+    struct Identities {
+        control: Arc<Mutex<Identity>>,
+        data: Arc<Mutex<Identity>>,
+    }
+
+    /// Every command the server received, on any connection, in order.
+    type Log = Arc<Mutex<Vec<String>>>;
+
+    struct Server {
+        port: u16,
+        identities: Identities,
+        log: Log,
+    }
+
+    impl Server {
+        async fn commands(&self) -> Vec<String> {
+            self.log.lock().await.clone()
+        }
+
+        /// How many times a password reached the server.
+        async fn passwords(&self) -> usize {
+            let log = self.log.lock().await;
+            log.iter().filter(|l| l.starts_with("PASS")).count()
+        }
+    }
+
+    /// Serve FTPS with `control` on the control connection and `data` on
+    /// the data connections.
+    async fn start_server(control: Identity, data: Identity) -> Server {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let identities = Identities {
+            control: Arc::new(Mutex::new(control)),
+            data: Arc::new(Mutex::new(data)),
+        };
+        let log: Log = Arc::new(Mutex::new(Vec::new()));
+        let (identities_l, log_l) = (identities.clone(), Arc::clone(&log));
+        tokio::spawn(async move {
+            while let Ok((sock, _)) = listener.accept().await {
+                let (identities, log) = (identities_l.clone(), Arc::clone(&log_l));
+                tokio::spawn(async move {
+                    // A client that refuses the certificate ends the
+                    // connection mid-handshake; that is the test, not a
+                    // failure of the server.
+                    let _ = handle_control(sock, identities, log).await;
+                });
+            }
+        });
+        Server {
+            port,
+            identities,
+            log,
+        }
+    }
+
+    async fn handle_control(
+        mut sock: TcpStream,
+        identities: Identities,
+        log: Log,
+    ) -> std::io::Result<()> {
+        sock.write_all(b"220 blink test server\r\n").await?;
+
+        // Explicit TLS: one command in the clear, then the handshake.
+        let mut first = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            if tokio::io::AsyncReadExt::read(&mut sock, &mut byte).await? == 0 {
+                return Ok(());
+            }
+            first.push(byte[0]);
+            if first.ends_with(b"\r\n") {
+                break;
+            }
+        }
+        let first = String::from_utf8_lossy(&first).trim_end().to_string();
+        log.lock().await.push(first.clone());
+        if first != "AUTH TLS" {
+            sock.write_all(b"530 use AUTH TLS first\r\n").await?;
+            return Ok(());
+        }
+        sock.write_all(b"234 starting TLS\r\n").await?;
+        let control = *identities.control.lock().await;
+        let tls = acceptor(control).accept(sock).await?;
+
+        let (read_half, mut w) = tokio::io::split(tls);
+        let mut lines = BufReader::new(read_half).lines();
+        // Bound by PASV, consumed by the next LIST.
+        let mut pasv: Option<TcpListener> = None;
+
+        while let Some(line) = lines.next_line().await? {
+            let line = line.trim_end();
+            log.lock().await.push(line.to_string());
+            let cmd = line.split(' ').next().unwrap_or("").to_ascii_uppercase();
+            match cmd.as_str() {
+                "PBSZ" | "PROT" | "TYPE" => w.write_all(b"200 ok\r\n").await?,
+                "USER" => w.write_all(b"331 password required\r\n").await?,
+                "PASS" => w.write_all(b"230 logged in\r\n").await?,
+                "PASV" => {
+                    let data_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+                    let port = data_listener.local_addr()?.port();
+                    pasv = Some(data_listener);
+                    let reply = format!(
+                        "227 Entering Passive Mode (127,0,0,1,{},{})\r\n",
+                        port / 256,
+                        port % 256
+                    );
+                    w.write_all(reply.as_bytes()).await?;
+                }
+                "LIST" => {
+                    let Some(data_listener) = pasv.take() else {
+                        w.write_all(b"425 use PASV first\r\n").await?;
+                        continue;
+                    };
+                    w.write_all(b"150 here it comes\r\n").await?;
+                    let (data_sock, _) = data_listener.accept().await?;
+                    let data = *identities.data.lock().await;
+                    match acceptor(data).accept(data_sock).await {
+                        Ok(mut data_tls) => {
+                            let listing = "-rw-r--r-- 1 owner group 12 Nov 01 12:00 a.txt\r\n";
+                            data_tls.write_all(listing.as_bytes()).await?;
+                            data_tls.shutdown().await?;
+                            w.write_all(b"226 transfer complete\r\n").await?;
+                        }
+                        Err(_) => w.write_all(b"425 data handshake failed\r\n").await?,
+                    }
+                }
+                "QUIT" => {
+                    w.write_all(b"221 goodbye\r\n").await?;
+                    break;
+                }
+                _ => w.write_all(b"502 command not implemented\r\n").await?,
+            }
+        }
+        Ok(())
+    }
+
+    /// A session for the server on `port` that pins rather than checks the
+    /// chain, holding `pin` if one is given.
+    fn pinning_session(port: u16, pin: Option<String>) -> Session {
+        Session {
+            name: "it".to_string(),
+            protocol: Protocol::Ftps,
+            host: "127.0.0.1".to_string(),
+            port,
+            username: "tester".to_string(),
+            remote_dir: "/".to_string(),
+            local_dir: None,
+            auth: AuthMethod::Password,
+            parallel_downloads: None,
+            theme: None,
+            accept_invalid_certs: true,
+            cert_sha256: pin,
+        }
+    }
+
+    /// What a connect came to, and the trust prompts it raised.
+    struct Attempt {
+        result: crate::error::Result<(FtpsTransport, Option<NewCertPin>)>,
+        /// The fingerprint each prompt showed.
+        prompts: Vec<String>,
+        /// Passwords the server had seen when each prompt was raised.
+        passwords_at_prompt: Vec<usize>,
+        /// Where later prompts would arrive, kept open so a reconnect that
+        /// asked would be seen to.
+        events: mpsc::UnboundedReceiver<AppEvent>,
+    }
+
+    /// Connect to `server` as `session`, answering every trust prompt with
+    /// `decision`.
+    async fn connect(server: &Server, session: &Session, decision: HostKeyDecision) -> Attempt {
+        let (tx, mut events) = mpsc::unbounded_channel();
+        let (user_wait, _waiting) = UserWait::new();
+        let mut prompts = Vec::new();
+        let mut passwords_at_prompt = Vec::new();
+
+        let result = {
+            let connecting = FtpsTransport::connect(session, Some("secret"), &tx, &user_wait);
+            tokio::pin!(connecting);
+            loop {
+                tokio::select! {
+                    result = &mut connecting => break result,
+                    Some(event) = events.recv() => {
+                        let AppEvent::HostKeyUnknown { subject, fingerprint, decision_tx, .. } = event
+                        else {
+                            panic!("expected a trust prompt");
+                        };
+                        assert_eq!(subject, TrustSubject::FtpsCertificate);
+                        prompts.push(fingerprint);
+                        passwords_at_prompt.push(server.passwords().await);
+                        let _ = decision_tx.send(decision);
+                    }
+                }
+            }
+        };
+        Attempt {
+            result,
+            prompts,
+            passwords_at_prompt,
+            events,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_presenting_the_pinned_certificate_connects_and_lists() {
+        let server = start_server(A, A).await;
+        let session = pinning_session(server.port, Some(pin_of(A)));
+
+        let attempt = connect(&server, &session, HostKeyDecision::Reject).await;
+
+        let (mut transport, new_pin) = attempt.result.expect("the pinned certificate connects");
+        assert_eq!(new_pin, None, "a pin that matched is not a new one");
+        assert!(attempt.prompts.is_empty(), "and nothing is asked");
+        let listing = transport.list("/").await.expect("the data connection too");
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].raw_name, "a.txt");
+    }
+
+    /// A stored pin in upper case is the same pin.
+    #[tokio::test]
+    async fn a_pin_matches_whatever_its_case() {
+        let server = start_server(A, A).await;
+        let session = pinning_session(server.port, Some(pin_of(A).to_ascii_uppercase()));
+
+        let attempt = connect(&server, &session, HostKeyDecision::Reject).await;
+
+        assert!(attempt.result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn another_certificate_than_the_pinned_one_is_refused_before_the_password() {
+        let server = start_server(B, B).await;
+        let session = pinning_session(server.port, Some(pin_of(A)));
+
+        let attempt = connect(&server, &session, HostKeyDecision::AcceptAndSave).await;
+
+        let err = attempt
+            .result
+            .err()
+            .expect("a changed certificate is refused");
+        assert!(err.to_string().contains("pin mismatch"), "{err}");
+        assert!(attempt.prompts.is_empty(), "a mismatch is not a question");
+        assert_eq!(server.passwords().await, 0);
+    }
+
+    /// Turning chain validation off must not turn the name check off: a
+    /// certificate for another host is not this host's, whoever signed it.
+    #[tokio::test]
+    async fn a_certificate_for_another_name_is_refused_without_asking() {
+        let server = start_server(OTHER_NAME, OTHER_NAME).await;
+        let session = pinning_session(server.port, None);
+
+        let attempt = connect(&server, &session, HostKeyDecision::AcceptAndSave).await;
+
+        assert!(attempt.result.is_err());
+        assert!(
+            attempt.prompts.is_empty(),
+            "there is nothing to offer to trust"
+        );
+        assert_eq!(server.passwords().await, 0);
+    }
+
+    /// Pinning its own certificate doesn't rescue it either.
+    #[tokio::test]
+    async fn a_certificate_for_another_name_is_refused_even_when_pinned() {
+        let server = start_server(OTHER_NAME, OTHER_NAME).await;
+        let session = pinning_session(server.port, Some(pin_of(OTHER_NAME)));
+
+        let attempt = connect(&server, &session, HostKeyDecision::AcceptAndSave).await;
+
+        assert!(attempt.result.is_err());
+        assert_eq!(server.passwords().await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_first_connect_asks_about_the_certificate_before_sending_the_password() {
+        let server = start_server(A, A).await;
+        let session = pinning_session(server.port, None);
+
+        let attempt = connect(&server, &session, HostKeyDecision::AcceptAndSave).await;
+
+        let (_transport, new_pin) = attempt.result.expect("an accepted certificate connects");
+        assert_eq!(
+            new_pin,
+            Some(NewCertPin {
+                sha256: pin_of(A),
+                save: true
+            })
+        );
+        assert_eq!(attempt.prompts, [colon_hex(&pin_of(A))]);
+        assert_eq!(attempt.passwords_at_prompt, [0], "asked first");
+        assert_eq!(server.passwords().await, 1, "then logged in");
+    }
+
+    #[tokio::test]
+    async fn trusting_a_certificate_once_pins_it_without_saving() {
+        let server = start_server(A, A).await;
+        let session = pinning_session(server.port, None);
+
+        let attempt = connect(&server, &session, HostKeyDecision::AcceptOnce).await;
+
+        let (_transport, new_pin) = attempt.result.unwrap();
+        assert_eq!(
+            new_pin,
+            Some(NewCertPin {
+                sha256: pin_of(A),
+                save: false
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_certificate_never_gets_the_password() {
+        let server = start_server(A, A).await;
+        let session = pinning_session(server.port, None);
+
+        let attempt = connect(&server, &session, HostKeyDecision::Reject).await;
+
+        assert!(attempt.result.is_err());
+        assert_eq!(attempt.prompts.len(), 1);
+        assert_eq!(server.passwords().await, 0);
+        let commands = server.commands().await;
+        assert!(
+            !commands.iter().any(|c| c.starts_with("USER")),
+            "{commands:?}"
+        );
+    }
+
+    /// The data connections carry the files. One presenting another
+    /// certificate than the pinned one is someone else's.
+    #[tokio::test]
+    async fn a_data_connection_with_another_certificate_is_refused() {
+        let server = start_server(A, B).await;
+        let session = pinning_session(server.port, Some(pin_of(A)));
+        let attempt = connect(&server, &session, HostKeyDecision::Reject).await;
+        let (mut transport, _) = attempt.result.unwrap();
+
+        assert!(transport.list("/").await.is_err());
+    }
+
+    /// The same during the connection that first trusted a certificate,
+    /// when the session itself holds no pin yet.
+    #[tokio::test]
+    async fn a_data_connection_must_present_the_certificate_just_accepted() {
+        let server = start_server(A, B).await;
+        let session = pinning_session(server.port, None);
+        let attempt = connect(&server, &session, HostKeyDecision::AcceptOnce).await;
+        let (mut transport, _) = attempt.result.unwrap();
+
+        assert!(transport.list("/").await.is_err());
+    }
+
+    /// A reconnect meets a server that has changed its certificate since
+    /// the user accepted the first. No one is there to ask, and the caller
+    /// would not save the answer, so it is refused, password unsent.
+    #[tokio::test]
+    async fn a_reconnect_refuses_another_certificate_than_the_one_accepted() {
+        let server = start_server(A, A).await;
+        let session = pinning_session(server.port, None);
+        let mut attempt = connect(&server, &session, HostKeyDecision::AcceptOnce).await;
+        let (mut transport, _) = attempt.result.unwrap();
+        assert_eq!(server.passwords().await, 1);
+
+        *server.identities.control.lock().await = B;
+        *server.identities.data.lock().await = B;
+        transport.broken = true;
+        let listed = transport.list("/").await;
+
+        let err = listed.expect_err("the reconnect is refused");
+        assert!(err.to_string().contains("pin mismatch"), "{err}");
+        assert!(attempt.events.try_recv().is_err(), "and nothing is asked");
+        assert_eq!(server.passwords().await, 1, "nor the password sent again");
+    }
+
+    /// And one that finds the same certificate carries on.
+    #[tokio::test]
+    async fn a_reconnect_to_the_accepted_certificate_carries_on() {
+        let server = start_server(A, A).await;
+        let session = pinning_session(server.port, None);
+        let mut attempt = connect(&server, &session, HostKeyDecision::AcceptOnce).await;
+        let (mut transport, _) = attempt.result.unwrap();
+
+        transport.broken = true;
+        let listing = transport.list("/").await.expect("the reconnect succeeds");
+
+        assert_eq!(listing.entries.len(), 1);
+        assert!(attempt.events.try_recv().is_err(), "without asking again");
+        assert_eq!(server.passwords().await, 2);
+    }
+
+    /// With chain validation on, the default, a self-signed certificate is
+    /// refused outright: a pin in the session changes nothing.
+    #[tokio::test]
+    async fn a_self_signed_certificate_is_refused_when_the_chain_is_checked() {
+        let server = start_server(A, A).await;
+        let mut session = pinning_session(server.port, Some(pin_of(A)));
+        session.accept_invalid_certs = false;
+
+        let attempt = connect(&server, &session, HostKeyDecision::AcceptAndSave).await;
+
+        assert!(attempt.result.is_err());
+        assert!(attempt.prompts.is_empty());
+        assert_eq!(server.passwords().await, 0);
+    }
+
+    #[tokio::test]
+    async fn key_or_agent_auth_is_refused_before_connecting() {
+        let server = start_server(A, A).await;
+        let mut session = pinning_session(server.port, Some(pin_of(A)));
+        session.auth = AuthMethod::Agent;
+
+        let attempt = connect(&server, &session, HostKeyDecision::Reject).await;
+
+        assert!(attempt.result.is_err());
+        assert!(server.commands().await.is_empty(), "nothing was sent");
+    }
+}

@@ -370,16 +370,21 @@ pub fn append(host: &str, port: u16, key_type: &str, key_b64: &str) -> Result<()
             )));
         }
     }
-    // Spaces in the host or key_type would silently break the 3-field format
-    // when the line is re-parsed, potentially aliasing one entry to another.
-    if host.contains(' ') {
-        return Err(BlinkError::config(
-            "space not allowed in known_hosts field 'host'",
-        ));
+    // `parse_line` splits fields on any whitespace and drops a line with
+    // fewer than three, so whitespace in a field, or an empty one, writes a
+    // line that reads back as another entry or as none.
+    for (field, value) in [("host", host), ("key_type", key_type), ("key_b64", key_b64)] {
+        if value.is_empty() || value.contains(char::is_whitespace) {
+            return Err(BlinkError::config(format!(
+                "known_hosts field '{field}' must not be empty or contain whitespace"
+            )));
+        }
     }
-    if key_type.contains(' ') {
+    // A comma separates the names of a host list, so a host holding one
+    // would be stored as two hosts, neither of them this one.
+    if host.contains(',') {
         return Err(BlinkError::config(
-            "space not allowed in known_hosts field 'key_type'",
+            "comma not allowed in known_hosts field 'host'",
         ));
     }
 
@@ -660,6 +665,100 @@ mod tests {
         let path = known_hosts_path().unwrap();
         fs::write(&path, contents).unwrap();
         path
+    }
+
+    // --- remove_host: the file itself, not only the text it is given ---
+
+    #[test]
+    fn removing_a_host_takes_every_key_it_has_and_leaves_the_rest() {
+        let _home = crate::paths::test_home();
+        let path = write_known_hosts(&format!(
+            "# mine\n\
+             a.example ssh-ed25519 {ED_KEY}\n\
+             a.example ssh-rsa RSAKEY\n\
+             b.example ssh-ed25519 {ED_KEY_2}\n"
+        ));
+
+        assert_eq!(remove_host("a.example", 22).unwrap(), 2);
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("# mine\nb.example ssh-ed25519 {ED_KEY_2}\n"),
+        );
+        assert_eq!(
+            check("a.example", 22, "ssh-ed25519", ED_KEY).unwrap(),
+            KeyStatus::Unknown,
+            "the next connect asks again",
+        );
+    }
+
+    #[test]
+    fn removing_a_host_is_per_port() {
+        let _home = crate::paths::test_home();
+        let line = format!("[a.example]:2222 ssh-ed25519 {ED_KEY}\n");
+        let path = write_known_hosts(&line);
+
+        assert_eq!(remove_host("a.example", 22).unwrap(), 0);
+        assert_eq!(fs::read_to_string(&path).unwrap(), line);
+
+        assert_eq!(remove_host("a.example", 2222).unwrap(), 1);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+    }
+
+    /// Nothing to remove means nothing is written: the file keeps its exact
+    /// bytes, here a last line with no newline, which a rewrite would add.
+    #[test]
+    fn removing_a_host_that_isnt_there_leaves_the_file_untouched() {
+        let _home = crate::paths::test_home();
+        let contents = format!("b.example ssh-ed25519 {ED_KEY_2}");
+        let path = write_known_hosts(&contents);
+
+        assert_eq!(remove_host("a.example", 22).unwrap(), 0);
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+    }
+
+    #[test]
+    fn removing_a_host_with_no_known_hosts_file_removes_nothing() {
+        let _home = crate::paths::test_home();
+        let path = known_hosts_path().unwrap();
+
+        assert_eq!(remove_host("a.example", 22).unwrap(), 0);
+
+        assert!(!path.exists(), "and doesn't create one");
+    }
+
+    /// Forgetting a host must not un-revoke a key.
+    #[test]
+    fn removing_a_host_keeps_its_revoked_keys_revoked() {
+        let _home = crate::paths::test_home();
+        write_known_hosts(&format!(
+            "@revoked a.example ssh-ed25519 {ED_KEY}\n\
+             a.example ssh-ed25519 {ED_KEY_2}\n"
+        ));
+
+        assert_eq!(remove_host("a.example", 22).unwrap(), 1);
+
+        assert_eq!(
+            check("a.example", 22, "ssh-ed25519", ED_KEY).unwrap(),
+            KeyStatus::Revoked,
+        );
+    }
+
+    /// The rewrite goes through a temp file beside the real one; none may
+    /// be left behind.
+    #[test]
+    fn removing_a_host_leaves_no_temp_file() {
+        let _home = crate::paths::test_home();
+        let path = write_known_hosts(&format!("a.example ssh-ed25519 {ED_KEY}\n"));
+
+        remove_host("a.example", 22).unwrap();
+
+        let names: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["known_hosts"]);
     }
 
     #[test]
@@ -1002,6 +1101,26 @@ mod tests {
     fn append_rejects_space_in_host() {
         let r = super::append("evil host", 22, "ssh-ed25519", "KEY");
         assert!(r.is_err());
+    }
+
+    /// The parser splits fields on any whitespace and host lists on commas,
+    /// so a host holding either would be written as a line that reads back
+    /// as something else.
+    #[test]
+    fn append_rejects_a_tab_or_comma_in_host() {
+        let _home = crate::paths::test_home();
+        for host in ["evil\thost", "a.example,b.example"] {
+            let r = super::append(host, 22, "ssh-ed25519", "KEY");
+            assert!(r.is_err(), "{host:?}");
+        }
+    }
+
+    #[test]
+    fn append_rejects_whitespace_in_the_key_fields() {
+        let _home = crate::paths::test_home();
+        assert!(super::append("h.example", 22, "ssh\ted25519", "KEY").is_err());
+        assert!(super::append("h.example", 22, "ssh-ed25519", "KEY extra").is_err());
+        assert!(super::append("h.example", 22, "ssh-ed25519", "").is_err());
     }
 
     #[test]

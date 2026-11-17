@@ -6,22 +6,17 @@ spec in `docs/superpowers/specs/` instead.
 
 ---
 
-## `ssh-key` and `rsa` reach a release
+## `ssh-key` reaches a release
 
-Watch `russh` rather than `ssh-key` and `rsa` directly: it pins both with exact
-`=` requirements, so they move when it moves. blink is on pre-releases of
-both (`ssh-key 0.7.0-rc.11`, `rsa 0.10.0-rc.18`).
+Watch `russh` rather than `ssh-key` directly: it pins it with an exact `=`
+requirement, so it moves when russh moves. blink is on a pre-release
+(`ssh-key 0.7.0-rc.12`).
 
-RUSTSEC-2023-0071 now lists `rsa >= 0.10.0` as patched and names rc.18 as
-affected. The fixes are RustCrypto/RSA#739 (blinding the default
-decryption paths) and #749 (implicit rejection), which replaced #702 and
-#680 and closed #626. So the ignore in `.cargo/audit.toml`, and the RSA
-caveat in the README, can go as soon as russh's pin reaches `rsa 0.10.0`
-or later — confirm with `cargo audit` after the bump.
+`rsa` is done: russh 0.65.2 relaxed its pin to `rsa 0.10`, the lockfile is on
+`rsa 0.10.0`, and the RUSTSEC-2023-0071 ignore and README caveat are gone.
 
-Last checked 2026-11-13: `rsa 0.10.0` is out as a full release and
-`ssh-key` is at `0.7.0-rc.12`, but russh 0.65.1, the latest and what blink
-is on, still pins `rsa =0.10.0-rc.18` and `ssh-key =0.7.0-rc.11`.
+Last checked 2026-11-17: russh 0.65.2, the latest and what blink is on, pins
+`ssh-key =0.7.0-rc.12`; no `ssh-key 0.7.0` release yet.
 
 ## russh can't load an encrypted legacy-PEM ECDSA key
 
@@ -36,3 +31,43 @@ and `ssh-keygen -p -f <key>` converts it to OpenSSH. The unencrypted
 form of the same key loads. Upstream's bug, still there in russh 0.65.1
 (checked 2026-11-13) and not yet reported. There's nothing for blink to do
 beyond, at most, naming the workaround in the error.
+
+## Features with no tests
+
+From a `cargo llvm-cov` run on 2026-11-17 (80% of lines, 84% of
+functions). Re-run it before picking one up; `cargo llvm-cov --json` lists
+functions with a count of zero. In rough order of value:
+
+- **Session edit and delete.** `submit_edit_session`, including the rule
+  that drops the FTPS pin when host or port changes, and `Session::delete`.
+- **Host-key rejections in the TUI.** The `HostKeyChanged`,
+  `HostKeyRevoked` and `HostCertificateRejected` arms of
+  `handle_app_event`: what the user is told is unchecked.
+- **Remote mkdir, delete and search.** `submit_mkdir`, `open_delete`,
+  `start_delete`, `open_search`, `apply_search_filter` and their key
+  handlers; only `remote_name_error` is tested. `SftpTransport::mkdir`,
+  `delete_file` and `rename` are never called either.
+- **Transfer controls.** `tui/app/controls.rs`: cancel one, cancel a
+  batch, pause and resume, cycle theme; and `TransferManager::pause`,
+  `resume`, `set_parallelism`.
+- **The rest of the CLI.** `main.rs` has no tests: `sessions`, `themes`,
+  `known-hosts remove`'s output, and `init_tracing` with its check of the
+  log file's mode. (`known_hosts::remove_host` and
+  `checkpoint::list_and_clean` themselves are covered.)
+- **Rendering.** Nineteen of the `render` functions in `tui/views.rs`
+  never run: every modal but the host-key ones, and help. One smoke test
+  each against ratatui's `TestBackend` would do.
+- **Key handling.** `handle_main` (69 of 122 lines unrun) and the viewer,
+  save-session, quit and disconnect handlers.
+- **Image preview.** The Kitty and iTerm2 backends and `decode_cp437`;
+  only Sixel runs. `after_draw`, `image_area`, `viewer_scroll_to`.
+- **SCP.** `transport/scp.rs` is a wrapper over SFTP that no test
+  connects through.
+- **The folder guard in the upload rename fallback.** A folder in the way
+  of an upload is left alone (`finalize_remote_rename_unbounded`,
+  `ftp_upload`), but neither test server can rename a folder, so nothing
+  exercises it.
+- **Terminal lifecycle.** `tui/mod.rs`: setup, restore, the panic hook.
+- **Small helpers.** `format_bytes_per_sec`, `format_eta`,
+  `resolve_local_dir`, `Theme::list_all_names`, `Config::load`, and the
+  edit form's field navigation in `tui/state.rs`.

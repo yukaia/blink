@@ -28,6 +28,13 @@ the git history for those.
   was emptied through the link: whatever it pointed at lost its files.
   blink now checks the folder is still a real directory before deleting
   it, and on SFTP every subfolder too, and stops with an error if not.
+- **A host key that can't be encoded is refused.** Such a key was checked
+  and stored as an empty one, which any other key failing the same way
+  would have matched. No known key fails to encode; the connection is now
+  rejected if one does.
+- **`known_hosts` entries can't be written malformed.** Saving a host key
+  refused a space in the host name but not a tab or a comma, either of
+  which made a line that read back as a different entry.
 - **Folder downloads don't follow a symlink another user planted.** The
   fix above for partial files didn't cover the folders a recursive
   download creates: in a download directory other users can write to, a
@@ -59,6 +66,28 @@ the git history for those.
 
 ### Fixed
 
+- **A session file with a bad port is refused.** A `port` that wasn't a
+  number, such as `2222x`, fell back to the protocol's default without a
+  word, so blink connected, and asked for the password, on another port
+  than the file named. Such a file is now skipped with the reason, as is
+  one with port 0. A missing or empty `port` is still the default.
+- **Replacing a file on upload can't lose the old one.** On a server whose
+  rename won't replace a file (FTP servers that refuse it, SFTP servers
+  without `posix-rename`), blink deleted the old file and renamed the
+  upload into place. If that rename failed too, the old file was gone and
+  the new one sat under its `.blink-part` name. The old file is now moved
+  aside to `<name>.<hash>.blink-old`, removed once the rename lands, and
+  moved back if it doesn't. A folder in the way is no longer touched.
+- **A symlink to a folder is a folder in the local pane.** It was listed
+  as a file a few bytes long, so it could not be entered, and uploading
+  it failed. A link to a file now shows the file's size.
+- **Viewing a FIFO or device says so.** `v` on a local FIFO left the
+  viewer on "loading" for as long as nothing wrote to it. Only regular
+  files are opened now.
+- **A new or renamed remote entry can't hold invisible characters.** The
+  rename and new-folder prompts refused control characters but let
+  through bidi overrides and zero-width characters, which a listing then
+  showed as spaces.
 - **Large batches no longer skip "complete" lines or the remote refresh.**
   When the interface fell behind a fast batch of small files, some
   finished jobs were logged without their file, or not at all, and an
@@ -189,6 +218,12 @@ the git history for those.
 - `russh` 0.64 -> 0.65, for RUSTSEC-2026-0495 (russh's agent server, which
   blink does not run). No changes outside the test server. It still pins
   `rsa` and `ssh-key` to the same release candidates.
+- Lockfile refresh (`cargo update`). `russh` 0.65.2 drops its exact pin on
+  the `rsa` release candidate, so `rsa` moves to 0.10.0, the release that
+  fixes RUSTSEC-2023-0071 (the "Marvin Attack" timing sidechannel in RSA
+  private-key operations). The `cargo audit` ignore for it and the README
+  caveat about RSA client keys are removed. `ssh-key` is still a release
+  candidate (0.7.0-rc.12), pinned by russh.
 - Lockfile refresh (`cargo update`). `webpki-roots` 1.0.12 drops six trust
   roots (Buypass Class 2 and Class 3, Certigna Root CA, DigiCert Trusted
   Root G4, QuoVadis Root CA 1 G3 and 3 G3): an FTPS server whose
