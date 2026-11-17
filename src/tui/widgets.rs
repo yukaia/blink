@@ -204,10 +204,22 @@ pub mod bottom_pane {
             app.theme.border_inactive
         };
 
-        let block = Block::default()
+        let mut block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color))
             .title(tab_title(app));
+        // Scrolled back, say so: new lines arrive out of sight.
+        let rows = usize::from(area.height.saturating_sub(2));
+        let newer = app.log_scroll.min(app.log.len().saturating_sub(rows));
+        if app.bottom_pane == BottomPane::Log && newer > 0 {
+            block = block.title_top(
+                Line::from(Span::styled(
+                    format!(" ↓ {newer} newer "),
+                    Style::default().fg(app.theme.accent),
+                ))
+                .right_aligned(),
+            );
+        }
         let inner = block.inner(area);
         f.render_widget(block, area);
 
@@ -288,8 +300,22 @@ pub mod bottom_pane {
             .map(|m| m.is_paused())
             .unwrap_or(false);
 
+        // Up to MAX_PARALLEL jobs run at once, more than the pane has rows:
+        // the list scrolls to keep the cursor, and what `c` cancels, in view.
+        let window = crate::tui::state::scrolled_window(
+            app.transfer_view_offset.get(),
+            cursor,
+            jobs.len(),
+            area.height as usize,
+        );
+        app.transfer_view_offset.set(window.start);
         let mut lines = Vec::with_capacity(area.height as usize);
-        for (i, job) in jobs.iter().enumerate().take(area.height as usize) {
+        for (i, job) in jobs
+            .iter()
+            .enumerate()
+            .skip(window.start)
+            .take(window.len())
+        {
             let is_cursor = i == cursor && focused;
             lines.push(render_transfer_line(
                 app,
@@ -362,10 +388,14 @@ pub mod bottom_pane {
         let filled = (BAR_WIDTH * percent as usize / 100).min(BAR_WIDTH);
         let empty = BAR_WIDTH - filled;
 
+        let arrow = match job.direction {
+            crate::transfer::Direction::Download => "↓ ",
+            crate::transfer::Direction::Upload | crate::transfer::Direction::CreateDir => "↑ ",
+        };
         let line = Line::from(vec![
             Span::raw(" "),
             Span::styled(
-                "↓ ",
+                arrow,
                 Style::default()
                     .fg(app.theme.directory)
                     .add_modifier(Modifier::BOLD),
@@ -396,12 +426,15 @@ pub mod bottom_pane {
     // ----- Log page -------------------------------------------------------
 
     fn render_log(f: &mut Frame, app: &App, area: Rect) {
+        app.hit.log_body.set(Some(area));
         let h = area.height as usize;
         let total = app.log.len();
-        let start = total.saturating_sub(h);
+        let scroll = app.log_scroll.min(total.saturating_sub(h));
+        let end = total - scroll;
+        let start = end.saturating_sub(h);
 
         let mut lines = Vec::with_capacity(area.height as usize);
-        for entry in app.log.range(start..) {
+        for entry in app.log.range(start..end) {
             let ts = entry.time.format("%H:%M:%S").to_string();
             let level_color = match entry.level {
                 LogLevel::Info => app.theme.dim,

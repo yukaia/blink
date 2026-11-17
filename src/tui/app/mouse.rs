@@ -116,12 +116,30 @@ impl App {
             match m.kind {
                 MouseEventKind::ScrollUp => self.move_transfer_cursor(-WHEEL_STEP),
                 MouseEventKind::ScrollDown => self.move_transfer_cursor(WHEEL_STEP),
-                MouseEventKind::Down(MouseButton::Left) if r < self.active_jobs().len() => {
-                    self.transfer_cursor = r;
+                MouseEventKind::Down(MouseButton::Left)
+                    if self.transfer_view_offset.get() + r < self.active_jobs().len() =>
+                {
+                    self.transfer_cursor = self.transfer_view_offset.get() + r;
                 }
                 _ => {}
             }
             return;
+        }
+        // The wheel over the log scrolls it, and focuses it as the wheel
+        // over the transfer list does.
+        if self.bottom_pane == BottomPane::Log
+            && row_in(self.hit.bottom_pane.get(), col, row).is_some()
+        {
+            let delta = match m.kind {
+                MouseEventKind::ScrollUp => WHEEL_STEP,
+                MouseEventKind::ScrollDown => -WHEEL_STEP,
+                _ => 0,
+            };
+            if delta != 0 {
+                self.active_pane = Pane::Log;
+                self.log_scroll_by(delta);
+                return;
+            }
         }
         // Anywhere else in the bottom pane — the log, empty space, the
         // border — a click focuses the page it is showing, as a click
@@ -778,5 +796,127 @@ mod tests {
         a.handle_mouse_at(press(pane.x, pane.y + 3), Instant::now());
         assert_eq!(a.active_pane, Pane::Log, "a click on the border");
         assert_eq!(a.bottom_pane, BottomPane::Log, "the page shown stays");
+    }
+
+    // -- scrolling the bottom pane ----------------------------------------------
+
+    fn text(buf: &ratatui::buffer::Buffer) -> String {
+        buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    fn running(a: &mut App, n: usize) {
+        let m = crate::transfer::TransferManager::new(10).0;
+        for i in 0..n {
+            m.enqueue_download(format!("/r/job{i:02}"), format!("/l/{i}").into())
+                .unwrap();
+            m.take_next_pending().unwrap();
+        }
+        a.transfer_manager = Some(m);
+        a.bottom_pane = BottomPane::Transfers;
+        a.active_pane = Pane::Transfers;
+    }
+
+    #[test]
+    fn the_transfer_list_scrolls_to_keep_the_cursor_in_view() {
+        let mut a = app_on_main(0);
+        running(&mut a, 10);
+        a.transfer_cursor = 9;
+        let shown = text(&draw(&a));
+        assert!(
+            shown.contains("job09"),
+            "the cursor's job is off screen:\n{shown}"
+        );
+        assert!(!shown.contains("job00"), "{shown}");
+
+        // A click on the top row means the first job shown, not job 0.
+        let list = a.hit.transfer_list.get().unwrap();
+        a.handle_mouse_at(press(list.x + 2, list.y), Instant::now());
+        let first_shown = 10 - usize::from(list.height);
+        assert_eq!(a.transfer_cursor, first_shown);
+    }
+
+    #[test]
+    fn an_upload_row_points_up() {
+        let mut a = app_on_main(0);
+        let m = crate::transfer::TransferManager::new(2).0;
+        m.enqueue_upload("/l/up.txt".into(), "/r/up.txt".into())
+            .unwrap();
+        m.take_next_pending().unwrap();
+        m.enqueue_download("/r/down.txt".into(), "/l/down.txt".into())
+            .unwrap();
+        m.take_next_pending().unwrap();
+        a.transfer_manager = Some(m);
+        a.bottom_pane = BottomPane::Transfers;
+        let shown = text(&draw(&a));
+        assert!(shown.contains("↑ up.txt"), "{shown}");
+        assert!(shown.contains("↓ down.txt"), "{shown}");
+    }
+
+    fn with_log(n: usize) -> App {
+        let mut a = app_on_main(0);
+        a.log.clear();
+        for i in 0..n {
+            a.push_log(crate::tui::app::LogLevel::Info, format!("entry {i:02}"));
+        }
+        a.bottom_pane = BottomPane::Log;
+        a.active_pane = Pane::Log;
+        a
+    }
+
+    fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn the_log_scrolls_back_with_the_arrows_and_stays_put_as_lines_arrive() {
+        use crossterm::event::KeyCode;
+        let mut a = with_log(50);
+        draw(&a);
+        for _ in 0..10 {
+            a.handle_key(key(KeyCode::Up));
+        }
+        let shown = text(&draw(&a));
+        assert!(!shown.contains("entry 49"), "{shown}");
+        assert!(shown.contains("entry 39"), "{shown}");
+
+        a.push_log(crate::tui::app::LogLevel::Info, "entry 50".into());
+        let shown = text(&draw(&a));
+        assert!(shown.contains("entry 39"), "the view moved:\n{shown}");
+        assert!(!shown.contains("entry 50"), "{shown}");
+
+        for _ in 0..20 {
+            a.handle_key(key(KeyCode::Down));
+        }
+        let shown = text(&draw(&a));
+        assert!(shown.contains("entry 50"), "back at the end:\n{shown}");
+    }
+
+    #[test]
+    fn the_log_stops_scrolling_at_its_first_line() {
+        use crossterm::event::KeyCode;
+        let mut a = with_log(30);
+        draw(&a);
+        for _ in 0..100 {
+            a.handle_key(key(KeyCode::PageUp));
+        }
+        let shown = text(&draw(&a));
+        assert!(shown.contains("entry 00"), "{shown}");
+        a.handle_key(key(KeyCode::Down));
+        let shown = text(&draw(&a));
+        assert!(
+            !shown.contains("entry 00"),
+            "one line down moves at once:\n{shown}"
+        );
+    }
+
+    #[test]
+    fn the_wheel_over_the_log_scrolls_it() {
+        let mut a = with_log(50);
+        a.active_pane = Pane::Local;
+        draw(&a);
+        let pane = a.hit.bottom_pane.get().unwrap();
+        a.handle_mouse_at(wheel(false, pane.x + 3, pane.y + 3), Instant::now());
+        let shown = text(&draw(&a));
+        assert!(!shown.contains("entry 49"), "{shown}");
     }
 }

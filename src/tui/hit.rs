@@ -21,6 +21,8 @@ pub struct HitMap {
     pub transfers_tab: Cell<Option<Rect>>,
     pub log_tab: Cell<Option<Rect>>,
     pub transfer_list: Cell<Option<Rect>>,
+    /// The log's lines, when the bottom pane shows the log.
+    pub log_body: Cell<Option<Rect>>,
     /// The whole bottom pane, border included, for focus.
     pub bottom_pane: Cell<Option<Rect>>,
     pub viewer_body: Cell<Option<Rect>>,
@@ -39,6 +41,7 @@ impl HitMap {
             &self.transfers_tab,
             &self.log_tab,
             &self.transfer_list,
+            &self.log_body,
             &self.bottom_pane,
             &self.viewer_body,
             &self.help_body,

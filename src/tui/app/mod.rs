@@ -279,6 +279,12 @@ pub struct App {
     pub bottom_pane: BottomPane,
     /// Cursor within the active-jobs list when the Transfers pane is focused.
     pub transfer_cursor: usize,
+    /// The first job the transfer list showed when last drawn, as
+    /// [`PaneState::view_offset`] is for a file pane.
+    pub transfer_view_offset: std::cell::Cell<usize>,
+    /// Lines the log is scrolled back from its newest. Zero follows new
+    /// lines as they arrive; anything else holds the view where it is.
+    pub log_scroll: usize,
     /// Cancellation in progress: the user has pressed `c` and is being asked
     /// to confirm. Cleared on confirm/cancel.
     pub pending_cancel: Option<PendingCancel>,
@@ -474,6 +480,8 @@ impl App {
             transfers: Vec::new(),
             bottom_pane: BottomPane::Log,
             transfer_cursor: 0,
+            transfer_view_offset: std::cell::Cell::new(0),
+            log_scroll: 0,
             pending_cancel: None,
             rename_input: String::new(),
             rename_original: String::new(),
@@ -1020,6 +1028,7 @@ impl App {
         self.prompt_ready_at = None;
         self.pending_delete = None;
         self.transfer_cursor = 0;
+        self.transfer_view_offset.set(0);
         self.bottom_pane = BottomPane::Log;
         self.remote = PaneState::empty();
         self.remote_listing = None;
@@ -1110,11 +1119,30 @@ impl App {
             level,
             message: crate::error::sanitize(message),
         });
+        // Scrolled back, the view stays on the lines it shows.
+        if self.log_scroll > 0 {
+            self.log_scroll = (self.log_scroll + 1).min(self.log.len() - 1);
+        }
         // VecDeque pop_front is O(1); the old Vec drain(0..n) shifted every
         // remaining element down by N on every overflow.
         while self.log.len() > 500 {
             self.log.pop_front();
         }
+    }
+
+    /// Scroll the log `delta` lines back (negative: toward the newest),
+    /// stopping with its first line at the top of the pane as last drawn.
+    pub(super) fn log_scroll_by(&mut self, delta: isize) {
+        let max = self.log.len().saturating_sub(self.log_rows());
+        self.log_scroll = self.log_scroll.saturating_add_signed(delta).min(max);
+    }
+
+    /// Lines of log the pane showed when last drawn; one before then.
+    pub(super) fn log_rows(&self) -> usize {
+        self.hit
+            .log_body
+            .get()
+            .map_or(1, |r| usize::from(r.height).max(1))
     }
 
     /// Show the next post-connect offer, or fall through to the main view.

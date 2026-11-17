@@ -308,22 +308,22 @@ impl App {
             KeyCode::Up => match self.active_pane {
                 Pane::Local | Pane::Remote => self.active_pane_mut().unwrap().move_cursor(-1),
                 Pane::Transfers => self.move_transfer_cursor(-1),
-                Pane::Log => {}
+                Pane::Log => self.log_scroll_by(1),
             },
             KeyCode::Down => match self.active_pane {
                 Pane::Local | Pane::Remote => self.active_pane_mut().unwrap().move_cursor(1),
                 Pane::Transfers => self.move_transfer_cursor(1),
-                Pane::Log => {}
+                Pane::Log => self.log_scroll_by(-1),
             },
             KeyCode::PageUp => match self.active_pane {
                 Pane::Local | Pane::Remote => self.active_pane_mut().unwrap().move_cursor(-10),
                 Pane::Transfers => self.move_transfer_cursor(-10),
-                Pane::Log => {}
+                Pane::Log => self.log_scroll_by(self.log_rows() as isize),
             },
             KeyCode::PageDown => match self.active_pane {
                 Pane::Local | Pane::Remote => self.active_pane_mut().unwrap().move_cursor(10),
                 Pane::Transfers => self.move_transfer_cursor(10),
-                Pane::Log => {}
+                Pane::Log => self.log_scroll_by(-(self.log_rows() as isize)),
             },
             KeyCode::Enter => match self.active_pane {
                 Pane::Local => self.local_enter(),
