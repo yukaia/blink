@@ -334,7 +334,271 @@ pub(super) async fn read_local_bounded(
 
 #[cfg(test)]
 mod tests {
-    use super::read_local_bounded;
+    use super::{image_area, read_local_bounded};
+    use crate::config::ImagePreviewMode;
+    use crate::tui::app::tests_support::{app_on_main, draw};
+    use crate::tui::app::{App, Pane, Screen};
+    use crate::tui::state::{ImageArea, ImageRender, PaneEntry, Viewer, ViewerKind};
+    use ratatui::layout::Rect;
+
+    fn logged(a: &App, needle: &str) -> bool {
+        a.log.iter().any(|l| l.message.contains(needle))
+    }
+
+    // --- opening a file ---
+
+    /// An app whose local pane is a real folder holding `files`.
+    fn app_in(home: &crate::paths::TestHome, files: &[(&str, &[u8])]) -> App {
+        for (name, body) in files {
+            std::fs::write(home.path().join(name), body).unwrap();
+        }
+        let mut a = app_on_main(0);
+        a.local.path = home.path().display().to_string();
+        a.local.set_entries(
+            files
+                .iter()
+                .map(|(n, b)| PaneEntry::new(n.to_string(), false, b.len() as u64))
+                .collect(),
+        );
+        a
+    }
+
+    #[tokio::test]
+    async fn viewing_a_local_text_file_loads_it_into_the_viewer() {
+        let home = crate::paths::test_home();
+        let mut a = app_in(&home, &[("notes.txt", b"one\ntwo\nthree\n")]);
+        let mut events = a.app_event_rx.take().unwrap();
+
+        a.handle_view_request();
+
+        assert_eq!(a.screen, Screen::Viewer);
+        assert_eq!(a.previous_screen, Screen::Main);
+        let v = a.viewer.as_ref().unwrap();
+        assert_eq!(v.name, "notes.txt");
+        assert!(matches!(v.kind, ViewerKind::Loading));
+
+        let event = events.recv().await.unwrap();
+        a.handle_app_event(event);
+        match &a.viewer.as_ref().unwrap().kind {
+            ViewerKind::Text { tokens, scroll } => {
+                assert_eq!(tokens.len(), 3);
+                assert_eq!(*scroll, 0);
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_local_file_shows_why_in_the_viewer() {
+        let home = crate::paths::test_home();
+        let mut a = app_in(&home, &[]);
+        a.local
+            .set_entries(vec![PaneEntry::new("gone.txt".into(), false, 3)]);
+        let mut events = a.app_event_rx.take().unwrap();
+
+        a.handle_view_request();
+        a.handle_app_event(events.recv().await.unwrap());
+
+        assert!(
+            matches!(a.viewer.as_ref().unwrap().kind, ViewerKind::Unsupported(_)),
+            "{:?}",
+            a.viewer.as_ref().unwrap().kind
+        );
+    }
+
+    #[test]
+    fn a_folder_cannot_be_viewed() {
+        let mut a = app_on_main(0);
+        a.local
+            .set_entries(vec![PaneEntry::new("dir".into(), true, 0)]);
+        a.handle_view_request();
+        assert_eq!(a.screen, Screen::Main);
+        assert!(a.viewer.is_none());
+    }
+
+    #[test]
+    fn an_unsupported_file_is_refused_with_a_reason() {
+        let mut a = app_on_main(0);
+        a.local
+            .set_entries(vec![PaneEntry::new("disk.iso".into(), false, 10)]);
+        a.handle_view_request();
+        assert_eq!(a.screen, Screen::Main);
+        assert!(logged(&a, "can't view disk.iso: unsupported file type"));
+    }
+
+    #[test]
+    fn a_file_whose_name_is_not_utf8_cannot_be_opened() {
+        let mut a = app_on_main(0);
+        let mut e = PaneEntry::new("bad.txt".into(), false, 10);
+        e.lossy_name = true;
+        a.local.set_entries(vec![e]);
+        a.handle_view_request();
+        assert!(a.viewer.is_none());
+        assert!(logged(&a, "not valid UTF-8"));
+    }
+
+    #[test]
+    fn a_remote_file_without_a_connection_does_not_open_the_viewer() {
+        let mut a = app_on_main(0);
+        a.active_pane = Pane::Remote;
+        a.remote
+            .set_entries(vec![PaneEntry::new("r.txt".into(), false, 10)]);
+        a.handle_view_request();
+        assert_eq!(a.screen, Screen::Main);
+        assert!(a.viewer.is_none());
+    }
+
+    #[test]
+    fn the_bottom_panes_have_nothing_to_view() {
+        let mut a = app_on_main(3);
+        for pane in [Pane::Log, Pane::Transfers] {
+            a.active_pane = pane;
+            a.handle_view_request();
+            assert!(a.viewer.is_none(), "{pane:?}");
+        }
+    }
+
+    // --- image rendering ---
+
+    fn viewing_image(render: ImageRender) -> App {
+        let mut a = app_on_main(1);
+        a.viewer = Some(Viewer {
+            name: "i.png".into(),
+            kind: ViewerKind::Image {
+                bytes: bytes::Bytes::from_static(b"png"),
+                render,
+            },
+            id: 7,
+        });
+        a.screen = Screen::Viewer;
+        a.image_needs_redraw = true;
+        a
+    }
+
+    const AREA: ImageArea = ImageArea {
+        x: 1,
+        y: 2,
+        w: 30,
+        h: 10,
+    };
+
+    /// The image is drawn on top of the cells the viewer leaves blank for
+    /// it; the two layouts are computed separately and must agree.
+    #[test]
+    fn the_image_area_is_the_viewers_body() {
+        let a = viewing_image(ImageRender::default());
+        draw(&a);
+        let body = a.hit.viewer_body.get().unwrap();
+        let area = image_area(Rect::new(0, 0, 100, 30)).unwrap();
+        assert_eq!(
+            (area.x, area.y, area.w, area.h),
+            (body.x, body.y, body.width, body.height)
+        );
+    }
+
+    #[test]
+    fn a_terminal_too_small_for_any_image_has_no_image_area() {
+        assert!(image_area(Rect::new(0, 0, 2, 2)).is_none());
+    }
+
+    #[test]
+    fn nothing_is_written_until_a_redraw_is_owed() {
+        let mut a = viewing_image(ImageRender {
+            done: Some((AREA, b"esc".to_vec())),
+            in_flight: None,
+        });
+        a.image_needs_redraw = false;
+        assert_eq!(a.image_output_for(AREA), None);
+    }
+
+    #[test]
+    fn a_finished_render_for_this_area_is_written_once() {
+        let mut a = viewing_image(ImageRender {
+            done: Some((AREA, b"esc".to_vec())),
+            in_flight: None,
+        });
+        assert_eq!(a.image_output_for(AREA), Some(b"esc".to_vec()));
+        assert!(!a.image_needs_redraw);
+        assert_eq!(a.image_output_for(AREA), None);
+    }
+
+    #[test]
+    fn a_viewer_that_is_not_an_image_owes_nothing() {
+        let mut a = viewing_image(ImageRender::default());
+        a.viewer.as_mut().unwrap().kind = ViewerKind::Loading;
+        assert_eq!(a.image_output_for(AREA), None);
+        assert!(!a.image_needs_redraw);
+    }
+
+    #[test]
+    fn a_render_already_running_is_not_started_twice() {
+        let other = ImageArea { w: 99, ..AREA };
+        let mut a = viewing_image(ImageRender {
+            done: None,
+            in_flight: Some(other),
+        });
+        // No runtime here: starting a render would panic.
+        assert_eq!(a.image_output_for(AREA), None);
+        let ViewerKind::Image { render, .. } = &a.viewer.as_ref().unwrap().kind else {
+            unreachable!()
+        };
+        assert_eq!(render.in_flight, Some(other));
+        assert!(a.image_needs_redraw, "still owed");
+    }
+
+    #[tokio::test]
+    async fn a_render_with_no_graphics_protocol_fails_into_the_viewer() {
+        let mut a = viewing_image(ImageRender::default());
+        a.config.terminal.image_preview = ImagePreviewMode::None;
+        let mut events = a.app_event_rx.take().unwrap();
+
+        assert_eq!(a.image_output_for(AREA), None);
+        let ViewerKind::Image { render, .. } = &a.viewer.as_ref().unwrap().kind else {
+            unreachable!()
+        };
+        assert_eq!(render.in_flight, Some(AREA));
+
+        a.handle_app_event(events.recv().await.unwrap());
+
+        match &a.viewer.as_ref().unwrap().kind {
+            ViewerKind::Unsupported(why) => {
+                assert!(why.contains("no supported graphics protocol"), "{why}");
+            }
+            other => panic!("expected the failure, got {other:?}"),
+        }
+        assert!(!a.image_needs_redraw);
+        assert!(logged(&a, "image preview: no supported graphics protocol"));
+    }
+
+    #[test]
+    fn a_finished_render_is_kept_and_owed_a_redraw() {
+        let mut a = viewing_image(ImageRender {
+            done: None,
+            in_flight: Some(AREA),
+        });
+        a.image_needs_redraw = false;
+        a.image_rendered(7, AREA, Ok(b"esc".to_vec()));
+        let ViewerKind::Image { render, .. } = &a.viewer.as_ref().unwrap().kind else {
+            unreachable!()
+        };
+        assert_eq!(render.in_flight, None);
+        assert_eq!(render.done, Some((AREA, b"esc".to_vec())));
+        assert!(a.image_needs_redraw);
+    }
+
+    #[test]
+    fn a_render_for_another_viewer_is_dropped() {
+        let mut a = viewing_image(ImageRender {
+            done: None,
+            in_flight: Some(AREA),
+        });
+        a.image_rendered(8, AREA, Ok(b"esc".to_vec()));
+        let ViewerKind::Image { render, .. } = &a.viewer.as_ref().unwrap().kind else {
+            unreachable!()
+        };
+        assert_eq!(render.done, None);
+        assert_eq!(render.in_flight, Some(AREA));
+    }
 
     #[tokio::test]
     async fn a_file_is_read_up_to_one_byte_past_the_limit() {

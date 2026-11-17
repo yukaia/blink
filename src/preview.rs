@@ -24,6 +24,11 @@ pub enum GraphicsProtocol {
 
 /// Inspect environment variables to figure out what the host terminal supports.
 pub fn detect(prefer: ImagePreviewMode) -> GraphicsProtocol {
+    detect_from(prefer, |name| env::var(name).ok())
+}
+
+/// [`detect`], reading the environment through `var`.
+fn detect_from(prefer: ImagePreviewMode, var: impl Fn(&str) -> Option<String>) -> GraphicsProtocol {
     if prefer == ImagePreviewMode::None {
         return GraphicsProtocol::None;
     }
@@ -35,36 +40,36 @@ pub fn detect(prefer: ImagePreviewMode) -> GraphicsProtocol {
         _ => {}
     }
 
-    let term = env::var("TERM").unwrap_or_default();
-    let term_program = env::var("TERM_PROGRAM").unwrap_or_default();
+    let term = var("TERM").unwrap_or_default();
+    let term_program = var("TERM_PROGRAM").unwrap_or_default();
 
-    if term.contains("kitty") || env::var("KITTY_WINDOW_ID").is_ok() {
+    if term.contains("kitty") || var("KITTY_WINDOW_ID").is_some() {
         return GraphicsProtocol::Kitty;
     }
     if term_program == "WezTerm" {
         return GraphicsProtocol::Kitty;
     }
-    if term_program == "ghostty" || env::var("GHOSTTY_RESOURCES_DIR").is_ok() {
+    if term_program == "ghostty" || var("GHOSTTY_RESOURCES_DIR").is_some() {
         return GraphicsProtocol::Kitty;
     }
     if term_program == "iTerm.app" {
         return GraphicsProtocol::Iterm2;
     }
     // Konsole has supported sixel since ~22.04 and sets KONSOLE_VERSION.
-    if env::var("KONSOLE_VERSION").is_ok() {
+    if var("KONSOLE_VERSION").is_some() {
         return GraphicsProtocol::Sixel;
     }
     // mlterm sets MLTERM; xterm with sixel sets XTERM_VERSION.
-    if env::var("MLTERM").is_ok() {
+    if var("MLTERM").is_some() {
         return GraphicsProtocol::Sixel;
     }
-    if term.contains("xterm") && env::var("XTERM_VERSION").is_ok() {
+    if term.contains("xterm") && var("XTERM_VERSION").is_some() {
         return GraphicsProtocol::Sixel;
     }
     // Windows Terminal (≥ 1.22) supports sixel and always sets WT_SESSION
     // (a GUID) regardless of what the shell sets TERM to — including leaving
     // it unset entirely when running under WSL.
-    if env::var("WT_SESSION").is_ok() {
+    if var("WT_SESSION").is_some() {
         return GraphicsProtocol::Sixel;
     }
     GraphicsProtocol::None
@@ -184,17 +189,20 @@ struct ScaledForCells {
 ///
 /// Never upscales: if the image is smaller than the panel, it stays at its
 /// native pixel size and is centered.
+///
+/// `(px_per_col, px_per_row)` is the terminal's cell size; see
+/// [`cell_pixels`].
 fn scale_for_cells(
     image_bytes: &[u8],
     col: u16,
     row: u16,
     cols: u16,
     rows: u16,
+    (px_per_col, px_per_row): (u32, u32),
 ) -> Result<ScaledForCells, PreviewError> {
     if cols == 0 || rows == 0 {
         return Err(PreviewError::EmptyPanel);
     }
-    let (px_per_col, px_per_row) = cell_pixels();
 
     // Use ImageReader with explicit limits so a hostile image cannot OOM us
     // before we get a chance to look at its dimensions: a highly-compressed
@@ -281,42 +289,53 @@ impl PreviewBackend for KittyBackend {
         cols: u16,
         rows: u16,
     ) -> Result<Vec<u8>, PreviewError> {
-        let scaled = scale_for_cells(image_bytes, col, row, cols, rows)?;
-        let png = encode_png_rgba(&scaled.rgba, scaled.width_px, scaled.height_px)
-            .map_err(|e| PreviewError::Encode(e.to_string()))?;
-
-        let b64 = BASE64.encode(&png);
-        let chunks: Vec<&[u8]> = b64.as_bytes().chunks(4096).collect();
-        if chunks.is_empty() {
-            return Err(PreviewError::Encode("empty PNG payload".into()));
-        }
-
-        let mut out = Vec::with_capacity(b64.len() + 256);
-        let _ = write!(
-            out,
-            "\x1b[{};{}H",
-            scaled.display_row.saturating_add(1),
-            scaled.display_col.saturating_add(1)
-        );
-
-        for (i, chunk) in chunks.iter().enumerate() {
-            let last = i == chunks.len() - 1;
-            let m = if last { 0 } else { 1 };
-            if i == 0 {
-                // q=2 suppresses kitty's per-image response strings.
-                let _ = write!(
-                    out,
-                    "\x1b_Gf=100,a=T,c={},r={},q=2,m={m};",
-                    scaled.cells_w, scaled.cells_h
-                );
-            } else {
-                let _ = write!(out, "\x1b_Gm={m};");
-            }
-            out.extend_from_slice(chunk);
-            out.extend_from_slice(b"\x1b\\");
-        }
-        Ok(out)
+        kitty_escape(&scale_for_cells(
+            image_bytes,
+            col,
+            row,
+            cols,
+            rows,
+            cell_pixels(),
+        )?)
     }
+}
+
+/// The kitty escape sequence that draws `scaled`.
+fn kitty_escape(scaled: &ScaledForCells) -> Result<Vec<u8>, PreviewError> {
+    let png = encode_png_rgba(&scaled.rgba, scaled.width_px, scaled.height_px)
+        .map_err(|e| PreviewError::Encode(e.to_string()))?;
+
+    let b64 = BASE64.encode(&png);
+    let chunks: Vec<&[u8]> = b64.as_bytes().chunks(4096).collect();
+    if chunks.is_empty() {
+        return Err(PreviewError::Encode("empty PNG payload".into()));
+    }
+
+    let mut out = Vec::with_capacity(b64.len() + 256);
+    let _ = write!(
+        out,
+        "\x1b[{};{}H",
+        scaled.display_row.saturating_add(1),
+        scaled.display_col.saturating_add(1)
+    );
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let last = i == chunks.len() - 1;
+        let m = if last { 0 } else { 1 };
+        if i == 0 {
+            // q=2 suppresses kitty's per-image response strings.
+            let _ = write!(
+                out,
+                "\x1b_Gf=100,a=T,c={},r={},q=2,m={m};",
+                scaled.cells_w, scaled.cells_h
+            );
+        } else {
+            let _ = write!(out, "\x1b_Gm={m};");
+        }
+        out.extend_from_slice(chunk);
+        out.extend_from_slice(b"\x1b\\");
+    }
+    Ok(out)
 }
 
 /// iTerm2 inline image protocol — single OSC 1337 escape with base64 payload.
@@ -331,24 +350,35 @@ impl PreviewBackend for Iterm2Backend {
         cols: u16,
         rows: u16,
     ) -> Result<Vec<u8>, PreviewError> {
-        let scaled = scale_for_cells(image_bytes, col, row, cols, rows)?;
-        let png = encode_png_rgba(&scaled.rgba, scaled.width_px, scaled.height_px)
-            .map_err(|e| PreviewError::Encode(e.to_string()))?;
-        let b64 = BASE64.encode(&png);
-        let mut out = Vec::with_capacity(b64.len() + 128);
-        let _ = write!(
-            out,
-            "\x1b[{};{}H",
-            scaled.display_row.saturating_add(1),
-            scaled.display_col.saturating_add(1)
-        );
-        let _ = write!(
-            out,
-            "\x1b]1337;File=inline=1;width={};height={};preserveAspectRatio=1:{b64}\x07",
-            scaled.cells_w, scaled.cells_h
-        );
-        Ok(out)
+        iterm2_escape(&scale_for_cells(
+            image_bytes,
+            col,
+            row,
+            cols,
+            rows,
+            cell_pixels(),
+        )?)
     }
+}
+
+/// The iTerm2 escape sequence that draws `scaled`.
+fn iterm2_escape(scaled: &ScaledForCells) -> Result<Vec<u8>, PreviewError> {
+    let png = encode_png_rgba(&scaled.rgba, scaled.width_px, scaled.height_px)
+        .map_err(|e| PreviewError::Encode(e.to_string()))?;
+    let b64 = BASE64.encode(&png);
+    let mut out = Vec::with_capacity(b64.len() + 128);
+    let _ = write!(
+        out,
+        "\x1b[{};{}H",
+        scaled.display_row.saturating_add(1),
+        scaled.display_col.saturating_add(1)
+    );
+    let _ = write!(
+        out,
+        "\x1b]1337;File=inline=1;width={};height={};preserveAspectRatio=1:{b64}\x07",
+        scaled.cells_w, scaled.cells_h
+    );
+    Ok(out)
 }
 
 /// Sixel — DEC's sixel graphics protocol. Encoded via `icy_sixel`'s pure-Rust
@@ -365,27 +395,37 @@ impl PreviewBackend for SixelBackend {
         cols: u16,
         rows: u16,
     ) -> Result<Vec<u8>, PreviewError> {
-        let scaled = scale_for_cells(image_bytes, col, row, cols, rows)?;
-
-        let sixel_image = icy_sixel::SixelImage::from_rgba(
-            scaled.rgba,
-            scaled.width_px as usize,
-            scaled.height_px as usize,
-        );
-        let sixel_str = sixel_image
-            .encode()
-            .map_err(|e| PreviewError::Encode(format!("{e:?}")))?;
-
-        let mut out = Vec::with_capacity(sixel_str.len() + 16);
-        let _ = write!(
-            out,
-            "\x1b[{};{}H",
-            scaled.display_row.saturating_add(1),
-            scaled.display_col.saturating_add(1)
-        );
-        out.extend_from_slice(sixel_str.as_bytes());
-        Ok(out)
+        sixel_escape(scale_for_cells(
+            image_bytes,
+            col,
+            row,
+            cols,
+            rows,
+            cell_pixels(),
+        )?)
     }
+}
+
+/// The sixel escape sequence that draws `scaled`.
+fn sixel_escape(scaled: ScaledForCells) -> Result<Vec<u8>, PreviewError> {
+    let sixel_image = icy_sixel::SixelImage::from_rgba(
+        scaled.rgba,
+        scaled.width_px as usize,
+        scaled.height_px as usize,
+    );
+    let sixel_str = sixel_image
+        .encode()
+        .map_err(|e| PreviewError::Encode(format!("{e:?}")))?;
+
+    let mut out = Vec::with_capacity(sixel_str.len() + 16);
+    let _ = write!(
+        out,
+        "\x1b[{};{}H",
+        scaled.display_row.saturating_add(1),
+        scaled.display_col.saturating_add(1)
+    );
+    out.extend_from_slice(sixel_str.as_bytes());
+    Ok(out)
 }
 
 pub fn backend_for(protocol: GraphicsProtocol) -> Option<Box<dyn PreviewBackend>> {
@@ -695,7 +735,7 @@ mod tests {
             }
         }
         let png = encode_png_rgba(&rgba, w, h).unwrap();
-        let scaled = scale_for_cells(&png, 0, 0, 400, 200).unwrap();
+        let scaled = scale_for_cells(&png, 0, 0, 400, 200, (10, 20)).unwrap();
 
         let sixel = icy_sixel::SixelImage::from_rgba(
             scaled.rgba.clone(),
@@ -729,5 +769,316 @@ mod tests {
             mean < 10.0,
             "mean absolute error {mean:.2}/255 after a sixel round trip",
         );
+    }
+
+    // --- protocol detection ---
+
+    fn detect_with(prefer: ImagePreviewMode, vars: &[(&str, &str)]) -> GraphicsProtocol {
+        detect_from(prefer, |name| {
+            vars.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| v.to_string())
+        })
+    }
+
+    #[test]
+    fn a_configured_protocol_wins_over_the_environment() {
+        let kitty = [("TERM", "xterm-kitty")];
+        assert_eq!(
+            detect_with(ImagePreviewMode::None, &kitty),
+            GraphicsProtocol::None
+        );
+        assert_eq!(
+            detect_with(ImagePreviewMode::Sixel, &kitty),
+            GraphicsProtocol::Sixel
+        );
+        assert_eq!(
+            detect_with(ImagePreviewMode::Iterm2, &kitty),
+            GraphicsProtocol::Iterm2
+        );
+        assert_eq!(
+            detect_with(ImagePreviewMode::Kitty, &[]),
+            GraphicsProtocol::Kitty
+        );
+    }
+
+    #[test]
+    fn auto_detects_each_terminal_from_its_environment() {
+        use GraphicsProtocol::*;
+        let cases: &[(&[(&str, &str)], GraphicsProtocol)] = &[
+            (&[("TERM", "xterm-kitty")], Kitty),
+            (&[("KITTY_WINDOW_ID", "1")], Kitty),
+            (&[("TERM_PROGRAM", "WezTerm")], Kitty),
+            (&[("TERM_PROGRAM", "ghostty")], Kitty),
+            (&[("GHOSTTY_RESOURCES_DIR", "/g")], Kitty),
+            (&[("TERM_PROGRAM", "iTerm.app")], Iterm2),
+            (&[("KONSOLE_VERSION", "230800")], Sixel),
+            (&[("MLTERM", "3.9")], Sixel),
+            (
+                &[("TERM", "xterm-256color"), ("XTERM_VERSION", "XTerm(390)")],
+                Sixel,
+            ),
+            (&[("WT_SESSION", "guid")], Sixel),
+            // xterm without a version could be anything claiming to be xterm.
+            (&[("TERM", "xterm-256color")], None),
+            (&[], None),
+        ];
+        for (vars, want) in cases {
+            assert_eq!(detect_with(ImagePreviewMode::Auto, vars), *want, "{vars:?}");
+        }
+    }
+
+    #[test]
+    fn kitty_outranks_a_sixel_terminal_it_runs_inside() {
+        let vars = [("KITTY_WINDOW_ID", "1"), ("WT_SESSION", "guid")];
+        assert_eq!(
+            detect_with(ImagePreviewMode::Auto, &vars),
+            GraphicsProtocol::Kitty
+        );
+    }
+
+    #[test]
+    fn every_protocol_but_none_has_a_backend() {
+        for p in [
+            GraphicsProtocol::Kitty,
+            GraphicsProtocol::Sixel,
+            GraphicsProtocol::Iterm2,
+        ] {
+            assert!(backend_for(p).is_some(), "{p:?}");
+        }
+        assert!(backend_for(GraphicsProtocol::None).is_none());
+    }
+
+    // --- scaling ---
+
+    /// A `w`x`h` PNG of noise, which compresses badly: big enough payloads
+    /// to need more than one kitty chunk.
+    fn noise_png(w: u32, h: u32) -> Vec<u8> {
+        let mut seed = 0x2545_f491_u32;
+        let rgba: Vec<u8> = (0..w * h * 4)
+            .map(|i| {
+                if i % 4 == 3 {
+                    return 255;
+                }
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        encode_png_rgba(&rgba, w, h).unwrap()
+    }
+
+    const CELL: (u32, u32) = (10, 20);
+
+    #[test]
+    fn a_small_image_keeps_its_size_and_is_centred() {
+        // 100x40 px is 10x2 cells; the panel is 20x10 cells at (5, 3).
+        let s = scale_for_cells(&noise_png(100, 40), 5, 3, 20, 10, CELL).unwrap();
+        assert_eq!((s.width_px, s.height_px), (100, 40));
+        assert_eq!((s.cells_w, s.cells_h), (10, 2));
+        assert_eq!((s.display_col, s.display_row), (10, 7));
+        assert_eq!(s.rgba.len(), 100 * 40 * 4);
+    }
+
+    #[test]
+    fn a_large_image_is_scaled_down_keeping_its_shape() {
+        // The panel is 200x200 px; 400x100 halves to 200x50.
+        let s = scale_for_cells(&noise_png(400, 100), 0, 0, 20, 10, CELL).unwrap();
+        assert_eq!((s.width_px, s.height_px), (200, 50));
+        assert_eq!((s.cells_w, s.cells_h), (20, 3));
+        assert_eq!((s.display_col, s.display_row), (0, 3));
+    }
+
+    #[test]
+    fn an_empty_panel_is_refused_before_decoding() {
+        let err = scale_for_cells(b"not even an image", 0, 0, 0, 10, CELL);
+        assert!(matches!(err, Err(PreviewError::EmptyPanel)));
+    }
+
+    #[test]
+    fn bytes_that_are_not_an_image_fail_to_decode() {
+        let err = scale_for_cells(b"not an image", 0, 0, 10, 10, CELL);
+        assert!(
+            matches!(err, Err(PreviewError::Decode(_))),
+            "{:?}",
+            err.err()
+        );
+    }
+
+    #[test]
+    fn an_image_declaring_huge_dimensions_is_refused_unread() {
+        // A valid PNG header claiming 5000x5000, with no pixel data at all.
+        let mut png = Vec::new();
+        png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(b"IHDR");
+        ihdr.extend_from_slice(&5000u32.to_be_bytes());
+        ihdr.extend_from_slice(&5000u32.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(&ihdr);
+        png.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+
+        let err = scale_for_cells(&png, 0, 0, 10, 10, CELL);
+        assert!(
+            matches!(err, Err(PreviewError::TooLarge)),
+            "{:?}",
+            err.err()
+        );
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    #[test]
+    fn preview_errors_read_as_sentences() {
+        assert_eq!(
+            PreviewError::TooLarge.to_string(),
+            "image too large for preview"
+        );
+        assert_eq!(
+            PreviewError::Decode("bad".into()).to_string(),
+            "image decode failed: bad"
+        );
+        assert_eq!(
+            PreviewError::Encode("bad".into()).to_string(),
+            "image encode failed: bad"
+        );
+        assert_eq!(
+            PreviewError::EmptyPanel.to_string(),
+            "viewer panel has no room"
+        );
+    }
+
+    // --- escape sequences ---
+
+    fn png_dimensions(png: &[u8]) -> (u32, u32) {
+        let img = image::load_from_memory_with_format(png, ImageFormat::Png).unwrap();
+        (img.width(), img.height())
+    }
+
+    #[test]
+    fn kitty_sends_the_png_in_chunks_after_moving_the_cursor() {
+        let scaled = scale_for_cells(&noise_png(100, 40), 5, 3, 20, 10, CELL).unwrap();
+        let out = String::from_utf8(kitty_escape(&scaled).unwrap()).unwrap();
+
+        // 1-based row;col of the centred top-left cell.
+        let rest = out.strip_prefix("\x1b[8;11H").expect(&out[..20]);
+        let chunks: Vec<&str> = rest.split_terminator("\x1b\\").collect();
+        assert!(chunks.len() > 1, "a 16 KB payload takes several chunks");
+
+        let mut b64 = String::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let last = i == chunks.len() - 1;
+            let header = if i == 0 {
+                format!("\x1b_Gf=100,a=T,c=10,r=2,q=2,m={};", u8::from(!last))
+            } else {
+                format!("\x1b_Gm={};", u8::from(!last))
+            };
+            let data = chunk
+                .strip_prefix(&header)
+                .unwrap_or_else(|| panic!("chunk {i}"));
+            assert!(data.len() <= 4096, "chunk {i} is {} bytes", data.len());
+            b64.push_str(data);
+        }
+        let png = BASE64.decode(b64).unwrap();
+        assert_eq!(png_dimensions(&png), (100, 40));
+    }
+
+    #[test]
+    fn iterm2_sends_one_inline_file_escape() {
+        let scaled = scale_for_cells(&noise_png(20, 20), 0, 0, 20, 10, CELL).unwrap();
+        let out = String::from_utf8(iterm2_escape(&scaled).unwrap()).unwrap();
+
+        let rest = out.strip_prefix("\x1b[5;10H").expect(&out[..12]);
+        let b64 = rest
+            .strip_prefix("\x1b]1337;File=inline=1;width=2;height=1;preserveAspectRatio=1:")
+            .and_then(|r| r.strip_suffix('\x07'))
+            .expect("one OSC 1337 sequence");
+        let png = BASE64.decode(b64).unwrap();
+        assert_eq!(png_dimensions(&png), (20, 20));
+    }
+
+    #[test]
+    fn sixel_moves_the_cursor_then_sends_the_sixel_stream() {
+        let scaled = scale_for_cells(&noise_png(20, 20), 0, 0, 20, 10, CELL).unwrap();
+        let out = sixel_escape(scaled).unwrap();
+        let sixel = out.strip_prefix(b"\x1b[5;10H").expect("cursor move first");
+        let decoded = icy_sixel::SixelImage::decode(sixel).unwrap();
+        assert_eq!(decoded.width, 20);
+    }
+
+    /// Each backend end to end, at whatever cell size this terminal reports:
+    /// an image small enough to fit any panel comes out as an escape
+    /// sequence that starts by placing the cursor.
+    #[test]
+    fn every_backend_renders_an_image() {
+        let png = noise_png(8, 8);
+        for p in [
+            GraphicsProtocol::Kitty,
+            GraphicsProtocol::Sixel,
+            GraphicsProtocol::Iterm2,
+        ] {
+            let out = backend_for(p).unwrap().render(&png, 0, 0, 40, 20).unwrap();
+            assert!(out.starts_with(b"\x1b["), "{p:?}");
+        }
+    }
+
+    #[test]
+    fn a_backend_reports_an_empty_panel() {
+        let png = noise_png(8, 8);
+        for p in [
+            GraphicsProtocol::Kitty,
+            GraphicsProtocol::Sixel,
+            GraphicsProtocol::Iterm2,
+        ] {
+            let err = backend_for(p).unwrap().render(&png, 0, 0, 40, 0);
+            assert!(matches!(err, Err(PreviewError::EmptyPanel)), "{p:?}");
+        }
+    }
+
+    // --- NFO text ---
+
+    #[test]
+    fn cp437_keeps_ascii_and_maps_the_high_half() {
+        assert_eq!(decode_cp437(b"plain ASCII\n"), "plain ASCII\n");
+        assert_eq!(
+            decode_cp437(&[0xC9, 0xCD, 0xBB, 0xB0, 0xDB, 0x80, 0xE1, 0xFF]),
+            "╔═╗░█Çß\u{00A0}"
+        );
+    }
+
+    #[test]
+    fn every_cp437_byte_decodes_to_exactly_one_char() {
+        let all: Vec<u8> = (0..=255).collect();
+        assert_eq!(decode_cp437(&all).chars().count(), 256);
+    }
+
+    #[test]
+    fn nfo_files_are_recognised_by_extension_in_any_case() {
+        assert!(is_nfo_file("release.nfo"));
+        assert!(is_nfo_file("RELEASE.NFO"));
+        assert!(!is_nfo_file("nfo.txt"));
+    }
+
+    #[test]
+    fn bare_well_known_names_are_text() {
+        for name in ["README", "Makefile", "LICENSE", "Dockerfile"] {
+            assert!(is_viewable_text(name), "{name}");
+        }
+        assert!(!is_viewable_text("randomname"));
     }
 }
