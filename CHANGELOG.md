@@ -66,6 +66,29 @@ the git history for those.
 
 ### Fixed
 
+- **An FTP server that won't resume no longer blocks a download.** After
+  an interrupted download, a server that refuses to resume (REST) failed
+  every retry, and the file could only be downloaded after deleting its
+  `.blink-part` by hand. The download now starts over instead.
+- **A plain FTP rename no longer replaces a file.** Renaming onto a name
+  that wasn't in the listing, but appeared since, replaced that file on
+  servers that allow it. It now fails, as it does over SFTP; renaming over
+  a file you confirmed still replaces it.
+- **On macOS, two names written differently are no longer downloaded onto
+  one file.** A server can hold `café` spelled two ways (composed and
+  decomposed), which macOS treats as one name, so one download silently
+  replaced the other. They now count as one destination, as `README` and
+  `readme` already did.
+- **Downloading a symlink to a folder downloads the folder** over SFTP and
+  SCP, rather than failing as a file the server can't send.
+- **Declining a download no longer leaves empty folders behind.** The
+  download's folder tree was created while it was planned, before the
+  overwrite prompt; it is now created when the download goes ahead.
+- **A symlink whose target is gone can be renamed over a file** over SFTP.
+  It was reported as not found.
+- **A transfer that hits an internal error fails instead of hanging.** It
+  stayed "running" for good, and resuming was refused for the rest of the
+  session.
 - **Dialogs fit small terminals.** Each dialog was a fixed share of the
   terminal's height, whatever it held, so on 80x24 nearly every one cut
   off its last lines: the keys to answer it, and any error message. The
