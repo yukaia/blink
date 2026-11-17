@@ -3715,6 +3715,177 @@ mod tests {
         }
     }
 
+    // What the user is told when a host is refused outright. Each refusal
+    // is followed by the connect failing, which must not bury the reason.
+
+    /// An app waiting on a connect to `h`.
+    fn connecting() -> App {
+        let mut a = app();
+        a.pending_session = Some(Session::from_url("sftp://me@h").unwrap());
+        a.screen = Screen::Connection;
+        a
+    }
+
+    fn changed_event(presented_key_type: &str, trusted_once: bool) -> AppEvent {
+        AppEvent::HostKeyChanged {
+            host: "[h]:2222".into(),
+            lookup_host: "h".into(),
+            lookup_port: 2222,
+            stored_key_type: "ssh-ed25519".into(),
+            presented_key_type: presented_key_type.into(),
+            fingerprint: "SHA256:abc".into(),
+            trusted_once,
+        }
+    }
+
+    fn errors(a: &App) -> Vec<&str> {
+        a.log
+            .iter()
+            .filter(|l| l.level == LogLevel::Error)
+            .map(|l| l.message.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn a_changed_host_key_stops_the_connect_and_raises_the_warning() {
+        let mut a = connecting();
+
+        a.handle_app_event(changed_event("ssh-rsa", true));
+
+        assert_eq!(a.screen, Screen::HostKeyChanged);
+        assert!(a.pending_session.is_none(), "the connect is over");
+        assert_eq!(
+            errors(&a),
+            [
+                "HOST KEY MISMATCH for [h]:2222: stored ssh-ed25519, got ssh-rsa — connection refused"
+            ],
+        );
+        let info = a
+            .host_key_changed_info
+            .as_ref()
+            .expect("the warning has its facts");
+        assert_eq!(
+            (
+                info.host.as_str(),
+                info.lookup_host.as_str(),
+                info.lookup_port
+            ),
+            ("[h]:2222", "h", 2222),
+            "shown as connected to, removed as stored",
+        );
+        assert_eq!(
+            (
+                info.stored_key_type.as_str(),
+                info.presented_key_type.as_str()
+            ),
+            ("ssh-ed25519", "ssh-rsa"),
+        );
+        assert_eq!(info.fingerprint, "SHA256:abc");
+        assert!(info.trusted_once);
+    }
+
+    /// The handler refusing the key makes the connect fail a moment later.
+    /// That failure is the same event told twice: it must not take the
+    /// warning down or add a vaguer line under it.
+    #[test]
+    fn the_connect_failing_after_a_changed_key_leaves_the_warning_up() {
+        let mut a = connecting();
+        a.handle_app_event(changed_event("ssh-rsa", false));
+
+        a.handle_app_event(AppEvent::ConnectFailed("ssh connect: rejected".into()));
+
+        assert_eq!(a.screen, Screen::HostKeyChanged);
+        assert!(a.host_key_changed_info.is_some());
+        assert_eq!(errors(&a).len(), 1, "{:?}", errors(&a));
+    }
+
+    /// The key type is the server's own text.
+    #[test]
+    fn a_changed_keys_type_cant_carry_escapes_into_the_log() {
+        let mut a = connecting();
+
+        a.handle_app_event(changed_event("ssh\u{1b}[31m-rsa", false));
+
+        assert!(
+            errors(&a)[0].contains("got ssh [31m-rsa"),
+            "{:?}",
+            errors(&a)
+        );
+    }
+
+    #[test]
+    fn a_host_certificate_is_refused_with_the_reason_and_no_question() {
+        let mut a = connecting();
+
+        a.handle_app_event(AppEvent::HostCertificateRejected {
+            host: "[h]:2222".into(),
+        });
+
+        assert_eq!(
+            a.screen,
+            Screen::Connection,
+            "nothing to decide, so no modal"
+        );
+        assert_eq!(
+            errors(&a),
+            [
+                "HOST CERTIFICATE for [h]:2222: blink cannot validate host certificates — \
+              connection refused"
+            ],
+        );
+        assert!(a.host_key_changed_info.is_none());
+        assert!(a.pending_host_key.is_none());
+    }
+
+    #[test]
+    fn a_revoked_host_key_is_refused_naming_the_key_and_no_question() {
+        let mut a = connecting();
+
+        a.handle_app_event(AppEvent::HostKeyRevoked {
+            host: "h".into(),
+            key_type: "ssh-ed25519".into(),
+            fingerprint: "SHA256:abc".into(),
+        });
+
+        assert_eq!(a.screen, Screen::Connection);
+        assert_eq!(
+            errors(&a),
+            [
+                "REVOKED HOST KEY for h: ssh-ed25519 SHA256:abc is marked @revoked in \
+              known_hosts — connection refused"
+            ],
+        );
+        assert!(a.host_key_changed_info.is_none());
+        assert!(a.pending_host_key.is_none());
+    }
+
+    /// With no modal to hold the screen, the failed connect returns to the
+    /// selector, and the reason is still the first thing in the log.
+    #[test]
+    fn a_refused_certificate_or_revoked_key_ends_back_at_the_selector() {
+        let refusals = [
+            AppEvent::HostCertificateRejected { host: "h".into() },
+            AppEvent::HostKeyRevoked {
+                host: "h".into(),
+                key_type: "ssh-ed25519".into(),
+                fingerprint: "SHA256:abc".into(),
+            },
+        ];
+        for refusal in refusals {
+            let mut a = connecting();
+            a.handle_app_event(refusal);
+
+            a.handle_app_event(AppEvent::ConnectFailed("ssh connect: rejected".into()));
+
+            assert_eq!(a.screen, Screen::SessionSelect);
+            assert!(a.pending_session.is_none());
+            let errors = errors(&a);
+            assert_eq!(errors.len(), 2, "{errors:?}");
+            assert!(errors[0].contains("connection refused"), "{errors:?}");
+            assert_eq!(errors[1], "connect failed: ssh connect: rejected");
+        }
+    }
+
     fn changed_modal_text(info: HostKeyChangedInfo) -> String {
         let mut a = app();
         a.host_key_changed_info = Some(info);
