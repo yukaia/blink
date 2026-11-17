@@ -835,3 +835,1009 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::super::tests_support::app_on_main;
+    use super::super::{App, Pane, Screen};
+    use crate::checkpoint::{CheckpointKind, CheckpointOffer};
+    use crate::config::Config;
+    use crate::session::{AuthMethod, Session};
+    use crate::theme::Theme;
+    use crate::transfer::TransferManager;
+    use crate::tui::state::{
+        EditField, EditSessionForm, OverwritePending, PendingCancel, PendingDelete,
+        PostConnectOffer, Viewer, ViewerKind,
+    };
+
+    fn app() -> App {
+        App::new(Config::default(), Theme::load("dracula").unwrap())
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn press(a: &mut App, code: KeyCode) {
+        a.dispatch_key(key(code));
+    }
+
+    fn typed(a: &mut App, s: &str) {
+        for c in s.chars() {
+            press(a, KeyCode::Char(c));
+        }
+    }
+
+    fn logged(a: &App, needle: &str) -> bool {
+        a.log.iter().any(|l| l.message.contains(needle))
+    }
+
+    fn session(url: &str) -> Session {
+        Session::from_url(url).unwrap()
+    }
+
+    fn named(url: &str, name: &str) -> Session {
+        let mut s = session(url);
+        s.name = name.into();
+        s
+    }
+
+    // --- session selector ---
+
+    #[test]
+    fn arrows_move_the_session_cursor_and_stop_at_the_ends() {
+        let mut a = app();
+        a.sessions = vec![
+            session("sftp://a@h"),
+            session("sftp://b@h"),
+            session("sftp://c@h"),
+        ];
+        for _ in 0..5 {
+            press(&mut a, KeyCode::Down);
+        }
+        assert_eq!(a.session_cursor, 2);
+        for _ in 0..5 {
+            press(&mut a, KeyCode::Up);
+        }
+        assert_eq!(a.session_cursor, 0);
+    }
+
+    #[test]
+    fn enter_with_no_saved_sessions_does_nothing() {
+        let mut a = app();
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.screen, Screen::SessionSelect);
+        assert!(a.pending_session.is_none());
+    }
+
+    #[tokio::test]
+    async fn enter_on_an_agent_session_connects_without_asking() {
+        let mut a = app();
+        let mut s = session("sftp://me@127.0.0.1:1");
+        s.auth = AuthMethod::Agent;
+        a.sessions = vec![s];
+        a.pending_password = Some(zeroize::Zeroizing::new("stale".into()));
+
+        press(&mut a, KeyCode::Enter);
+
+        assert_eq!(a.screen, Screen::Connection);
+        assert!(a.pending_password.is_none());
+        assert!(logged(&a, "connecting to me@127.0.0.1:1 via sftp"));
+    }
+
+    #[test]
+    fn n_opens_a_blank_new_session_form() {
+        let mut a = app();
+        a.new_session_input = "left over".into();
+        a.new_session_error = Some("old".into());
+        press(&mut a, KeyCode::Char('n'));
+        assert_eq!(a.screen, Screen::NewSession);
+        assert!(a.new_session_input.is_empty());
+        assert!(a.new_session_error.is_none());
+    }
+
+    #[test]
+    fn e_and_d_open_the_edit_and_delete_modals_for_the_selected_session() {
+        let mut a = app();
+        a.sessions = vec![named("sftp://me@h", "one"), named("sftp://me@h", "two")];
+        a.session_cursor = 1;
+
+        press(&mut a, KeyCode::Char('e'));
+        assert_eq!(a.screen, Screen::EditSession);
+        assert_eq!(a.edit_session_form.as_ref().unwrap().original_name, "two");
+
+        a.screen = Screen::SessionSelect;
+        press(&mut a, KeyCode::Char('d'));
+        assert_eq!(a.screen, Screen::ConfirmDeleteSession);
+        assert_eq!(a.pending_session_delete.as_ref().unwrap().name, "two");
+    }
+
+    #[test]
+    fn q_and_esc_ask_before_quitting_and_remember_where_from() {
+        for code in [KeyCode::Char('q'), KeyCode::Esc] {
+            let mut a = app();
+            press(&mut a, code);
+            assert_eq!(a.screen, Screen::ConfirmQuit);
+            assert_eq!(a.previous_screen, Screen::SessionSelect);
+            assert!(!a.should_quit);
+
+            let mut a = app_on_main(1);
+            press(&mut a, code);
+            assert_eq!(a.screen, Screen::ConfirmQuit);
+            assert_eq!(a.previous_screen, Screen::Main);
+        }
+    }
+
+    #[test]
+    fn with_the_quit_confirmation_off_q_quits_at_once() {
+        let mut a = app();
+        a.config.general.confirm_quit = false;
+        press(&mut a, KeyCode::Char('q'));
+        assert!(a.should_quit);
+
+        let mut a = app_on_main(1);
+        a.config.general.confirm_quit = false;
+        press(&mut a, KeyCode::Esc);
+        assert!(a.should_quit);
+    }
+
+    // --- new session ---
+
+    #[test]
+    fn esc_abandons_the_new_session_form() {
+        let mut a = app();
+        a.screen = Screen::NewSession;
+        typed(&mut a, "sftp://half");
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.screen, Screen::SessionSelect);
+        assert!(a.new_session_input.is_empty());
+    }
+
+    #[test]
+    fn a_bad_url_is_reported_and_editing_clears_the_error() {
+        let mut a = app();
+        a.screen = Screen::NewSession;
+        typed(&mut a, "gopher://x");
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.screen, Screen::NewSession);
+        assert!(a.new_session_error.is_some());
+
+        press(&mut a, KeyCode::Backspace);
+        assert_eq!(a.new_session_input, "gopher://");
+        assert!(a.new_session_error.is_none());
+
+        a.dispatch_key(ctrl('u'));
+        assert!(a.new_session_input.is_empty());
+
+        // Keys the form doesn't edit with change nothing.
+        a.new_session_error = Some("kept".into());
+        press(&mut a, KeyCode::Left);
+        assert_eq!(a.new_session_error.as_deref(), Some("kept"));
+    }
+
+    // --- edit session ---
+
+    fn editing() -> App {
+        let mut a = app();
+        let s = named("sftp://me@h", "my");
+        a.edit_session_form = Some(EditSessionForm::from_session(&s));
+        a.sessions = vec![s];
+        a.screen = Screen::EditSession;
+        a
+    }
+
+    #[test]
+    fn up_moves_to_the_previous_field() {
+        let mut a = editing();
+        a.edit_session_form.as_mut().unwrap().focused = EditField::Host;
+        press(&mut a, KeyCode::Up);
+        assert_eq!(
+            a.edit_session_form.as_ref().unwrap().focused,
+            EditField::Name
+        );
+    }
+
+    #[test]
+    fn space_in_a_text_field_types_a_space() {
+        let mut a = editing();
+        a.edit_session_form.as_mut().unwrap().error = Some("old".into());
+        press(&mut a, KeyCode::Char(' '));
+        let form = a.edit_session_form.as_ref().unwrap();
+        assert_eq!(form.name, "my ");
+        assert!(form.error.is_none());
+    }
+
+    // --- delete session ---
+
+    #[test]
+    fn deleting_the_last_session_in_the_list_moves_the_cursor_up() {
+        let _home = crate::paths::test_home();
+        let one = named("sftp://me@h", "one");
+        let two = named("sftp://me@h", "two");
+        one.save().unwrap();
+        two.save().unwrap();
+        let mut a = app();
+        a.reload_sessions();
+        a.session_cursor = 1;
+        a.pending_session_delete = Some(a.sessions[1].clone());
+        a.screen = Screen::ConfirmDeleteSession;
+
+        press(&mut a, KeyCode::Char('y'));
+
+        assert_eq!(a.screen, Screen::SessionSelect);
+        assert_eq!(a.sessions.len(), 1);
+        assert_eq!(a.session_cursor, 0);
+        assert!(logged(&a, "session deleted"));
+    }
+
+    #[test]
+    fn deleting_the_only_session_leaves_the_cursor_at_zero() {
+        let _home = crate::paths::test_home();
+        let one = named("sftp://me@h", "one");
+        one.save().unwrap();
+        let mut a = app();
+        a.reload_sessions();
+        a.pending_session_delete = Some(one);
+        a.screen = Screen::ConfirmDeleteSession;
+
+        press(&mut a, KeyCode::Char('Y'));
+
+        assert!(a.sessions.is_empty());
+        assert_eq!(a.session_cursor, 0);
+    }
+
+    #[test]
+    fn a_failed_session_delete_is_logged() {
+        let _home = crate::paths::test_home();
+        let mut a = app();
+        a.pending_session_delete = Some(named("sftp://me@h", "ghost"));
+        a.screen = Screen::ConfirmDeleteSession;
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(a.screen, Screen::SessionSelect);
+        assert!(logged(&a, "delete ghost failed"));
+    }
+
+    // --- password and passphrase prompts ---
+
+    #[test]
+    fn esc_at_the_password_prompt_wipes_it_and_forgets_the_session() {
+        let mut a = app();
+        a.screen = Screen::PasswordPrompt;
+        a.pending_session = Some(session("sftp://me@h"));
+        typed(&mut a, "hunt");
+        press(&mut a, KeyCode::Backspace);
+        assert_eq!(a.password_input.as_str(), "hun");
+
+        press(&mut a, KeyCode::Esc);
+
+        assert_eq!(a.screen, Screen::SessionSelect);
+        assert!(a.password_input.is_empty());
+        assert!(a.pending_session.is_none());
+        assert!(a.pending_password.is_none());
+    }
+
+    #[test]
+    fn a_password_with_no_session_to_send_it_to_goes_back() {
+        let mut a = app();
+        a.screen = Screen::PasswordPrompt;
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.screen, Screen::SessionSelect);
+    }
+
+    fn at_passphrase_prompt() -> App {
+        let mut a = app();
+        a.screen = Screen::KeyPassphrasePrompt;
+        let mut s = session("sftp://me@127.0.0.1:1");
+        s.auth = AuthMethod::Key {
+            path: "/k/id".into(),
+        };
+        a.pending_session = Some(s);
+        a
+    }
+
+    #[test]
+    fn esc_at_the_passphrase_prompt_cancels_the_connect_and_says_so() {
+        let mut a = at_passphrase_prompt();
+        typed(&mut a, "secret");
+        a.passphrase_attempted = true;
+        a.passphrase_error = Some("wrong".into());
+
+        press(&mut a, KeyCode::Esc);
+
+        assert_eq!(a.screen, Screen::SessionSelect);
+        assert!(a.passphrase_input.is_empty());
+        assert!(a.passphrase_error.is_none());
+        assert!(!a.passphrase_attempted);
+        assert!(a.pending_session.is_none());
+        assert!(logged(&a, "connect cancelled"));
+    }
+
+    #[test]
+    fn an_empty_passphrase_is_not_sent() {
+        let mut a = at_passphrase_prompt();
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.screen, Screen::KeyPassphrasePrompt);
+        assert_eq!(
+            a.passphrase_error.as_deref(),
+            Some("enter the passphrase or [esc] to cancel")
+        );
+
+        typed(&mut a, "x");
+        assert!(a.passphrase_error.is_none(), "typing clears the hint");
+    }
+
+    #[test]
+    fn a_passphrase_with_no_session_to_send_it_to_goes_back() {
+        let mut a = at_passphrase_prompt();
+        a.pending_session = None;
+        typed(&mut a, "x");
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.screen, Screen::SessionSelect);
+    }
+
+    // --- main view: moving around ---
+
+    #[test]
+    fn arrows_and_pages_move_the_file_cursor() {
+        let mut a = app_on_main(30);
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.local.cursor, 1);
+        press(&mut a, KeyCode::PageDown);
+        assert_eq!(a.local.cursor, 11);
+        press(&mut a, KeyCode::PageUp);
+        assert_eq!(a.local.cursor, 1);
+        press(&mut a, KeyCode::Up);
+        assert_eq!(a.local.cursor, 0);
+    }
+
+    /// Give `a` `n` downloads, each started as the dispatcher would start
+    /// it, so they show in the transfers pane.
+    fn with_running(a: &mut App, n: usize) -> Vec<u64> {
+        let (m, _events) = TransferManager::new(u8::try_from(n).unwrap());
+        for i in 0..n {
+            m.enqueue_download(format!("/r/f{i}"), format!("/l/f{i}").into())
+                .unwrap();
+        }
+        let ids = (0..n)
+            .map(|_| m.take_next_pending().expect("a job is queued").id)
+            .collect();
+        a.transfer_manager = Some(m);
+        ids
+    }
+
+    #[test]
+    fn arrows_and_pages_on_the_transfers_pane_move_the_transfer_cursor() {
+        let mut a = app_on_main(1);
+        with_running(&mut a, 10);
+        a.active_pane = Pane::Transfers;
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.transfer_cursor, 1);
+        press(&mut a, KeyCode::PageDown);
+        assert_eq!(a.transfer_cursor, 9, "stops at the last transfer");
+        press(&mut a, KeyCode::Up);
+        assert_eq!(a.transfer_cursor, 8);
+        press(&mut a, KeyCode::PageUp);
+        assert_eq!(a.transfer_cursor, 0, "stops at the first");
+    }
+
+    #[test]
+    fn moving_keys_on_the_log_pane_do_nothing() {
+        let mut a = app_on_main(5);
+        a.active_pane = Pane::Log;
+        for code in [
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::PageDown,
+            KeyCode::PageUp,
+            KeyCode::Enter,
+            KeyCode::Backspace,
+            KeyCode::Char(' '),
+            KeyCode::Char('/'),
+            KeyCode::Char('v'),
+            KeyCode::F(5),
+        ] {
+            press(&mut a, code);
+        }
+        assert_eq!(a.screen, Screen::Main);
+        assert_eq!(a.local.cursor, 0);
+        assert_eq!(a.local.path, "/l");
+    }
+
+    #[test]
+    fn tab_and_shift_tab_cycle_the_panes() {
+        let mut a = app_on_main(1);
+        press(&mut a, KeyCode::Tab);
+        assert_eq!(a.active_pane, Pane::Remote);
+        press(&mut a, KeyCode::BackTab);
+        press(&mut a, KeyCode::BackTab);
+        assert_eq!(a.active_pane, Pane::Log);
+    }
+
+    #[tokio::test]
+    async fn backspace_on_the_local_pane_goes_up_a_folder() {
+        let mut a = app_on_main(3);
+        a.local.path = "/l/sub".into();
+        a.local.cursor = 2;
+        press(&mut a, KeyCode::Backspace);
+        assert_eq!(a.local.path, "/l");
+        assert_eq!(a.local.cursor, 0);
+
+        a.local.path = "/".into();
+        press(&mut a, KeyCode::Backspace);
+        assert_eq!(a.local.path, "/", "the root has no parent");
+    }
+
+    #[test]
+    fn backspace_at_the_remote_root_stays_put() {
+        let mut a = app_on_main(1);
+        a.active_pane = Pane::Remote;
+        a.remote.path = "/".into();
+        press(&mut a, KeyCode::Backspace);
+        assert_eq!(a.remote.path, "/");
+        assert!(a.log.is_empty());
+    }
+
+    #[test]
+    fn space_selects_the_entry_under_the_cursor() {
+        let mut a = app_on_main(3);
+        press(&mut a, KeyCode::Char(' '));
+        assert_eq!(a.local.selected_entries().len(), 1);
+        a.active_pane = Pane::Transfers;
+        press(&mut a, KeyCode::Char(' '));
+        assert_eq!(a.local.selected_entries().len(), 1);
+    }
+
+    // --- main view: keys tied to a pane or a connection ---
+
+    #[test]
+    fn transfer_keys_do_nothing_outside_the_transfers_pane() {
+        let mut a = app_on_main(1);
+        with_running(&mut a, 2);
+        for c in ['c', 'C', 'r', 'R'] {
+            press(&mut a, KeyCode::Char(c));
+        }
+        assert_eq!(a.screen, Screen::Main);
+        assert!(a.pending_cancel.is_none());
+        assert!(a.log.is_empty(), "{:?}", a.log);
+    }
+
+    #[test]
+    fn c_and_shift_c_on_the_transfers_pane_ask_to_cancel() {
+        let mut a = app_on_main(1);
+        with_running(&mut a, 2);
+        a.active_pane = Pane::Transfers;
+        press(&mut a, KeyCode::Char('c'));
+        assert_eq!(a.screen, Screen::ConfirmCancel);
+        assert!(matches!(
+            a.pending_cancel,
+            Some(PendingCancel::Single { .. })
+        ));
+    }
+
+    #[test]
+    fn r_on_the_transfers_pane_tries_to_resume() {
+        let mut a = app_on_main(1);
+        a.active_pane = Pane::Transfers;
+        press(&mut a, KeyCode::Char('r'));
+        press(&mut a, KeyCode::Char('R'));
+        assert!(!a.log.is_empty(), "resume reports what it found");
+    }
+
+    #[test]
+    fn remote_file_keys_do_nothing_on_the_local_pane() {
+        let mut a = app_on_main(1);
+        a.dispatch_key(key(KeyCode::F(2)));
+        a.dispatch_key(key(KeyCode::F(7)));
+        a.dispatch_key(key(KeyCode::Char('D')));
+        a.dispatch_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::SHIFT));
+        assert_eq!(a.screen, Screen::Main);
+        assert!(a.log.is_empty(), "{:?}", a.log);
+    }
+
+    #[test]
+    fn remote_file_keys_on_the_remote_pane_need_a_connection() {
+        for k in [
+            key(KeyCode::F(2)),
+            key(KeyCode::F(7)),
+            key(KeyCode::Char('D')),
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::SHIFT),
+        ] {
+            let mut a = app_on_main(1);
+            a.active_pane = Pane::Remote;
+            a.dispatch_key(k);
+            assert_eq!(a.screen, Screen::Main, "{k:?}");
+            assert!(logged(&a, "not connected"), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn plain_delete_is_not_shift_delete() {
+        let mut a = app_on_main(1);
+        a.active_pane = Pane::Remote;
+        press(&mut a, KeyCode::Delete);
+        assert!(a.log.is_empty());
+    }
+
+    #[test]
+    fn transfer_and_save_shortcuts_need_a_connection() {
+        for c in ['d', 'u', 's'] {
+            let mut a = app_on_main(1);
+            a.dispatch_key(ctrl(c));
+            assert_eq!(a.screen, Screen::Main, "ctrl+{c}");
+            assert!(logged(&a, "not connected"), "ctrl+{c}");
+        }
+    }
+
+    #[test]
+    fn ctrl_x_without_a_connection_does_nothing() {
+        let mut a = app_on_main(1);
+        a.dispatch_key(ctrl('x'));
+        assert_eq!(a.screen, Screen::Main);
+    }
+
+    #[test]
+    fn slash_opens_search_on_the_active_file_pane() {
+        let mut a = app_on_main(3);
+        a.active_pane = Pane::Transfers;
+        press(&mut a, KeyCode::Char('/'));
+        assert_eq!(a.screen, Screen::Main);
+
+        a.active_pane = Pane::Local;
+        press(&mut a, KeyCode::Char('/'));
+        assert_eq!(a.screen, Screen::Search);
+        assert_eq!(a.search_target, Pane::Local);
+    }
+
+    #[tokio::test]
+    async fn f5_refreshes_the_local_pane() {
+        let mut a = app_on_main(3);
+        press(&mut a, KeyCode::F(5));
+        assert!(logged(&a, "refreshed: /l"));
+    }
+
+    #[test]
+    fn f5_on_the_remote_pane_needs_a_connection() {
+        let mut a = app_on_main(1);
+        a.active_pane = Pane::Remote;
+        press(&mut a, KeyCode::F(5));
+        assert!(logged(&a, "not connected"));
+    }
+
+    // --- confirmations over the main view ---
+
+    #[test]
+    fn declining_a_cancel_keeps_the_transfer() {
+        for code in [KeyCode::Char('n'), KeyCode::Char('N'), KeyCode::Esc] {
+            let mut a = app_on_main(1);
+            let ids = with_running(&mut a, 1);
+            a.pending_cancel = Some(PendingCancel::Single {
+                id: ids[0],
+                name: "f0".into(),
+            });
+            a.previous_screen = Screen::Main;
+            a.screen = Screen::ConfirmCancel;
+
+            press(&mut a, code);
+
+            assert_eq!(a.screen, Screen::Main);
+            assert!(a.pending_cancel.is_none());
+            assert_eq!(a.active_jobs().len(), 1);
+        }
+    }
+
+    #[test]
+    fn cancelling_the_last_transfer_pulls_the_cursor_back() {
+        let mut a = app_on_main(1);
+        let ids = with_running(&mut a, 2);
+        a.transfer_cursor = 1;
+        a.pending_cancel = Some(PendingCancel::Single {
+            id: ids[1],
+            name: "f1".into(),
+        });
+        a.previous_screen = Screen::Main;
+        a.screen = Screen::ConfirmCancel;
+
+        press(&mut a, KeyCode::Char('y'));
+
+        assert_eq!(a.active_jobs().len(), 1);
+        assert_eq!(a.transfer_cursor, 0);
+    }
+
+    #[test]
+    fn cancelling_every_transfer_resets_the_cursor() {
+        let mut a = app_on_main(1);
+        let ids = with_running(&mut a, 1);
+        a.pending_cancel = Some(PendingCancel::Single {
+            id: ids[0],
+            name: "f0".into(),
+        });
+        a.previous_screen = Screen::Main;
+        a.screen = Screen::ConfirmCancel;
+
+        press(&mut a, KeyCode::Char('y'));
+
+        assert!(a.active_jobs().is_empty());
+        assert_eq!(a.transfer_cursor, 0);
+        assert!(logged(&a, "cancelled: f0"));
+    }
+
+    #[test]
+    fn declining_a_delete_keeps_the_file() {
+        for code in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut a = app_on_main(1);
+            a.pending_delete = Some(PendingDelete {
+                name: "x".into(),
+                is_dir: false,
+                remote_path: "/x".into(),
+            });
+            a.screen = Screen::ConfirmDelete;
+            press(&mut a, code);
+            assert_eq!(a.screen, Screen::Main);
+            assert!(a.pending_delete.is_none());
+        }
+    }
+
+    #[test]
+    fn declining_an_overwrite_drops_the_rename_and_says_so() {
+        let mut a = app_on_main(1);
+        a.rename_input = "b".into();
+        a.rename_original = "a".into();
+        a.pending_overwrite = Some(OverwritePending::Rename {
+            from: "/a".into(),
+            to: "/b".into(),
+            target_name: "b".into(),
+        });
+        a.screen = Screen::ConfirmOverwrite;
+
+        press(&mut a, KeyCode::Esc);
+
+        assert_eq!(a.screen, Screen::Main);
+        assert!(a.pending_overwrite.is_none());
+        assert!(a.rename_input.is_empty());
+        assert!(a.rename_original.is_empty());
+        assert!(logged(&a, "overwrite cancelled"));
+    }
+
+    #[test]
+    fn other_keys_leave_an_overwrite_question_open() {
+        let mut a = app_on_main(1);
+        a.pending_overwrite = Some(OverwritePending::Rename {
+            from: "/a".into(),
+            to: "/b".into(),
+            target_name: "b".into(),
+        });
+        a.screen = Screen::ConfirmOverwrite;
+        press(&mut a, KeyCode::Char('x'));
+        assert_eq!(a.screen, Screen::ConfirmOverwrite);
+        assert!(a.pending_overwrite.is_some());
+    }
+
+    #[test]
+    fn rename_and_mkdir_forms_edit_and_cancel() {
+        let mut a = app_on_main(1);
+        a.screen = Screen::Rename;
+        a.rename_error = Some("old".into());
+        typed(&mut a, "ab");
+        assert_eq!(a.rename_input, "ab");
+        assert!(a.rename_error.is_none());
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.screen, Screen::Main);
+
+        a.screen = Screen::Mkdir;
+        a.mkdir_error = Some("old".into());
+        typed(&mut a, "dir");
+        assert_eq!(a.mkdir_input, "dir");
+        assert!(a.mkdir_error.is_none());
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.screen, Screen::Main);
+        assert!(a.mkdir_input.is_empty());
+    }
+
+    // --- search ---
+
+    #[test]
+    fn esc_clears_the_search_and_enter_keeps_it() {
+        let mut a = app_on_main(20);
+        press(&mut a, KeyCode::Char('/'));
+        typed(&mut a, "file01");
+        assert_eq!(a.local.entries.len(), 10);
+        press(&mut a, KeyCode::PageDown);
+        assert_eq!(a.local.cursor, 9);
+        press(&mut a, KeyCode::PageUp);
+        assert_eq!(a.local.cursor, 0);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.screen, Screen::Main);
+        assert_eq!(a.local.entries.len(), 10, "enter keeps the filter");
+
+        press(&mut a, KeyCode::Char('/'));
+        assert_eq!(a.search_input, "file01", "reopening shows the filter");
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.screen, Screen::Main);
+        assert_eq!(a.local.entries.len(), 20);
+        assert!(a.search_input.is_empty());
+    }
+
+    // --- save session ---
+
+    fn saving(name: &str) -> App {
+        let mut a = app_on_main(1);
+        a.current_session = Some(session("sftp://me@h.example"));
+        a.screen = Screen::SaveSession;
+        a.save_session_input = name.into();
+        a
+    }
+
+    #[test]
+    fn esc_closes_the_save_form() {
+        let mut a = saving("x");
+        a.save_session_error = Some("old".into());
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.screen, Screen::Main);
+        assert!(a.save_session_error.is_none());
+    }
+
+    #[test]
+    fn a_blank_name_is_refused() {
+        let mut a = saving("   ");
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.screen, Screen::SaveSession);
+        assert_eq!(
+            a.save_session_error.as_deref(),
+            Some("name cannot be empty")
+        );
+
+        typed(&mut a, "w");
+        assert!(a.save_session_error.is_none(), "typing clears the error");
+    }
+
+    #[test]
+    fn saving_with_no_connection_is_refused() {
+        let mut a = saving("work");
+        a.current_session = None;
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.save_session_error.as_deref(), Some("no active session"));
+    }
+
+    #[test]
+    fn saving_records_where_you_are() {
+        let _home = crate::paths::test_home();
+        let mut a = saving(" work ");
+        a.remote.path = String::new();
+
+        press(&mut a, KeyCode::Enter);
+
+        assert_eq!(a.screen, Screen::Main);
+        assert!(logged(&a, "session saved: work"));
+        let saved = Session::list_all().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].name, "work");
+        assert_eq!(saved[0].remote_dir, "/");
+        assert_eq!(
+            saved[0].local_dir.as_deref(),
+            Some(std::path::Path::new("/l"))
+        );
+        assert_eq!(a.current_session.as_ref().unwrap().name, "work");
+        assert_eq!(a.sessions.len(), 1, "the selector list is reloaded");
+    }
+
+    #[test]
+    fn a_name_that_cannot_be_saved_says_why() {
+        let _home = crate::paths::test_home();
+        let mut a = saving("bad\nname");
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.screen, Screen::SaveSession);
+        let err = a.save_session_error.clone().unwrap();
+        assert!(err.contains("newlines"), "{err}");
+    }
+
+    // --- viewer ---
+
+    fn viewing(kind: ViewerKind) -> App {
+        let mut a = app_on_main(1);
+        a.viewer = Some(Viewer {
+            name: "f".into(),
+            kind,
+            id: 1,
+        });
+        a.previous_screen = Screen::Main;
+        a.screen = Screen::Viewer;
+        a
+    }
+
+    fn text_lines(n: usize) -> ViewerKind {
+        ViewerKind::Text {
+            tokens: vec![Vec::new(); n],
+            scroll: 0,
+        }
+    }
+
+    fn scroll_of(a: &App) -> usize {
+        match &a.viewer.as_ref().unwrap().kind {
+            ViewerKind::Text { scroll, .. } => *scroll,
+            _ => panic!("not text"),
+        }
+    }
+
+    #[test]
+    fn viewer_keys_scroll_and_stop_at_both_ends() {
+        let mut a = viewing(text_lines(50));
+        let steps: [(KeyCode, usize); 11] = [
+            (KeyCode::Char('j'), 1),
+            (KeyCode::Down, 2),
+            (KeyCode::Char('k'), 1),
+            (KeyCode::Up, 0),
+            (KeyCode::Up, 0),
+            (KeyCode::PageDown, 20),
+            (KeyCode::Char(' '), 40),
+            (KeyCode::PageDown, 49),
+            (KeyCode::PageUp, 29),
+            (KeyCode::Home, 0),
+            (KeyCode::End, 49),
+        ];
+        for (code, want) in steps {
+            press(&mut a, code);
+            assert_eq!(scroll_of(&a), want, "after {code:?}");
+        }
+        press(&mut a, KeyCode::Char('g'));
+        assert_eq!(scroll_of(&a), 0);
+        press(&mut a, KeyCode::Char('G'));
+        assert_eq!(scroll_of(&a), 49);
+    }
+
+    #[test]
+    fn scrolling_a_viewer_that_is_not_text_does_nothing() {
+        let mut a = viewing(ViewerKind::Loading);
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::End);
+        assert!(matches!(
+            a.viewer.as_ref().unwrap().kind,
+            ViewerKind::Loading
+        ));
+    }
+
+    #[test]
+    fn closing_a_text_viewer_needs_no_repaint() {
+        let mut a = viewing(text_lines(3));
+        a.image_needs_redraw = true;
+        press(&mut a, KeyCode::Char('q'));
+        assert_eq!(a.screen, Screen::Main);
+        assert!(a.viewer.is_none());
+        assert!(!a.image_needs_redraw);
+        assert!(!a.needs_terminal_clear);
+    }
+
+    #[test]
+    fn closing_an_image_clears_the_terminal() {
+        let mut a = viewing(ViewerKind::Image {
+            bytes: bytes::Bytes::new(),
+            render: Default::default(),
+        });
+        press(&mut a, KeyCode::Esc);
+        assert!(a.viewer.is_none());
+        assert!(
+            a.needs_terminal_clear,
+            "graphics aren't in ratatui's buffer"
+        );
+    }
+
+    // --- post-connect offers ---
+
+    #[test]
+    fn declining_the_save_offer_says_how_to_save_later() {
+        let mut a = app_on_main(1);
+        super::super::tests_support::queue_offer(&mut a, PostConnectOffer::SaveSession);
+        a.screen = Screen::OfferSaveSession;
+        press(&mut a, KeyCode::Char('x'));
+        assert_eq!(
+            a.screen,
+            Screen::OfferSaveSession,
+            "unlisted keys are ignored"
+        );
+
+        press(&mut a, KeyCode::Esc);
+
+        assert_eq!(a.screen, Screen::Main);
+        assert!(a.pending_offers.is_empty());
+        assert!(logged(&a, "press ctrl+s any time"));
+    }
+
+    fn offer(kind: CheckpointKind) -> PostConnectOffer {
+        PostConnectOffer::ResumeCheckpoint(CheckpointOffer {
+            kind,
+            session: "work".into(),
+            origin: "me@h:22".into(),
+            remaining: 1,
+            total: 2,
+            age: None,
+            sample_paths: vec![],
+        })
+    }
+
+    #[test]
+    fn a_resume_offer_with_nothing_queued_moves_on() {
+        let mut a = app_on_main(1);
+        a.screen = Screen::OfferResumeCheckpoint;
+        press(&mut a, KeyCode::Char('r'));
+        assert_eq!(a.screen, Screen::Main);
+    }
+
+    #[test]
+    fn keeping_a_checkpoint_says_which_key_resumes_it() {
+        for (kind, hint) in [
+            (CheckpointKind::Download, "press r in"),
+            (CheckpointKind::Upload, "press R in"),
+        ] {
+            let mut a = app_on_main(1);
+            super::super::tests_support::queue_offer(&mut a, offer(kind));
+            super::super::tests_support::queue_offer(&mut a, PostConnectOffer::SaveSession);
+            a.screen = Screen::OfferResumeCheckpoint;
+
+            press(&mut a, KeyCode::Esc);
+
+            assert!(logged(&a, hint), "{kind:?}");
+            assert_eq!(a.screen, Screen::OfferSaveSession, "the next offer follows");
+        }
+    }
+
+    #[test]
+    fn discarding_a_checkpoint_says_so() {
+        let _home = crate::paths::test_home();
+        let mut a = app_on_main(1);
+        super::super::tests_support::queue_offer(&mut a, offer(CheckpointKind::Download));
+        a.screen = Screen::OfferResumeCheckpoint;
+
+        press(&mut a, KeyCode::Char('d'));
+
+        assert_eq!(a.screen, Screen::Main);
+        assert!(a.pending_offers.is_empty());
+        assert!(
+            logged(&a, "discarded the download checkpoint"),
+            "{:?}",
+            a.log
+        );
+    }
+
+    #[test]
+    fn other_keys_leave_the_resume_offer_up() {
+        let mut a = app_on_main(1);
+        super::super::tests_support::queue_offer(&mut a, offer(CheckpointKind::Upload));
+        a.screen = Screen::OfferResumeCheckpoint;
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.screen, Screen::OfferResumeCheckpoint);
+        assert_eq!(a.pending_offers.len(), 1);
+    }
+
+    // --- disconnect ---
+
+    #[test]
+    fn declining_to_disconnect_stays_connected() {
+        for code in [KeyCode::Char('n'), KeyCode::Esc] {
+            let mut a = app_on_main(1);
+            a.current_session = Some(session("sftp://me@h"));
+            a.screen = Screen::ConfirmDisconnect;
+            press(&mut a, code);
+            assert_eq!(a.screen, Screen::Main);
+            assert!(a.current_session.is_some());
+        }
+    }
+
+    #[tokio::test]
+    async fn confirming_a_disconnect_returns_to_the_selector() {
+        let mut a = app_on_main(1);
+        a.current_session = Some(session("sftp://me@h"));
+        with_running(&mut a, 1);
+        a.screen = Screen::ConfirmDisconnect;
+
+        press(&mut a, KeyCode::Char('y'));
+
+        assert_eq!(a.screen, Screen::SessionSelect);
+        assert!(a.current_session.is_none());
+        assert!(a.transfer_manager.is_none());
+    }
+}
