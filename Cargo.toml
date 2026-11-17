@@ -71,6 +71,9 @@ sha2 = { version = "0.11", default-features = false }
 zeroize = "1"
 
 # Misc
+# Folding composed and decomposed names to one, as APFS does; see
+# `transfer::destination_key`.
+unicode-normalization = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 bytes = "1"
 parking_lot = "0.12"
