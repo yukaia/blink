@@ -34,27 +34,23 @@ beyond, at most, naming the workaround in the error.
 
 ## Features with no tests
 
-From `cargo llvm-cov` runs on 2026-11-17 (84% of lines, 88% of functions
-after the tests added that day). Re-run it before picking one up; `cargo llvm-cov --json` lists
-functions with a count of zero. In rough order of value:
+From `cargo llvm-cov` on 2026-11-17, after a pass over the previous list
+(now 93% of lines, 92% of functions). Re-run it before picking one up;
+`cargo llvm-cov --json` lists functions with a count of zero. In rough
+order of value:
 
-- **The rest of the CLI.** `main.rs` has no tests: `sessions`, `themes`,
-  `known-hosts remove`'s output, and `init_tracing` with its check of the
-  log file's mode. (`known_hosts::remove_host` and
-  `checkpoint::list_and_clean` themselves are covered.)
-- **Rendering.** Nineteen of the `render` functions in `tui/views.rs`
-  never run: every modal but the host-key ones, and help. One smoke test
-  each against ratatui's `TestBackend` would do.
-- **Key handling.** `handle_main` (69 of 122 lines unrun) and the viewer,
-  save-session, quit and disconnect handlers.
-- **Image preview.** The Kitty and iTerm2 backends and `decode_cp437`;
-  only Sixel runs. `after_draw`, `image_area`, `viewer_scroll_to`.
-- **SCP.** `transport/scp.rs` is a wrapper over SFTP that no test
-  connects through.
-- **The folder guard in the upload rename fallback.** A folder in the way
-  of an upload is left alone (`finalize_remote_rename_unbounded`,
-  `ftp_upload`), but neither test server can rename a folder, so nothing
-  exercises it.
-- **Terminal lifecycle.** `tui/mod.rs`: setup, restore, the panic hook.
-- **Small helpers.** `format_bytes_per_sec`, `format_eta`,
-  `resolve_local_dir` and `Config::load`.
+- **App events.** `tui/app/events.rs` is at 68%. Unrun arms of
+  `handle_app_event`: most of `Connected` (choosing the local folder,
+  queuing post-connect offers), `ConnectKeyNeedsPassphrase` after a
+  wrong passphrase, `LocalListFailed`, `Renamed`, `WalkComplete` and
+  `WalkFailed`, and `ViewLoaded`'s NFO and over-limit paths.
+- **Starting transfers.** `tui/app/transfers.rs`: `start_upload_walk`,
+  `start_download_walk`, and `confirm_overwrite_proceed`'s skip path,
+  driven from the app rather than the walk functions underneath.
+- **Things that need a real terminal.** `App::run`, `tui::run` and
+  `run_with_session`, raw mode, the panic hook's UI-thread check,
+  `viewer::after_draw` (writes to stdout) and `main`'s dispatch. The
+  escape sequences for entering and leaving the screen are covered;
+  the rest would need a pseudo-terminal harness.
+- **Dead code.** `handle_new_session`'s key/agent arm can't run:
+  `Session::from_url` always gives password auth.
