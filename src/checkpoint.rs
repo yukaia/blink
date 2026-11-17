@@ -1723,6 +1723,188 @@ mod sweep_tests {
     }
 }
 
+/// `blink checkpoints`, against real files: what `--clean` and `--force`
+/// delete, and what they leave.
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use crate::session::Session;
+    use std::path::PathBuf;
+
+    /// A config home holding one saved session, `host`, whose origin is
+    /// [`TEST_ORIGIN`], and a folder for downloads to land in.
+    fn home_with_session() -> (paths::TestHome, PathBuf) {
+        let home = paths::test_home();
+        Session::from_url("sftp://me@host").unwrap().save().unwrap();
+        let downloads = home.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        (home, downloads)
+    }
+
+    /// Write a download checkpoint for `session` with one job per
+    /// `(name, status)`, and a partial on disk for each. Returns the
+    /// checkpoint's path and the partials'.
+    fn write_checkpoint(
+        session: &str,
+        downloads: &Path,
+        jobs: &[(&str, JobStatus)],
+    ) -> (PathBuf, Vec<PathBuf>) {
+        let mut parts = Vec::new();
+        let jobs = jobs
+            .iter()
+            .map(|(name, status)| {
+                let local_path = downloads.join(name);
+                let part = crate::transport::part_path(&local_path);
+                std::fs::write(&part, b"partial").unwrap();
+                parts.push(part);
+                CheckpointJob::Download {
+                    remote_path: format!("/r/{name}"),
+                    local_path,
+                    status: *status,
+                }
+            })
+            .collect();
+        let mut cp = Checkpoint::new(session, TEST_ORIGIN, CheckpointKind::Download, jobs);
+        cp.flush().unwrap();
+        let path = Checkpoint::path_for(session, TEST_ORIGIN, CheckpointKind::Download).unwrap();
+        assert!(path.exists());
+        (path, parts)
+    }
+
+    #[test]
+    fn with_no_checkpoints_there_is_nothing_to_do() {
+        let _home = paths::test_home();
+        list_and_clean(true, true).unwrap();
+    }
+
+    #[test]
+    fn listing_removes_nothing() {
+        let (_home, downloads) = home_with_session();
+        let (done, _) = write_checkpoint("host", &downloads, &[("a", JobStatus::Done)]);
+        let (orphan, parts) = write_checkpoint("gone", &downloads, &[("b", JobStatus::Pending)]);
+
+        list_and_clean(false, false).unwrap();
+
+        assert!(done.exists() && orphan.exists());
+        assert!(parts[0].exists());
+    }
+
+    #[test]
+    fn clean_removes_a_checkpoint_with_nothing_left_to_run() {
+        let (_home, downloads) = home_with_session();
+        let (path, _) = write_checkpoint("host", &downloads, &[("a", JobStatus::Done)]);
+
+        list_and_clean(true, false).unwrap();
+
+        assert!(!path.exists());
+    }
+
+    /// A batch that can still be resumed is what a checkpoint is for.
+    #[test]
+    fn clean_keeps_an_unfinished_batch_and_its_partials() {
+        let (_home, downloads) = home_with_session();
+        let (path, parts) = write_checkpoint(
+            "host",
+            &downloads,
+            &[("a", JobStatus::Done), ("b", JobStatus::Pending)],
+        );
+
+        list_and_clean(true, false).unwrap();
+
+        assert!(path.exists());
+        assert!(parts[1].exists(), "the unfinished download's partial stays");
+    }
+
+    /// No session can be offered it, so it goes, and the partials only it
+    /// knew of go with it.
+    #[test]
+    fn clean_removes_a_deleted_sessions_checkpoint_and_its_partials() {
+        let (_home, downloads) = home_with_session();
+        let (path, parts) = write_checkpoint(
+            "gone",
+            &downloads,
+            &[("a", JobStatus::Pending), ("b", JobStatus::InProgress)],
+        );
+
+        list_and_clean(true, false).unwrap();
+
+        assert!(!path.exists());
+        assert!(parts.iter().all(|p| !p.exists()), "{parts:?}");
+    }
+
+    /// A session file that won't load may be the very session a checkpoint
+    /// belongs to. Unable to tell, `--clean` keeps it.
+    #[test]
+    fn clean_keeps_orphans_while_a_session_file_cant_be_read() {
+        let (_home, downloads) = home_with_session();
+        std::fs::write(
+            paths::sessions_dir().unwrap().join("broken.ini"),
+            "not a session",
+        )
+        .unwrap();
+        let (path, parts) = write_checkpoint("gone", &downloads, &[("a", JobStatus::Pending)]);
+
+        list_and_clean(true, false).unwrap();
+
+        assert!(path.exists());
+        assert!(parts[0].exists());
+    }
+
+    #[test]
+    fn force_removes_every_checkpoint_and_the_unfinished_partials() {
+        let (_home, downloads) = home_with_session();
+        let (kept_by_clean, parts) =
+            write_checkpoint("host", &downloads, &[("a", JobStatus::Pending)]);
+        let (orphan, orphan_parts) =
+            write_checkpoint("gone", &downloads, &[("b", JobStatus::Pending)]);
+
+        list_and_clean(false, true).unwrap();
+
+        assert!(!kept_by_clean.exists() && !orphan.exists());
+        assert!(!parts[0].exists() && !orphan_parts[0].exists());
+    }
+
+    /// A finished job's partial was renamed away long ago. A file at that
+    /// name now is some other transfer's, and is not swept.
+    #[test]
+    fn a_finished_jobs_partial_name_is_not_swept() {
+        let (_home, downloads) = home_with_session();
+        let (_, parts) = write_checkpoint("host", &downloads, &[("a", JobStatus::Done)]);
+
+        list_and_clean(false, true).unwrap();
+
+        assert!(parts[0].exists());
+    }
+
+    /// A file that can't be read as a checkpoint names no partials and
+    /// belongs to no one blink can tell; it is reported and left, and the
+    /// rest are still dealt with.
+    #[test]
+    fn an_unreadable_checkpoint_is_left_and_the_rest_still_handled() {
+        let (_home, downloads) = home_with_session();
+        let garbage = paths::checkpoints_dir().unwrap().join("aaa-garbage.json");
+        std::fs::write(&garbage, "{ not json").unwrap();
+        let (path, _) = write_checkpoint("host", &downloads, &[("a", JobStatus::Pending)]);
+
+        list_and_clean(false, true).unwrap();
+
+        assert!(garbage.exists());
+        assert!(!path.exists());
+    }
+
+    /// Only `.json` files are checkpoints.
+    #[test]
+    fn other_files_in_the_folder_are_ignored() {
+        let _home = paths::test_home();
+        let stray = paths::checkpoints_dir().unwrap().join("notes.txt");
+        std::fs::write(&stray, "mine").unwrap();
+
+        list_and_clean(false, true).unwrap();
+
+        assert!(stray.exists());
+    }
+}
+
 #[cfg(test)]
 mod offer_tests {
     use super::*;

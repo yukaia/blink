@@ -542,6 +542,9 @@ pub(crate) mod error_map;
 pub mod ftp;
 pub(crate) mod ftp_impl;
 pub mod ftps;
+/// Throwaway TLS certificates used only by `ftps`'s integration tests.
+#[cfg(test)]
+mod ftps_test_certs;
 pub mod scp;
 pub mod sftp;
 /// Throwaway SSH keys used only by `sftp`'s integration tests.

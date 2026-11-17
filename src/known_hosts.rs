@@ -667,6 +667,100 @@ mod tests {
         path
     }
 
+    // --- remove_host: the file itself, not only the text it is given ---
+
+    #[test]
+    fn removing_a_host_takes_every_key_it_has_and_leaves_the_rest() {
+        let _home = crate::paths::test_home();
+        let path = write_known_hosts(&format!(
+            "# mine\n\
+             a.example ssh-ed25519 {ED_KEY}\n\
+             a.example ssh-rsa RSAKEY\n\
+             b.example ssh-ed25519 {ED_KEY_2}\n"
+        ));
+
+        assert_eq!(remove_host("a.example", 22).unwrap(), 2);
+
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("# mine\nb.example ssh-ed25519 {ED_KEY_2}\n"),
+        );
+        assert_eq!(
+            check("a.example", 22, "ssh-ed25519", ED_KEY).unwrap(),
+            KeyStatus::Unknown,
+            "the next connect asks again",
+        );
+    }
+
+    #[test]
+    fn removing_a_host_is_per_port() {
+        let _home = crate::paths::test_home();
+        let line = format!("[a.example]:2222 ssh-ed25519 {ED_KEY}\n");
+        let path = write_known_hosts(&line);
+
+        assert_eq!(remove_host("a.example", 22).unwrap(), 0);
+        assert_eq!(fs::read_to_string(&path).unwrap(), line);
+
+        assert_eq!(remove_host("a.example", 2222).unwrap(), 1);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+    }
+
+    /// Nothing to remove means nothing is written: the file keeps its exact
+    /// bytes, here a last line with no newline, which a rewrite would add.
+    #[test]
+    fn removing_a_host_that_isnt_there_leaves_the_file_untouched() {
+        let _home = crate::paths::test_home();
+        let contents = format!("b.example ssh-ed25519 {ED_KEY_2}");
+        let path = write_known_hosts(&contents);
+
+        assert_eq!(remove_host("a.example", 22).unwrap(), 0);
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), contents);
+    }
+
+    #[test]
+    fn removing_a_host_with_no_known_hosts_file_removes_nothing() {
+        let _home = crate::paths::test_home();
+        let path = known_hosts_path().unwrap();
+
+        assert_eq!(remove_host("a.example", 22).unwrap(), 0);
+
+        assert!(!path.exists(), "and doesn't create one");
+    }
+
+    /// Forgetting a host must not un-revoke a key.
+    #[test]
+    fn removing_a_host_keeps_its_revoked_keys_revoked() {
+        let _home = crate::paths::test_home();
+        write_known_hosts(&format!(
+            "@revoked a.example ssh-ed25519 {ED_KEY}\n\
+             a.example ssh-ed25519 {ED_KEY_2}\n"
+        ));
+
+        assert_eq!(remove_host("a.example", 22).unwrap(), 1);
+
+        assert_eq!(
+            check("a.example", 22, "ssh-ed25519", ED_KEY).unwrap(),
+            KeyStatus::Revoked,
+        );
+    }
+
+    /// The rewrite goes through a temp file beside the real one; none may
+    /// be left behind.
+    #[test]
+    fn removing_a_host_leaves_no_temp_file() {
+        let _home = crate::paths::test_home();
+        let path = write_known_hosts(&format!("a.example ssh-ed25519 {ED_KEY}\n"));
+
+        remove_host("a.example", 22).unwrap();
+
+        let names: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["known_hosts"]);
+    }
+
     #[test]
     fn appending_after_a_last_line_without_a_newline_keeps_both_entries() {
         let _home = crate::paths::test_home();
