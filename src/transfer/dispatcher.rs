@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
+use futures::FutureExt as _;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -260,7 +261,28 @@ async fn run_loop(
             if start_rx.await.is_err() {
                 return;
             }
-            run_one(manager_w, session_w, password_w, tx_w, pool_w, trust_w, job).await;
+            // A panic would skip `run_one`'s own marking and leave the job
+            // Active for good: its destination still taken, its batch never
+            // finished, and resume refused as "still in flight".
+            let manager_p = manager_w.clone();
+            let ran = std::panic::AssertUnwindSafe(run_one(
+                manager_w, session_w, password_w, tx_w, pool_w, trust_w, job,
+            ))
+            .catch_unwind()
+            .await;
+            if let Err(panic) = ran
+                && manager_p.deregister_active(job_id)
+            {
+                let what = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown cause".into());
+                manager_p.mark(
+                    job_id,
+                    TransferState::Failed(error::sanitize(format!("internal error: {what}"))),
+                );
+            }
         });
         manager.register_active(job_id, join.abort_handle());
         // Registration is done — release the worker. A send error means the
@@ -616,5 +638,109 @@ mod tests {
         })
         .await;
         assert!(drained.is_ok(), "shutdown must leave no loop behind");
+    }
+
+    /// A connection whose mkdir panics, as a bug in a transport would.
+    struct PanickingTransport;
+
+    #[async_trait::async_trait]
+    impl Transport for PanickingTransport {
+        fn protocol(&self) -> crate::session::Protocol {
+            crate::session::Protocol::Sftp
+        }
+        async fn list(&mut self, _: &str) -> crate::error::Result<transport::Listing> {
+            unreachable!()
+        }
+        async fn download(
+            &mut self,
+            _: &str,
+            _: &std::path::Path,
+            _: Option<mpsc::UnboundedSender<ProgressUpdate>>,
+        ) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        async fn upload(
+            &mut self,
+            _: &std::path::Path,
+            _: &str,
+            _: Option<mpsc::UnboundedSender<ProgressUpdate>>,
+        ) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        async fn rename(&mut self, _: &str, _: &str) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        async fn rename_over(&mut self, _: &str, _: &str) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        async fn delete_file(&mut self, _: &str) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        async fn delete_dir(&mut self, _: &str, _: bool) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        async fn mkdir(&mut self, _: &str) -> crate::error::Result<()> {
+            panic!("transport bug");
+        }
+        async fn metadata(
+            &mut self,
+            _: &str,
+        ) -> crate::error::Result<Option<transport::RemoteEntry>> {
+            unreachable!()
+        }
+        async fn read_to_bytes(&mut self, _: &str) -> crate::error::Result<bytes::Bytes> {
+            unreachable!()
+        }
+        async fn close(&mut self) -> crate::error::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A worker that panics fails its job. It used to leave it Active for
+    /// good: its destination stayed taken, its batch never finished, and
+    /// `r` was refused for the rest of the session as "still in flight".
+    #[tokio::test]
+    async fn a_worker_that_panics_fails_its_job() {
+        let (manager, _events_rx) = TransferManager::new(1);
+        let pool = Pool::new();
+        pool.put(boxed(), 2);
+        pool.put(Box::new(PanickingTransport), 2);
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        let dispatcher = Dispatcher::spawn_with_pool(
+            manager.clone(),
+            idle_session(),
+            None,
+            ev_tx,
+            crate::known_hosts::SessionTrust::new(),
+            pool,
+        );
+        let first = manager.enqueue_mkdir("/a".into()).unwrap();
+        let second = manager.enqueue_mkdir("/b".into()).unwrap();
+
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let states = [first, second].map(|id| manager.job(id).unwrap().state);
+                if states
+                    .iter()
+                    .all(|s| !matches!(s, TransferState::Pending | TransferState::Active))
+                {
+                    return states;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("both jobs end");
+
+        match &settled[0] {
+            TransferState::Failed(why) => assert!(why.contains("transport bug"), "{why}"),
+            other => panic!("the panicking job should fail, not {other:?}"),
+        }
+        assert_eq!(
+            settled[1],
+            TransferState::Complete,
+            "the next job still runs"
+        );
+        dispatcher.shutdown().await;
     }
 }
