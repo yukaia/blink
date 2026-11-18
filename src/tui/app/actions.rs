@@ -192,6 +192,19 @@ impl App {
                         format!("renamed session saved, but failed to remove old file: {e}"),
                     );
                 }
+                // Its checkpoints follow it: they are keyed by name, and left
+                // under the old one they were never offered again. Keyed by
+                // the server they were made for, too, so a session that now
+                // points elsewhere is not offered them either way.
+                if name != form.original_name {
+                    for failure in crate::checkpoint::rename_session(
+                        &form.original_name,
+                        &name,
+                        &crate::transport::origin_of(&original),
+                    ) {
+                        self.push_log(LogLevel::Warn, failure);
+                    }
+                }
                 self.reload_sessions();
                 // Keep the cursor pointed at the freshly-edited session if
                 // we can find it, otherwise clamp.
@@ -789,6 +802,33 @@ mod tests {
     }
 
     /// Saving under a name another session has would write over it.
+    /// Checkpoints are keyed by session name; a rename that left them
+    /// behind meant they were never offered again.
+    #[test]
+    fn renaming_a_session_takes_its_checkpoints_along() {
+        let (mut a, _home) = editing(&[ftps_session()]);
+        let original = on_disk("files");
+        let origin = crate::transport::origin_of(&original);
+        crate::checkpoint::Checkpoint::new(
+            "files",
+            &origin,
+            crate::checkpoint::CheckpointKind::Download,
+            vec![crate::checkpoint::CheckpointJob::Download {
+                remote_path: "/r/a".into(),
+                local_path: PathBuf::from("/l/a"),
+                status: crate::checkpoint::JobStatus::Pending,
+            }],
+        )
+        .flush()
+        .unwrap();
+
+        form(&mut a).name = "renamed".into();
+        a.submit_edit_session();
+
+        assert!(crate::checkpoint::offers_for("files", &origin).is_empty());
+        assert_eq!(crate::checkpoint::offers_for("renamed", &origin).len(), 1);
+    }
+
     #[test]
     fn renaming_onto_another_sessions_name_is_refused() {
         let other = Session::from_url("sftp://me@other.example").unwrap();

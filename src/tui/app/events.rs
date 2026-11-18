@@ -44,8 +44,9 @@ impl App {
                 // require the same certificate; save it only if asked to.
                 if let Some(new_pin) = connected.new_cert_pin {
                     let fingerprint = crate::transport::ftps::colon_hex(&new_pin.sha256);
-                    session.cert_sha256 = Some(new_pin.sha256);
+                    session.cert_sha256 = Some(new_pin.sha256.clone());
                     if !new_pin.save {
+                        self.trust_once_pin = Some(new_pin.sha256);
                         self.push_log(
                             LogLevel::Info,
                             format!(
@@ -796,8 +797,8 @@ impl App {
                 // file (the `Started` write already flipped them from
                 // `pending`). On resume they will be re-queued, which is
                 // safe: partial downloads are overwritten, mkdir is
-                // idempotent. If the batch was explicitly discarded via
-                // batch-cancel, `active_checkpoint` is already None.
+                // idempotent. A job the user cancelled had its entry marked
+                // cancelled, and its map entry removed, by the cancel itself.
                 //
                 // Force-flush here so the most recent batch of Done marks
                 // hits disk: the user is likely to react to the failure by

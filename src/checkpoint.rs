@@ -21,9 +21,13 @@
 //! upload made for one account used to send its files to the other.
 //!
 //! A new walk of the same direction *appends* its jobs to the checkpoint
-//! already tracking that direction rather than replacing it: replacing it
-//! destroyed the plan of a batch still running. The file is removed once
+//! already tracking that direction, or already on disk, rather than
+//! replacing it: replacing it destroyed the plan of a batch still running,
+//! or of one the user chose to resume later. The file is removed once
 //! nothing in it still needs to run.
+//!
+//! Renaming a session moves its checkpoints to the new name; see
+//! [`rename_session`].
 //!
 //! ## Format (version 4)
 //!
@@ -76,9 +80,10 @@
 //!
 //! ## Version migration
 //!
-//! Version 1 files used a boolean `done` field. They are automatically
-//! migrated on load: `done: true` → `status: "done"`, `done: false` →
-//! `status: "pending"`. The migrated document is written back as version 2.
+//! Version 1 files used a boolean `done` field. They are migrated in
+//! memory on load: `done: true` → `status: "done"`, `done: false` →
+//! `status: "pending"`. The file itself is not rewritten: loading is how
+//! `blink checkpoints` lists files, and listing must not change them.
 //!
 //! Files before version 4 have no `origin`, so nothing can say which server
 //! they were made for. They load (with `origin: None`) but are never
@@ -349,7 +354,7 @@ impl Checkpoint {
     }
 
     /// Force-write this checkpoint to disk, overwriting any previous one
-    /// for the same (session, kind) pair.
+    /// for the same session, origin and direction.
     ///
     /// Most callers should use [`Self::flush_if_due`] instead — that one
     /// debounces back-to-back mutations into a single write. Call this
@@ -433,8 +438,8 @@ impl Checkpoint {
     /// Append `jobs` to this checkpoint, returning the index the first one
     /// landed at.
     ///
-    /// Storage is one checkpoint per (session, direction), so a second batch
-    /// of the same direction used to overwrite the first — while the first
+    /// Storage is one checkpoint per session, origin and direction, so a
+    /// second batch of the same direction used to overwrite the first — while the first
     /// was still running, leaving it unresumable and its `.blink-part` files
     /// unfindable. Appending keeps both in one file; the caller offsets its
     /// job-id map by the returned base.
@@ -536,7 +541,7 @@ impl Checkpoint {
     // -----------------------------------------------------------------------
 
     /// Load and validate a checkpoint. Returns `None` if no file exists.
-    /// Automatically migrates version 1 files to version 2 and rewrites them.
+    /// Migrates a version-1 document in memory; the file is left as it is.
     ///
     /// A file whose recorded origin is not `origin` reads as absent: it is
     /// not this connection's to resume.
@@ -594,7 +599,7 @@ impl Checkpoint {
         if version < 2 {
             let doc = serde_json::from_str(&raw)
                 .map_err(|e| BlinkError::config(format!("checkpoint parse: {e}")))?;
-            return Self::migrate_v1(path, doc);
+            return Self::migrate_v1(doc);
         }
 
         let cp: Self = serde_json::from_str(&raw)
@@ -604,9 +609,13 @@ impl Checkpoint {
         Ok(Some(cp))
     }
 
-    /// Migrate a version-1 checkpoint document to version 2 in memory and
-    /// rewrite the file. Returns the migrated checkpoint.
-    fn migrate_v1(path: &Path, mut doc: serde_json::Value) -> Result<Option<Self>> {
+    /// Migrate a version-1 checkpoint document to version 2, in memory.
+    ///
+    /// It used to write the result back, so that a plain `blink checkpoints`
+    /// listing rewrote the files it listed. Nothing is gained by it: a file
+    /// before version 4 records no server, so it is never resumed, and only
+    /// that listing ever reads one.
+    fn migrate_v1(mut doc: serde_json::Value) -> Result<Option<Self>> {
         use serde_json::Value;
 
         // Rewrite each job entry.
@@ -626,16 +635,7 @@ impl Checkpoint {
             map.insert("version".to_string(), Value::Number(2.into()));
         }
 
-        let migrated_json = serde_json::to_string_pretty(&doc)
-            .map_err(|e| BlinkError::config(format!("checkpoint migrate serialize: {e}")))?;
-
-        // Write the migrated file back atomically so future loads don't need
-        // to migrate. Non-fatal: we have the migrated data in memory.
-        if let Err(e) = Self::atomic_write(path, &migrated_json) {
-            tracing::warn!(?path, "could not rewrite migrated checkpoint: {e}");
-        }
-
-        let cp: Self = serde_json::from_str(&migrated_json)
+        let cp: Self = serde_json::from_value(doc)
             .map_err(|e| BlinkError::config(format!("checkpoint migrate parse: {e}")))?;
 
         Self::validate(&cp)?;
@@ -831,6 +831,47 @@ pub fn discard(session: &str, origin: &str, kind: CheckpointKind) -> Result<Disc
             .push(format!("could not remove the checkpoint file: {e}"));
     }
     Ok(outcome)
+}
+
+/// Move `old`'s checkpoints for `origin` to the session name `new`, for a
+/// session being renamed. Returns what could not be moved.
+///
+/// Checkpoints are keyed by session name, so a rename that left them
+/// behind cut the session off from its unfinished batches: they were no
+/// longer offered or resumed, and `blink checkpoints --clean` could delete
+/// them, with their partial downloads, as orphaned. When `new` already has
+/// a checkpoint for the same server, the two are merged, `old`'s jobs
+/// first. A checkpoint that can't be moved stays where it was.
+pub fn rename_session(old: &str, new: &str, origin: &str) -> Vec<String> {
+    if old == new {
+        return Vec::new();
+    }
+    [CheckpointKind::Download, CheckpointKind::Upload]
+        .into_iter()
+        .filter_map(|kind| {
+            rename_one(old, new, origin, kind).err().map(|e| {
+                format!(
+                    "could not move the {} checkpoint to `{new}`: {e}",
+                    kind.as_str()
+                )
+            })
+        })
+        .collect()
+}
+
+/// [`rename_session`] for one direction.
+fn rename_one(old: &str, new: &str, origin: &str, kind: CheckpointKind) -> Result<()> {
+    let Some(mut cp) = Checkpoint::load(old, origin, kind)? else {
+        return Ok(());
+    };
+    // Unreadable is an error here, not "absent": writing over it would
+    // destroy whatever it holds.
+    if let Some(existing) = Checkpoint::load(new, origin, kind)? {
+        cp.append(existing.jobs)?;
+    }
+    cp.session = new.to_string();
+    cp.flush()?;
+    Checkpoint::remove(old, origin, kind)
 }
 
 /// Whether a checkpoint write is owed right now.
@@ -1038,11 +1079,29 @@ fn known_sessions(listing: Result<crate::session::SessionListing>) -> KnownSessi
 /// from a list we know to be partial proves nothing, so a missing session
 /// only counts when the list is complete. A file with no origin (from
 /// before version 4) is orphaned whatever the list says.
+///
+/// Nor is one an ad-hoc connection could reach: `blink connect` names its
+/// session after the host and saves nothing, so its checkpoints match no
+/// saved session, yet connecting the same way again offers them.
 fn is_orphaned(cp: &Checkpoint, known: &KnownSessions) -> bool {
     let Some(origin) = &cp.origin else {
         return true;
     };
-    known.complete && !known.keys.contains(&(cp.session.clone(), origin.clone()))
+    known.complete
+        && !known.keys.contains(&(cp.session.clone(), origin.clone()))
+        && !reachable_ad_hoc(&cp.session, origin)
+}
+
+/// Whether `blink connect` to `origin` names its session `session`: the
+/// session name is the origin's host. See [`is_orphaned`].
+///
+/// The origin is `user@host:port` with the host lowercased; the user can
+/// hold an `@` and an IPv6 host holds `:`, so the host is what lies between
+/// the last `@` and the last `:`.
+fn reachable_ad_hoc(session: &str, origin: &str) -> bool {
+    let host_port = origin.rsplit_once('@').map_or(origin, |(_, h)| h);
+    let host = host_port.rsplit_once(':').map_or(host_port, |(h, _)| h);
+    session.eq_ignore_ascii_case(host)
 }
 
 /// The `blink checkpoints` column naming a checkpoint's server: two
@@ -1054,6 +1113,14 @@ fn origin_column(cp: &Checkpoint) -> String {
     }
 }
 
+/// Whether `path` is a temporary file an interrupted checkpoint write left
+/// behind: `.{name}.{pid}.{n}.tmp`, as [`paths::atomic_write`] names them.
+fn is_leftover_temp(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with('.') && n.ends_with(".tmp"))
+}
+
 /// Print checkpoint info. Pass `clean` to remove completed/orphaned files,
 /// `force` to remove every file unconditionally.
 pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
@@ -1062,9 +1129,21 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
 
     let dir = paths::checkpoints_dir()?;
 
-    let mut entries: Vec<std::path::PathBuf> = fs::read_dir(&dir)?
-        .flatten()
-        .map(|e| e.path())
+    let all: Vec<std::path::PathBuf> = fs::read_dir(&dir)?.flatten().map(|e| e.path()).collect();
+
+    // A write cut short by a crash leaves its temporary file (see
+    // `paths::atomic_write`). Only `--force` touches them: under `--clean`
+    // a running blink may be in the middle of that very write.
+    if force {
+        for tmp in all.iter().filter(|p| is_leftover_temp(p)) {
+            if let Err(e) = fs::remove_file(tmp) {
+                eprintln!("warning: could not remove {}: {e}", tmp.display());
+            }
+        }
+    }
+
+    let mut entries: Vec<std::path::PathBuf> = all
+        .into_iter()
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
         .collect();
     entries.sort();
@@ -1092,6 +1171,18 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
         let cp = match Checkpoint::load_from(path) {
             Ok(Some(cp)) => cp,
             Ok(None) => continue,
+            // `--force` promises every file. One it can't read names no
+            // partials to sweep, so the file is all there is to remove.
+            Err(e) if force => {
+                match fs::remove_file(path) {
+                    Ok(()) => {
+                        println!("removed  {}  (unreadable: {e})", path.display());
+                        removed += 1;
+                    }
+                    Err(e) => eprintln!("error: could not remove {}: {e}", path.display()),
+                }
+                continue;
+            }
             Err(e) => {
                 eprintln!("warning: could not read {}: {e}", path.display());
                 continue;
@@ -1877,19 +1968,89 @@ mod cli_tests {
     }
 
     /// A file that can't be read as a checkpoint names no partials and
-    /// belongs to no one blink can tell; it is reported and left, and the
-    /// rest are still dealt with.
+    /// belongs to no one blink can tell; `--clean` reports it and leaves
+    /// it, and the rest are still dealt with.
     #[test]
-    fn an_unreadable_checkpoint_is_left_and_the_rest_still_handled() {
+    fn clean_leaves_an_unreadable_checkpoint_and_handles_the_rest() {
         let (_home, downloads) = home_with_session();
         let garbage = paths::checkpoints_dir().unwrap().join("aaa-garbage.json");
         std::fs::write(&garbage, "{ not json").unwrap();
+        let (path, _) = write_checkpoint("host", &downloads, &[("a", JobStatus::Done)]);
+
+        list_and_clean(true, false).unwrap();
+
+        assert!(garbage.exists());
+        assert!(!path.exists());
+    }
+
+    /// `--force` removes every checkpoint file, including ones it can't
+    /// read: corrupt, or written by a newer blink.
+    #[test]
+    fn force_removes_an_unreadable_checkpoint_too() {
+        let (_home, downloads) = home_with_session();
+        let dir = paths::checkpoints_dir().unwrap();
+        let garbage = dir.join("aaa-garbage.json");
+        std::fs::write(&garbage, "{ not json").unwrap();
+        let newer = dir.join("aab-newer.json");
+        std::fs::write(
+            &newer,
+            r#"{"version":99,"session":"s","kind":"download","jobs":[]}"#,
+        )
+        .unwrap();
         let (path, _) = write_checkpoint("host", &downloads, &[("a", JobStatus::Pending)]);
 
         list_and_clean(false, true).unwrap();
 
-        assert!(garbage.exists());
-        assert!(!path.exists());
+        assert!(!garbage.exists() && !newer.exists() && !path.exists());
+    }
+
+    /// A write cut short by a crash leaves its temporary file beside the
+    /// checkpoints. `--force` clears those out too; `--clean` leaves them,
+    /// since a running blink may be mid-write.
+    #[test]
+    fn force_removes_leftover_temporary_files() {
+        let _home = paths::test_home();
+        let tmp = paths::checkpoints_dir()
+            .unwrap()
+            .join(".host-12345678-download.json.4242.0.tmp");
+        std::fs::write(&tmp, "{").unwrap();
+
+        list_and_clean(true, false).unwrap();
+        assert!(tmp.exists(), "--clean leaves it");
+
+        list_and_clean(false, true).unwrap();
+        assert!(!tmp.exists(), "--force removes it");
+    }
+
+    /// `blink connect sftp://me@host` names its session after the host and
+    /// saves nothing, so no saved session matches its checkpoint. It can
+    /// still be resumed by connecting the same way, so `--clean` keeps it.
+    #[test]
+    fn clean_keeps_an_ad_hoc_connections_checkpoint() {
+        let _home = paths::test_home();
+        let downloads = _home.path().join("downloads");
+        std::fs::create_dir(&downloads).unwrap();
+        let (path, parts) = write_checkpoint("host", &downloads, &[("a", JobStatus::Pending)]);
+
+        list_and_clean(true, false).unwrap();
+        assert!(path.exists() && parts[0].exists(), "--clean keeps it");
+
+        list_and_clean(false, true).unwrap();
+        assert!(!path.exists() && !parts[0].exists(), "--force removes it");
+    }
+
+    #[test]
+    fn an_ad_hoc_session_is_named_after_its_origins_host() {
+        assert!(reachable_ad_hoc("host", "me@host:22"));
+        assert!(reachable_ad_hoc("Host.Example", "me@host.example:22"));
+        assert!(reachable_ad_hoc(
+            "ftp.example",
+            "me@mail.example@ftp.example:21"
+        ));
+        assert!(reachable_ad_hoc("::1", "me@::1:22"));
+        assert!(reachable_ad_hoc("host", "@host:22"), "no user");
+        assert!(!reachable_ad_hoc("prod", "me@host:22"));
+        assert!(!reachable_ad_hoc("host:22", "me@host:22"));
     }
 
     /// Only `.json` files are checkpoints.
@@ -1902,6 +2063,118 @@ mod cli_tests {
         list_and_clean(false, true).unwrap();
 
         assert!(stray.exists());
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn dl(name: &str) -> CheckpointJob {
+        CheckpointJob::Download {
+            remote_path: format!("/r/{name}"),
+            local_path: PathBuf::from(format!("/l/{name}")),
+            status: JobStatus::Pending,
+        }
+    }
+
+    fn save(session: &str, origin: &str, kind: CheckpointKind, names: &[&str]) {
+        let jobs = names.iter().map(|n| dl(n)).collect();
+        Checkpoint::new(session, origin, kind, jobs)
+            .flush()
+            .unwrap();
+    }
+
+    fn remote_paths(session: &str, origin: &str, kind: CheckpointKind) -> Option<Vec<String>> {
+        Checkpoint::load(session, origin, kind).unwrap().map(|cp| {
+            cp.jobs
+                .iter()
+                .map(|j| j.remote_path().to_string())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn a_rename_moves_both_directions_to_the_new_name() {
+        let _home = paths::test_home();
+        save("old", TEST_ORIGIN, CheckpointKind::Download, &["a"]);
+        save("old", TEST_ORIGIN, CheckpointKind::Upload, &["b"]);
+
+        assert!(rename_session("old", "new", TEST_ORIGIN).is_empty());
+
+        for kind in [CheckpointKind::Download, CheckpointKind::Upload] {
+            assert_eq!(remote_paths("old", TEST_ORIGIN, kind), None);
+            let cp = Checkpoint::load("new", TEST_ORIGIN, kind).unwrap().unwrap();
+            assert_eq!(cp.session, "new", "the document names its session too");
+        }
+    }
+
+    /// The new name may already have a checkpoint for the same server, left
+    /// by an ad-hoc connect or a deleted session. Both batches are kept.
+    #[test]
+    fn a_rename_onto_an_existing_checkpoint_keeps_both() {
+        let _home = paths::test_home();
+        save("old", TEST_ORIGIN, CheckpointKind::Download, &["a"]);
+        save("new", TEST_ORIGIN, CheckpointKind::Download, &["b"]);
+
+        assert!(rename_session("old", "new", TEST_ORIGIN).is_empty());
+
+        assert_eq!(
+            remote_paths("new", TEST_ORIGIN, CheckpointKind::Download),
+            Some(vec!["/r/a".to_string(), "/r/b".to_string()]),
+        );
+        assert_eq!(
+            remote_paths("old", TEST_ORIGIN, CheckpointKind::Download),
+            None
+        );
+    }
+
+    /// Another account's checkpoint under the old name is not this
+    /// session's to move.
+    #[test]
+    fn a_rename_leaves_other_servers_checkpoints_alone() {
+        let _home = paths::test_home();
+        save(
+            "old",
+            "other@elsewhere:22",
+            CheckpointKind::Download,
+            &["a"],
+        );
+
+        assert!(rename_session("old", "new", TEST_ORIGIN).is_empty());
+
+        assert!(remote_paths("old", "other@elsewhere:22", CheckpointKind::Download).is_some());
+        assert_eq!(
+            remote_paths("new", "other@elsewhere:22", CheckpointKind::Download),
+            None
+        );
+    }
+
+    /// A destination that can't be read is not written over; the batch
+    /// stays where it was, and the failure is reported.
+    #[test]
+    fn a_rename_onto_an_unreadable_checkpoint_moves_nothing() {
+        let _home = paths::test_home();
+        save("old", TEST_ORIGIN, CheckpointKind::Download, &["a"]);
+        let dest = Checkpoint::path_for("new", TEST_ORIGIN, CheckpointKind::Download).unwrap();
+        std::fs::write(&dest, "{ not json").unwrap();
+
+        let failures = rename_session("old", "new", TEST_ORIGIN);
+
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(remote_paths("old", TEST_ORIGIN, CheckpointKind::Download).is_some());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn renaming_to_the_same_name_does_nothing() {
+        let _home = paths::test_home();
+        save("same", TEST_ORIGIN, CheckpointKind::Download, &["a"]);
+
+        assert!(rename_session("same", "same", TEST_ORIGIN).is_empty());
+
+        assert!(remote_paths("same", TEST_ORIGIN, CheckpointKind::Download).is_some());
     }
 }
 
@@ -2390,11 +2663,14 @@ mod merge_tests {
         )
         .unwrap();
 
+        let before = std::fs::read_to_string(&path).unwrap();
+
         let cp = Checkpoint::load_from(&path).unwrap().expect("file exists");
         assert_eq!(cp.done_count(), 1);
         assert_eq!(cp.pending_count(), 1);
-        let rewritten = std::fs::read_to_string(&path).unwrap();
-        assert!(rewritten.contains(r#""version": 2"#), "{rewritten}");
+        // Reading is only reading: `blink checkpoints` loads every file,
+        // and listing them must not change any.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     #[test]

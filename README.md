@@ -114,7 +114,11 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   that session also connects as `alice` to the same host and port. Editing
   a saved session's user, host or port leaves its old checkpoint behind:
   it is no longer offered, and `blink checkpoints --clean` removes it as
-  orphaned (see [Run](#run)).
+  orphaned (see [Run](#run)). Renaming a session, in the edit form or by
+  saving it under a new name with `ctrl+s`, takes its checkpoints along.
+- **A cancelled transfer stays cancelled.** Whether you cancel one file
+  (`c`) or a whole batch (`C`), the cancelled jobs are never offered for
+  resume or re-queued by `r` / `R`.
 - **Checkpoint file format** is versioned (currently version 4, which
   records the server and account each checkpoint belongs to). Files from
   versions 1–3 record no server, so they are never offered for resume;
@@ -308,13 +312,16 @@ blink checkpoints
 # Remove completed and orphaned checkpoint files
 blink checkpoints --clean
 # (a checkpoint counts as orphaned when no saved session has its name and
-#  server — its user, host and port. If
+#  server — its user, host and port. A checkpoint from an ad-hoc
+#  `blink connect` is kept: its session is named after the host, and
+#  connecting the same way again offers it. If
 #  the session list itself can't be read — an unreadable sessions directory,
 #  or a session file that won't parse — orphan detection is skipped and a
 #  warning is printed, so `--clean` removes only completed checkpoints
 #  rather than deleting resume data it can't vouch for)
 
-# Remove all checkpoint files unconditionally
+# Remove all checkpoint files unconditionally, including ones that can't
+# be read and temporary files left by an interrupted write
 blink checkpoints --force
 # (both also delete the .blink-part files, and their .meta sidecars, left
 #  by the batches they remove)

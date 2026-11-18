@@ -3,14 +3,16 @@
 //!
 //! These methods own the checkpoint state on `App`:
 //!
-//! - [`App::dispatch_plan`] takes a finalised `Vec<PlannedJob>`, writes a
-//!   fresh checkpoint to disk *before* enqueuing anything, then hands
+//! - [`App::dispatch_plan`] takes a finalised `Vec<PlannedJob>`, appends
+//!   it to the direction's checkpoint (the one in memory, or else the one
+//!   on disk) and writes that *before* enqueuing anything, then hands
 //!   jobs to the dispatcher and records the `job_id → cp_idx` mapping
 //!   so the per-job event handler in `events.rs` knows which plan
 //!   entry each dispatcher event refers to.
 //! - [`App::resume_walk`] loads a previously persisted checkpoint, drops
-//!   the done entries, and re-queues the remainder through
-//!   `dispatch_plan`.
+//!   the done and cancelled entries, and re-queues the remainder through
+//!   `dispatch_plan` under a fresh record.
+//! - [`App::move_checkpoints`] follows the session to a new name.
 //! - [`App::cancel_batch_in_checkpoint`] marks a cancelled batch's entries
 //!   and hands off to [`App::settle_checkpoint`], which drops the
 //!   checkpoint once nothing resumable is left, or flushes it otherwise.
@@ -42,13 +44,13 @@ pub(super) enum CheckpointFlush {
 }
 
 impl App {
-    /// Tear down the active checkpoint: remove the in-memory state and
-    /// delete the file on disk.
+    /// Mark the entries of cancelled jobs `job_ids` cancelled, so they are
+    /// never offered or resumed again, then settle each checkpoint touched:
+    /// it is removed if nothing resumable is left, and written otherwise.
     ///
-    /// Called when a whole batch is cancelled (user pressed `C` and
-    /// confirmed) or when a transfer fails in a way that makes the batch
-    /// unresumable. Soft-failures (e.g. the file was already removed) are
-    /// logged at `warn` and do not abort other work.
+    /// Called when the user confirms a cancel, of a whole batch (`C`) or of
+    /// one job (`c`). Failing to write or remove the file is logged and
+    /// does not abort other work.
     pub(super) fn cancel_batch_in_checkpoint(&mut self, job_ids: &[u64]) {
         // Mark just this batch's entries, then drop the checkpoint only if
         // nothing resumable is left. Removing the whole file — which is what
@@ -81,6 +83,28 @@ impl App {
         for cp in self.active_checkpoints.values_mut() {
             if let Err(e) = cp.flush_if_dirty() {
                 tracing::warn!("checkpoint flush on exit failed: {e}");
+            }
+        }
+    }
+
+    /// Follow the connected session to its new name `new`: move its
+    /// checkpoint files, and point the ones tracked in memory at them.
+    ///
+    /// Held-back marks are written first, so the files moved are current.
+    /// A tracked checkpoint is then reloaded from its new file, which may
+    /// hold another batch merged in after its own jobs; its own jobs keep
+    /// their positions, so the job-id map stays valid.
+    pub(super) fn move_checkpoints(&mut self, old: &str, new: &str, origin: &str) {
+        self.flush_checkpoints();
+        for failure in crate::checkpoint::rename_session(old, new, origin) {
+            self.push_log(LogLevel::Warn, failure);
+        }
+        let kinds: Vec<CheckpointKind> = self.active_checkpoints.keys().copied().collect();
+        for kind in kinds {
+            // Not moved, the warning above says why: it keeps writing under
+            // the old name, where it can at least be found.
+            if let Ok(Some(moved)) = Checkpoint::load(new, origin, kind) {
+                self.active_checkpoints.insert(kind, moved);
             }
         }
     }
@@ -205,10 +229,38 @@ impl App {
         // the queue cap wait in the checkpoint, so running the plan without
         // it isn't possible, and saving it anyway would leave a file that
         // won't load.
-        let cp = self
-            .active_checkpoints
-            .entry(ck_kind)
-            .or_insert_with(|| Checkpoint::new(&session_name, &origin, ck_kind, Vec::new()));
+        //
+        // With nothing tracked in memory — the first batch since connecting,
+        // or since a retry — the file on disk may still hold a batch the
+        // user deferred at the resume offer, or one a quit interrupted.
+        // Starting from an empty checkpoint wrote over it, losing that batch
+        // and the record of its partial downloads.
+        if !self.active_checkpoints.contains_key(&ck_kind) {
+            let existing = match Checkpoint::load(&session_name, &origin, ck_kind) {
+                Ok(existing) => existing,
+                // Unreadable, so nothing in it can be resumed anyway; say so
+                // before it is replaced.
+                Err(e) => {
+                    self.push_log(
+                        LogLevel::Warn,
+                        format!(
+                            "replacing an unreadable {} checkpoint: {e}",
+                            ck_kind.as_str()
+                        ),
+                    );
+                    None
+                }
+            };
+            self.active_checkpoints.insert(
+                ck_kind,
+                existing.unwrap_or_else(|| {
+                    Checkpoint::new(&session_name, &origin, ck_kind, Vec::new())
+                }),
+            );
+        }
+        let Some(cp) = self.active_checkpoints.get_mut(&ck_kind) else {
+            return;
+        };
         let base = match cp.append(ck_jobs) {
             Ok(base) => base,
             Err(e) => {
@@ -564,8 +616,8 @@ impl App {
     /// Dispatch a *resumed* plan: load the checkpoint for `kind`, skip jobs
     /// already marked done, and enqueue only the remaining ones.
     ///
-    /// Called from the `r` keybinding in the Transfers pane (or `--resume`
-    /// at startup). Logs a message if there is nothing to resume.
+    /// Called from `r` / `R` in the Transfers pane, and from the resume
+    /// offer after connecting. Logs a message if there is nothing to resume.
     pub fn resume_walk(&mut self, ck_kind: CheckpointKind) {
         let (session_name, origin) = self.checkpoint_key();
 
@@ -660,10 +712,25 @@ impl App {
             })
             .collect();
 
-        // dispatch_plan overwrites the checkpoint with a fresh plan covering
-        // only the re-queued jobs, all starting as `pending`. They will
-        // transition through `in_progress` → `done` as they run.
+        // The resumed jobs get a fresh record, all `pending`, which replaces
+        // the file they were read from once `dispatch_plan` writes it.
+        // Without this, `dispatch_plan` would load that file and append the
+        // same jobs to it a second time.
+        self.active_checkpoints.insert(
+            ck_kind,
+            Checkpoint::new(&session_name, &origin, ck_kind, Vec::new()),
+        );
         self.dispatch_plan(resume_plan, ck_kind);
+        // A plan that queued nothing (every job already running elsewhere)
+        // wrote nothing; leave the file as it was rather than tracking an
+        // empty record that a later batch would write over it.
+        if self
+            .active_checkpoints
+            .get(&ck_kind)
+            .is_some_and(|cp| cp.jobs.is_empty())
+        {
+            self.active_checkpoints.remove(&ck_kind);
+        }
     }
 }
 
