@@ -288,8 +288,11 @@ impl Theme {
 }
 
 /// Every `.ini` in the themes dir, as (stem, path).
+///
+/// Only reads: a themes folder that doesn't exist yet has no files, and
+/// isn't created.
 fn user_files() -> Vec<(String, PathBuf)> {
-    let Ok(dir) = paths::themes_dir() else {
+    let Ok(dir) = paths::lookup("themes") else {
         return Vec::new();
     };
     let Ok(read) = fs::read_dir(&dir) else {
@@ -312,7 +315,7 @@ fn user_files() -> Vec<(String, PathBuf)> {
 /// the key wins; otherwise the first, in sorted order, that normalises to
 /// it — so the choice doesn't depend on directory order.
 fn user_file(key: &str) -> Option<PathBuf> {
-    let exact = paths::themes_dir().ok()?.join(format!("{key}.ini"));
+    let exact = paths::lookup("themes").ok()?.join(format!("{key}.ini"));
     let files = user_files();
     if files.iter().any(|(_, p)| *p == exact) {
         return Some(exact);

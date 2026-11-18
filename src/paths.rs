@@ -57,6 +57,14 @@ pub fn checkpoints_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Where `sub` (a folder directly under the config directory) would be,
+/// without creating it or anything above it: for code that only reads, so
+/// `blink sessions` on a fresh machine doesn't leave folders behind. A
+/// missing folder is the caller's to treat as empty.
+pub fn lookup(sub: &str) -> Result<PathBuf> {
+    Ok(base_dir()?.join(sub))
+}
+
 /// Root of the application's data directory.
 ///
 /// Under test this never resolves to the user's real directory — see

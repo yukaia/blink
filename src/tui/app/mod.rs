@@ -5254,23 +5254,24 @@ mod pane_audit_tests {
         }
     }
 
-    /// A folder tightened mid-session (here, the first `t` finding
-    /// `themes/` open to others) used to wait in the notice list until the
-    /// next launch, since the list was only read at startup.
+    /// A folder tightened mid-session (here, the first batch's checkpoint
+    /// finding `checkpoints/` open to others) used to wait in the notice
+    /// list until the next launch, since the list was only read at startup.
     #[cfg(unix)]
     #[test]
     fn a_folder_made_private_mid_session_is_logged_right_away() {
         use std::os::unix::fs::PermissionsExt;
         let _home = crate::paths::test_home();
         let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
-        let themes = crate::paths::root_dir().unwrap().join("themes");
-        std::fs::create_dir_all(&themes).unwrap();
-        std::fs::set_permissions(&themes, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let dir = crate::paths::root_dir().unwrap().join("checkpoints");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        a.cycle_theme();
+        // What saving a batch's checkpoint does first.
+        crate::paths::checkpoints_dir().unwrap();
         a.drain_path_notices();
 
-        let shown = themes.display().to_string();
+        let shown = dir.display().to_string();
         assert!(
             a.log
                 .iter()

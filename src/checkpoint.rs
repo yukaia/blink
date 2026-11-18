@@ -1121,9 +1121,14 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
     use crate::session::Session;
     use std::fs;
 
-    let dir = paths::checkpoints_dir()?;
-
-    let all: Vec<std::path::PathBuf> = fs::read_dir(&dir)?.flatten().map(|e| e.path()).collect();
+    // Only reads unless asked to clean: a checkpoints folder that doesn't
+    // exist yet holds nothing, and isn't created.
+    let dir = paths::lookup("checkpoints")?;
+    let all: Vec<std::path::PathBuf> = match fs::read_dir(&dir) {
+        Ok(read) => read.flatten().map(|e| e.path()).collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e.into()),
+    };
 
     // A write cut short by a crash leaves its temporary file (see
     // `paths::atomic_write`). Only `--force` touches them: under `--clean`

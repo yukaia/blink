@@ -243,6 +243,14 @@ pub(crate) fn validate_theme_name(name: &str) -> Result<()> {
             "theme name must not contain path separators",
         ));
     }
+    // Control characters can't be typed into a config sensibly, and a
+    // theme file named with one put raw escapes on the terminal when
+    // `blink themes` listed it.
+    if name.chars().any(char::is_control) {
+        return Err(BlinkError::config(
+            "theme name must not contain control characters",
+        ));
+    }
     // Reject `..` anywhere in the name to block traversal via dots.
     // Path separators are already rejected above, so split-based checks
     // are unnecessary; `contains` is sufficient.
@@ -529,6 +537,15 @@ pub(crate) mod tests {
     fn theme_name_colon_errors() {
         assert!(validate_theme_name("C:evil").is_err());
         assert!(validate_theme_name("a:b").is_err());
+    }
+
+    /// A theme file named with an escape sequence put it raw on the
+    /// terminal when `blink themes` listed it.
+    #[test]
+    fn theme_name_control_characters_error() {
+        assert!(validate_theme_name("a\x1b[31mred").is_err());
+        assert!(validate_theme_name("tab\there").is_err());
+        assert!(validate_theme_name("del\u{7f}").is_err());
     }
 
     #[test]
