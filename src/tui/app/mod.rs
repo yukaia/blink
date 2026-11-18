@@ -580,14 +580,20 @@ impl App {
             LogLevel::Info,
             format!("blink {} — ready", env!("CARGO_PKG_VERSION")),
         );
-        let proto = preview::detect(self.config.terminal.image_preview);
+        let (proto, why) = preview::detect_explained(self.config.terminal.image_preview);
         let proto_label = match proto {
             preview::GraphicsProtocol::Kitty => "kitty",
             preview::GraphicsProtocol::Sixel => "sixel",
             preview::GraphicsProtocol::Iterm2 => "iterm2",
             preview::GraphicsProtocol::None => "none",
         };
-        self.push_log(LogLevel::Info, format!("graphics protocol: {proto_label}"));
+        self.push_log(
+            LogLevel::Info,
+            match why {
+                Some(why) => format!("graphics protocol: {proto_label} ({why})"),
+                None => format!("graphics protocol: {proto_label}"),
+            },
+        );
         // Session files that wouldn't parse. Reported here rather than left
         // to `tracing`, which goes to a sink unless BLINK_LOG_FILE is set —
         // so the session just disappeared from the selector with no clue why.

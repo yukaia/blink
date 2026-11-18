@@ -10,7 +10,8 @@ use std::io::{Cursor, Write};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use image::{ImageError, ImageFormat, ImageReader, Limits};
+use image::metadata::Orientation;
+use image::{DynamicImage, ImageDecoder, ImageError, ImageFormat, ImageReader, Limits};
 
 use crate::config::ImagePreviewMode;
 
@@ -24,55 +25,94 @@ pub enum GraphicsProtocol {
 
 /// Inspect environment variables to figure out what the host terminal supports.
 pub fn detect(prefer: ImagePreviewMode) -> GraphicsProtocol {
-    detect_from(prefer, |name| env::var(name).ok())
+    detect_explained(prefer).0
+}
+
+/// [`detect`], plus why auto-detection chose nothing when that is worth
+/// telling the user: a multiplexer is in the way of a terminal that may
+/// well draw images itself.
+pub fn detect_explained(prefer: ImagePreviewMode) -> (GraphicsProtocol, Option<&'static str>) {
+    detect_explained_from(prefer, |name| env::var(name).ok())
 }
 
 /// [`detect`], reading the environment through `var`.
+#[cfg(test)]
 fn detect_from(prefer: ImagePreviewMode, var: impl Fn(&str) -> Option<String>) -> GraphicsProtocol {
-    if prefer == ImagePreviewMode::None {
-        return GraphicsProtocol::None;
-    }
+    detect_explained_from(prefer, var).0
+}
 
+/// [`detect_explained`], reading the environment through `var`.
+fn detect_explained_from(
+    prefer: ImagePreviewMode,
+    var: impl Fn(&str) -> Option<String>,
+) -> (GraphicsProtocol, Option<&'static str>) {
     match prefer {
-        ImagePreviewMode::Kitty => return GraphicsProtocol::Kitty,
-        ImagePreviewMode::Sixel => return GraphicsProtocol::Sixel,
-        ImagePreviewMode::Iterm2 => return GraphicsProtocol::Iterm2,
-        _ => {}
+        ImagePreviewMode::None => return (GraphicsProtocol::None, None),
+        ImagePreviewMode::Kitty => return (GraphicsProtocol::Kitty, None),
+        ImagePreviewMode::Sixel => return (GraphicsProtocol::Sixel, None),
+        ImagePreviewMode::Iterm2 => return (GraphicsProtocol::Iterm2, None),
+        ImagePreviewMode::Auto => {}
     }
 
     let term = var("TERM").unwrap_or_default();
     let term_program = var("TERM_PROGRAM").unwrap_or_default();
 
-    if term.contains("kitty") || var("KITTY_WINDOW_ID").is_some() {
-        return GraphicsProtocol::Kitty;
+    // A multiplexer keeps the outer terminal's variables (KITTY_WINDOW_ID,
+    // WT_SESSION, …) but not its graphics: tmux drops kitty's escapes and,
+    // without passthrough, iTerm2's, and draws sixel only when built for
+    // it. Guessing from those variables left a blank viewer. tmux sets TERM
+    // to screen-* by default, so it is asked about first.
+    if var("TMUX").is_some() || term.starts_with("tmux") {
+        return (
+            GraphicsProtocol::None,
+            Some(
+                "inside tmux, which doesn't pass image escapes on; set image_preview to use one anyway",
+            ),
+        );
     }
-    if term_program == "WezTerm" {
-        return GraphicsProtocol::Kitty;
+    if var("STY").is_some() || term.starts_with("screen") {
+        return (
+            GraphicsProtocol::None,
+            Some(
+                "inside screen, which doesn't pass image escapes on; set image_preview to use one anyway",
+            ),
+        );
+    }
+
+    if term.contains("kitty") || var("KITTY_WINDOW_ID").is_some() {
+        return (GraphicsProtocol::Kitty, None);
     }
     if term_program == "ghostty" || var("GHOSTTY_RESOURCES_DIR").is_some() {
-        return GraphicsProtocol::Kitty;
+        return (GraphicsProtocol::Kitty, None);
     }
-    if term_program == "iTerm.app" {
-        return GraphicsProtocol::Iterm2;
+    // WezTerm speaks kitty graphics only with `enable_kitty_graphics` set;
+    // iTerm2's protocol works out of the box.
+    if term_program == "WezTerm" || term_program == "iTerm.app" {
+        return (GraphicsProtocol::Iterm2, None);
     }
     // Konsole has supported sixel since ~22.04 and sets KONSOLE_VERSION.
     if var("KONSOLE_VERSION").is_some() {
-        return GraphicsProtocol::Sixel;
+        return (GraphicsProtocol::Sixel, None);
     }
-    // mlterm sets MLTERM; xterm with sixel sets XTERM_VERSION.
+    // foot says who it is only through TERM (foot, foot-extra).
+    if term.starts_with("foot") {
+        return (GraphicsProtocol::Sixel, None);
+    }
+    // mlterm sets MLTERM.
     if var("MLTERM").is_some() {
-        return GraphicsProtocol::Sixel;
+        return (GraphicsProtocol::Sixel, None);
     }
-    if term.contains("xterm") && var("XTERM_VERSION").is_some() {
-        return GraphicsProtocol::Sixel;
-    }
+    // Not xterm: every xterm sets XTERM_VERSION, but only one started with
+    // a VT340 terminal id draws sixel, and the rest showed a blank viewer.
+    // Set `image_preview = sixel` for one that does.
+    //
     // Windows Terminal (≥ 1.22) supports sixel and always sets WT_SESSION
     // (a GUID) regardless of what the shell sets TERM to — including leaving
     // it unset entirely when running under WSL.
     if var("WT_SESSION").is_some() {
-        return GraphicsProtocol::Sixel;
+        return (GraphicsProtocol::Sixel, None);
     }
-    GraphicsProtocol::None
+    (GraphicsProtocol::None, None)
 }
 
 /// What can go wrong rendering an image preview.
@@ -82,11 +122,12 @@ fn detect_from(prefer: ImagePreviewMode, var: impl Fn(&str) -> Option<String>) -
 #[derive(Debug)]
 pub enum PreviewError {
     /// Image dimensions or memory footprint exceeded our limits before any
-    /// allocation happened. Distinct from a decode failure because the user
-    /// can sometimes recover (smaller image, larger limit).
+    /// allocation happened. Distinct from a decode failure: the file may be
+    /// fine, just bigger than the viewer takes.
     TooLarge,
     /// `image::ImageReader::decode` failed — bad bytes, unsupported codec,
-    /// truncated download, etc. Message is short and already sanitised.
+    /// truncated download, etc. The message is the decoder's own, not
+    /// sanitised here; the log and the viewer sanitise what they show.
     Decode(String),
     /// Re-encoding the scaled RGBA buffer as PNG (kitty / iterm2 path) or
     /// as sixel failed. Should not happen in practice but we surface a real
@@ -128,11 +169,30 @@ pub trait PreviewBackend {
     ) -> Result<Vec<u8>, PreviewError>;
 }
 
-/// Approximate cell-to-pixel ratio used when the terminal doesn't report its
-/// real cell size. Different terminals have different cell sizes; the runtime
-/// query ([`cell_pixels`]) gets us the exact values where supported.
-const FALLBACK_PX_PER_COL: u32 = 10;
-const FALLBACK_PX_PER_ROW: u32 = 20;
+/// A terminal cell's size in pixels, and whether the terminal said so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellSize {
+    /// `(px_per_col, px_per_row)`.
+    pub px: (u32, u32),
+    /// False when the terminal reported nothing and [`FALLBACK_CELL`] is in
+    /// use.
+    pub measured: bool,
+}
+
+/// The cell size assumed when the terminal doesn't report one (the Windows
+/// console API, some old terminals).
+///
+/// It errs small. Sixel draws an image at its own pixel size, so a guess
+/// larger than the real cells made images spill out of the viewer; one
+/// smaller only makes them smaller. Kitty and iTerm2 are told a box of
+/// cells when the size is guessed, which they fit the image to.
+const FALLBACK_CELL: CellSize = CellSize {
+    px: (8, 16),
+    measured: false,
+};
+
+/// Sixel draws in bands of this many pixel rows, and a band is drawn whole.
+const SIXEL_BAND: u32 = 6;
 
 /// Maximum width or height (in pixels) accepted for a previewed image.
 ///
@@ -150,24 +210,27 @@ const MAX_IMAGE_ALLOC: u64 = 128 * 1024 * 1024;
 
 /// Query the terminal for cell pixel dimensions.
 ///
-/// Returns `(px_per_col, px_per_row)`. Uses crossterm's `window_size()` which
+/// Uses crossterm's `window_size()` which
 /// goes through `TIOCGWINSZ` on Unix. Many terminals — Konsole, kitty, iTerm2,
 /// xterm with `-tn xterm-direct`, etc. — populate `ws_xpixel` and `ws_ypixel`
 /// correctly. When the report comes back as zero (some old terminals, the
-/// Windows console host) we fall back to a reasonable default.
-pub fn cell_pixels() -> (u32, u32) {
+/// Windows console host) we fall back to [`FALLBACK_CELL`].
+pub fn cell_pixels() -> CellSize {
     if let Ok(ws) = crossterm::terminal::window_size()
         && ws.columns > 0
         && ws.rows > 0
         && ws.width > 0
         && ws.height > 0
     {
-        return (
-            (ws.width as u32 / ws.columns as u32).max(1),
-            (ws.height as u32 / ws.rows as u32).max(1),
-        );
+        return CellSize {
+            px: (
+                (ws.width as u32 / ws.columns as u32).max(1),
+                (ws.height as u32 / ws.rows as u32).max(1),
+            ),
+            measured: true,
+        };
     }
-    (FALLBACK_PX_PER_COL, FALLBACK_PX_PER_ROW)
+    FALLBACK_CELL
 }
 
 /// Result of fitting an image into a cell-bounded panel: pre-scaled RGBA
@@ -182,6 +245,10 @@ struct ScaledForCells {
     /// How many cells the displayed image will occupy.
     cells_w: u16,
     cells_h: u16,
+    /// Whether the cell size was measured. When it was, `width_px` by
+    /// `height_px` is the size to show the image at; when guessed, the
+    /// image is fitted to `cells_w` by `cells_h` cells instead.
+    measured: bool,
 }
 
 /// Decode the image, downscale to fit the panel area while preserving the
@@ -190,16 +257,19 @@ struct ScaledForCells {
 /// Never upscales: if the image is smaller than the panel, it stays at its
 /// native pixel size and is centered.
 ///
-/// `(px_per_col, px_per_row)` is the terminal's cell size; see
-/// [`cell_pixels`].
+/// `cell` is the terminal's cell size; see [`cell_pixels`].
+///
+/// The image is turned the way its EXIF orientation says: phone photos are
+/// stored unrotated, and shown as stored they came out sideways.
 fn scale_for_cells(
     image_bytes: &[u8],
     col: u16,
     row: u16,
     cols: u16,
     rows: u16,
-    (px_per_col, px_per_row): (u32, u32),
+    cell: CellSize,
 ) -> Result<ScaledForCells, PreviewError> {
+    let (px_per_col, px_per_row) = cell.px;
     if cols == 0 || rows == 0 {
         return Err(PreviewError::EmptyPanel);
     }
@@ -218,16 +288,29 @@ fn scale_for_cells(
     limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
     limits.max_alloc = Some(MAX_IMAGE_ALLOC);
     reader.limits(limits);
-    let img = match reader.decode() {
-        Ok(img) => img,
-        Err(ImageError::Limits(_)) => return Err(PreviewError::TooLarge),
-        Err(e) => return Err(PreviewError::Decode(e.to_string())),
+    let decode_error = |e: ImageError| match e {
+        ImageError::Limits(_) => PreviewError::TooLarge,
+        e => PreviewError::Decode(e.to_string()),
     };
+    // Through the decoder rather than `decode()`, which would not say how
+    // the image is meant to be turned. `decode()` also checked the whole
+    // buffer against `max_alloc`; that check is made here instead.
+    let mut decoder = reader.into_decoder().map_err(decode_error)?;
+    if decoder.total_bytes() > MAX_IMAGE_ALLOC {
+        return Err(PreviewError::TooLarge);
+    }
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let mut img = DynamicImage::from_decoder(decoder).map_err(decode_error)?;
+    img.apply_orientation(orientation);
 
     let (iw, ih) = (img.width().max(1), img.height().max(1));
 
     let panel_w_px = u32::from(cols).saturating_mul(px_per_col).max(1);
-    let panel_h_px = u32::from(rows).saturating_mul(px_per_row).max(1);
+    // Whole sixel bands only: the last band is drawn whole, so an image as
+    // tall as the panel ran up to five pixels past it. The other protocols
+    // lose at most five pixels of height.
+    let panel_h_px = u32::from(rows).saturating_mul(px_per_row);
+    let panel_h_px = (panel_h_px - panel_h_px % SIXEL_BAND).max(1);
 
     // Aspect-preserving scale factor (downscale only).
     let scale_w = panel_w_px as f64 / iw as f64;
@@ -237,11 +320,14 @@ fn scale_for_cells(
     let scaled_w = ((iw as f64 * scale) as u32).max(1);
     let scaled_h = ((ih as f64 * scale) as u32).max(1);
 
+    // `thumbnail_exact`, not a Lanczos3 `resize_exact`: that one keeps a
+    // 32-bit float copy of the whole source width at the new height, up to
+    // 256 MiB for a 4096-pixel image, on top of the decode limits above.
+    // The box filter works pixel by pixel and only ever shrinks here.
     let resized = if scaled_w == iw && scaled_h == ih {
         img.to_rgba8()
     } else {
-        img.resize_exact(scaled_w, scaled_h, image::imageops::FilterType::Lanczos3)
-            .to_rgba8()
+        img.thumbnail_exact(scaled_w, scaled_h).to_rgba8()
     };
 
     // Cell extent of the scaled image, rounded up so we don't truncate.
@@ -259,6 +345,7 @@ fn scale_for_cells(
         display_row: row.saturating_add(offset_y),
         cells_w: used_w_cells,
         cells_h: used_h_cells,
+        measured: cell.measured,
     })
 }
 
@@ -277,7 +364,7 @@ fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, imag
 
 /// Kitty graphics protocol — chunked base64 PNG transmission.
 ///
-/// Supported by kitty, ghostty, WezTerm (with kitty mode).
+/// Supported by kitty, ghostty, and WezTerm with `enable_kitty_graphics`.
 pub struct KittyBackend;
 
 impl PreviewBackend for KittyBackend {
@@ -323,12 +410,17 @@ fn kitty_escape(scaled: &ScaledForCells) -> Result<Vec<u8>, PreviewError> {
         let last = i == chunks.len() - 1;
         let m = if last { 0 } else { 1 };
         if i == 0 {
-            // q=2 suppresses kitty's per-image response strings.
-            let _ = write!(
-                out,
-                "\x1b_Gf=100,a=T,c={},r={},q=2,m={m};",
-                scaled.cells_w, scaled.cells_h
-            );
+            // q=2 suppresses kitty's per-image response strings. With the
+            // cell size measured, the PNG is already the size to show, and
+            // a cell box (rounded up to whole cells) only stretched it:
+            // a 12x8 icon filled 2x1 cells as a 20x20 square. Guessed, the
+            // box is what keeps it inside the panel.
+            let size = if scaled.measured {
+                String::new()
+            } else {
+                format!("c={},r={},", scaled.cells_w, scaled.cells_h)
+            };
+            let _ = write!(out, "\x1b_Gf=100,a=T,{size}q=2,m={m};");
         } else {
             let _ = write!(out, "\x1b_Gm={m};");
         }
@@ -339,6 +431,8 @@ fn kitty_escape(scaled: &ScaledForCells) -> Result<Vec<u8>, PreviewError> {
 }
 
 /// iTerm2 inline image protocol — single OSC 1337 escape with base64 payload.
+///
+/// Supported by iTerm2 and WezTerm.
 pub struct Iterm2Backend;
 
 impl PreviewBackend for Iterm2Backend {
@@ -373,17 +467,26 @@ fn iterm2_escape(scaled: &ScaledForCells) -> Result<Vec<u8>, PreviewError> {
         scaled.display_row.saturating_add(1),
         scaled.display_col.saturating_add(1)
     );
+    // In pixels when the cell size is measured: in cells, iTerm2 scales
+    // the image up to fill them. Guessed, the cells keep it in the panel.
+    let (width, height) = if scaled.measured {
+        (
+            format!("{}px", scaled.width_px),
+            format!("{}px", scaled.height_px),
+        )
+    } else {
+        (scaled.cells_w.to_string(), scaled.cells_h.to_string())
+    };
     let _ = write!(
         out,
-        "\x1b]1337;File=inline=1;width={};height={};preserveAspectRatio=1:{b64}\x07",
-        scaled.cells_w, scaled.cells_h
+        "\x1b]1337;File=inline=1;width={width};height={height};preserveAspectRatio=1:{b64}\x07",
     );
     Ok(out)
 }
 
 /// Sixel — DEC's sixel graphics protocol. Encoded via `icy_sixel`'s pure-Rust
-/// implementation. Supported by Konsole (≥22.04), mlterm, foot, xterm with
-/// `-ti vt340`, and others.
+/// implementation. Supported by Konsole (≥22.04), mlterm, foot, Windows
+/// Terminal (≥1.22), xterm started with `-ti vt340`, and others.
 pub struct SixelBackend;
 
 impl PreviewBackend for SixelBackend {
@@ -530,6 +633,12 @@ pub fn is_previewable_image(name: &str) -> bool {
 /// Heuristic: filename suggests a plain-text format. Conservative on purpose —
 /// false negatives here just mean the user has to download to see it.
 pub fn is_viewable_text(name: &str) -> bool {
+    // Anything the highlighter has a language for is text. Kept apart, the
+    // two lists drifted: `.bashrc`, `justfile` and `.pyi` were highlighted
+    // but never opened.
+    if crate::highlight::lang_for_name(name) != crate::highlight::Lang::Unknown {
+        return true;
+    }
     let lower = name.to_ascii_lowercase();
 
     // Common bare filenames without extensions.
@@ -620,6 +729,21 @@ pub fn is_viewable_text(name: &str) -> bool {
 /// Returns `true` if the file is an NFO file (CP437-encoded release info).
 pub fn is_nfo_file(name: &str) -> bool {
     name.to_ascii_lowercase().ends_with(".nfo")
+}
+
+/// Decode an `.nfo` file.
+///
+/// Scene release notes are CP437, but media managers such as Kodi write
+/// `.nfo` files as UTF-8 XML, whose accented letters CP437 mangled (`é`
+/// became `├⌐`). Valid UTF-8 is read as UTF-8, less any byte-order mark:
+/// CP437 art, built from bytes 0xB0–0xDF, almost never is. Plain ASCII
+/// reads the same either way.
+pub fn decode_nfo(bytes: &[u8]) -> String {
+    let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => decode_cp437(bytes),
+    }
 }
 
 /// Decode CP437-encoded bytes to a UTF-8 `String`.
@@ -735,7 +859,7 @@ mod tests {
             }
         }
         let png = encode_png_rgba(&rgba, w, h).unwrap();
-        let scaled = scale_for_cells(&png, 0, 0, 400, 200, (10, 20)).unwrap();
+        let scaled = scale_for_cells(&png, 0, 0, 400, 200, CELL).unwrap();
 
         let sixel = icy_sixel::SixelImage::from_rgba(
             scaled.rgba.clone(),
@@ -808,15 +932,21 @@ mod tests {
         let cases: &[(&[(&str, &str)], GraphicsProtocol)] = &[
             (&[("TERM", "xterm-kitty")], Kitty),
             (&[("KITTY_WINDOW_ID", "1")], Kitty),
-            (&[("TERM_PROGRAM", "WezTerm")], Kitty),
+            // WezTerm speaks kitty graphics only when configured to; iTerm2
+            // images work out of the box.
+            (&[("TERM_PROGRAM", "WezTerm")], Iterm2),
+            (&[("TERM", "foot")], Sixel),
+            (&[("TERM", "foot-extra")], Sixel),
             (&[("TERM_PROGRAM", "ghostty")], Kitty),
             (&[("GHOSTTY_RESOURCES_DIR", "/g")], Kitty),
             (&[("TERM_PROGRAM", "iTerm.app")], Iterm2),
             (&[("KONSOLE_VERSION", "230800")], Sixel),
             (&[("MLTERM", "3.9")], Sixel),
+            // Every xterm sets XTERM_VERSION; only one configured for it
+            // draws sixel, so xterm is left to the config.
             (
                 &[("TERM", "xterm-256color"), ("XTERM_VERSION", "XTerm(390)")],
-                Sixel,
+                None,
             ),
             (&[("WT_SESSION", "guid")], Sixel),
             // xterm without a version could be anything claiming to be xterm.
@@ -826,6 +956,45 @@ mod tests {
         for (vars, want) in cases {
             assert_eq!(detect_with(ImagePreviewMode::Auto, vars), *want, "{vars:?}");
         }
+    }
+
+    /// tmux and screen keep the outer terminal's variables but don't pass
+    /// its graphics escapes on, so auto picks nothing, and says why.
+    #[test]
+    fn auto_picks_nothing_inside_a_multiplexer() {
+        let cases: &[&[(&str, &str)]] = &[
+            &[
+                ("TMUX", "/tmp/tmux-1000/default,1,0"),
+                ("KITTY_WINDOW_ID", "1"),
+            ],
+            &[("TERM", "tmux-256color"), ("WT_SESSION", "guid")],
+            &[("TERM", "screen-256color"), ("KONSOLE_VERSION", "230800")],
+            &[("STY", "1234.pts-0.host"), ("TERM_PROGRAM", "iTerm.app")],
+        ];
+        for vars in cases {
+            let lookup = |name: &str| {
+                vars.iter()
+                    .find(|(k, _)| *k == name)
+                    .map(|(_, v)| v.to_string())
+            };
+            let (proto, why) = detect_explained_from(ImagePreviewMode::Auto, lookup);
+            assert_eq!(proto, GraphicsProtocol::None, "{vars:?}");
+            let why = why.unwrap_or_default();
+            assert!(
+                why.contains("tmux") || why.contains("screen"),
+                "{vars:?}: {why}"
+            );
+        }
+    }
+
+    /// Configured explicitly, a protocol is used inside tmux too: tmux 3.4
+    /// can draw sixel, and passthrough can carry the others.
+    #[test]
+    fn a_configured_protocol_is_used_inside_a_multiplexer() {
+        assert_eq!(
+            detect_with(ImagePreviewMode::Sixel, &[("TMUX", "x")]),
+            GraphicsProtocol::Sixel
+        );
     }
 
     #[test]
@@ -869,7 +1038,16 @@ mod tests {
         encode_png_rgba(&rgba, w, h).unwrap()
     }
 
-    const CELL: (u32, u32) = (10, 20);
+    /// A cell size the terminal reported.
+    const CELL: CellSize = CellSize {
+        px: (10, 20),
+        measured: true,
+    };
+    /// The same size, guessed because the terminal reported none.
+    const GUESSED: CellSize = CellSize {
+        px: (10, 20),
+        measured: false,
+    };
 
     #[test]
     fn a_small_image_keeps_its_size_and_is_centred() {
@@ -984,7 +1162,9 @@ mod tests {
         for (i, chunk) in chunks.iter().enumerate() {
             let last = i == chunks.len() - 1;
             let header = if i == 0 {
-                format!("\x1b_Gf=100,a=T,c=10,r=2,q=2,m={};", u8::from(!last))
+                // A measured cell size: the PNG is already the size to
+                // show, so kitty is not told a cell box to stretch it to.
+                format!("\x1b_Gf=100,a=T,q=2,m={};", u8::from(!last))
             } else {
                 format!("\x1b_Gm={};", u8::from(!last))
             };
@@ -1005,7 +1185,7 @@ mod tests {
 
         let rest = out.strip_prefix("\x1b[5;10H").expect(&out[..12]);
         let b64 = rest
-            .strip_prefix("\x1b]1337;File=inline=1;width=2;height=1;preserveAspectRatio=1:")
+            .strip_prefix("\x1b]1337;File=inline=1;width=20px;height=20px;preserveAspectRatio=1:")
             .and_then(|r| r.strip_suffix('\x07'))
             .expect("one OSC 1337 sequence");
         let png = BASE64.decode(b64).unwrap();
@@ -1019,6 +1199,76 @@ mod tests {
         let sixel = out.strip_prefix(b"\x1b[5;10H").expect("cursor move first");
         let decoded = icy_sixel::SixelImage::decode(sixel).unwrap();
         assert_eq!(decoded.width, 20);
+    }
+
+    /// With the cell size guessed, the image is fitted to a box of cells
+    /// instead, which keeps it inside the panel whatever the real size.
+    #[test]
+    fn a_guessed_cell_size_sizes_the_image_in_cells() {
+        let scaled = scale_for_cells(&noise_png(100, 40), 5, 3, 20, 10, GUESSED).unwrap();
+        let kitty = String::from_utf8(kitty_escape(&scaled).unwrap()).unwrap();
+        assert!(
+            kitty.contains("\x1b_Gf=100,a=T,c=10,r=2,q=2,"),
+            "{}",
+            &kitty[..40]
+        );
+        let iterm = String::from_utf8(iterm2_escape(&scaled).unwrap()).unwrap();
+        assert!(iterm.contains(";width=10;height=2;"), "{}", &iterm[..60]);
+    }
+
+    /// A tiny image is no longer blown up to fill whole cells: kitty used
+    /// to be told 2x1 cells for a 12x8 icon, and stretched it to 20x20.
+    #[test]
+    fn a_tiny_image_is_not_stretched_to_whole_cells() {
+        let scaled = scale_for_cells(&noise_png(12, 8), 0, 0, 20, 10, CELL).unwrap();
+        let kitty = String::from_utf8(kitty_escape(&scaled).unwrap()).unwrap();
+        assert!(!kitty.contains("c="), "{}", &kitty[..40]);
+        assert!(!kitty.contains("r="), "{}", &kitty[..40]);
+    }
+
+    /// Sixel draws in bands six pixels tall, and the last band is drawn
+    /// whole. An image as tall as the panel ran up to five pixels past it.
+    #[test]
+    fn a_tall_image_fits_whole_sixel_bands_inside_the_panel() {
+        // The panel is 10 rows of 20 px: 200 px, of which 198 are whole bands.
+        let s = scale_for_cells(&noise_png(100, 1000), 0, 0, 20, 10, CELL).unwrap();
+        assert!(s.height_px <= 198, "{}", s.height_px);
+        assert_eq!(s.height_px % 6, 0, "{}", s.height_px);
+    }
+
+    // When the terminal reports no cell size, the guess errs small, so an
+    // image drawn at its own pixel size (sixel) stays inside the panel on a
+    // terminal with small cells. Checked when the tests build.
+    const _: () =
+        assert!(!FALLBACK_CELL.measured && FALLBACK_CELL.px.0 <= 8 && FALLBACK_CELL.px.1 <= 16);
+
+    /// A JPEG holding EXIF orientation 6 ("rotate 90° clockwise to view"):
+    /// stored 40 wide and 20 tall, it is seen 20 wide and 40 tall.
+    fn rotated_jpeg() -> Vec<u8> {
+        use image::ImageEncoder;
+        // Big-endian TIFF: one IFD entry, Orientation (0x0112), SHORT, 6.
+        let exif: Vec<u8> = [
+            b"MM\0\x2a\0\0\0\x08".as_slice(),
+            &[0, 1],
+            &[0x01, 0x12, 0, 3, 0, 0, 0, 1, 0, 6, 0, 0],
+            &[0, 0, 0, 0],
+        ]
+        .concat();
+        let img = image::RgbImage::from_pixel(40, 20, image::Rgb([200, 30, 30]));
+        let mut out = Vec::new();
+        let mut enc = image::codecs::jpeg::JpegEncoder::new(&mut out);
+        enc.set_exif_metadata(exif).unwrap();
+        enc.write_image(img.as_raw(), 40, 20, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        out
+    }
+
+    /// Phone photos store their pixels unrotated and say how to turn them
+    /// in EXIF; shown as stored, they came out sideways.
+    #[test]
+    fn a_photo_is_turned_the_way_its_exif_says() {
+        let s = scale_for_cells(&rotated_jpeg(), 0, 0, 80, 40, CELL).unwrap();
+        assert_eq!((s.width_px, s.height_px), (20, 40));
     }
 
     /// Each backend end to end, at whatever cell size this terminal reports:
@@ -1052,6 +1302,22 @@ mod tests {
 
     // --- NFO text ---
 
+    /// Media managers such as Kodi write `.nfo` files as UTF-8 XML; read as
+    /// CP437, `é` came out as `├⌐`.
+    #[test]
+    fn a_utf8_nfo_is_read_as_utf8() {
+        let xml = "<title>Amélie</title>";
+        assert_eq!(decode_nfo(xml.as_bytes()), xml);
+        let with_bom = [b"\xEF\xBB\xBF".as_slice(), xml.as_bytes()].concat();
+        assert_eq!(decode_nfo(&with_bom), xml, "the byte-order mark is dropped");
+    }
+
+    /// Scene NFO art is CP437, which is almost never valid UTF-8.
+    #[test]
+    fn a_cp437_nfo_is_read_as_cp437() {
+        assert_eq!(decode_nfo(b"\xDB\xDB\xB0 hi"), "██░ hi");
+    }
+
     #[test]
     fn cp437_keeps_ascii_and_maps_the_high_half() {
         assert_eq!(decode_cp437(b"plain ASCII\n"), "plain ASCII\n");
@@ -1072,6 +1338,30 @@ mod tests {
         assert!(is_nfo_file("release.nfo"));
         assert!(is_nfo_file("RELEASE.NFO"));
         assert!(!is_nfo_file("nfo.txt"));
+    }
+
+    /// Every file the highlighter has a language for opens in the viewer:
+    /// `.bashrc`, `justfile` and `.pyi` were highlighted but never shown.
+    #[test]
+    fn whatever_the_highlighter_knows_is_viewable() {
+        for name in [
+            ".bashrc",
+            ".zshrc",
+            ".profile",
+            ".bash_profile",
+            ".bash_aliases",
+            "GNUmakefile",
+            "justfile",
+            "tool.pyw",
+            "stub.pyi",
+            "settings.jsonc",
+        ] {
+            assert_ne!(
+                crate::highlight::lang_for_name(name),
+                crate::highlight::Lang::Unknown
+            );
+            assert!(is_viewable_text(name), "{name}");
+        }
     }
 
     #[test]
