@@ -204,11 +204,22 @@ impl Handler for KnownHostsHandler {
                     // Fail closed: if we cannot read the known-hosts file we
                     // cannot verify the host key, so reject the connection
                     // rather than prompting the user (which would be
-                    // fail-open).
+                    // fail-open). And say why: logged only to `tracing`, it
+                    // was a connect failure with no reason given.
                     tracing::error!(
                         host = %display_host,
                         "known_hosts read error — rejecting connection: {e}"
                     );
+                    let event = crate::tui::event::AppEvent::HostKeyStoreProblem {
+                        message: error::sanitize(format!(
+                            "could not check {display_host}'s host key, so the \
+                             connection was refused: {e}"
+                        )),
+                        refused: true,
+                    };
+                    if let Some(tx) = self.event_tx.take() {
+                        let _ = tx.send(event);
+                    }
                     return Ok(false);
                 }
             };
@@ -298,10 +309,47 @@ impl Handler for KnownHostsHandler {
 
         match decision {
             HostKeyDecision::AcceptAndSave => {
-                if let Err(e) = known_hosts::append(&self.host, self.port, &key_type, &key_b64) {
-                    tracing::warn!("could not save host key: {e}");
+                match known_hosts::append(&self.host, self.port, &key_type, &key_b64) {
+                    Ok(known_hosts::Saved::Added | known_hosts::Saved::AlreadyTrusted) => {
+                        // Also trusted for the session: if the file becomes
+                        // unreadable later, the workers still don't ask.
+                        self.trust.trust(&self.host, self.port, &key_type, &key_b64);
+                        Ok(true)
+                    }
+                    Ok(known_hosts::Saved::Conflict(_)) => {
+                        // Another blink saved a different key for this host
+                        // (or revoked this one) while the prompt was open.
+                        // One of the two is suspect; don't pick for the user.
+                        tracing::warn!(
+                            host = %display_host,
+                            "known_hosts changed while deciding — rejecting connection",
+                        );
+                        let _ = tx.send(crate::tui::event::AppEvent::HostKeyStoreProblem {
+                            message: format!(
+                                "while you were deciding, known_hosts got a different \
+                                 entry for {display_host} (from another blink?), so the \
+                                 connection was refused; connect again to check the key"
+                            ),
+                            refused: true,
+                        });
+                        Ok(false)
+                    }
+                    Err(e) => {
+                        // Trusted for the session anyway, as the user chose,
+                        // so the workers that follow don't each ask again —
+                        // they used to, mid-transfer, once per worker.
+                        self.trust.trust(&self.host, self.port, &key_type, &key_b64);
+                        tracing::warn!("could not save host key: {e}");
+                        let _ = tx.send(crate::tui::event::AppEvent::HostKeyStoreProblem {
+                            message: error::sanitize(format!(
+                                "accepted {display_host}'s host key for this session, \
+                                 but could not save it: {e}"
+                            )),
+                            refused: false,
+                        });
+                        Ok(true)
+                    }
                 }
-                Ok(true)
             }
             HostKeyDecision::AcceptOnce => {
                 // Scope the decision to this session so the connections that
@@ -4173,6 +4221,108 @@ mod integration {
         let _ = decision_tx.send(super::HostKeyDecision::AcceptOnce);
         assert!(check.await.unwrap().unwrap(), "accepted once");
         assert!(!*waiting.borrow(), "answered, so the deadline runs again");
+    }
+
+    /// The next event the handler sent, which must be a known_hosts
+    /// problem: its message and whether it refused the connection.
+    fn store_problem(
+        ev_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::tui::event::AppEvent>,
+    ) -> (String, bool) {
+        match ev_rx.try_recv() {
+            Ok(crate::tui::event::AppEvent::HostKeyStoreProblem { message, refused }) => {
+                (message, refused)
+            }
+            _ => panic!("expected AppEvent::HostKeyStoreProblem"),
+        }
+    }
+
+    /// A known_hosts blink couldn't read refused every connection with the
+    /// reason only in the debug log, a sink by default.
+    #[tokio::test]
+    async fn an_unreadable_known_hosts_refuses_and_says_why() {
+        use russh::client::Handler as _;
+        let _home = crate::paths::test_home();
+        let path = crate::known_hosts::known_hosts_path().unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let (mut handler, presented, mut ev_rx, _waiting) = prompting_handler();
+
+        assert!(!handler.check_server_key(&presented).await.unwrap());
+
+        let (message, refused) = store_problem(&mut ev_rx);
+        assert!(refused);
+        assert!(
+            message.contains("could not check example.test"),
+            "{message}"
+        );
+        assert!(message.contains(&path.display().to_string()), "{message}");
+    }
+
+    /// A save that failed was logged only to `tracing`, and the key wasn't
+    /// trusted for the session either, so every transfer worker asked again.
+    #[tokio::test]
+    async fn a_failed_save_still_trusts_the_key_for_the_session() {
+        use russh::client::Handler as _;
+        let _home = crate::paths::test_home();
+        // The store's lock can't be taken, so `append` fails; reading works.
+        std::fs::create_dir(crate::paths::root_dir().unwrap().join("known_hosts.lock")).unwrap();
+        let (mut handler, presented, mut ev_rx, _waiting) = prompting_handler();
+        let trust = handler.trust.clone();
+        let russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } = &presented else {
+            unreachable!()
+        };
+        let key_b64 = super::host_key_b64(key.to_bytes()).unwrap();
+
+        let check = tokio::spawn(async move { handler.check_server_key(&presented).await });
+        let Some(crate::tui::event::AppEvent::HostKeyUnknown { decision_tx, .. }) =
+            ev_rx.recv().await
+        else {
+            panic!("an unknown key must raise the prompt");
+        };
+        let _ = decision_tx.send(super::HostKeyDecision::AcceptAndSave);
+        assert!(check.await.unwrap().unwrap(), "accepted, as the user chose");
+
+        let (message, refused) = store_problem(&mut ev_rx);
+        assert!(!refused);
+        assert!(message.contains("could not save it"), "{message}");
+        assert_eq!(
+            trust.check("example.test", 22, "ssh-ed25519", &key_b64),
+            crate::known_hosts::KeyStatus::Trusted,
+            "the workers that follow don't ask again",
+        );
+    }
+
+    /// Another blink saved a different key for the host while the prompt
+    /// was open: saving this one too would leave both trusted.
+    #[tokio::test]
+    async fn a_key_saved_elsewhere_while_deciding_refuses_the_connection() {
+        use russh::client::Handler as _;
+        let _home = crate::paths::test_home();
+        let (mut handler, presented, mut ev_rx, _waiting) = prompting_handler();
+        let trust = handler.trust.clone();
+        let russh::keys::PublicKeyOrCertificate::PublicKey { key, .. } = &presented else {
+            unreachable!()
+        };
+        let key_b64 = super::host_key_b64(key.to_bytes()).unwrap();
+
+        let check = tokio::spawn(async move { handler.check_server_key(&presented).await });
+        let Some(crate::tui::event::AppEvent::HostKeyUnknown { decision_tx, .. }) =
+            ev_rx.recv().await
+        else {
+            panic!("an unknown key must raise the prompt");
+        };
+        let other = "AAAAC3NzaC1lZDI1NTE5AAAAIOtherkey";
+        crate::known_hosts::append("example.test", 22, "ssh-ed25519", other).unwrap();
+        let _ = decision_tx.send(super::HostKeyDecision::AcceptAndSave);
+
+        assert!(!check.await.unwrap().unwrap(), "refused");
+        let (message, refused) = store_problem(&mut ev_rx);
+        assert!(refused);
+        assert!(message.contains("while you were deciding"), "{message}");
+        assert_eq!(
+            trust.check("example.test", 22, "ssh-ed25519", &key_b64),
+            crate::known_hosts::KeyStatus::Unknown,
+            "and nothing was trusted for the session",
+        );
     }
 
     /// Nobody answering is not an open-ended pause: the prompt expires on

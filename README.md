@@ -389,6 +389,7 @@ Inside it:
 | `sessions/`    | Saved sessions, one `.ini` each |
 | `themes/`      | User themes, one `.ini` each |
 | `known_hosts`  | SSH host keys |
+| `known_hosts.lock` | Empty; held while `known_hosts` is changed |
 | `checkpoints/` | Interrupted batch-transfer state |
 
 ### `known_hosts` — SSH host key store
@@ -397,12 +398,23 @@ blink maintains its own known-hosts file separate from `~/.ssh/known_hosts`.
 The on-disk format matches OpenSSH: one entry per line, `hostname key-type
 base64-key`. The hostname is stored as a bare lowercased host for the
 default SSH port and `[host]:port` for any other port — exactly as OpenSSH
-writes it. Comma-separated host lists and `@revoked` lines are read as
-OpenSSH reads them, and a revoked key is refused for every host; hashed
-(`|1|salt|hash`) entries from `HashKnownHosts=yes` and wildcard host
-patterns are not, and `@cert-authority` lines are ignored — a server
-presenting an SSH host certificate is refused rather than pinned (see
-[Security](#protocol)). Files written by older
+writes it. Everything else is read as OpenSSH reads it, so you can copy
+your `~/.ssh/known_hosts` in:
+
+- comma-separated host lists, and `!`-negated names;
+- hashed names (`|1|salt|hash`), as written with `HashKnownHosts=yes`;
+- wildcard patterns (`*.example.com`, `[*.example.com]:2222`, `?` for one
+  character);
+- `@revoked` lines, refusing that key for every host.
+
+`@cert-authority` lines are ignored — a server presenting an SSH host
+certificate is refused rather than pinned (see [Security](#protocol)).
+`blink known-hosts remove` takes out a host's plain and hashed names but
+never a wildcard pattern, which may vouch for other hosts too.
+
+The file is read even if it isn't valid UTF-8 (a Latin-1 comment, say).
+If it can't be read at all, blink refuses the connection and the log says
+why. Files written by older
 blink versions in the `host:port` form are still accepted on lookup, so
 upgrades don't force re-verification.
 

@@ -5279,4 +5279,20 @@ mod pane_audit_tests {
             "the change is in the log"
         );
     }
+
+    #[test]
+    fn known_hosts_problems_reach_the_log_at_their_level() {
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        a.handle_app_event(AppEvent::HostKeyStoreProblem {
+            message: "refused one".into(),
+            refused: true,
+        });
+        a.handle_app_event(AppEvent::HostKeyStoreProblem {
+            message: "warned one".into(),
+            refused: false,
+        });
+        let level = |m: &str| a.log.iter().find(|l| l.message == m).map(|l| l.level);
+        assert_eq!(level("refused one"), Some(LogLevel::Error));
+        assert_eq!(level("warned one"), Some(LogLevel::Warn));
+    }
 }
