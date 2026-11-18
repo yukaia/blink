@@ -87,67 +87,62 @@ impl App {
         // handle_transfer_event when the dispatcher echoes the event back.
     }
 
-    /// Cycle to the next theme in `Theme::list_all_names`. Built-ins come
-    /// first alphabetically, then user themes (deduplicated by name). The
-    /// new theme is applied immediately and persisted to `config.ini` so
-    /// it survives a restart.
+    /// Cycle to the next theme in `Theme::list_all_names`: every key,
+    /// built-in or user, sorted together. The new theme is applied
+    /// immediately and persisted to `config.ini` so it survives a restart.
     ///
     /// Both the position lookup and the persisted value use the theme's
-    /// *key* — the name `Theme::load` accepts, which is a built-in name or a
-    /// user theme's filename stem — rather than `Theme.name`, which is the
-    /// display label from the file's optional `[theme] name` field.
-    ///
-    /// Those are not the same string, and conflating them broke two things.
-    /// `list_all_names` yields keys, so a user theme whose display name
-    /// differed from its filename never matched and the cycle jumped back to
-    /// index 0 instead of advancing. Worse, the persisted value was the
-    /// display name: cycling onto `custom.ini` containing
-    /// `[theme] name = My Cool Theme` wrote `theme = My Cool Theme` into
-    /// config.ini, which resolves to no file and no built-in, so the next
-    /// launch fell back to dracula. `config.general.theme` is by definition
-    /// the key, so it serves as both.
+    /// *key* (`Theme.key`) — the normalised name `Theme::load` accepts —
+    /// rather than `Theme.name`, the display label from the file's optional
+    /// `[theme] name` field. Conflating them broke the cycle (a display
+    /// name never matched a listed key, so it jumped back to index 0) and
+    /// the next launch (`theme = My Cool Theme` resolves to nothing).
     pub(super) fn cycle_theme(&mut self) {
         let names = Theme::list_all_names();
         if names.is_empty() {
             return;
         }
-        // Find current; if the configured value isn't a known key (a
-        // hand-edited config naming a theme that no longer exists, say),
-        // start from -1 so the first cycle lands on index 0 — and writes a
-        // valid key on the way, so the state self-heals.
+        // Start from the theme on screen — a session's own theme, if one is
+        // showing, not the config's. If its key isn't in the list (a file
+        // removed since it loaded, say), start from -1 so the first cycle
+        // lands on index 0 — and writes a valid key on the way.
         let current_idx = names
             .iter()
-            .position(|n| n == &self.config.general.theme)
+            .position(|n| *n == self.theme.key)
             .map(|i| i as isize)
             .unwrap_or(-1);
-        let next_idx = ((current_idx + 1) as usize) % names.len();
-        let next_name = &names[next_idx];
 
-        match Theme::load(next_name) {
-            Ok(theme) => {
-                self.config.general.theme = next_name.clone();
-                self.theme = theme;
-                self.push_log(
-                    LogLevel::Info,
-                    format!("theme: {} ({}/{})", next_name, next_idx + 1, names.len()),
-                );
-                // Persist as a best-effort. A save failure here shouldn't
-                // refuse the in-memory swap (the user can see the new theme
-                // already), so we log and move on.
-                if let Err(e) = self.config.save() {
+        // A file that won't load is reported and stepped over; stopping on
+        // it meant every later press retried it and nothing after it could
+        // be reached. Built-ins always load, so this ends.
+        for step in 1..=names.len() {
+            let idx = ((current_idx + step as isize) as usize) % names.len();
+            let next_name = &names[idx];
+            match Theme::load(next_name) {
+                Ok(theme) => {
+                    self.config.general.theme = next_name.clone();
+                    self.theme = theme;
                     self.push_log(
-                        LogLevel::Warn,
-                        format!("could not save theme preference: {e}"),
+                        LogLevel::Info,
+                        format!("theme: {} ({}/{})", next_name, idx + 1, names.len()),
+                    );
+                    // Persist as a best-effort. A save failure here shouldn't
+                    // refuse the in-memory swap (the user can see the new
+                    // theme already), so we log and move on.
+                    if let Err(e) = self.config.save() {
+                        self.push_log(
+                            LogLevel::Warn,
+                            format!("could not save theme preference: {e}"),
+                        );
+                    }
+                    return;
+                }
+                Err(e) => {
+                    self.push_log(
+                        LogLevel::Error,
+                        format!("theme {next_name} failed to load, skipped: {e}"),
                     );
                 }
-            }
-            Err(e) => {
-                // Should be rare since list_all_names already probed parse-
-                // ability, but a TOCTOU between probe and load is possible.
-                self.push_log(
-                    LogLevel::Error,
-                    format!("theme {next_name} failed to load: {e}"),
-                );
             }
         }
     }
@@ -455,10 +450,13 @@ mod tests {
             .theme
     }
 
+    /// An app showing `name`, as startup would: falling back to dracula
+    /// when it doesn't load.
     fn app_with_theme(name: &str) -> App {
         let mut config = Config::default();
         config.general.theme = name.to_string();
-        App::new(config, Theme::load("dracula").unwrap())
+        let (theme, _) = Theme::load_or_fallback(name);
+        App::new(config, theme)
     }
 
     #[test]
@@ -490,17 +488,32 @@ mod tests {
         assert_eq!(a.config.general.theme, names[0]);
     }
 
-    /// A config naming a theme that no longer exists starts over from the
-    /// first, and is put right on disk as it does.
+    /// A config naming a theme that no longer exists shows dracula, so `t`
+    /// moves on from dracula — and writes a valid key over the stale one.
     #[test]
-    fn a_theme_that_no_longer_exists_cycles_to_the_first() {
+    fn a_theme_that_no_longer_exists_cycles_on_from_the_fallback() {
         let _home = paths::test_home();
+        let names = Theme::list_all_names();
         let mut a = app_with_theme("long-gone");
 
         a.cycle_theme();
 
-        assert_eq!(a.config.general.theme, Theme::list_all_names()[0]);
+        let i = names.iter().position(|n| n == "dracula").unwrap();
+        assert_eq!(a.config.general.theme, names[(i + 1) % names.len()]);
         assert_eq!(saved_theme(), a.config.general.theme);
+    }
+
+    /// A theme on screen whose key has left the list (its file deleted
+    /// since) starts the cycle over from the first.
+    #[test]
+    fn a_theme_no_longer_listed_cycles_to_the_first() {
+        let _home = paths::test_home();
+        let mut a = app_with_theme("dracula");
+        a.theme.key = "deleted-since".into();
+
+        a.cycle_theme();
+
+        assert_eq!(a.config.general.theme, Theme::list_all_names()[0]);
     }
 
     /// A user theme is known by its file name. Its `[theme] name` is only
@@ -531,5 +544,60 @@ mod tests {
             a.config.general.theme, names[1],
             "and the cycle moves on from it"
         );
+    }
+
+    /// A theme file that won't load was retried on every press, so the
+    /// cycle stuck on it and nothing after it could be reached.
+    #[test]
+    fn a_broken_theme_is_skipped_not_stuck_on() {
+        let _home = paths::test_home();
+        std::fs::write(
+            paths::themes_dir().unwrap().join("aaa-broken.ini"),
+            "[colors]\nbg=nope\n",
+        )
+        .unwrap();
+        let names = Theme::list_all_names();
+        assert_eq!(names[0], "aaa-broken");
+        let mut a = app_with_theme(names.last().unwrap());
+
+        a.cycle_theme();
+        assert_eq!(
+            a.config.general.theme, names[1],
+            "stepped over the broken one"
+        );
+        assert!(logged(&a, "theme aaa-broken failed to load, skipped"));
+
+        a.cycle_theme();
+        assert_eq!(a.config.general.theme, names[2], "and keeps going");
+    }
+
+    /// With a session's theme on screen, `t` moves on from that one, not
+    /// from the config's.
+    #[test]
+    fn t_cycles_from_the_theme_on_screen() {
+        let _home = paths::test_home();
+        let names = Theme::list_all_names();
+        let mut a = app_with_theme("dracula");
+        a.theme = Theme::load("nord").unwrap();
+
+        a.cycle_theme();
+
+        let after_nord =
+            &names[(names.iter().position(|n| n == "nord").unwrap() + 1) % names.len()];
+        assert_eq!(&a.config.general.theme, after_nord);
+    }
+
+    /// `Tokyo Night` loads tokyo-night, so the cycle has to know it's there
+    /// rather than starting over from the first theme.
+    #[test]
+    fn a_loosely_spelled_config_theme_cycles_on_from_itself() {
+        let _home = paths::test_home();
+        let names = Theme::list_all_names();
+        let mut a = app_with_theme("Tokyo Night");
+
+        a.cycle_theme();
+
+        let i = names.iter().position(|n| n == "tokyo-night").unwrap();
+        assert_eq!(a.config.general.theme, names[(i + 1) % names.len()]);
     }
 }

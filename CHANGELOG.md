@@ -20,8 +20,29 @@ the git history for those.
   double-click on a link to a file downloads it. Over FTP, where the
   server can't say, a link is treated as a file.
 
+- **Themes fall back to 256 colours** on a terminal that doesn't say it
+  shows 24-bit colour (via `COLORTERM`, or by being one known to), such as
+  macOS Terminal. Each colour becomes its nearest in the 256-colour
+  palette, rather than whatever the terminal made of a 24-bit one. Set
+  `COLORTERM=truecolor` if yours is wrongly left out.
+
 ### Changed
 
+- **`blink themes` lists your own themes too**, marked `(user)`, since `t`
+  cycles through them. A theme file that won't load, or whose name can't be
+  used, is a warning on stderr, as with `blink sessions`.
+- **Theme names are matched one way everywhere**: ignoring case, with
+  spaces as hyphens. Built-ins already were; user theme files and the `t`
+  cycle weren't. On Linux this means a user `Dracula.ini` now replaces the
+  built-in `dracula` instead of being a separate theme.
+- **A user theme can leave colours out**; they come from `dracula`.
+  Previously every colour was required, so a new one would have broken
+  every existing theme file.
+- **tokyo-night shows errors in their own red.** They were the accent's
+  pink, so an error line looked like any other highlight.
+- **solarized-dark uses Solarized's own text colours**: base0 for text and
+  base01 for dimmed text. It used base2, the light variant's background,
+  which was much brighter than the scheme intends.
 - **On Windows, the config folder is now `%APPDATA%\blink`.** It was in
   `Documents\blink`, a folder meant for your own files, and one that
   OneDrive often syncs, taking your `known_hosts` and sessions with it.
@@ -78,6 +99,22 @@ the git history for those.
 
 ### Fixed
 
+- **One broken theme file no longer stops `t`.** It was retried on every
+  press, so no theme after it could be reached. It's now reported and
+  skipped.
+- **A theme that falls back at startup says why**, in the log. It always
+  said "not found", even for a file with a bad colour, and said it on
+  stderr just before the screen cleared, where it couldn't be read.
+- **`t` moves on from the theme on screen**, a session's own theme
+  included, and from a loosely spelled one like `Tokyo Night`. It started
+  from the config's theme, or from the first theme.
+- **Theme files with unusable names aren't offered.** A file named with
+  `:` or `..` was listed by `t` but could never load.
+- **Theme colours must be plain hex.** `+1+2+3` and `###1a2b3c` were
+  accepted as colours.
+- **A theme name in wide characters fits the status bar.** It was measured
+  in characters rather than columns, and could push the version off the
+  edge.
 - **Photos are shown the right way up.** Phone photos store their pixels
   unrotated and record the rotation in EXIF, which the viewer ignored, so
   portrait shots came out sideways.

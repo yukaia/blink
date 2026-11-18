@@ -46,7 +46,7 @@ enum Command {
     Connect { url: String },
     /// List saved sessions.
     Sessions,
-    /// List built-in themes.
+    /// List themes: the built-ins and your own.
     Themes,
     /// Show any interrupted walk checkpoints that can be resumed.
     ///
@@ -99,32 +99,30 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     let config = Config::load()?;
-    let theme = Theme::load(&config.general.theme).unwrap_or_else(|_| {
-        eprintln!(
-            "warning: theme `{}` not found, falling back to dracula",
-            sanitize_display(&config.general.theme)
-        );
-        Theme::load("dracula").expect("dracula is always available")
-    });
+    // A theme that won't load is reported in the log once the TUI is up;
+    // printed here it would be hidden behind the alternate screen.
+    let (theme, theme_warning) = Theme::load_or_fallback(&config.general.theme);
 
     match cli.command {
-        None => tui::run(config, theme).await,
+        None => tui::run(config, theme, theme_warning).await,
         Some(Command::Sessions) => {
             list_sessions(&mut std::io::stdout().lock(), &mut std::io::stderr().lock())
         }
-        Some(Command::Themes) => list_themes(&mut std::io::stdout().lock()),
+        Some(Command::Themes) => {
+            list_themes(&mut std::io::stdout().lock(), &mut std::io::stderr().lock())
+        }
         Some(Command::Open { name }) => {
             let session = session::Session::list_all()?
                 .into_iter()
                 .find(|s| s.name == name)
                 .ok_or_else(|| crate::error::BlinkError::session_not_found(name.clone()))?;
             // Loaded from disk — already saved.
-            tui::run_with_session(config, theme, session, false).await
+            tui::run_with_session(config, theme, theme_warning, session, false).await
         }
         Some(Command::Connect { url }) => {
             let session = session::Session::from_url(&url)?;
             // Built from a URL — nothing on disk behind it.
-            tui::run_with_session(config, theme, session, true).await
+            tui::run_with_session(config, theme, theme_warning, session, true).await
         }
         Some(Command::Checkpoints { clean, force }) => list_checkpoints(clean, force),
         Some(Command::KnownHosts { action }) => match action {
@@ -267,9 +265,35 @@ fn list_sessions(out: &mut impl Write, err: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-fn list_themes(out: &mut impl Write) -> Result<()> {
-    for name in Theme::list_builtin_names() {
-        writeln!(out, "{name}")?;
+/// Every theme `t` cycles through, one key per line, user themes marked.
+/// User files are loaded here, so one that would fail is reported on stderr
+/// (like `blink sessions` does) rather than listed.
+fn list_themes(out: &mut impl Write, err: &mut impl Write) -> Result<()> {
+    let listing = Theme::list_detailed();
+    let builtins = Theme::list_builtin_names();
+    for entry in &listing.entries {
+        if !entry.user {
+            writeln!(out, "{}", entry.key)?;
+            continue;
+        }
+        match Theme::load(&entry.key) {
+            Ok(_) if builtins.contains(&entry.key.as_str()) => {
+                writeln!(out, "{} (user, replaces the built-in)", entry.key)?
+            }
+            Ok(_) => writeln!(out, "{} (user)", entry.key)?,
+            Err(e) => writeln!(
+                err,
+                "warning: skipped theme {}: {}",
+                entry.key,
+                sanitize_display(&e.to_string())
+            )?,
+        }
+    }
+    for name in &listing.invalid {
+        writeln!(
+            err,
+            "warning: skipped {name}: the name can't be used as a theme name"
+        )?;
     }
     Ok(())
 }
@@ -379,12 +403,44 @@ mod tests {
 
     #[test]
     fn themes_prints_every_builtin_one_per_line() {
-        let mut out = Vec::new();
-        list_themes(&mut out).unwrap();
+        let _home = crate::paths::test_home();
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        list_themes(&mut out, &mut err).unwrap();
         let out = text(out);
-        let names: Vec<&str> = out.lines().collect();
-        assert_eq!(names, Theme::list_builtin_names());
-        assert!(names.contains(&"dracula"));
+        let mut names: Vec<&str> = out.lines().collect();
+        names.sort();
+        let mut builtins = Theme::list_builtin_names();
+        builtins.sort();
+        assert_eq!(names, builtins);
+        assert!(err.is_empty());
+    }
+
+    /// `t` cycles through user themes too, so `blink themes` lists them,
+    /// marked; a file that won't load is a warning, as with sessions.
+    #[test]
+    fn themes_lists_user_themes_and_warns_about_broken_ones() {
+        let _home = crate::paths::test_home();
+        let dir = crate::paths::themes_dir().unwrap();
+        std::fs::write(dir.join("mine.ini"), "[colors]\nbg=#000000\n").unwrap();
+        std::fs::write(dir.join("nord.ini"), "[colors]\nbg=#000000\n").unwrap();
+        std::fs::write(dir.join("broken.ini"), "[colors]\nbg=zzz\n").unwrap();
+        std::fs::write(dir.join("x..y.ini"), "[colors]\n").unwrap();
+
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        list_themes(&mut out, &mut err).unwrap();
+        let (out, err) = (text(out), text(err));
+
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines.contains(&"dracula"), "{out}");
+        assert!(lines.contains(&"mine (user)"), "{out}");
+        assert!(
+            lines.contains(&"nord (user, replaces the built-in)"),
+            "{out}"
+        );
+        assert!(!out.contains("broken"), "{out}");
+        assert!(err.contains("warning: skipped theme broken: "), "{err}");
+        assert!(err.contains("bad color for `bg`"), "{err}");
+        assert!(err.contains("warning: skipped x..y.ini"), "{err}");
     }
 
     // --- `blink known-hosts remove` ---

@@ -430,9 +430,10 @@ pub struct App {
     /// Whether [`Self::autoconnect`] was built from a URL (`blink connect`)
     /// rather than loaded from disk (`blink open`).
     autoconnect_unsaved: bool,
-    /// Session files that failed to load during [`App::new`], drained into
-    /// the log by [`App::run`] once there is somewhere to put them.
-    startup_warnings: Vec<String>,
+    /// Warnings from before the log existed — session files that failed to
+    /// load during [`App::new`], a configured theme that fell back — drained
+    /// into the log by [`App::run`] once there is somewhere to put them.
+    pub(crate) startup_warnings: Vec<String>,
 }
 
 mod actions;
@@ -452,7 +453,13 @@ impl App {
         // let `run` report them once the log exists.
         let listing = Session::list_all_detailed().ok();
         let (sessions, startup_warnings) = match listing {
-            Some(l) => (l.sessions, l.skipped),
+            Some(l) => (
+                l.sessions,
+                l.skipped
+                    .into_iter()
+                    .map(|skip| format!("unreadable session {skip}"))
+                    .collect(),
+            ),
             None => (Vec::new(), Vec::new()),
         };
         let mut local = PaneState::empty();
@@ -594,11 +601,12 @@ impl App {
                 None => format!("graphics protocol: {proto_label}"),
             },
         );
-        // Session files that wouldn't parse. Reported here rather than left
-        // to `tracing`, which goes to a sink unless BLINK_LOG_FILE is set —
-        // so the session just disappeared from the selector with no clue why.
-        for skip in std::mem::take(&mut self.startup_warnings) {
-            self.push_log(LogLevel::Warn, format!("unreadable session {skip}"));
+        // Session files that wouldn't parse, and a configured theme that
+        // wouldn't load. Reported here rather than left to `tracing` (a sink
+        // unless BLINK_LOG_FILE is set) or stderr (hidden behind the
+        // alternate screen), where there'd be no clue why.
+        for warning in std::mem::take(&mut self.startup_warnings) {
+            self.push_log(LogLevel::Warn, warning);
         }
 
         // Autoconnect: `blink open` / `blink connect` pre-populate this
@@ -5211,5 +5219,25 @@ mod pane_audit_tests {
         let a = conflicts(&["/srv/x/readme.md"]);
         let shown = text(&draw(&a));
         assert!(shown.contains("• readme.md"), "{shown}");
+    }
+
+    /// The selector's status bar measured the theme label in chars, so a
+    /// label in wide characters overran it and pushed the version off the
+    /// edge. Measured in columns, the version is always whole when shown.
+    #[test]
+    fn a_wide_theme_label_never_pushes_the_version_off_the_bar() {
+        let _home = crate::paths::test_home();
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        a.theme.name = "テーマテーマテーマテーマ".into();
+        let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+        for width in 60..140u16 {
+            let buf = super::tests_support::draw_sized(&a, width, 20);
+            let row: String = (0..width)
+                .map(|x| buf[(x, 19)].symbol().to_string())
+                .collect();
+            if row.contains("theme:") {
+                assert!(row.trim_end().ends_with(&version), "width {width}: {row}");
+            }
+        }
     }
 }

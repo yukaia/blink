@@ -110,9 +110,14 @@ fn leave_screen(out: &mut impl io::Write) -> io::Result<()> {
 }
 
 /// Run the TUI to completion. Always restores the terminal even on error.
-pub async fn run(config: Config, theme: Theme) -> Result<()> {
+///
+/// `theme_warning` is why the configured theme wasn't used, if it wasn't;
+/// it goes to the log, where it can be seen.
+pub async fn run(config: Config, theme: Theme, theme_warning: Option<String>) -> Result<()> {
     let mut terminal = setup(config.terminal.mouse)?;
-    let result = App::new(config, theme).run(&mut terminal).await;
+    let mut app = App::new(config, theme);
+    app.startup_warnings.extend(theme_warning);
+    let result = app.run(&mut terminal).await;
     let _ = restore(&mut terminal);
     result
 }
@@ -125,13 +130,14 @@ pub async fn run(config: Config, theme: Theme) -> Result<()> {
 pub async fn run_with_session(
     config: Config,
     theme: Theme,
+    theme_warning: Option<String>,
     session: crate::session::Session,
     unsaved: bool,
 ) -> Result<()> {
     let mut terminal = setup(config.terminal.mouse)?;
-    let result = App::with_session(config, theme, session, unsaved)
-        .run(&mut terminal)
-        .await;
+    let mut app = App::with_session(config, theme, session, unsaved);
+    app.startup_warnings.extend(theme_warning);
+    let result = app.run(&mut terminal).await;
     let _ = restore(&mut terminal);
     result
 }

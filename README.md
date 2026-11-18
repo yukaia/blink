@@ -163,7 +163,14 @@ Seven built-in themes — `dracula`, `aura`, `nord`, `solarized-dark`,
 `solarized-osaka`, `tokyo-night`, `cyberpunk-neon` — user-supplied themes
 drop in as INI files in the themes directory. **`t`** cycles through
 available themes from either the session selector or the main view, with
-the choice persisted to `config.ini` automatically.
+the choice persisted to `config.ini` automatically. A theme file that
+won't load is reported in the log and skipped.
+
+Themes are 24-bit colour. When the terminal doesn't say it supports that
+(`COLORTERM=truecolor` or `24bit`, or a terminal known to, such as kitty,
+WezTerm, foot, Alacritty, Ghostty or iTerm2), each colour is shown as its
+nearest in the 256-colour palette instead. If yours supports 24-bit colour
+but isn't recognised, set `COLORTERM=truecolor`.
 
 ## Build
 
@@ -301,7 +308,7 @@ blink connect sftp://user@host:22
 # Open a saved session by name
 blink open production
 
-# Print built-in themes
+# List themes: built-ins, and your own marked (user)
 blink themes
 
 # List saved sessions
@@ -451,7 +458,8 @@ connects can't write duplicate or interleaved lines.
 
 ```ini
 [general]
-; one of the seven built-ins, or a user theme
+; one of the seven built-ins, or a user theme (falls back to dracula,
+; with the reason in the log, if it won't load)
 theme = dracula
 ; default; sessions can override (max 10)
 parallel_downloads = 2
@@ -539,8 +547,11 @@ image           = #f7768e
 selected        = #e0af68
 success         = #9ece6a
 warning         = #ff9e64
-error           = #f7768e
+error           = #db4b4b
 ```
+
+Every colour is optional: any you leave out is taken from `dracula`. A
+colour that's present must be `#rrggbb` (the `#` is optional).
 
 **The filename is the identifier, not the `[theme] name` field.** A theme is
 loaded by its *key* — a built-in name, or a user file's stem — which is what
@@ -548,6 +559,12 @@ goes in `config.ini` and what `t` cycles through. `[theme] name` is only the
 label shown in the status bar, and it is optional; leave it out and the stem
 is used for both. The two are allowed to differ, so `custom.ini` can present
 itself as `My Cool Theme`, but `theme = custom` is what selects it.
+
+Names are matched ignoring case, with spaces read as hyphens, for built-ins
+and user themes alike: `Tokyo Night` is `tokyo-night`, and `My Theme.ini`
+is selected by `my-theme`. A user theme with a built-in's name replaces it.
+A file whose name contains `:` or `..` can't be selected and is skipped
+(`blink themes` says so).
 
 ## Hotkeys
 
