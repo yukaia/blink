@@ -103,7 +103,14 @@ async fn main() -> Result<()> {
     // printed here it would be hidden behind the alternate screen.
     let (theme, theme_warning) = Theme::load_or_fallback(&config.general.theme);
 
-    match cli.command {
+    // Temp files a crash left behind. Long-dead ones only; see the fn.
+    paths::sweep_stale_temps();
+
+    let tui = matches!(
+        cli.command,
+        None | Some(Command::Open { .. }) | Some(Command::Connect { .. })
+    );
+    let result = match cli.command {
         None => tui::run(config, theme, theme_warning).await,
         Some(Command::Sessions) => {
             list_sessions(&mut std::io::stdout().lock(), &mut std::io::stderr().lock())
@@ -130,7 +137,14 @@ async fn main() -> Result<()> {
                 remove_known_host(&mut std::io::stdout().lock(), &host, port)
             }
         },
+    };
+    // The TUI puts these in its log; anything else says them on stderr.
+    if !tui {
+        for n in paths::take_notices() {
+            eprintln!("note: {n}");
+        }
     }
+    result
 }
 
 /// Forget the stored host key(s) for `host` on `port`.

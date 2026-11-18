@@ -372,9 +372,14 @@ Everything lives in one directory, in a platform-appropriate location:
 
 | Platform | Config directory |
 | -------- | ---------------- |
-| Linux    | `$XDG_CONFIG_HOME/blink/`, else `~/.config/blink/` |
+| Linux, BSD | `$XDG_CONFIG_HOME/blink/`, else `~/.config/blink/` |
 | macOS    | `~/Library/Application Support/blink/` (`$XDG_CONFIG_HOME/blink/` if that variable is explicitly set) |
 | Windows  | `%APPDATA%\blink\` |
+
+The variable used must hold an absolute path, or blink stops with an
+error rather than guessing where your config should go. That includes a
+relative `XDG_CONFIG_HOME`, which the XDG spec says to ignore: ignoring it
+would quietly put the config somewhere you didn't ask for.
 
 Inside it:
 
@@ -974,8 +979,13 @@ declaring huge dimensions is still rejected.
   upload interrupted by a hard kill or dropped connection
   can leave a stale `<remote>.<hash>.blink-part` behind; re-running the upload
   reuses (truncates) it.
-- Config directories are created with mode 0700 on Unix (not
-  world-readable). A log file gets mode 0600; see [Logging](#logging).
+- On Unix, config directories are kept at mode 0700 and the files blink
+  writes in them at 0600. A config directory found open to other users
+  (made by hand, say, or restored from a backup) is tightened to 0700,
+  and the log says so. A log file gets mode 0600; see [Logging](#logging).
+- Saves are atomic: each writes `.<name>.<pid>.<n>.tmp` and renames it
+  into place. A crash can leave one of those behind; any over an hour old
+  is removed at the next start.
 - `Config::save` round-trips unknown INI keys, so hand-edited or
   forward-compat options aren't silently dropped on a theme cycle.
 - Path-traversal and null-byte validation is applied when loading

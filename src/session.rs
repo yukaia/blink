@@ -199,7 +199,7 @@ impl Session {
         use sha2::{Digest, Sha256};
         paths::hashed_file_name(
             name,
-            &Sha256::digest(name.as_bytes()),
+            &Sha256::digest(name.as_bytes()).into(),
             ".ini",
             windows_rules,
         )
