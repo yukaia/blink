@@ -337,24 +337,44 @@ fn real_base_dir() -> Result<PathBuf> {
     ))
 }
 
-/// Things worth telling the user that happened before there was a log to
-/// tell them in — a config folder made private, say. Drained by
-/// [`take_notices`] once the TUI is up.
+/// Things worth telling the user that happen where there's no log to tell
+/// them in — a config folder made private, say. Drained by
+/// [`take_notices`]: by the TUI on every pass of its event loop, so one
+/// raised mid-session (the first `t` creating `themes/`) shows up at once.
+///
+/// Per-thread under test, like the test home, so one test draining the
+/// list can't take another's notices.
+#[cfg(not(test))]
 static NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
+#[cfg(test)]
+thread_local! {
+    static NOTICES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 #[cfg_attr(not(unix), allow(dead_code))]
-fn notice(msg: String) {
+pub(crate) fn notice(msg: String) {
+    #[cfg(not(test))]
     if let Ok(mut n) = NOTICES.lock() {
         n.push(msg);
     }
+    #[cfg(test)]
+    NOTICES.with(|n| n.borrow_mut().push(msg));
 }
 
 /// Everything [`notice`]d so far, oldest first; clears the list.
 pub fn take_notices() -> Vec<String> {
-    NOTICES
-        .lock()
-        .map(|mut n| std::mem::take(&mut *n))
-        .unwrap_or_default()
+    #[cfg(not(test))]
+    {
+        NOTICES
+            .lock()
+            .map(|mut n| std::mem::take(&mut *n))
+            .unwrap_or_default()
+    }
+    #[cfg(test)]
+    {
+        NOTICES.with(|n| std::mem::take(&mut *n.borrow_mut()))
+    }
 }
 
 /// Create `path` as an application-owned directory with restricted permissions.
@@ -467,14 +487,15 @@ pub const MAX_FILE_NAME_BYTES: usize = 255;
 /// A file name for a user-chosen `name`: `{stem}-{hash8}{suffix}`, where
 /// `hash8` is the first four bytes of `hash` (a SHA-256 digest) in hex.
 ///
-/// The stem is `name` with path separators and shell-special characters
-/// mapped to `_`, plus control characters when `windows_rules` is set
-/// (Windows refuses them; elsewhere they're left alone so existing files
-/// keep their names). It is cut on a char boundary to keep the whole within
+/// The stem is `name` with path separators, shell-special characters and
+/// control characters (C0, DEL and C1) mapped to `_`, the same on every
+/// platform: Windows refuses control characters in a name, and elsewhere a
+/// newline or escape in a file name is only trouble for whoever lists the
+/// folder. It is cut on a char boundary to keep the whole within
 /// [`MAX_FILE_NAME_BYTES`]. A longer name could never have been written, so
 /// cutting moves no existing file, and `hash`, taken over the full name,
 /// keeps cut names (and names that map to the same stem) apart.
-pub fn hashed_file_name(name: &str, hash: &[u8; 32], suffix: &str, windows_rules: bool) -> String {
+pub fn hashed_file_name(name: &str, hash: &[u8; 32], suffix: &str) -> String {
     use std::fmt::Write as _;
 
     let mut tail = String::from("-");
@@ -487,8 +508,8 @@ pub fn hashed_file_name(name: &str, hash: &[u8; 32], suffix: &str, windows_rules
     let mut stem = String::with_capacity(name.len().min(budget));
     for c in name.chars() {
         let c = match c {
-            '\0' | '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' ' => '_',
-            '\u{1}'..='\u{1f}' if windows_rules => '_',
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | ' ' => '_',
+            c if c.is_control() => '_',
             c => c,
         };
         if stem.len() + c.len_utf8() > budget {

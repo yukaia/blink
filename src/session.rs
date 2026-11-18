@@ -187,22 +187,12 @@ impl Session {
     /// Append the first eight hex chars of `sha256(name)` to disambiguate;
     /// the suffix is derived from the raw name (no sanitisation), so it's
     /// stable per logical name across sanitisation collisions.
+    ///
+    /// See [`paths::hashed_file_name`]: the stem is cut to keep the name
+    /// within the 255-byte limit, and control characters map to `_`.
     fn name_to_filename(name: &str) -> String {
-        Self::name_to_filename_with(name, cfg!(windows))
-    }
-
-    /// [`Self::name_to_filename`] with the platform policy passed in, so
-    /// both branches are testable on any host. See
-    /// [`paths::hashed_file_name`]: the stem is cut to keep the name within
-    /// the 255-byte limit, and on Windows control characters map to `_`.
-    fn name_to_filename_with(name: &str, windows_rules: bool) -> String {
         use sha2::{Digest, Sha256};
-        paths::hashed_file_name(
-            name,
-            &Sha256::digest(name.as_bytes()).into(),
-            ".ini",
-            windows_rules,
-        )
+        paths::hashed_file_name(name, &Sha256::digest(name.as_bytes()).into(), ".ini")
     }
 
     /// Filename written by older blink versions (sanitized stem only, no
@@ -1137,34 +1127,31 @@ mod tests {
 
     #[test]
     fn name_to_filename_fits_any_name_within_the_limit() {
-        for windows in [false, true] {
-            for name in [
-                "x".repeat(300),
-                "é".repeat(200),
-                format!("{}é", "a".repeat(241)),
-            ] {
-                let file = Session::name_to_filename_with(&name, windows);
-                assert!(
-                    file.len() <= paths::MAX_FILE_NAME_BYTES,
-                    "{} bytes",
-                    file.len()
-                );
-                assert!(file.ends_with(".ini"));
-            }
+        for name in [
+            "x".repeat(300),
+            "é".repeat(200),
+            format!("{}é", "a".repeat(241)),
+        ] {
+            let file = Session::name_to_filename(&name);
+            assert!(
+                file.len() <= paths::MAX_FILE_NAME_BYTES,
+                "{} bytes",
+                file.len()
+            );
+            assert!(file.ends_with(".ini"));
         }
         // Cut names stay apart: the hash covers the whole name.
         let a = format!("{}a", "x".repeat(300));
         let b = format!("{}b", "x".repeat(300));
-        assert_ne!(
-            Session::name_to_filename_with(&a, false),
-            Session::name_to_filename_with(&b, false)
-        );
+        assert_ne!(Session::name_to_filename(&a), Session::name_to_filename(&b));
     }
 
+    /// Kept off Windows so existing files kept their names; a newline or
+    /// escape in a file name only causes trouble, so they map everywhere.
     #[test]
-    fn name_to_filename_maps_control_characters_on_windows_only() {
-        assert!(Session::name_to_filename_with("a\tb", true).starts_with("a_b-"));
-        assert!(Session::name_to_filename_with("a\tb", false).starts_with("a\tb-"));
+    fn name_to_filename_maps_control_characters_everywhere() {
+        let file = Session::name_to_filename("a\tb\nc\u{1b}d\u{7f}e\u{85}f");
+        assert!(file.starts_with("a_b_c_d_e_f-"), "{file:?}");
     }
 
     #[test]

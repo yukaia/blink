@@ -337,7 +337,7 @@ impl Checkpoint {
     /// the raw session name (no sanitisation), so it's stable per logical
     /// name and server.
     fn path_for(session: &str, origin: &str, kind: CheckpointKind) -> Result<PathBuf> {
-        Ok(paths::checkpoints_dir()?.join(file_name_for(session, origin, kind, cfg!(windows))))
+        Ok(paths::checkpoints_dir()?.join(file_name_for(session, origin, kind)))
     }
 
     /// The origin this checkpoint's file is keyed by. Empty for a file
@@ -749,11 +749,10 @@ impl Checkpoint {
     }
 }
 
-/// The body of [`Checkpoint::path_for`]: `{stem}-{hash8}-{kind}.json`, with
-/// the platform policy passed in so both branches are testable on any host.
+/// The body of [`Checkpoint::path_for`]: `{stem}-{hash8}-{kind}.json`.
 /// See [`paths::hashed_file_name`]; the hash covers the origin as well as
 /// the session name.
-fn file_name_for(session: &str, origin: &str, kind: CheckpointKind, windows_rules: bool) -> String {
+fn file_name_for(session: &str, origin: &str, kind: CheckpointKind) -> String {
     use sha2::{Digest, Sha256};
 
     // NUL can appear in neither a session name nor an origin, so the two
@@ -763,12 +762,7 @@ fn file_name_for(session: &str, origin: &str, kind: CheckpointKind, windows_rule
         .chain_update([0])
         .chain_update(origin.as_bytes())
         .finalize();
-    paths::hashed_file_name(
-        session,
-        &hash.into(),
-        &format!("-{}.json", kind.as_str()),
-        windows_rules,
-    )
+    paths::hashed_file_name(session, &hash.into(), &format!("-{}.json", kind.as_str()))
 }
 
 /// Summaries of every checkpoint for `session` that still has work left.
@@ -2692,21 +2686,19 @@ mod merge_tests {
 mod tests {
     #[test]
     fn a_checkpoint_file_name_fits_the_platform_limit() {
-        for windows in [false, true] {
-            for session in [
-                "a".repeat(400),
-                "\u{e9}".repeat(200),
-                "\u{1f600}".repeat(100),
-            ] {
-                for kind in [CheckpointKind::Download, CheckpointKind::Upload] {
-                    let name = file_name_for(&session, TEST_ORIGIN, kind, windows);
-                    assert!(
-                        name.len() <= paths::MAX_FILE_NAME_BYTES,
-                        "{} bytes",
-                        name.len()
-                    );
-                    assert!(name.ends_with(&format!("-{}.json", kind.as_str())));
-                }
+        for session in [
+            "a".repeat(400),
+            "\u{e9}".repeat(200),
+            "\u{1f600}".repeat(100),
+        ] {
+            for kind in [CheckpointKind::Download, CheckpointKind::Upload] {
+                let name = file_name_for(&session, TEST_ORIGIN, kind);
+                assert!(
+                    name.len() <= paths::MAX_FILE_NAME_BYTES,
+                    "{} bytes",
+                    name.len()
+                );
+                assert!(name.ends_with(&format!("-{}.json", kind.as_str())));
             }
         }
     }
@@ -2730,20 +2722,15 @@ mod tests {
         let a = format!("{}a", "x".repeat(300));
         let b = format!("{}b", "x".repeat(300));
         assert_ne!(
-            file_name_for(&a, TEST_ORIGIN, CheckpointKind::Download, false),
-            file_name_for(&b, TEST_ORIGIN, CheckpointKind::Download, false)
+            file_name_for(&a, TEST_ORIGIN, CheckpointKind::Download),
+            file_name_for(&b, TEST_ORIGIN, CheckpointKind::Download)
         );
     }
 
     #[test]
-    fn a_short_name_maps_the_same_on_every_platform() {
-        assert_eq!(
-            file_name_for("my prod", TEST_ORIGIN, CheckpointKind::Download, false),
-            file_name_for("my prod", TEST_ORIGIN, CheckpointKind::Download, true),
-        );
+    fn a_short_name_maps_spaces_to_underscores() {
         assert!(
-            file_name_for("my prod", TEST_ORIGIN, CheckpointKind::Upload, false)
-                .starts_with("my_prod-")
+            file_name_for("my prod", TEST_ORIGIN, CheckpointKind::Upload).starts_with("my_prod-")
         );
     }
 
@@ -2753,23 +2740,22 @@ mod tests {
     fn two_accounts_sharing_a_session_name_get_separate_files() {
         let kind = CheckpointKind::Upload;
         assert_ne!(
-            file_name_for("host", "alice@host:22", kind, false),
-            file_name_for("host", "bob@host:22", kind, false),
+            file_name_for("host", "alice@host:22", kind),
+            file_name_for("host", "bob@host:22", kind),
         );
         // The separator keeps the name and origin from running together.
         assert_ne!(
-            file_name_for("ab", "c", kind, false),
-            file_name_for("a", "bc", kind, false),
+            file_name_for("ab", "c", kind),
+            file_name_for("a", "bc", kind),
         );
     }
 
+    /// Kept off Windows so existing files kept their names; a tab or an
+    /// escape in a file name only causes trouble, so they map everywhere.
     #[test]
-    fn control_characters_map_only_under_windows_rules() {
-        let session = "tab\there\u{1b}";
-        let unix = file_name_for(session, TEST_ORIGIN, CheckpointKind::Download, false);
-        let windows = file_name_for(session, TEST_ORIGIN, CheckpointKind::Download, true);
-        assert!(unix.starts_with("tab\there\u{1b}-"), "{unix:?}");
-        assert!(windows.starts_with("tab_here_-"), "{windows:?}");
+    fn control_characters_map_on_every_platform() {
+        let name = file_name_for("tab\there\u{1b}", TEST_ORIGIN, CheckpointKind::Download);
+        assert!(name.starts_with("tab_here_-"), "{name:?}");
     }
 
     use super::*;
