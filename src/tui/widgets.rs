@@ -626,9 +626,11 @@ pub mod status_bar {
             Span::raw(" quit"),
         ];
 
-        let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
-        let theme_w = theme_label.chars().count();
-        let ver_w = version_label.chars().count();
+        // Display columns, not chars: a theme label in CJK is two columns a
+        // character and overran the bar measured the other way.
+        let left_w: usize = left_spans.iter().map(Span::width).sum();
+        let theme_w = Span::raw(theme_label.as_str()).width();
+        let ver_w = Span::raw(version_label.as_str()).width();
         let total_w = area.width as usize;
         // Try to fit theme + version. If only one fits, prefer the version
         // (more universally useful) over the theme (also visible in colors).
