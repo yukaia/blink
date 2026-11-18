@@ -28,6 +28,12 @@ the git history for those.
 
 ### Changed
 
+- **Only the TUI reads `config.ini`.** A broken one still stops the TUI,
+  but no longer stops `blink sessions`, `themes`, `checkpoints` or
+  `known-hosts remove`, which don't use it.
+- **Listing creates nothing.** `blink sessions`, `themes` and
+  `checkpoints` left a `config.ini` and every folder behind on a fresh
+  machine; the TUI creates them when it starts.
 - **Large images are scaled to fit instead of refused.** The viewer
   turned away anything over 4096 pixels a side, which ruled out most
   phone photos and every panorama. Now any image that can be decoded in
@@ -57,6 +63,10 @@ the git history for those.
 
 ### Security
 
+- **`blink themes` can't print a raw escape sequence.** A theme file
+  named with one was listed as is, so its name could drive the terminal.
+  Theme names with control characters are now refused, and the listing is
+  sanitized as well.
 - **Files blink writes are private on their own** (mode 0600 on Unix).
   They took the umask's default, typically 0644, so they were private only
   while their folder was, and a `chmod 600` lasted until the next save.
@@ -112,6 +122,19 @@ the git history for those.
 
 ### Fixed
 
+- **Errors read as sentences**: `error: session not found: x`, not
+  `Error: SessionNotFound("x")`.
+- **Logging problems are reported where you'll see them.** An unusable
+  `BLINK_LOG_FILE`, or one other users can read, was warned about just
+  before the TUI took the screen; it's now in the log. An invalid
+  `BLINK_LOG` was ignored without a word; it's now warned about too.
+- **`blink open` names session files it couldn't read** when nothing
+  matches, instead of only saying "session not found".
+- **`blink sessions` brackets IPv6 hosts** (`u@[::1]:22`) and lines up
+  long and wide-character names.
+- **`blink themes` warns when the configured theme won't load**, since
+  the TUI would fall back from it.
+- **Notices aren't lost when a command fails** before the TUI starts.
 - **A save no longer reports failure after it succeeded.** On filesystems
   that won't sync a folder (some FUSE and network mounts), every save said
   it failed though the file had been written.

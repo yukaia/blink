@@ -563,6 +563,7 @@ impl Session {
     /// List all saved sessions, sorted by name. Files that fail to load are
     /// skipped rather than aborting the listing; use [`Self::list_all_detailed`]
     /// when the caller can tell the user about them.
+    #[cfg(test)]
     pub fn list_all() -> Result<Vec<Self>> {
         Ok(Self::list_all_detailed()?.sessions)
     }
@@ -575,11 +576,21 @@ impl Session {
     /// sink otherwise. Handing the reasons back lets the TUI and the CLI say
     /// which file was dropped and why, instead of leaving the user to wonder
     /// where their session went.
+    ///
+    /// Only reads: a sessions folder that doesn't exist yet is an empty
+    /// listing, and isn't created.
     pub fn list_all_detailed() -> Result<SessionListing> {
-        let dir = paths::sessions_dir()?;
+        let dir = paths::lookup("sessions")?;
         let mut sessions = Vec::new();
         let mut skipped = Vec::new();
-        for entry in fs::read_dir(&dir)? {
+        let read = match fs::read_dir(&dir) {
+            Ok(read) => read,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(SessionListing { sessions, skipped });
+            }
+            Err(e) => return Err(e.into()),
+        };
+        for entry in read {
             let entry = entry?;
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("ini") {
