@@ -608,10 +608,7 @@ impl App {
         for warning in std::mem::take(&mut self.startup_warnings) {
             self.push_log(LogLevel::Warn, warning);
         }
-        // A config folder found open to other users, and made private.
-        for note in crate::paths::take_notices() {
-            self.push_log(LogLevel::Warn, note);
-        }
+        self.drain_path_notices();
 
         // Autoconnect: `blink open` / `blink connect` pre-populate this
         // field. We trigger the connect here, after the runtime is live and
@@ -651,6 +648,10 @@ impl App {
                 }
             }
 
+            // A folder made private by whatever that event touched — the
+            // first `t` creating `themes/`, say — is said now, not next launch.
+            self.drain_path_notices();
+
             if self.should_quit {
                 break;
             }
@@ -666,6 +667,14 @@ impl App {
         self.pending_password = None;
 
         Ok(())
+    }
+
+    /// Move [`crate::paths::take_notices`] into the log: a config folder
+    /// found open to other users, and made private.
+    fn drain_path_notices(&mut self) {
+        for note in crate::paths::take_notices() {
+            self.push_log(LogLevel::Warn, note);
+        }
     }
 
     fn draw(&self, f: &mut Frame) {
@@ -5243,5 +5252,30 @@ mod pane_audit_tests {
                 assert!(row.trim_end().ends_with(&version), "width {width}: {row}");
             }
         }
+    }
+
+    /// A folder tightened mid-session (here, the first `t` finding
+    /// `themes/` open to others) used to wait in the notice list until the
+    /// next launch, since the list was only read at startup.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_made_private_mid_session_is_logged_right_away() {
+        use std::os::unix::fs::PermissionsExt;
+        let _home = crate::paths::test_home();
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        let themes = crate::paths::root_dir().unwrap().join("themes");
+        std::fs::create_dir_all(&themes).unwrap();
+        std::fs::set_permissions(&themes, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        a.cycle_theme();
+        a.drain_path_notices();
+
+        let shown = themes.display().to_string();
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.message.contains(&shown) && l.message.contains("made it private")),
+            "the change is in the log"
+        );
     }
 }

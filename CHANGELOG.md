@@ -114,6 +114,12 @@ the git history for those.
   folder blink was started from. They now use the same XDG rules as Linux.
 - **A file where a config folder belongs is reported as such**, not as a
   "Not a directory" error from whatever tried to open something inside it.
+- **A config folder made private mid-session is reported at once.** The
+  first `t` creating `themes/`, say, was only reported at the next launch.
+- **Control characters in a session name become `_` in its file name on
+  every platform**, not only Windows; that includes DEL and the C1 range.
+  A session or checkpoint whose name holds one is saved under a new file
+  name; the old file is not moved.
 - **Leftover temp files from a crash are cleaned up** at the next start,
   once over an hour old. Before, only `blink checkpoints --force` removed
   any, and only in the checkpoint folder; it now removes only files named
