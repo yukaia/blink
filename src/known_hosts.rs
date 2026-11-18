@@ -1,7 +1,8 @@
 //! Known-hosts store: read, check, and append host keys.
 //!
-//! The file lives at `~/.config/blink/known_hosts` and uses the same line
-//! format as OpenSSH's `~/.ssh/known_hosts`:
+//! The file is `known_hosts` in blink's config directory (see
+//! [`paths::root_dir`]) and uses the same line format as OpenSSH's
+//! `~/.ssh/known_hosts`, so an OpenSSH file can be copied in:
 //!
 //! ```text
 //! hostname key-type base64-public-key
@@ -20,14 +21,28 @@
 //! with older blink versions that wrote `host:port` unconditionally, lookups
 //! also accept the legacy `host:port` form (case-insensitive).
 //!
-//! ## Unsupported forms
+//! ## Other forms read
 //!
-//! Hashed entries (`|1|salt|hash`) written by OpenSSH with
-//! `HashKnownHosts=yes` are **not** recognised, nor are wildcard patterns
-//! (`*.example.com`); neither ever matches, so such a host is asked about as
-//! a new one. Comma-separated host lists and `!`-negated names are read.
+//! - Hashed names (`|1|salt|hash`), as OpenSSH writes with
+//!   `HashKnownHosts=yes`: HMAC-SHA1 of the host's canonical form, keyed
+//!   by the salt.
+//! - Wildcard patterns: `*` for any run of characters, `?` for one, matched
+//!   against the canonical form (so `[*.example.com]:2222` for a port).
+//! - Comma-separated host lists, and `!`-negated names and patterns.
+//!
 //! `@cert-authority` lines are ignored, since blink refuses host
-//! certificates outright.
+//! certificates outright. blink writes plain names only.
+//!
+//! Removing a host ([`remove_host`]) takes out its plain and hashed names,
+//! never a pattern: forgetting `a.example.com` must not forget every host
+//! `*.example.com` vouches for.
+//!
+//! ## Concurrency
+//!
+//! Every change, [`append`] and [`remove_host`] alike, holds an exclusive
+//! lock on `known_hosts.lock` beside the file. The lock can't live on
+//! `known_hosts` itself: removing rewrites the file and renames the new one
+//! into place, and a lock on the old file then guards nothing.
 //!
 //! ## Revocation
 //!
@@ -57,7 +72,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use crate::error::{self, BlinkError, Result};
@@ -144,9 +159,11 @@ impl SessionTrust {
         match self.accepted.lock().get(&(host.to_ascii_lowercase(), port)) {
             None => KeyStatus::Unknown,
             Some((t, k)) if t == key_type && k == key_b64 => KeyStatus::Trusted,
+            // Sanitized as [`check`] sanitizes what it read from the file:
+            // whoever shows a `Changed` can count on that either way.
             Some((t, k)) => KeyStatus::Changed {
-                stored_key_type: t.clone(),
-                stored_key_b64: k.clone(),
+                stored_key_type: error::sanitize(t.clone()),
+                stored_key_b64: error::sanitize(k.clone()),
             },
         }
     }
@@ -167,6 +184,34 @@ impl std::fmt::Debug for SessionTrust {
 
 pub fn known_hosts_path() -> Result<PathBuf> {
     Ok(paths::root_dir()?.join("known_hosts"))
+}
+
+/// Take the lock every change to the file holds; see the module docs.
+/// Released when the returned file is dropped.
+fn lock_store() -> Result<fs::File> {
+    let path = paths::root_dir()?.join("known_hosts.lock");
+    let mut opts = OpenOptions::new();
+    opts.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts
+        .open(&path)
+        .map_err(|e| BlinkError::config(format!("{}: {e}", path.display())))?;
+    // Blocks until acquired: the held regions are a read and a small write.
+    // `File::lock` is std's (stable since Rust 1.89), released on drop.
+    file.lock()
+        .map_err(|e| BlinkError::config(format!("{}: lock: {e}", path.display())))?;
+    Ok(file)
+}
+
+/// A read of the file that failed for a reason other than its absence,
+/// naming the file: "stream did not contain valid UTF-8" alone said
+/// nothing about where to look.
+fn read_error(path: &Path, e: std::io::Error) -> BlinkError {
+    BlinkError::config(format!("could not read {}: {e}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -192,13 +237,29 @@ fn legacy_host(host: &str, port: u16) -> String {
     format!("{host}:{port}")
 }
 
-/// Whether `file_host` (a known_hosts hostname field) refers to
-/// `(host, port)`. Accepts the canonical form and the legacy
-/// `host:port` form (case-insensitive).
-fn host_matches(file_host: &str, host: &str, port: u16) -> bool {
+/// Whether wildcard patterns in the file may match. Looking a host up
+/// takes them; removing one doesn't, so that forgetting `a.example.com`
+/// leaves `*.example.com` alone.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Patterns {
+    Match,
+    Literal,
+}
+
+/// Whether `file_host` (one name from a known_hosts host list) refers to
+/// `(host, port)`. Accepts the canonical form, a hashed name, a wildcard
+/// pattern (with [`Patterns::Match`]), and the legacy `host:port` form —
+/// all ignoring ASCII case.
+fn host_matches(file_host: &str, host: &str, port: u16, patterns: Patterns) -> bool {
     let canonical = canonical_host(host, port);
+    if let Some(hashed) = file_host.strip_prefix("|1|") {
+        return hashed_matches(hashed, &canonical);
+    }
     if file_host.eq_ignore_ascii_case(&canonical) {
         return true;
+    }
+    if file_host.contains(['*', '?']) {
+        return patterns == Patterns::Match && glob_matches(file_host, &canonical);
     }
     // Not for an IPv6 host: `::1:22` is legacy `::1` on port 22 and
     // canonical `::1:22` on port 22 alike, so reading it both ways would
@@ -210,6 +271,58 @@ fn host_matches(file_host: &str, host: &str, port: u16) -> bool {
     }
     let legacy = legacy_host(host, port);
     file_host.eq_ignore_ascii_case(&legacy)
+}
+
+/// Whether a hashed name's `salt|hash` (both base64) is `canonical`:
+/// OpenSSH's `HashKnownHosts` stores HMAC-SHA1(key = salt, the canonical
+/// lowercased name). Anything that doesn't decode matches nothing.
+fn hashed_matches(salt_and_hash: &str, canonical: &str) -> bool {
+    use base64::Engine as _;
+    use hmac::{Hmac, KeyInit, Mac};
+
+    let Some((salt, hash)) = salt_and_hash.split_once('|') else {
+        return false;
+    };
+    let b64 = base64::engine::general_purpose::STANDARD;
+    let (Ok(salt), Ok(hash)) = (b64.decode(salt), b64.decode(hash)) else {
+        return false;
+    };
+    let Ok(mut mac) = Hmac::<sha1::Sha1>::new_from_slice(&salt) else {
+        return false;
+    };
+    // Already lowercased: `canonical_host` folds case, as OpenSSH does
+    // before hashing.
+    mac.update(canonical.as_bytes());
+    // Constant-time, though nothing secret is compared: it costs nothing.
+    mac.verify_slice(&hash).is_ok()
+}
+
+/// Whether `text` fits `pattern`, where `*` stands for any run of
+/// characters (none included) and `?` for exactly one, ignoring ASCII case.
+/// OpenSSH's `match_pattern`.
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let t: Vec<char> = text.chars().map(|c| c.to_ascii_lowercase()).collect();
+    let (mut pi, mut ti) = (0, 0);
+    // Where the last `*` was, and how much of the text it had taken.
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if let Some((sp, st)) = star {
+            // Let the last `*` take one more character and try again.
+            pi = sp + 1;
+            ti = st + 1;
+            star = Some((sp, st + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
 }
 
 /// One non-comment line of a known_hosts file.
@@ -246,16 +359,16 @@ fn parse_line(line: &str) -> Option<Entry<'_>> {
 }
 
 /// Whether a comma-separated host list names `(host, port)`: some name
-/// matches it and no `!`-negated name does. Hashed (`|1|…`) names and
-/// wildcard patterns are never matched; see the module docs.
-fn hosts_match(hosts: &str, host: &str, port: u16) -> bool {
+/// matches it and no `!`-negated name does. See the module docs for the
+/// forms a name can take.
+fn hosts_match(hosts: &str, host: &str, port: u16, patterns: Patterns) -> bool {
     let mut matched = false;
     for name in hosts.split(',') {
         if let Some(negated) = name.strip_prefix('!') {
-            if host_matches(negated, host, port) {
+            if host_matches(negated, host, port, patterns) {
                 return false;
             }
-        } else if host_matches(name, host, port) {
+        } else if host_matches(name, host, port, patterns) {
             matched = true;
         }
     }
@@ -272,7 +385,7 @@ pub fn check(host: &str, port: u16, key_type: &str, key_b64: &str) -> Result<Key
     let raw = match read_bounded(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(KeyStatus::Unknown),
-        Err(e) => return Err(BlinkError::from(e)),
+        Err(e) => return Err(read_error(&path, e)),
     };
     Ok(check_in_str(&raw, host, port, key_type, key_b64))
 }
@@ -301,7 +414,7 @@ fn check_in_str(raw: &str, host: &str, port: u16, key_type: &str, key_b64: &str)
     // Other markers (`@cert-authority`) are not host keys: blink refuses
     // host certificates before it gets here.
     for e in entries.iter().filter(|e| e.marker.is_none()) {
-        if !hosts_match(e.hosts, host, port) {
+        if !hosts_match(e.hosts, host, port, Patterns::Match) {
             continue;
         }
         let stored = || KeyStatus::Changed {
@@ -343,7 +456,7 @@ fn stored_key_types_in_str(raw: &str, host: &str, port: u16) -> Vec<String> {
     let mut types: Vec<String> = Vec::new();
     for e in raw.lines().filter_map(parse_line) {
         if e.marker.is_none()
-            && hosts_match(e.hosts, host, port)
+            && hosts_match(e.hosts, host, port, Patterns::Match)
             && !types.iter().any(|t| t == e.key_type)
         {
             types.push(e.key_type.to_string());
@@ -352,13 +465,30 @@ fn stored_key_types_in_str(raw: &str, host: &str, port: u16) -> Vec<String> {
     types
 }
 
-/// Append a new entry to the known-hosts file.
+/// What [`append`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Saved {
+    /// The entry was written.
+    Added,
+    /// The file already trusts this key; nothing was written.
+    AlreadyTrusted,
+    /// The file now holds something else for this host — a different key,
+    /// saved by another blink while the user was deciding, or a revocation
+    /// of this one. Nothing was written: two keys for one host would both
+    /// be trusted from then on, and one of them is suspect.
+    Conflict(KeyStatus),
+}
+
+/// Append a new entry to the known-hosts file, in the canonical form
+/// (bare host for port 22, `[host]:port` otherwise).
 ///
-/// Creates the file if it does not exist. Takes an exclusive advisory lock
-/// across the check-then-write so two concurrent blink processes accepting
-/// the same host cannot interleave or duplicate the line. Writes the entry
-/// in the canonical `[host]:port` form (or bare host for port 22).
-pub fn append(host: &str, port: u16, key_type: &str, key_b64: &str) -> Result<()> {
+/// Creates the file if it does not exist. Holds the store's lock (see the
+/// module docs) across the check and the write, so two blinks accepting
+/// the same host can't both write, and the decision is made against the
+/// file as it is now rather than as it was when the prompt opened. The
+/// line goes in one write and is synced: written piecemeal, a crash could
+/// leave a key cut short, and that host would read as a changed key.
+pub fn append(host: &str, port: u16, key_type: &str, key_b64: &str) -> Result<Saved> {
     let stored_host = canonical_host(host, port);
 
     // Reject characters that would corrupt the whitespace-delimited format or
@@ -387,55 +517,57 @@ pub fn append(host: &str, port: u16, key_type: &str, key_b64: &str) -> Result<()
             "comma not allowed in known_hosts field 'host'",
         ));
     }
-
-    let path = known_hosts_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
+    // Written bare, a host starting with one of these reads back as a
+    // comment, a negation, a marker or a hashed name, and one holding a
+    // wildcard as a pattern for other hosts: never this host, so it would
+    // be asked about, and a dead line added, on every connect.
+    if host.starts_with(['#', '!', '@', '|']) || host.contains(['*', '?']) {
+        return Err(BlinkError::config(format!(
+            "host `{}` can't be stored in known_hosts",
+            error::sanitize(host.to_string())
+        )));
     }
 
-    // Open read+write, creating if missing (0600 on Unix, as
-    // `paths::atomic_write` creates every other file). We hold the same
-    // handle for the duration of the check + append so the advisory lock
-    // covers both.
+    let _lock = lock_store()?;
+    let path = known_hosts_path()?;
+    let raw = match read_bounded(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(read_error(&path, e)),
+    };
+    match check_in_str(&raw, host, port, key_type, key_b64) {
+        KeyStatus::Unknown => {}
+        KeyStatus::Trusted => return Ok(Saved::AlreadyTrusted),
+        other => return Ok(Saved::Conflict(other)),
+    }
+
+    // A file whose last line has no newline — hand-edited, say — would have
+    // this entry glued onto that line, changing its key blob: that host is
+    // then rejected as "key changed" and this one is never found. End the
+    // line first. An empty file needs nothing.
+    let mut line = String::new();
+    if !raw.is_empty() && !raw.ends_with('\n') {
+        line.push('\n');
+    }
+    line.push_str(&format!("{stored_host} {key_type} {key_b64}\n"));
+
+    // Created 0600 on Unix, as `paths::atomic_write` creates every other
+    // file.
     let mut opts = OpenOptions::new();
-    opts.create(true).read(true).append(true);
+    opts.create(true).append(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
     let mut file = opts.open(&path)?;
-
-    // Take an exclusive advisory lock to make the check-then-write sequence
-    // atomic with respect to other blink processes. Blocks until acquired —
-    // acceptable here because the held region is small. `File::lock` is std's
-    // (stable since Rust 1.89) and releases on drop, same flock semantics the
-    // fs4 crate provided before.
-    file.lock()
-        .map_err(|e| BlinkError::config(format!("known_hosts lock: {e}")))?;
-
-    let raw = read_bounded_from_handle(&mut file)?;
-    if matches!(
-        check_in_str(&raw, host, port, key_type, key_b64),
-        KeyStatus::Trusted
-    ) {
-        // Lock released on drop.
-        return Ok(());
+    file.write_all(line.as_bytes())?;
+    file.sync_data()?;
+    if raw.is_empty() {
+        // Possibly a new file: make its name durable too.
+        paths::sync_parent_dir(&path)?;
     }
-
-    // Ensure we write at the end even though `append(true)` should guarantee
-    // it; on some platforms the read above moved the cursor.
-    file.seek(SeekFrom::End(0))?;
-    // A file whose last line has no newline — hand-edited, say — would have
-    // this entry glued onto that line, changing its key blob: that host is
-    // then rejected as "key changed" and this one is never found. End the
-    // line first. An empty file needs nothing.
-    if !raw.is_empty() && !raw.ends_with('\n') {
-        writeln!(file)?;
-    }
-    writeln!(file, "{stored_host} {key_type} {key_b64}")?;
-    // Lock released on drop.
-    Ok(())
+    Ok(Saved::Added)
 }
 
 /// Remove every entry for `(host, port)` from the known-hosts file.
@@ -445,21 +577,25 @@ pub fn append(host: &str, port: u16, key_type: &str, key_b64: &str) -> Result<()
 /// named a different host form than the one that was stored (a bare host
 /// when the entry is `[host]:port`, or vice versa).
 ///
-/// Matching accepts the same forms as [`check`]: the canonical bare host for
-/// port 22, the bracketed `[host]:port`, and the legacy `host:port`.
+/// Matching accepts the same forms as [`check`] — the bare host for port
+/// 22, `[host]:port`, the legacy `host:port`, and hashed names — except
+/// wildcard patterns, which are left alone; see the module docs.
 pub fn remove_host(host: &str, port: u16) -> Result<usize> {
+    // Held across the read and the rewrite, so an `append` can't land in
+    // between and be lost when the rewritten file replaces this one.
+    let _lock = lock_store()?;
     let path = known_hosts_path()?;
 
     let raw = match read_bounded(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(BlinkError::from(e)),
+        Err(e) => return Err(read_error(&path, e)),
     };
 
     let (filtered, removed) = filter_out_host(&raw, host, port);
 
-    // Nothing to do — don't rewrite the file (and don't risk clobbering a
-    // concurrent append) just to produce identical content.
+    // Nothing to do — don't rewrite the file just to produce identical
+    // content.
     if removed == 0 {
         return Ok(0);
     }
@@ -467,12 +603,6 @@ pub fn remove_host(host: &str, port: u16) -> Result<usize> {
     // Atomic + durable write, as for every other file blink owns: a power
     // loss can't leave a zero-byte known_hosts, which would silently
     // downgrade every stored host to "unknown". See `paths::atomic_write`.
-    //
-    // Note this does NOT take the advisory lock `append` uses: that lock
-    // lives on the original inode, and renaming a replacement over it can't
-    // be serialised against it that way. A concurrent accept-and-save racing
-    // this removal can therefore be lost — the consequence is one re-prompt
-    // on the next connect, not a wrong trust decision.
     paths::atomic_write(&path, |f| f.write_all(filtered.as_bytes()))?;
     Ok(removed)
 }
@@ -488,26 +618,33 @@ pub fn remove_host(host: &str, port: u16) -> Result<usize> {
 /// different host or a different port are left alone — removing a key must
 /// not disturb neighbouring entries. A line listing other names as well
 /// keeps them and loses only the ones naming this host. Marker lines are
-/// never touched: forgetting a host must not un-revoke a key.
+/// never touched: forgetting a host must not un-revoke a key. Nor are
+/// wildcard patterns ([`Patterns::Literal`]). Each line keeps its own
+/// ending, so a CRLF file stays CRLF.
 fn filter_out_host(raw: &str, host: &str, port: u16) -> (String, usize) {
     let mut changed = 0usize;
     let mut out = String::with_capacity(raw.len());
-    for line in raw.lines() {
+    for segment in raw.split_inclusive('\n') {
+        let (line, ending) = if let Some(l) = segment.strip_suffix("\r\n") {
+            (l, "\r\n")
+        } else if let Some(l) = segment.strip_suffix('\n') {
+            (l, "\n")
+        } else {
+            (segment, "")
+        };
         let Some(e) = parse_line(line).filter(|e| e.marker.is_none()) else {
-            out.push_str(line);
-            out.push('\n');
+            out.push_str(segment);
             continue;
         };
-        if !hosts_match(e.hosts, host, port) {
-            out.push_str(line);
-            out.push('\n');
+        if !hosts_match(e.hosts, host, port, Patterns::Literal) {
+            out.push_str(segment);
             continue;
         }
         changed += 1;
         let kept: Vec<&str> = e
             .hosts
             .split(',')
-            .filter(|n| !host_matches(n, host, port))
+            .filter(|n| !host_matches(n, host, port, Patterns::Literal))
             .collect();
         // Nothing left but negations (or nothing at all) names no host.
         if kept.iter().all(|n| n.starts_with('!')) {
@@ -517,39 +654,28 @@ fn filter_out_host(raw: &str, host: &str, port: u16) -> (String, usize) {
         out.push_str(&kept.join(","));
         out.push(' ');
         out.push_str(rest);
-        out.push('\n');
+        out.push_str(ending);
     }
     (out, changed)
 }
 
 /// Open `path` and read at most `MAX_KNOWN_HOSTS_BYTES` into a `String`.
+///
+/// Bytes that aren't UTF-8 become U+FFFD rather than failing the read: one
+/// Latin-1 byte in a comment refused every SSH connection. That's safe,
+/// because host names and keys are ASCII, so a line with a bad byte in
+/// them simply never matches.
 fn read_bounded(path: &Path) -> std::io::Result<String> {
     let file = std::fs::File::open(path)?;
-    let mut raw = String::new();
-    file.take(MAX_KNOWN_HOSTS_BYTES + 1)
-        .read_to_string(&mut raw)?;
+    let mut raw = Vec::new();
+    file.take(MAX_KNOWN_HOSTS_BYTES + 1).read_to_end(&mut raw)?;
     if raw.len() as u64 > MAX_KNOWN_HOSTS_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("known_hosts file exceeds size limit ({MAX_KNOWN_HOSTS_BYTES} bytes)"),
         ));
     }
-    Ok(raw)
-}
-
-/// Like `read_bounded`, but reads from an already-open file (used while the
-/// advisory lock is held).
-fn read_bounded_from_handle(file: &mut std::fs::File) -> Result<String> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut raw = String::new();
-    file.take(MAX_KNOWN_HOSTS_BYTES + 1)
-        .read_to_string(&mut raw)?;
-    if raw.len() as u64 > MAX_KNOWN_HOSTS_BYTES {
-        return Err(BlinkError::config(format!(
-            "known_hosts file exceeds size limit ({MAX_KNOWN_HOSTS_BYTES} bytes)"
-        )));
-    }
-    Ok(raw)
+    Ok(String::from_utf8_lossy(&raw).into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -759,11 +885,12 @@ mod tests {
 
         remove_host("a.example", 22).unwrap();
 
-        let names: Vec<_> = fs::read_dir(path.parent().unwrap())
+        let mut names: Vec<_> = fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(names, ["known_hosts"]);
+        names.sort();
+        assert_eq!(names, ["known_hosts", "known_hosts.lock"]);
     }
 
     #[test]
@@ -1249,4 +1376,239 @@ mod tests {
             KeyStatus::Unknown,
         );
     }
+
+    // -- hashed names ---------------------------------------------------------
+
+    /// Written by OpenSSH's own `ssh-keygen -H` from
+    /// `a.example ssh-ed25519 {ED_KEY}` and `[b.example]:2222 …`.
+    const HASHED_A: &str = "|1|/vFRHUfW7wbP7gG4mC1gqEqH2io=|HJWwpCf91ODgEV7dMem2j/RtbcM=";
+    const HASHED_B_2222: &str = "|1|avZEsNwhTxngzGxBsmVcRUNXiqw=|lZfCM6NBzwTKbyRaamb+QyOp21I=";
+
+    /// A file from `HashKnownHosts=yes` (Debian and Ubuntu's default)
+    /// matched nothing, so every host in it was asked about as new — and a
+    /// man in the middle got the "accept?" prompt instead of a refusal.
+    #[test]
+    fn hashed_names_from_openssh_match() {
+        let raw =
+            format!("{HASHED_A} ssh-ed25519 {ED_KEY}\n{HASHED_B_2222} ssh-ed25519 {ED_KEY}\n");
+        let check = |h, p, k| check_in_str(&raw, h, p, "ssh-ed25519", k);
+        assert_eq!(check("a.example", 22, ED_KEY), KeyStatus::Trusted);
+        assert_eq!(check("A.Example", 22, ED_KEY), KeyStatus::Trusted);
+        assert_eq!(check("b.example", 2222, ED_KEY), KeyStatus::Trusted);
+        assert!(matches!(
+            check("a.example", 22, ED_KEY_2),
+            KeyStatus::Changed { .. }
+        ));
+        assert_eq!(check("b.example", 22, ED_KEY), KeyStatus::Unknown);
+        assert_eq!(check("c.example", 22, ED_KEY), KeyStatus::Unknown);
+    }
+
+    #[test]
+    fn a_malformed_hashed_name_matches_nothing() {
+        for name in [
+            "|1|",
+            "|1|nobar",
+            "|1|!!!|???",
+            "|2|/vFRHUfW7wbP7gG4mC1gqEqH2io=|x=",
+        ] {
+            let raw = format!("{name} ssh-ed25519 {ED_KEY}\n");
+            assert_eq!(
+                check_in_str(&raw, "a.example", 22, "ssh-ed25519", ED_KEY),
+                KeyStatus::Unknown,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn removing_a_host_takes_out_its_hashed_names() {
+        let raw = format!("{HASHED_A} ssh-ed25519 {ED_KEY}\nother ssh-ed25519 {ED_KEY}\n");
+        let (out, n) = filter_out_host(&raw, "a.example", 22);
+        assert_eq!(n, 1);
+        assert_eq!(out, format!("other ssh-ed25519 {ED_KEY}\n"));
+    }
+
+    // -- wildcard patterns ----------------------------------------------------
+
+    #[test]
+    fn glob_matching() {
+        for (p, t) in [
+            ("*", ""),
+            ("*", "anything"),
+            ("a*", "a"),
+            ("*.example.com", "a.example.com"),
+            ("*.EXAMPLE.com", "a.b.example.com"),
+            ("a*b*c", "axxbyyc"),
+            ("a*b*c", "abcbc"),
+            ("h?st", "host"),
+            ("[*.ex]:2222", "[a.ex]:2222"),
+        ] {
+            assert!(glob_matches(p, t), "{p} {t}");
+        }
+        for (p, t) in [
+            ("*.example.com", "example.com"),
+            ("h?st", "hst"),
+            ("a*b", "ac"),
+            ("a*b*c", "axxbyy"),
+            ("[*.ex]:2222", "[a.ex]:22"),
+        ] {
+            assert!(!glob_matches(p, t), "{p} {t}");
+        }
+    }
+
+    #[test]
+    fn wildcard_patterns_vouch_for_the_hosts_they_name() {
+        let raw = format!(
+            "*.example.com,!bad.example.com ssh-ed25519 {ED_KEY}\n\
+             [*.other]:2222 ssh-ed25519 {ED_KEY}\n"
+        );
+        let check = |h, p, k| check_in_str(&raw, h, p, "ssh-ed25519", k);
+        assert_eq!(check("a.example.com", 22, ED_KEY), KeyStatus::Trusted);
+        assert!(matches!(
+            check("a.example.com", 22, ED_KEY_2),
+            KeyStatus::Changed { .. }
+        ));
+        assert_eq!(check("bad.example.com", 22, ED_KEY), KeyStatus::Unknown);
+        assert_eq!(check("example.com", 22, ED_KEY), KeyStatus::Unknown);
+        assert_eq!(check("x.other", 2222, ED_KEY), KeyStatus::Trusted);
+        assert_eq!(check("x.other", 22, ED_KEY), KeyStatus::Unknown);
+        assert_eq!(
+            stored_key_types_in_str(&raw, "z.example.com", 22),
+            ["ssh-ed25519"]
+        );
+    }
+
+    /// Forgetting one host must not forget every host a pattern covers.
+    #[test]
+    fn removing_a_host_leaves_patterns_alone() {
+        let raw = format!("*.example.com ssh-ed25519 {ED_KEY}\n");
+        let (out, n) = filter_out_host(&raw, "a.example.com", 22);
+        assert_eq!((out.as_str(), n), (raw.as_str(), 0));
+    }
+
+    // -- reading ------------------------------------------------------------
+
+    /// One Latin-1 byte in a comment failed the whole read, and with it
+    /// every SSH connection.
+    #[test]
+    fn a_file_that_isnt_utf8_is_still_read() {
+        let _home = crate::paths::test_home();
+        let mut bytes = b"# caf\xe9 server\n".to_vec();
+        bytes.extend_from_slice(format!("a.example ssh-ed25519 {ED_KEY}\n").as_bytes());
+        fs::write(known_hosts_path().unwrap(), bytes).unwrap();
+
+        assert_eq!(
+            check("a.example", 22, "ssh-ed25519", ED_KEY).unwrap(),
+            KeyStatus::Trusted
+        );
+    }
+
+    #[test]
+    fn a_read_error_names_the_file() {
+        let _home = crate::paths::test_home();
+        let path = known_hosts_path().unwrap();
+        fs::create_dir(&path).unwrap();
+
+        let e = check("a.example", 22, "ssh-ed25519", ED_KEY)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains(&path.display().to_string()), "{e}");
+    }
+
+    /// Removing rewrote every line ending as `\n`.
+    #[test]
+    fn removing_a_host_keeps_crlf_line_endings() {
+        let raw = format!(
+            "# kept\r\na.example ssh-ed25519 {ED_KEY}\r\nb.example,a.example ssh-rsa {RSA_KEY}\r\nlast ssh-rsa {RSA_KEY}"
+        );
+        let (out, n) = filter_out_host(&raw, "a.example", 22);
+        assert_eq!(n, 2);
+        assert_eq!(
+            out,
+            format!("# kept\r\nb.example ssh-rsa {RSA_KEY}\r\nlast ssh-rsa {RSA_KEY}")
+        );
+    }
+
+    // -- appending ----------------------------------------------------------
+
+    /// The prompt can be open for minutes. If another blink saved a
+    /// different key meanwhile, writing this one too left both trusted.
+    #[test]
+    fn append_refuses_when_the_host_has_another_key_by_now() {
+        let _home = crate::paths::test_home();
+        let path = write_known_hosts(&format!("a.example ssh-ed25519 {ED_KEY_2}\n"));
+
+        let saved = append("a.example", 22, "ssh-ed25519", ED_KEY).unwrap();
+
+        assert!(matches!(saved, Saved::Conflict(KeyStatus::Changed { .. })));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("a.example ssh-ed25519 {ED_KEY_2}\n"),
+            "nothing written"
+        );
+    }
+
+    #[test]
+    fn append_refuses_a_revoked_key_and_skips_a_trusted_one() {
+        let _home = crate::paths::test_home();
+        write_known_hosts(&format!(
+            "@revoked * ssh-rsa {RSA_KEY}\na.example ssh-ed25519 {ED_KEY}\n"
+        ));
+        assert_eq!(
+            append("b.example", 22, "ssh-rsa", RSA_KEY).unwrap(),
+            Saved::Conflict(KeyStatus::Revoked)
+        );
+        assert_eq!(
+            append("a.example", 22, "ssh-ed25519", ED_KEY).unwrap(),
+            Saved::AlreadyTrusted
+        );
+        assert_eq!(
+            append("c.example", 22, "ssh-ed25519", ED_KEY).unwrap(),
+            Saved::Added
+        );
+    }
+
+    /// Stored bare, these read back as a comment, a negation, a marker, a
+    /// hashed name or a pattern: never as this host.
+    #[test]
+    fn append_refuses_hosts_the_format_cant_hold() {
+        let _home = crate::paths::test_home();
+        for host in ["#h", "!h", "@h", "|1|h", "a*b", "a?b"] {
+            assert!(append(host, 22, "ssh-ed25519", ED_KEY).is_err(), "{host}");
+        }
+        assert!(!known_hosts_path().unwrap().exists());
+    }
+
+    // -- session trust --------------------------------------------------------
+
+    #[test]
+    fn session_trust_sanitizes_what_it_reports_as_changed() {
+        let trust = SessionTrust::new();
+        trust.trust("h", 22, "evil\x1b[2J", ED_KEY);
+        match trust.check("h", 22, "ssh-ed25519", ED_KEY_2) {
+            KeyStatus::Changed {
+                stored_key_type, ..
+            } => assert!(!stored_key_type.contains('\x1b'), "{stored_key_type:?}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Removing replaces the file, so an append locking `known_hosts`
+    /// itself could write into the replaced file and be lost. Both now hold
+    /// `known_hosts.lock`; with it unobtainable, neither changes anything.
+    #[test]
+    fn changes_go_through_the_store_lock() {
+        let _home = crate::paths::test_home();
+        let path = write_known_hosts(&format!("a.example ssh-ed25519 {ED_KEY}\n"));
+        fs::create_dir(path.with_file_name("known_hosts.lock")).unwrap();
+
+        let e = remove_host("a.example", 22).unwrap_err().to_string();
+        assert!(e.contains("known_hosts.lock"), "{e}");
+        assert!(append("b.example", 22, "ssh-ed25519", ED_KEY).is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            format!("a.example ssh-ed25519 {ED_KEY}\n")
+        );
+    }
 }
+

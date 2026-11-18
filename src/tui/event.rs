@@ -224,6 +224,18 @@ pub enum AppEvent {
         host: String,
     },
 
+    /// Something went wrong with the known_hosts file itself while checking
+    /// or saving a host key. Carried to the TUI because the alternative,
+    /// the debug log, is a sink unless `BLINK_LOG_FILE` is set: a file that
+    /// couldn't be read refused every connection with no reason given.
+    HostKeyStoreProblem {
+        /// What happened, ready for the log (sanitized).
+        message: String,
+        /// Whether the connection was refused because of it; otherwise it
+        /// went ahead and this is a warning.
+        refused: bool,
+    },
+
     /// The server presented a key a `@revoked` line in known_hosts names —
     /// hard reject. Carries the reason so the TUI shows it instead of a
     /// generic connect failure.

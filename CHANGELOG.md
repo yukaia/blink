@@ -10,6 +10,13 @@ the git history for those.
 
 ### Added
 
+- **known_hosts reads hashed names and wildcard patterns**, so an
+  OpenSSH `known_hosts` copied in works: `|1|salt|hash` names from
+  `HashKnownHosts=yes` (Debian and Ubuntu's default), and patterns such
+  as `*.example.com`. Before, they matched nothing, so every such host was
+  asked about as new, and a man in the middle got the "accept?" prompt
+  rather than a refusal. `known-hosts remove` takes out hashed names but
+  never a pattern.
 - **Ctrl+C quits**, from any screen, through the usual quit prompt; a
   second Ctrl+C on the prompt quits at once.
 - **The log scrolls.** Focus it and use the arrows or page keys, or the
@@ -63,6 +70,13 @@ the git history for those.
 
 ### Security
 
+- **"Accept and save" no longer trusts two keys for one host.** If
+  another blink saved a different key for the host while the prompt was
+  open, both were kept and both trusted. The connection is now refused,
+  and the log says why.
+- **A saved host key can't be left half-written.** The entry was written
+  in pieces and not synced, so a crash could leave a key cut short, and
+  that host then read as a changed key.
 - **`blink themes` can't print a raw escape sequence.** A theme file
   named with one was listed as is, so its name could drive the terminal.
   Theme names with control characters are now refused, and the listing is
@@ -122,6 +136,19 @@ the git history for those.
 
 ### Fixed
 
+- **An unreadable known_hosts says why it refused the connection.** Only
+  the debug log knew, so every SSH connect just failed. One non-UTF-8 byte
+  (a Latin-1 comment) was enough; such a file is now read anyway.
+- **A host key that couldn't be saved is reported, and not asked about
+  again** by each transfer worker mid-transfer: it's trusted for the
+  session, as you chose.
+- **`known-hosts remove` can't lose a key being saved at the same time.**
+  Both now hold `known_hosts.lock`; the lock on `known_hosts` itself
+  guarded nothing once the file was replaced.
+- **`known-hosts remove` keeps CRLF line endings.**
+- **Hosts the file can't hold are refused when saving**: a name starting
+  with `#`, `!`, `@` or `|`, or holding `*` or `?`, read back as something
+  else and was asked about on every connect.
 - **Errors read as sentences**: `error: session not found: x`, not
   `Error: SessionNotFound("x")`.
 - **Logging problems are reported where you'll see them.** An unusable

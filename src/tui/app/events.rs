@@ -686,6 +686,14 @@ impl App {
                     ),
                 );
             }
+            AppEvent::HostKeyStoreProblem { message, refused } => {
+                let level = if refused {
+                    LogLevel::Error
+                } else {
+                    LogLevel::Warn
+                };
+                self.push_log(level, message);
+            }
             AppEvent::HostKeyRevoked {
                 host,
                 key_type,
