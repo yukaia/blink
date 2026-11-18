@@ -78,6 +78,31 @@ the git history for those.
 
 ### Fixed
 
+- **Starting a batch no longer wipes out one waiting to be resumed.**
+  After pressing esc at the resume offer, or after restarting blink, the
+  first new batch in that direction replaced the interrupted batch's
+  checkpoint. That batch could no longer be resumed, and its partial
+  downloads were left behind with nothing pointing to them.
+- **Renaming a session takes its checkpoints along.** Saving a connected
+  session under a new name with ctrl+s, or renaming it in the edit form,
+  left its checkpoints under the old name. `r` then found nothing to
+  resume, and `blink checkpoints --clean` could delete them as orphaned.
+- **Cancelling one transfer with `c` is final**, as cancelling a batch
+  with `C` already was. The cancelled file used to come back in the next
+  resume offer and on `r`.
+- **Saving with ctrl+s no longer stores a certificate you trusted for
+  one connection only.**
+- **`blink checkpoints --clean` keeps the checkpoints of ad-hoc
+  connections.** It deleted them, with their partial downloads, as
+  orphaned, though connecting with the same `blink connect` URL would
+  have offered to resume them. `--force` still removes them.
+- **`blink checkpoints --force` removes every checkpoint file**, including
+  ones it can't read and the temporary files an interrupted write leaves.
+- **Listing checkpoints no longer rewrites old ones.** A plain `blink
+  checkpoints` upgraded any version-1 file it listed.
+- **`blink connect` refuses port 0, and an empty port means the
+  default**, as in a session file. Port 0 connected nowhere, and the offer
+  to save the session then failed.
 - **Help no longer traps you in a prompt.** Opening help over the cancel
   prompt, then closing it, left that prompt answering every key by
   reopening itself. Help over the quit prompt did the same, leaving quit

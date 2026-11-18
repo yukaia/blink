@@ -797,8 +797,8 @@ impl App {
                 // file (the `Started` write already flipped them from
                 // `pending`). On resume they will be re-queued, which is
                 // safe: partial downloads are overwritten, mkdir is
-                // idempotent. If the batch was explicitly discarded via
-                // batch-cancel, `active_checkpoint` is already None.
+                // idempotent. A job the user cancelled had its entry marked
+                // cancelled, and its map entry removed, by the cancel itself.
                 //
                 // Force-flush here so the most recent batch of Done marks
                 // hits disk: the user is likely to react to the failure by

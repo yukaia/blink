@@ -709,9 +709,7 @@ impl Session {
             let port = if after.is_empty() {
                 protocol.default_port()
             } else if let Some(port_str) = after.strip_prefix(':') {
-                port_str
-                    .parse::<u16>()
-                    .map_err(|_| BlinkError::config(format!("bad port: {port_str}")))?
+                url_port(port_str, &protocol)?
             } else {
                 return Err(BlinkError::config(format!(
                     "unexpected text after ']': {after}"
@@ -728,10 +726,7 @@ impl Session {
                             "bare IPv6 addresses are not valid in URLs — use [::1]:port notation",
                         ));
                     }
-                    let parsed = p
-                        .parse::<u16>()
-                        .map_err(|_| BlinkError::config(format!("bad port: {p}")))?;
-                    (h.to_string(), parsed)
+                    (h.to_string(), url_port(p, &protocol)?)
                 }
                 None => (hostport.to_string(), protocol.default_port()),
             }
@@ -768,6 +763,19 @@ impl Session {
             cert_sha256: None,
         })
     }
+}
+
+/// The port in a URL, read as a session file reads `port`: empty is the
+/// protocol's default, and 0 is refused, since nothing listens there and a
+/// session holding it can't be saved.
+fn url_port(raw: &str, protocol: &Protocol) -> Result<u16> {
+    if raw.is_empty() {
+        return Ok(protocol.default_port());
+    }
+    raw.parse::<u16>()
+        .ok()
+        .filter(|p| *p != 0)
+        .ok_or_else(|| BlinkError::config(format!("bad port: {raw}")))
 }
 
 /// Decode `%xx` percent-escapes in a URL component into a UTF-8 string.
@@ -930,6 +938,24 @@ mod tests {
     fn ftps_default_port_is_not_implicit() {
         assert_eq!(Protocol::Ftps.default_port(), 21);
         assert_ne!(Protocol::Ftps.default_port(), 990);
+    }
+
+    /// Port 0 is refused here as a session file refuses it; connecting
+    /// there would fail, and the save offer then refused the session.
+    #[test]
+    fn from_url_refuses_port_zero() {
+        for url in ["sftp://host:0", "sftp://[::1]:0"] {
+            let err = Session::from_url(url).unwrap_err();
+            assert!(err.to_string().contains("bad port"), "{url}: {err}");
+        }
+    }
+
+    /// An empty port is the protocol's default, as in a session file.
+    #[test]
+    fn from_url_empty_port_is_the_default() {
+        for url in ["sftp://host:", "sftp://[::1]:"] {
+            assert_eq!(Session::from_url(url).unwrap().port, 22, "{url}");
+        }
     }
 
     #[test]

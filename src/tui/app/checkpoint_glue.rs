@@ -3,14 +3,16 @@
 //!
 //! These methods own the checkpoint state on `App`:
 //!
-//! - [`App::dispatch_plan`] takes a finalised `Vec<PlannedJob>`, writes a
-//!   fresh checkpoint to disk *before* enqueuing anything, then hands
+//! - [`App::dispatch_plan`] takes a finalised `Vec<PlannedJob>`, appends
+//!   it to the direction's checkpoint (the one in memory, or else the one
+//!   on disk) and writes that *before* enqueuing anything, then hands
 //!   jobs to the dispatcher and records the `job_id → cp_idx` mapping
 //!   so the per-job event handler in `events.rs` knows which plan
 //!   entry each dispatcher event refers to.
 //! - [`App::resume_walk`] loads a previously persisted checkpoint, drops
-//!   the done entries, and re-queues the remainder through
-//!   `dispatch_plan`.
+//!   the done and cancelled entries, and re-queues the remainder through
+//!   `dispatch_plan` under a fresh record.
+//! - [`App::move_checkpoints`] follows the session to a new name.
 //! - [`App::cancel_batch_in_checkpoint`] marks a cancelled batch's entries
 //!   and hands off to [`App::settle_checkpoint`], which drops the
 //!   checkpoint once nothing resumable is left, or flushes it otherwise.
@@ -42,13 +44,13 @@ pub(super) enum CheckpointFlush {
 }
 
 impl App {
-    /// Tear down the active checkpoint: remove the in-memory state and
-    /// delete the file on disk.
+    /// Mark the entries of cancelled jobs `job_ids` cancelled, so they are
+    /// never offered or resumed again, then settle each checkpoint touched:
+    /// it is removed if nothing resumable is left, and written otherwise.
     ///
-    /// Called when a whole batch is cancelled (user pressed `C` and
-    /// confirmed) or when a transfer fails in a way that makes the batch
-    /// unresumable. Soft-failures (e.g. the file was already removed) are
-    /// logged at `warn` and do not abort other work.
+    /// Called when the user confirms a cancel, of a whole batch (`C`) or of
+    /// one job (`c`). Failing to write or remove the file is logged and
+    /// does not abort other work.
     pub(super) fn cancel_batch_in_checkpoint(&mut self, job_ids: &[u64]) {
         // Mark just this batch's entries, then drop the checkpoint only if
         // nothing resumable is left. Removing the whole file — which is what
@@ -614,8 +616,8 @@ impl App {
     /// Dispatch a *resumed* plan: load the checkpoint for `kind`, skip jobs
     /// already marked done, and enqueue only the remaining ones.
     ///
-    /// Called from the `r` keybinding in the Transfers pane (or `--resume`
-    /// at startup). Logs a message if there is nothing to resume.
+    /// Called from `r` / `R` in the Transfers pane, and from the resume
+    /// offer after connecting. Logs a message if there is nothing to resume.
     pub fn resume_walk(&mut self, ck_kind: CheckpointKind) {
         let (session_name, origin) = self.checkpoint_key();
 
