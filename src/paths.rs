@@ -1,9 +1,15 @@
-//! Platform-specific paths for config, sessions, and themes.
+//! Platform-specific paths for everything blink keeps: `config.ini`,
+//! `known_hosts`, and the `sessions/`, `themes/` and `checkpoints/` folders.
 //!
-//! - Linux: `~/.config/blink/` (or `$XDG_CONFIG_HOME/blink/` if set)
+//! - Linux and other Unix (the BSDs): `~/.config/blink/` (or
+//!   `$XDG_CONFIG_HOME/blink/` if set)
 //! - macOS: `~/Library/Application Support/blink/` (or
 //!   `$XDG_CONFIG_HOME/blink/` if set)
 //! - Windows: `%APPDATA%\blink\`
+//!
+//! The location must resolve to an absolute path; anything else is an
+//! error rather than a guess. On Unix the folders are kept `0700` and the
+//! files blink writes `0600`.
 
 use std::path::{Path, PathBuf};
 use std::{env, fs};
@@ -237,7 +243,12 @@ mod test_home {
 /// A relative config home is refused rather than resolved against the
 /// current directory: where the config lands would then depend on where
 /// blink happened to be started from.
-#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+///
+/// For `XDG_CONFIG_HOME` this departs from the XDG spec on purpose: the
+/// spec says to ignore a relative value, but ignoring it would put the
+/// config somewhere other than where the user asked, silently. An error
+/// says what's wrong.
+#[cfg(any(unix, target_os = "windows"))]
 fn require_absolute(value: &str, var: &str) -> Result<PathBuf> {
     let path = PathBuf::from(value);
     if !path.is_absolute() {
@@ -254,7 +265,9 @@ fn require_absolute(value: &str, var: &str) -> Result<PathBuf> {
 ///
 /// An empty `XDG_CONFIG_HOME` counts as unset, matching the XDG spec and
 /// what every other XDG-aware tool does with it.
-#[cfg(target_os = "linux")]
+///
+/// Used on every Unix but macOS: the BSDs follow the same XDG layout.
+#[cfg(all(unix, not(target_os = "macos")))]
 fn base_dir_from(xdg: Option<&str>, home: Option<&str>) -> Result<PathBuf> {
     if let Some(xdg) = xdg.filter(|v| !v.is_empty()) {
         return Ok(require_absolute(xdg, "XDG_CONFIG_HOME")?.join(APP_DIR_NAME));
@@ -265,7 +278,7 @@ fn base_dir_from(xdg: Option<&str>, home: Option<&str>) -> Result<PathBuf> {
         .join(APP_DIR_NAME))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(unix, not(target_os = "macos")))]
 #[cfg_attr(test, allow(dead_code))]
 fn real_base_dir() -> Result<PathBuf> {
     let xdg = env::var("XDG_CONFIG_HOME").ok();
@@ -314,27 +327,56 @@ fn real_base_dir() -> Result<PathBuf> {
     base_dir_from(app_data.as_deref())
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+/// Anywhere else there is no known place for a config, and guessing one
+/// (the current directory, say) would scatter it by where blink was run.
+#[cfg(not(any(unix, target_os = "windows")))]
 #[cfg_attr(test, allow(dead_code))]
 fn real_base_dir() -> Result<PathBuf> {
-    if let Some(proj) = directories::ProjectDirs::from("", "", APP_DIR_NAME) {
-        return Ok(proj.config_dir().to_path_buf());
+    Err(BlinkError::config(
+        "no config directory is known for this platform",
+    ))
+}
+
+/// Things worth telling the user that happened before there was a log to
+/// tell them in — a config folder made private, say. Drained by
+/// [`take_notices`] once the TUI is up.
+static NOTICES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg_attr(not(unix), allow(dead_code))]
+fn notice(msg: String) {
+    if let Ok(mut n) = NOTICES.lock() {
+        n.push(msg);
     }
-    Ok(env::current_dir()?.join(APP_DIR_NAME))
+}
+
+/// Everything [`notice`]d so far, oldest first; clears the list.
+pub fn take_notices() -> Vec<String> {
+    NOTICES
+        .lock()
+        .map(|mut n| std::mem::take(&mut *n))
+        .unwrap_or_default()
 }
 
 /// Create `path` as an application-owned directory with restricted permissions.
 ///
 /// On Unix the directory is created with mode 0700 (owner read/write/execute
 /// only) so that session configs, known_hosts, and checkpoint files are not
-/// world-readable. Parent directories are created with default permissions
-/// (they may already exist and be shared with other applications).
+/// readable by other users. Parent directories are created with default
+/// permissions (they may already exist and be shared with other
+/// applications).
+///
+/// A directory that already exists but is open to others — made by hand, by
+/// a dotfiles sync, restored from a backup — is tightened to 0700 and the
+/// change noted for the log. If that fails (it isn't ours to change), that
+/// is noted instead. Something at `path` that isn't a directory is an error
+/// here, rather than a confusing "Not a directory" from whatever opens a
+/// file inside it later.
 ///
 /// On non-Unix platforms `fs::create_dir_all` is used unchanged.
 fn create_app_dir(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::DirBuilderExt;
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
         // Create any missing parents with default permissions — they may be
         // shared paths like ~/.config that other apps rely on.
@@ -342,12 +384,34 @@ fn create_app_dir(path: &Path) -> Result<()> {
             fs::create_dir_all(parent)?;
         }
 
-        // Create the target directory itself with 0700. Ignore AlreadyExists
-        // so this is idempotent on repeated calls.
         match fs::DirBuilder::new().mode(0o700).create(path) {
-            Ok(()) => {}
+            Ok(()) => return Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(BlinkError::from(e)),
+        }
+
+        // Already there. Follows a symlink: the user may keep the folder
+        // elsewhere, and only they can write its parent.
+        let meta = fs::metadata(path)?;
+        if !meta.is_dir() {
+            return Err(BlinkError::config(format!(
+                "{} exists but is not a directory",
+                path.display()
+            )));
+        }
+        let mode = meta.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            match fs::set_permissions(path, fs::Permissions::from_mode(0o700)) {
+                Ok(()) => notice(format!(
+                    "{} was readable by other users (mode {mode:o}); made it private (700)",
+                    path.display()
+                )),
+                Err(e) => notice(format!(
+                    "{} is readable by other users (mode {mode:o}) and could not be \
+                     made private: {e}",
+                    path.display()
+                )),
+            }
         }
         Ok(())
     }
@@ -355,6 +419,12 @@ fn create_app_dir(path: &Path) -> Result<()> {
     #[cfg(not(unix))]
     {
         fs::create_dir_all(path)?;
+        if !path.is_dir() {
+            return Err(BlinkError::config(format!(
+                "{} exists but is not a directory",
+                path.display()
+            )));
+        }
         Ok(())
     }
 }
@@ -395,7 +465,7 @@ pub fn sync_parent_dir(path: &Path) -> Result<()> {
 pub const MAX_FILE_NAME_BYTES: usize = 255;
 
 /// A file name for a user-chosen `name`: `{stem}-{hash8}{suffix}`, where
-/// `hash8` is the first four bytes of `hash` in hex.
+/// `hash8` is the first four bytes of `hash` (a SHA-256 digest) in hex.
 ///
 /// The stem is `name` with path separators and shell-special characters
 /// mapped to `_`, plus control characters when `windows_rules` is set
@@ -404,7 +474,7 @@ pub const MAX_FILE_NAME_BYTES: usize = 255;
 /// [`MAX_FILE_NAME_BYTES`]. A longer name could never have been written, so
 /// cutting moves no existing file, and `hash`, taken over the full name,
 /// keeps cut names (and names that map to the same stem) apart.
-pub fn hashed_file_name(name: &str, hash: &[u8], suffix: &str, windows_rules: bool) -> String {
+pub fn hashed_file_name(name: &str, hash: &[u8; 32], suffix: &str, windows_rules: bool) -> String {
     use std::fmt::Write as _;
 
     let mut tail = String::from("-");
@@ -440,59 +510,146 @@ pub fn hashed_file_name(name: &str, hash: &[u8], suffix: &str, windows_rules: bo
 /// rename a mix of both into place. Create-new also means whatever already
 /// sits at the name, a link included, is never written through. On failure
 /// the temp file is removed, and `path` is left as it was.
+///
+/// On Unix the file is created `0600`. It used to take the umask's default
+/// (typically `0644`), private only for as long as its folder was — and
+/// since every save is a new file, a `chmod 600` lasted until the next one.
 pub fn atomic_write(
     path: &Path,
     write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
 ) -> Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
-
-    // The temp name is `.{name}.{pid}.{n}.tmp`, with `name` cut so the whole
-    // stays within MAX_FILE_NAME_BYTES: a `path` whose own name is near the
-    // limit is still writable. The pid and counter keep cut names unique.
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tail = format!(
-        ".{}.{}.tmp",
+    let tmp = temp_path(
+        path,
         std::process::id(),
-        NEXT.fetch_add(1, Ordering::Relaxed)
+        NEXT.fetch_add(1, Ordering::Relaxed),
     );
+    atomic_write_via(path, &tmp, write, sync_parent_dir)
+}
+
+/// The temp name for one [`atomic_write`] of `path`: `.{name}.{pid}.{n}.tmp`,
+/// with `name` cut so the whole stays within [`MAX_FILE_NAME_BYTES`] — a
+/// `path` whose own name is near the limit is still writable. The pid and
+/// counter keep cut names unique.
+fn temp_path(path: &Path, pid: u32, n: u64) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tail = format!(".{pid}.{n}.tmp");
     let budget = MAX_FILE_NAME_BYTES - 1 - tail.len();
     let mut cut = name.len().min(budget);
     while !name.is_char_boundary(cut) {
         cut -= 1;
     }
-    let tmp = path.with_file_name(format!(".{}{tail}", &name[..cut]));
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)?;
+    path.with_file_name(format!(".{}{tail}", &name[..cut]))
+}
+
+/// Whether `name` is a temp file [`atomic_write`] would make:
+/// `.{name}.{pid}.{n}.tmp`.
+pub fn is_temp_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.').and_then(|n| n.strip_suffix(".tmp")) else {
+        return false;
+    };
+    let mut parts = rest.rsplitn(3, '.');
+    let digits =
+        |p: Option<&str>| p.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    digits(parts.next()) && digits(parts.next()) && parts.next().is_some_and(|n| !n.is_empty())
+}
+
+/// [`atomic_write`] through a given temp path and directory sync, so tests
+/// can plant something at the temp name and make the sync fail.
+fn atomic_write_via(
+    path: &Path,
+    tmp: &Path,
+    write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+    sync_dir: impl FnOnce(&Path) -> Result<()>,
+) -> Result<()> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(tmp)?;
     let written = write(&mut f).and_then(|()| f.sync_all()).and_then(|()| {
         drop(f);
-        fs::rename(&tmp, path)
+        fs::rename(tmp, path)
     });
     if let Err(e) = written {
-        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(tmp);
         return Err(e.into());
     }
-    sync_parent_dir(path)
+    // The new file is in place: from here, failing would tell the caller a
+    // save didn't happen when it did. Some filesystems (FUSE, some network
+    // mounts) refuse to sync a directory at all, and every save would then
+    // report an error. Durability is the most that's lost, so say so in
+    // the debug log and carry on.
+    if let Err(e) = sync_dir(path) {
+        tracing::warn!(?path, "saved, but syncing its folder failed: {e}");
+    }
+    Ok(())
+}
+
+/// How old a leftover temp file has to be before [`sweep_stale_temps`]
+/// removes it. No write takes this long, so nothing in progress is touched.
+const STALE_TEMP_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Remove temp files that an [`atomic_write`] interrupted by a crash or
+/// power loss left behind, in every folder blink writes to. Only files
+/// named as `atomic_write` names them and older than [`STALE_TEMP_AGE`]
+/// go, so another blink's write in progress is safe. Best effort.
+pub fn sweep_stale_temps() {
+    let dirs = [root_dir(), sessions_dir(), checkpoints_dir()];
+    for dir in dirs.into_iter().flatten() {
+        sweep_stale_temps_in(&dir, STALE_TEMP_AGE);
+    }
+}
+
+fn sweep_stale_temps_in(dir: &Path, age: std::time::Duration) {
+    let Ok(read) = fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in read.flatten() {
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(is_temp_name) {
+            continue;
+        }
+        // Not following links: only plain files are ours.
+        let Ok(meta) = entry.metadata() else { continue };
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .is_some_and(|d| d >= age);
+        if meta.is_file() && old {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Default local working directory: the user's home dir.
 ///
-/// Falls back to the filesystem root rather than a relative path so that the
-/// TUI always has an absolute, navigable starting point even if the process
-/// working directory is unavailable.
+/// Without one, the current directory; without that either, the root of
+/// the filesystem (on Windows, of the system drive), so the TUI always has
+/// an absolute, navigable starting point.
 pub fn default_local_dir() -> PathBuf {
     if let Some(home) = directories::UserDirs::new() {
         return home.home_dir().to_path_buf();
     }
-    env::current_dir().unwrap_or_else(|_| {
-        if cfg!(windows) {
-            PathBuf::from("C:\\")
-        } else {
-            PathBuf::from("/")
-        }
-    })
+    env::current_dir().unwrap_or_else(|_| fallback_root(env::var("SystemDrive").ok().as_deref()))
+}
+
+/// The filesystem root: `/`, or on Windows the system drive's (`C:\` if
+/// `%SystemDrive%` isn't set).
+fn fallback_root(system_drive: Option<&str>) -> PathBuf {
+    if cfg!(windows) {
+        let drive = system_drive.filter(|d| !d.is_empty()).unwrap_or("C:");
+        PathBuf::from(format!("{drive}\\"))
+    } else {
+        let _ = system_drive;
+        PathBuf::from("/")
+    }
 }
 
 #[cfg(test)]
@@ -611,7 +768,9 @@ mod tests {
     }
 
     /// The temp file is opened create-new: something already at its name —
-    /// a link planted there — is never written through.
+    /// a link planted there — is never written through. Planted at the name
+    /// actually used; an earlier version of this test planted at `f.tmp`,
+    /// a name the temp file hadn't had in a while, and so tested nothing.
     #[cfg(unix)]
     #[test]
     fn atomic_write_never_writes_through_an_existing_file() {
@@ -620,7 +779,53 @@ mod tests {
         let path = dir.join("f.ini");
         let victim = dir.join("victim");
         fs::write(&victim, "untouched").unwrap();
-        std::os::unix::fs::symlink(&victim, dir.join("f.tmp")).unwrap();
+        let tmp = temp_path(&path, 1, 2);
+        std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+
+        let err = atomic_write_via(
+            &path,
+            &tmp,
+            |f| {
+                use std::io::Write as _;
+                f.write_all(b"new")
+            },
+            sync_parent_dir,
+        )
+        .expect_err("an occupied temp name is refused");
+
+        assert!(err.to_string().contains("exists"), "{err}");
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn temp_names_are_recognised_exactly() {
+        let tmp = temp_path(Path::new("/x/f.ini"), 42, 7);
+        assert_eq!(tmp, Path::new("/x/.f.ini.42.7.tmp"));
+        assert!(is_temp_name(".f.ini.42.7.tmp"));
+        assert!(is_temp_name(".a.b.c.1.0.tmp"));
+        for not in [
+            ".f.ini.tmp",
+            ".42.7.tmp",
+            "f.ini.42.7.tmp",
+            ".f.x.7.tmp",
+            ".f.1..tmp",
+            ".hidden.tmp",
+        ] {
+            assert!(!is_temp_name(not), "{not}");
+        }
+    }
+
+    /// Created umask-default (0644), a file was private only while its
+    /// folder was, and each save undid a `chmod 600`.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_makes_the_file_private_and_keeps_it_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let _home = test_home();
+        let path = root_dir().unwrap().join("f.ini");
+        fs::write(&path, "old").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
 
         atomic_write(&path, |f| {
             use std::io::Write as _;
@@ -628,8 +833,117 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(fs::read_to_string(&victim).unwrap(), "untouched");
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    /// Once the rename is done the file is saved; a folder that won't sync
+    /// (some FUSE and network mounts) made every save report failure.
+    #[test]
+    fn a_folder_that_wont_sync_does_not_fail_a_finished_save() {
+        let _home = test_home();
+        let path = root_dir().unwrap().join("f.ini");
+
+        atomic_write_via(
+            &path,
+            &temp_path(&path, 1, 1),
+            |f| {
+                use std::io::Write as _;
+                f.write_all(b"new")
+            },
+            |_| Err(BlinkError::config("EINVAL")),
+        )
+        .expect("the file is in place, so the save succeeded");
+
         assert_eq!(fs::read_to_string(&path).unwrap(), "new");
+    }
+
+    // -- the app folders ----------------------------------------------------
+
+    /// A folder made by hand or restored at 0755 stayed that way, and with
+    /// it every file inside was readable by other users.
+    #[cfg(unix)]
+    #[test]
+    fn an_existing_folder_open_to_others_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let _home = test_home();
+        let sessions = root_dir().unwrap().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        fs::set_permissions(&sessions, fs::Permissions::from_mode(0o755)).unwrap();
+
+        sessions_dir().unwrap();
+
+        let mode = fs::metadata(&sessions).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        let shown = sessions.display().to_string();
+        assert!(
+            take_notices()
+                .iter()
+                .any(|n| n.contains(&shown) && n.contains("made it private")),
+            "the change is reported"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_folder_is_left_alone_and_not_reported() {
+        let _home = test_home();
+        sessions_dir().unwrap();
+        let shown = root_dir().unwrap().join("sessions").display().to_string();
+        sessions_dir().unwrap();
+        assert!(!take_notices().iter().any(|n| n.contains(&shown)));
+    }
+
+    /// A file where a folder belongs is said plainly, not left to fail as
+    /// "Not a directory" at whatever opens a file inside it.
+    #[test]
+    fn a_file_where_a_folder_belongs_is_an_error() {
+        let _home = test_home();
+        fs::write(root_dir().unwrap().join("themes"), "x").unwrap();
+
+        let err = themes_dir().expect_err("not a folder");
+        assert!(err.to_string().contains("is not a directory"), "{err}");
+    }
+
+    // -- leftover temp files ----------------------------------------------
+
+    #[test]
+    fn stale_temp_files_are_swept_and_nothing_else() {
+        let _home = test_home();
+        let dir = root_dir().unwrap();
+        let old = dir.join(".f.ini.1.0.tmp");
+        let fresh = dir.join(".f.ini.1.1.tmp");
+        let other = dir.join(".notes.tmp");
+        let real = dir.join("f.ini");
+        for p in [&old, &fresh, &other, &real] {
+            fs::write(p, "x").unwrap();
+        }
+        let long_ago = std::time::SystemTime::now() - 2 * STALE_TEMP_AGE;
+        for p in [&old, &other, &real] {
+            fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+        }
+
+        sweep_stale_temps_in(&dir, STALE_TEMP_AGE);
+
+        assert!(!old.exists(), "an old leftover goes");
+        assert!(fresh.exists(), "one that may still be being written stays");
+        assert!(other.exists(), "a file not named as ours stays");
+        assert!(real.exists());
+    }
+
+    #[test]
+    fn the_windows_fallback_root_is_the_system_drive() {
+        if cfg!(windows) {
+            assert_eq!(fallback_root(Some("D:")), PathBuf::from("D:\\"));
+            assert_eq!(fallback_root(None), PathBuf::from("C:\\"));
+        } else {
+            assert_eq!(fallback_root(Some("D:")), PathBuf::from("/"));
+        }
     }
 
     #[test]
@@ -751,14 +1065,14 @@ mod tests {
         assert!(err.to_string().contains("absolute"), "{err}");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn xdg_config_home_wins_when_it_is_absolute() {
         let dir = base_dir_from(Some("/xdg"), Some("/home/u")).expect("valid");
         assert_eq!(dir, PathBuf::from("/xdg/blink"));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_relative_xdg_config_home_is_an_error_rather_than_a_fallback() {
         // Falling back to $HOME here would silently ignore a setting the
@@ -769,7 +1083,7 @@ mod tests {
         assert!(err.to_string().contains("XDG_CONFIG_HOME"), "{err}");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn an_empty_xdg_config_home_falls_through_to_home() {
         // Set-but-empty means "unset" here. It is invisible, load-bearing,
@@ -778,21 +1092,21 @@ mod tests {
         assert_eq!(dir, PathBuf::from("/home/u/.config/blink"));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn home_is_used_when_xdg_config_home_is_unset() {
         let dir = base_dir_from(None, Some("/home/u")).expect("valid");
         assert_eq!(dir, PathBuf::from("/home/u/.config/blink"));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn an_unset_home_is_an_error() {
         let err = base_dir_from(None, None).expect_err("nothing left to resolve from");
         assert!(err.to_string().contains("$HOME is not set"), "{err}");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn a_relative_home_is_an_error() {
         let err = base_dir_from(None, Some("u")).expect_err("relative $HOME");

@@ -393,13 +393,18 @@ pub fn append(host: &str, port: u16, key_type: &str, key_b64: &str) -> Result<()
         fs::create_dir_all(parent)?;
     }
 
-    // Open read+write, creating if missing. We hold the same handle for the
-    // duration of the check + append so the advisory lock covers both.
-    let mut file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .append(true)
-        .open(&path)?;
+    // Open read+write, creating if missing (0600 on Unix, as
+    // `paths::atomic_write` creates every other file). We hold the same
+    // handle for the duration of the check + append so the advisory lock
+    // covers both.
+    let mut opts = OpenOptions::new();
+    opts.create(true).read(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&path)?;
 
     // Take an exclusive advisory lock to make the check-then-write sequence
     // atomic with respect to other blink processes. Blocks until acquired —
@@ -1090,6 +1095,22 @@ mod tests {
     // end-to-end coverage of append() (writing an entry and reading it back)
     // is possible now and simply hasn't been written yet. Only the
     // validation paths are covered here for the moment.
+
+    /// Created umask-default, the file was private only while its folder
+    /// was; it's made 0600 like every other file blink writes.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_known_hosts_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let _home = crate::paths::test_home();
+        super::append("a.example", 22, "ssh-ed25519", "AAAA").unwrap();
+        let mode = std::fs::metadata(known_hosts_path().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 
     #[test]
     fn append_rejects_newline_in_host() {

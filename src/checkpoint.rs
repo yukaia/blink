@@ -765,7 +765,7 @@ fn file_name_for(session: &str, origin: &str, kind: CheckpointKind, windows_rule
         .finalize();
     paths::hashed_file_name(
         session,
-        &hash,
+        &hash.into(),
         &format!("-{}.json", kind.as_str()),
         windows_rules,
     )
@@ -1118,7 +1118,7 @@ fn origin_column(cp: &Checkpoint) -> String {
 fn is_leftover_temp(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with('.') && n.ends_with(".tmp"))
+        .is_some_and(paths::is_temp_name)
 }
 
 /// Print checkpoint info. Pass `clean` to remove completed/orphaned files,

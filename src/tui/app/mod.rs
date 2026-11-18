@@ -608,6 +608,10 @@ impl App {
         for warning in std::mem::take(&mut self.startup_warnings) {
             self.push_log(LogLevel::Warn, warning);
         }
+        // A config folder found open to other users, and made private.
+        for note in crate::paths::take_notices() {
+            self.push_log(LogLevel::Warn, note);
+        }
 
         // Autoconnect: `blink open` / `blink connect` pre-populate this
         // field. We trigger the connect here, after the runtime is live and

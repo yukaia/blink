@@ -51,6 +51,13 @@ the git history for those.
 
 ### Security
 
+- **Files blink writes are private on their own** (mode 0600 on Unix).
+  They took the umask's default, typically 0644, so they were private only
+  while their folder was, and a `chmod 600` lasted until the next save.
+- **A config folder open to other users is made private.** One made by
+  hand or restored from a backup at 0755 stayed that way, leaving every
+  session and `known_hosts` readable by other users. It's now tightened
+  to 0700 and the log says so.
 - **More invisible characters show up in file names.** blink already shows
   bidi overrides and zero-width spaces in server-supplied names as spaces,
   so two names can't look identical. Soft hyphens, word joiners, invisible
@@ -99,6 +106,18 @@ the git history for those.
 
 ### Fixed
 
+- **A save no longer reports failure after it succeeded.** On filesystems
+  that won't sync a folder (some FUSE and network mounts), every save said
+  it failed though the file had been written.
+- **On the BSDs, a missing config location is an error**, as it is
+  elsewhere, instead of putting the config in `blink/` under whatever
+  folder blink was started from. They now use the same XDG rules as Linux.
+- **A file where a config folder belongs is reported as such**, not as a
+  "Not a directory" error from whatever tried to open something inside it.
+- **Leftover temp files from a crash are cleaned up** at the next start,
+  once over an hour old. Before, only `blink checkpoints --force` removed
+  any, and only in the checkpoint folder; it now removes only files named
+  as blink's own temp files.
 - **One broken theme file no longer stops `t`.** It was retried on every
   press, so no theme after it could be reached. It's now reported and
   skipped.
