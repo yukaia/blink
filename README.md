@@ -898,8 +898,8 @@ Applied to:
 | -------- | ----- |
 | Text file preview read | 1 MB |
 | Image file preview read | 25 MB |
-| Image decoder pre-decode dimension cap | 4096 × 4096 px |
-| Image decoder max allocation | 128 MiB (enforced *before* full pixel-buffer alloc) |
+| Image dimensions | none of their own; any image that fits the allocation cap is scaled down to fit the viewer |
+| Image decoder max allocation | 512 MiB (about 170 MP at 8-bit RGB; enforced *before* the pixel buffer is allocated) |
 | Transfer job queue | 100,000 jobs |
 | Recursive walk plan | 100,000 entries — planned jobs *plus* directories visited and queued (bails before materialising the whole tree) |
 | Error string length | 512 characters |

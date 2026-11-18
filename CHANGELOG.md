@@ -28,6 +28,12 @@ the git history for those.
 
 ### Changed
 
+- **Large images are scaled to fit instead of refused.** The viewer
+  turned away anything over 4096 pixels a side, which ruled out most
+  phone photos and every panorama. Now any image that can be decoded in
+  512 MiB (about 170 megapixels; it was 128 MiB) is shown, scaled down to
+  the viewer. Photos are scaled before they're turned the right way up,
+  so a large one isn't copied at full size just to be rotated.
 - **`blink themes` lists your own themes too**, marked `(user)`, since `t`
   cycles through them. A theme file that won't load, or whose name can't be
   used, is a warning on stderr, as with `blink sessions`.

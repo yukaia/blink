@@ -121,8 +121,8 @@ fn detect_explained_from(
 /// instead of a blank pane (`Vec::new()` was the old failure signal).
 #[derive(Debug)]
 pub enum PreviewError {
-    /// Image dimensions or memory footprint exceeded our limits before any
-    /// allocation happened. Distinct from a decode failure: the file may be
+    /// The decoded image would need more memory than the viewer allows,
+    /// known from its header before any pixel buffer was allocated. Distinct from a decode failure: the file may be
     /// fine, just bigger than the viewer takes.
     TooLarge,
     /// `image::ImageReader::decode` failed — bad bytes, unsupported codec,
@@ -194,19 +194,15 @@ const FALLBACK_CELL: CellSize = CellSize {
 /// Sixel draws in bands of this many pixel rows, and a band is drawn whole.
 const SIXEL_BAND: u32 = 6;
 
-/// Maximum width or height (in pixels) accepted for a previewed image.
+/// Hard cap on bytes the image decoder may allocate, checked against the
+/// size the header declares before any pixel buffer exists.
 ///
-/// 4096 px per side is far beyond any terminal preview panel and keeps the
-/// worst-case post-decode buffer under ~64 MiB at RGBA8. Passed to
-/// `image::io::Limits` so the decoder rejects the file before allocating
-/// the full pixel buffer — a 10 MB PNG declaring 16k × 16k can no longer
-/// consume ~1 GiB before being checked.
-const MAX_IMAGE_DIMENSION: u32 = 4096;
-
-/// Hard cap on bytes the image decoder is allowed to allocate. Strict
-/// upper bound on `MAX_IMAGE_DIMENSION² × 4` (RGBA), with headroom for
-/// intermediate buffers a decoder may briefly own.
-const MAX_IMAGE_ALLOC: u64 = 128 * 1024 * 1024;
+/// This is the only bound on an image's dimensions: any width and height
+/// that decode within it are shown, scaled down to fit the panel. 512 MiB
+/// holds about 170 megapixels at 8-bit RGB (a 48 MP phone photo is
+/// 144 MiB) or 130 at RGBA. The buffer lives only while the image is
+/// scaled, on a blocking thread, and is freed before anything is drawn.
+const MAX_IMAGE_ALLOC: u64 = 512 * 1024 * 1024;
 
 /// Query the terminal for cell pixel dimensions.
 ///
@@ -274,18 +270,19 @@ fn scale_for_cells(
         return Err(PreviewError::EmptyPanel);
     }
 
-    // Use ImageReader with explicit limits so a hostile image cannot OOM us
-    // before we get a chance to look at its dimensions: a highly-compressed
-    // PNG declaring 16k × 16k would otherwise allocate ~1 GiB inside
-    // `load_from_memory` and only THEN be rejected by an after-the-fact
-    // size check. With `max_image_width/height` set, the decoder fails
-    // fast on the header.
+    // Use ImageReader with an explicit allocation limit so a hostile image
+    // cannot OOM us: a highly-compressed PNG declaring 20k × 20k would
+    // otherwise allocate 1.6 GB inside the decoder. `total_bytes` below
+    // refuses it from the header; `max_alloc` covers what decoders allocate
+    // on the way.
     let mut reader = ImageReader::new(Cursor::new(image_bytes))
         .with_guessed_format()
         .map_err(|e| PreviewError::Decode(e.to_string()))?;
     let mut limits = Limits::default();
-    limits.max_image_width = Some(MAX_IMAGE_DIMENSION);
-    limits.max_image_height = Some(MAX_IMAGE_DIMENSION);
+    // No cap on width or height (the default is 65535 a side): memory is
+    // what matters, and any shape that fits in it is scaled down.
+    limits.max_image_width = None;
+    limits.max_image_height = None;
     limits.max_alloc = Some(MAX_IMAGE_ALLOC);
     reader.limits(limits);
     let decode_error = |e: ImageError| match e {
@@ -300,10 +297,19 @@ fn scale_for_cells(
         return Err(PreviewError::TooLarge);
     }
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-    let mut img = DynamicImage::from_decoder(decoder).map_err(decode_error)?;
-    img.apply_orientation(orientation);
+    // A quarter turn swaps width and height: the fit is worked out for the
+    // shape the image is seen in.
+    let quarter_turn = matches!(
+        orientation,
+        Orientation::Rotate90
+            | Orientation::Rotate270
+            | Orientation::Rotate90FlipH
+            | Orientation::Rotate270FlipH
+    );
+    let img = DynamicImage::from_decoder(decoder).map_err(decode_error)?;
 
-    let (iw, ih) = (img.width().max(1), img.height().max(1));
+    let (sw, sh) = (img.width().max(1), img.height().max(1));
+    let (iw, ih) = if quarter_turn { (sh, sw) } else { (sw, sh) };
 
     let panel_w_px = u32::from(cols).saturating_mul(px_per_col).max(1);
     // Whole sixel bands only: the last band is drawn whole, so an image as
@@ -320,15 +326,31 @@ fn scale_for_cells(
     let scaled_w = ((iw as f64 * scale) as u32).max(1);
     let scaled_h = ((ih as f64 * scale) as u32).max(1);
 
+    // Scale first, in the stored shape, and turn the small result: turning
+    // first copied the whole decoded image, doubling the peak memory of a
+    // large photo for nothing.
+    //
     // `thumbnail_exact`, not a Lanczos3 `resize_exact`: that one keeps a
-    // 32-bit float copy of the whole source width at the new height, up to
-    // 256 MiB for a 4096-pixel image, on top of the decode limits above.
-    // The box filter works pixel by pixel and only ever shrinks here.
-    let resized = if scaled_w == iw && scaled_h == ih {
-        img.to_rgba8()
+    // 32-bit float copy of the whole source width at the new height, which
+    // for a large image is far bigger than the image itself. The box filter
+    // works pixel by pixel and only ever shrinks here.
+    let (tw, th) = if quarter_turn {
+        (scaled_h, scaled_w)
     } else {
-        img.thumbnail_exact(scaled_w, scaled_h).to_rgba8()
+        (scaled_w, scaled_h)
     };
+    let mut small = if tw == sw && th == sh {
+        img
+    } else {
+        let small = img.thumbnail_exact(tw, th);
+        drop(img);
+        small
+    };
+    small.apply_orientation(orientation);
+    let resized = small.into_rgba8();
+    // What was actually made, which everything below describes: should the
+    // two disagree, the escape would misdescribe its own pixels.
+    let (scaled_w, scaled_h) = resized.dimensions();
 
     // Cell extent of the scaled image, rounded up so we don't truncate.
     let used_w_cells = scaled_w.div_ceil(px_per_col).max(1).min(u32::from(cols)) as u16;
@@ -562,9 +584,9 @@ pub(crate) const TEXT_VIEW_LIMIT: u64 = 1_000_000; // 1 MB
 /// every image between the two values would silently truncate instead of
 /// being refused. Keeping one definition makes them impossible to drift.
 ///
-/// Note this bounds bytes fetched, not decode memory — [`MAX_IMAGE_DIMENSION`]
-/// and [`MAX_IMAGE_ALLOC`] bound that independently, and the decoder rejects
-/// an oversized declaration from the header before allocating a pixel buffer.
+/// Note this bounds bytes fetched, not decode memory — [`MAX_IMAGE_ALLOC`]
+/// bounds that independently, and an oversized declaration is refused from
+/// the header before a pixel buffer is allocated.
 pub(crate) const IMAGE_VIEW_LIMIT: u64 = 25_000_000; // 25 MB
 
 /// Compile-time guard on the relationship described above.
@@ -1084,23 +1106,56 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_image_declaring_huge_dimensions_is_refused_unread() {
-        // A valid PNG header claiming 5000x5000, with no pixel data at all.
+    /// A PNG declaring `w` x `h` RGBA, with no pixel data at all.
+    fn png_header_only(w: u32, h: u32) -> Vec<u8> {
         let mut png = Vec::new();
         png.extend_from_slice(b"\x89PNG\r\n\x1a\n");
         let mut ihdr = Vec::new();
         ihdr.extend_from_slice(b"IHDR");
-        ihdr.extend_from_slice(&5000u32.to_be_bytes());
-        ihdr.extend_from_slice(&5000u32.to_be_bytes());
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
         ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
         png.extend_from_slice(&13u32.to_be_bytes());
         png.extend_from_slice(&ihdr);
         png.extend_from_slice(&crc32(&ihdr).to_be_bytes());
+        // The decoder reads up to the first data chunk before it reports the
+        // size, so give it one: a zlib header and nothing after it.
+        let idat = b"IDAT\x78\x9c";
+        png.extend_from_slice(&2u32.to_be_bytes());
+        png.extend_from_slice(idat);
+        png.extend_from_slice(&crc32(idat).to_be_bytes());
+        png
+    }
 
-        let err = scale_for_cells(&png, 0, 0, 10, 10, CELL);
+    /// Too big to hold decoded (20000 x 20000 RGBA is 1.6 GB): refused from
+    /// the header, before a pixel buffer is allocated.
+    #[test]
+    fn an_image_too_big_to_decode_is_refused_unread() {
+        let err = scale_for_cells(&png_header_only(20_000, 20_000), 0, 0, 10, 10, CELL);
         assert!(
             matches!(err, Err(PreviewError::TooLarge)),
+            "{:?}",
+            err.err()
+        );
+    }
+
+    /// Past 4096 px a side the image was refused outright, however little
+    /// memory it needed. Now only memory limits it, and it's scaled to fit.
+    #[test]
+    fn an_image_wider_than_4096_px_is_scaled_to_fit() {
+        // The panel is 200x200 px; 6000x600 shrinks to 200x20.
+        let s = scale_for_cells(&noise_png(6000, 600), 0, 0, 20, 10, CELL).unwrap();
+        assert_eq!((s.width_px, s.height_px), (200, 20));
+        assert_eq!(s.rgba.len(), 200 * 20 * 4);
+    }
+
+    #[test]
+    fn a_header_past_the_old_4096_px_cap_is_not_refused_as_too_large() {
+        // 5000x5000 RGBA is 100 MB decoded: within the memory cap. With no
+        // pixel data it fails to decode, but not for being too large.
+        let err = scale_for_cells(&png_header_only(5000, 5000), 0, 0, 10, 10, CELL);
+        assert!(
+            matches!(err, Err(PreviewError::Decode(_))),
             "{:?}",
             err.err()
         );
@@ -1269,6 +1324,17 @@ mod tests {
     fn a_photo_is_turned_the_way_its_exif_says() {
         let s = scale_for_cells(&rotated_jpeg(), 0, 0, 80, 40, CELL).unwrap();
         assert_eq!((s.width_px, s.height_px), (20, 40));
+    }
+
+    /// Scaled before it's turned, to spare turning the full-size image: the
+    /// fit has to be worked out for the shape it's seen in, not stored in.
+    #[test]
+    fn a_turned_photo_is_fitted_in_the_shape_it_is_seen() {
+        // Seen 20x40; the panel is 10x18 px (20 rounded down to whole sixel
+        // bands), so it fits at 9x18.
+        let s = scale_for_cells(&rotated_jpeg(), 0, 0, 1, 1, CELL).unwrap();
+        assert_eq!((s.width_px, s.height_px), (9, 18));
+        assert_eq!(s.rgba.len(), 9 * 18 * 4);
     }
 
     /// Each backend end to end, at whatever cell size this terminal reports:
