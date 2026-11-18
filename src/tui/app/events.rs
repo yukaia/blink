@@ -44,8 +44,9 @@ impl App {
                 // require the same certificate; save it only if asked to.
                 if let Some(new_pin) = connected.new_cert_pin {
                     let fingerprint = crate::transport::ftps::colon_hex(&new_pin.sha256);
-                    session.cert_sha256 = Some(new_pin.sha256);
+                    session.cert_sha256 = Some(new_pin.sha256.clone());
                     if !new_pin.save {
+                        self.trust_once_pin = Some(new_pin.sha256);
                         self.push_log(
                             LogLevel::Info,
                             format!(

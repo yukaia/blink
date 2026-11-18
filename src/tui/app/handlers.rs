@@ -448,12 +448,11 @@ impl App {
                                     );
                                 } else {
                                     self.push_log(LogLevel::Warn, format!("cancelled: {name}"));
-                                    // Remove this job from the checkpoint map so a
-                                    // subsequent resume re-queues it (it was never
-                                    // completed, so it must not be skipped). The
-                                    // checkpoint file itself is kept — the rest of
-                                    // the batch can still complete and be tracked.
-                                    self.checkpoint_job_map.remove(&id);
+                                    // Mark it cancelled, as `C` does for a whole
+                                    // batch: left `pending`, the file came back
+                                    // with the next resume offer or `r`. The rest
+                                    // of its batch keeps the checkpoint.
+                                    self.cancel_batch_in_checkpoint(&[id]);
                                 }
                             }
                             PendingCancel::Batch { batch_id, .. } => {
@@ -676,6 +675,7 @@ impl App {
 
                 // Snapshot the current navigation state into the saved session
                 // so reopening picks up where we left off.
+                let old_name = current.name.clone();
                 let mut to_save = current;
                 to_save.name = name.clone();
                 to_save.remote_dir = if self.remote.path.is_empty() {
@@ -685,10 +685,23 @@ impl App {
                 };
                 to_save.local_dir = Some(std::path::PathBuf::from(&self.local.path));
 
-                match to_save.save() {
+                // A certificate trusted for this connection only stays out
+                // of the file. The connection keeps requiring it.
+                let mut file_copy = to_save.clone();
+                if self.trust_once_pin.is_some() && file_copy.cert_sha256 == self.trust_once_pin {
+                    file_copy.cert_sha256 = None;
+                }
+
+                match file_copy.save() {
                     Ok(()) => {
+                        let origin = crate::transport::origin_of(&to_save);
                         self.current_session = Some(to_save);
                         self.current_session_saved = true;
+                        // Checkpoints are keyed by session name; left under
+                        // the old one, `r` could no longer find them.
+                        if old_name != name {
+                            self.move_checkpoints(&old_name, &name, &origin);
+                        }
                         // Refresh the sessions list so it reflects the new
                         // entry next time the user opens the selector.
                         self.reload_sessions();

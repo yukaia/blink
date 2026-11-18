@@ -833,6 +833,47 @@ pub fn discard(session: &str, origin: &str, kind: CheckpointKind) -> Result<Disc
     Ok(outcome)
 }
 
+/// Move `old`'s checkpoints for `origin` to the session name `new`, for a
+/// session being renamed. Returns what could not be moved.
+///
+/// Checkpoints are keyed by session name, so a rename that left them
+/// behind cut the session off from its unfinished batches: they were no
+/// longer offered or resumed, and `blink checkpoints --clean` could delete
+/// them, with their partial downloads, as orphaned. When `new` already has
+/// a checkpoint for the same server, the two are merged, `old`'s jobs
+/// first. A checkpoint that can't be moved stays where it was.
+pub fn rename_session(old: &str, new: &str, origin: &str) -> Vec<String> {
+    if old == new {
+        return Vec::new();
+    }
+    [CheckpointKind::Download, CheckpointKind::Upload]
+        .into_iter()
+        .filter_map(|kind| {
+            rename_one(old, new, origin, kind).err().map(|e| {
+                format!(
+                    "could not move the {} checkpoint to `{new}`: {e}",
+                    kind.as_str()
+                )
+            })
+        })
+        .collect()
+}
+
+/// [`rename_session`] for one direction.
+fn rename_one(old: &str, new: &str, origin: &str, kind: CheckpointKind) -> Result<()> {
+    let Some(mut cp) = Checkpoint::load(old, origin, kind)? else {
+        return Ok(());
+    };
+    // Unreadable is an error here, not "absent": writing over it would
+    // destroy whatever it holds.
+    if let Some(existing) = Checkpoint::load(new, origin, kind)? {
+        cp.append(existing.jobs)?;
+    }
+    cp.session = new.to_string();
+    cp.flush()?;
+    Checkpoint::remove(old, origin, kind)
+}
+
 /// Whether a checkpoint write is owed right now.
 ///
 /// Split out from [`Checkpoint::flush_if_due`] so the policy can be tested
@@ -1902,6 +1943,118 @@ mod cli_tests {
         list_and_clean(false, true).unwrap();
 
         assert!(stray.exists());
+    }
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn dl(name: &str) -> CheckpointJob {
+        CheckpointJob::Download {
+            remote_path: format!("/r/{name}"),
+            local_path: PathBuf::from(format!("/l/{name}")),
+            status: JobStatus::Pending,
+        }
+    }
+
+    fn save(session: &str, origin: &str, kind: CheckpointKind, names: &[&str]) {
+        let jobs = names.iter().map(|n| dl(n)).collect();
+        Checkpoint::new(session, origin, kind, jobs)
+            .flush()
+            .unwrap();
+    }
+
+    fn remote_paths(session: &str, origin: &str, kind: CheckpointKind) -> Option<Vec<String>> {
+        Checkpoint::load(session, origin, kind).unwrap().map(|cp| {
+            cp.jobs
+                .iter()
+                .map(|j| j.remote_path().to_string())
+                .collect()
+        })
+    }
+
+    #[test]
+    fn a_rename_moves_both_directions_to_the_new_name() {
+        let _home = paths::test_home();
+        save("old", TEST_ORIGIN, CheckpointKind::Download, &["a"]);
+        save("old", TEST_ORIGIN, CheckpointKind::Upload, &["b"]);
+
+        assert!(rename_session("old", "new", TEST_ORIGIN).is_empty());
+
+        for kind in [CheckpointKind::Download, CheckpointKind::Upload] {
+            assert_eq!(remote_paths("old", TEST_ORIGIN, kind), None);
+            let cp = Checkpoint::load("new", TEST_ORIGIN, kind).unwrap().unwrap();
+            assert_eq!(cp.session, "new", "the document names its session too");
+        }
+    }
+
+    /// The new name may already have a checkpoint for the same server, left
+    /// by an ad-hoc connect or a deleted session. Both batches are kept.
+    #[test]
+    fn a_rename_onto_an_existing_checkpoint_keeps_both() {
+        let _home = paths::test_home();
+        save("old", TEST_ORIGIN, CheckpointKind::Download, &["a"]);
+        save("new", TEST_ORIGIN, CheckpointKind::Download, &["b"]);
+
+        assert!(rename_session("old", "new", TEST_ORIGIN).is_empty());
+
+        assert_eq!(
+            remote_paths("new", TEST_ORIGIN, CheckpointKind::Download),
+            Some(vec!["/r/a".to_string(), "/r/b".to_string()]),
+        );
+        assert_eq!(
+            remote_paths("old", TEST_ORIGIN, CheckpointKind::Download),
+            None
+        );
+    }
+
+    /// Another account's checkpoint under the old name is not this
+    /// session's to move.
+    #[test]
+    fn a_rename_leaves_other_servers_checkpoints_alone() {
+        let _home = paths::test_home();
+        save(
+            "old",
+            "other@elsewhere:22",
+            CheckpointKind::Download,
+            &["a"],
+        );
+
+        assert!(rename_session("old", "new", TEST_ORIGIN).is_empty());
+
+        assert!(remote_paths("old", "other@elsewhere:22", CheckpointKind::Download).is_some());
+        assert_eq!(
+            remote_paths("new", "other@elsewhere:22", CheckpointKind::Download),
+            None
+        );
+    }
+
+    /// A destination that can't be read is not written over; the batch
+    /// stays where it was, and the failure is reported.
+    #[test]
+    fn a_rename_onto_an_unreadable_checkpoint_moves_nothing() {
+        let _home = paths::test_home();
+        save("old", TEST_ORIGIN, CheckpointKind::Download, &["a"]);
+        let dest = Checkpoint::path_for("new", TEST_ORIGIN, CheckpointKind::Download).unwrap();
+        std::fs::write(&dest, "{ not json").unwrap();
+
+        let failures = rename_session("old", "new", TEST_ORIGIN);
+
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(remote_paths("old", TEST_ORIGIN, CheckpointKind::Download).is_some());
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "{ not json");
+    }
+
+    #[test]
+    fn renaming_to_the_same_name_does_nothing() {
+        let _home = paths::test_home();
+        save("same", TEST_ORIGIN, CheckpointKind::Download, &["a"]);
+
+        assert!(rename_session("same", "same", TEST_ORIGIN).is_empty());
+
+        assert!(remote_paths("same", TEST_ORIGIN, CheckpointKind::Download).is_some());
     }
 }
 

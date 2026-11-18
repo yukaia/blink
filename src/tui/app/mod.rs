@@ -218,6 +218,11 @@ pub struct App {
     /// `pending_session` at every site that populates it, and consumed by the
     /// `Connected` handler to decide whether to offer persistence.
     pending_session_unsaved: bool,
+    /// The FTPS certificate fingerprint the user trusted for this
+    /// connection only. The connected session holds it, so the connection
+    /// and its workers keep requiring that certificate, but saving the
+    /// session must leave it out: the user chose not to keep it.
+    trust_once_pin: Option<String>,
     /// Questions to ask once the connection is up, in order. Checkpoints
     /// first, then the save offer — see `show_next_offer`.
     pending_offers: std::collections::VecDeque<PostConnectOffer>,
@@ -467,6 +472,7 @@ impl App {
             session_view_offset: std::cell::Cell::new(0),
             pending_session: None,
             pending_session_unsaved: false,
+            trust_once_pin: None,
             pending_offers: std::collections::VecDeque::new(),
             password_input: credential_buffer(),
             passphrase_input: credential_buffer(),
@@ -1032,6 +1038,7 @@ impl App {
         self.batch_tallies.clear();
         self.job_batches.clear();
         self.pending_offers.clear();
+        self.trust_once_pin = None;
         self.transfer_manager = None;
         // Back to the default theme, if the session had its own.
         if self
@@ -2299,6 +2306,209 @@ mod tests {
         assert_eq!(idx.len(), 3, "checkpoint indices must be distinct");
     }
 
+    /// The remote paths of the checkpoint on disk for the connected
+    /// session, in order.
+    fn on_disk_jobs(a: &App, kind: CheckpointKind) -> Vec<String> {
+        let s = a.current_session.as_ref().unwrap();
+        crate::checkpoint::Checkpoint::load(&s.name, &crate::transport::origin_of(s), kind)
+            .unwrap()
+            .map(|cp| {
+                cp.jobs
+                    .iter()
+                    .map(|j| j.remote_path().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Deferring the offer, then starting another batch, used to write the
+    /// new batch over the deferred one: nothing had loaded it, so the new
+    /// batch started an empty checkpoint and replaced the file.
+    #[tokio::test]
+    async fn a_new_batch_keeps_the_deferred_one_on_disk() {
+        let (mut a, _cleanup) = app_with_queued_offer("defer-then-new");
+        a.handle_offer_resume_checkpoint(press(KeyCode::Esc));
+
+        a.dispatch_plan(vec![download(0)], CheckpointKind::Download);
+
+        assert_eq!(
+            on_disk_jobs(&a, CheckpointKind::Download),
+            vec!["/srv/a.bin".to_string(), "/r/0".to_string()],
+        );
+    }
+
+    /// Once the new batch is done, `r` resumes the deferred work, once.
+    #[tokio::test]
+    async fn the_deferred_batch_resumes_after_the_new_one_finishes() {
+        let (mut a, _cleanup) = app_with_queued_offer("defer-then-resume");
+        a.handle_offer_resume_checkpoint(press(KeyCode::Esc));
+        a.dispatch_plan(vec![download(0)], CheckpointKind::Download);
+        finish_next(&mut a, crate::transfer::TransferState::Complete).unwrap();
+
+        a.resume_walk(CheckpointKind::Download);
+
+        assert_eq!(
+            on_disk_jobs(&a, CheckpointKind::Download),
+            vec!["/srv/a.bin".to_string()],
+            "the resumed batch is recorded once, without the finished one",
+        );
+        assert_eq!(pending(&a), 1);
+    }
+
+    /// Resuming from the offer records the resumed jobs once, not on top
+    /// of the file they were read from.
+    #[tokio::test]
+    async fn resuming_from_the_offer_does_not_duplicate_the_checkpoint() {
+        let (mut a, _cleanup) = app_with_queued_offer("resume-once");
+
+        a.handle_offer_resume_checkpoint(press(KeyCode::Char('r')));
+
+        assert_eq!(
+            on_disk_jobs(&a, CheckpointKind::Download),
+            vec!["/srv/a.bin".to_string()],
+        );
+    }
+
+    /// Saving the session under a new name mid-batch used to leave the
+    /// batch's checkpoint under the old name, where `r` didn't look.
+    #[tokio::test]
+    async fn renaming_the_session_takes_its_checkpoint_along() {
+        let (mut a, _cleanup) = checkpoint_app("rename-mid-batch");
+        let old = a.current_session.as_ref().unwrap().clone();
+        a.dispatch_plan(vec![download(0), download(1)], CheckpointKind::Download);
+        let failed = finish_next(
+            &mut a,
+            crate::transfer::TransferState::Failed("boom".into()),
+        );
+        assert!(failed.is_some());
+
+        a.open_save_session();
+        a.save_session_input = "renamed".into();
+        a.handle_save_session(press(KeyCode::Enter));
+        assert_eq!(a.current_session.as_ref().unwrap().name, "renamed");
+
+        assert!(
+            crate::checkpoint::Checkpoint::load(
+                &old.name,
+                &crate::transport::origin_of(&old),
+                CheckpointKind::Download,
+            )
+            .unwrap()
+            .is_none(),
+            "nothing is left under the old name",
+        );
+        assert_eq!(
+            on_disk_jobs(&a, CheckpointKind::Download),
+            vec!["/r/0".to_string(), "/r/1".to_string()],
+        );
+        // The rest of the batch still settles under the new name.
+        finish_next(&mut a, crate::transfer::TransferState::Complete).unwrap();
+        a.resume_walk(CheckpointKind::Download);
+        assert!(!logged(&a, "no checkpoint found"));
+        assert_eq!(
+            on_disk_jobs(&a, CheckpointKind::Download),
+            vec!["/r/0".to_string()],
+            "the failed job is resumed under the new name",
+        );
+    }
+
+    /// `c` used to leave its job pending in the checkpoint, so the
+    /// cancelled file came back on the next connect.
+    #[tokio::test]
+    async fn a_single_cancel_never_comes_back() {
+        let (mut a, _cleanup) = checkpoint_app("single-cancel");
+        a.dispatch_plan(vec![download(0)], CheckpointKind::Download);
+        // `c` cancels a running job.
+        let id = a
+            .transfer_manager
+            .as_ref()
+            .unwrap()
+            .take_next_pending()
+            .unwrap()
+            .id;
+        a.pending_cancel = Some(crate::tui::state::PendingCancel::Single {
+            id,
+            name: "0".into(),
+        });
+        a.previous_screen = Screen::Main;
+        a.screen = Screen::ConfirmCancel;
+
+        a.handle_key(press(KeyCode::Char('y')));
+
+        let s = a.current_session.as_ref().unwrap();
+        assert!(
+            crate::checkpoint::offers_for(&s.name, &crate::transport::origin_of(s)).is_empty(),
+            "a cancelled job is not offered again",
+        );
+        assert!(!a.active_checkpoints.contains_key(&CheckpointKind::Download));
+    }
+
+    /// One file of a batch cancelled with `c` is marked cancelled, and the
+    /// rest of the batch keeps its checkpoint.
+    #[tokio::test]
+    async fn a_single_cancel_inside_a_batch_marks_only_that_job() {
+        let (mut a, _cleanup) = checkpoint_app("single-cancel-batch");
+        a.dispatch_plan(vec![download(0), download(1)], CheckpointKind::Download);
+        // `c` cancels a running job: start the first.
+        let id = a
+            .transfer_manager
+            .as_ref()
+            .unwrap()
+            .take_next_pending()
+            .unwrap()
+            .id;
+        let (_, idx) = a.checkpoint_job_map[&id];
+        a.pending_cancel = Some(crate::tui::state::PendingCancel::Single {
+            id,
+            name: "1".into(),
+        });
+        a.previous_screen = Screen::Main;
+        a.screen = Screen::ConfirmCancel;
+
+        a.handle_key(press(KeyCode::Char('y')));
+
+        let cp = &a.active_checkpoints[&CheckpointKind::Download];
+        assert_eq!(
+            cp.jobs[idx].status(),
+            crate::checkpoint::JobStatus::Cancelled
+        );
+        assert_eq!(cp.pending_count(), 1, "the other job still runs");
+    }
+
+    /// A certificate trusted for this connection only stays out of the
+    /// session file, even when the session is saved with ctrl+s.
+    #[tokio::test]
+    async fn saving_the_session_leaves_out_a_trust_once_pin() {
+        let (mut a, _cleanup) = checkpoint_app("trust-once");
+        let pin = "ab".repeat(32);
+        {
+            let s = a.current_session.as_mut().unwrap();
+            s.protocol = crate::session::Protocol::Ftps;
+            s.accept_invalid_certs = true;
+            s.cert_sha256 = Some(pin.clone());
+        }
+        a.trust_once_pin = Some(pin.clone());
+
+        a.open_save_session();
+        a.save_session_input = "ftps-site".into();
+        a.handle_save_session(press(KeyCode::Enter));
+
+        let saved = Session::list_all()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "ftps-site")
+            .expect("saved");
+        assert_eq!(
+            saved.cert_sha256, None,
+            "the pin was for this connection only"
+        );
+        assert_eq!(
+            a.current_session.as_ref().unwrap().cert_sha256,
+            Some(pin),
+            "this connection still holds it",
+        );
+    }
+
     /// The manager's copy of job `id`, as the events about it carry.
     fn job_of(a: &App, id: u64) -> crate::transfer::TransferJob {
         a.transfer_manager.as_ref().unwrap().job(id).unwrap()
@@ -3250,6 +3460,21 @@ mod tests {
         );
         assert!(Session::list_all().unwrap().is_empty());
         assert!(logged(&a, "AB:AB"));
+    }
+
+    /// Saving the session afterwards with ctrl+s still leaves it out.
+    #[tokio::test]
+    async fn a_certificate_trusted_once_stays_out_of_a_later_save() {
+        let _home = crate::paths::test_home();
+        let pin = "ab".repeat(32);
+        let mut a = ftps_connected(&pin, false);
+
+        a.open_save_session();
+        a.handle_save_session(press(KeyCode::Enter));
+
+        let saved = Session::list_all().unwrap();
+        assert_eq!(saved.len(), 1, "the save went through");
+        assert_eq!(saved[0].cert_sha256, None);
     }
 
     #[tokio::test]

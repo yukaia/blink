@@ -85,6 +85,28 @@ impl App {
         }
     }
 
+    /// Follow the connected session to its new name `new`: move its
+    /// checkpoint files, and point the ones tracked in memory at them.
+    ///
+    /// Held-back marks are written first, so the files moved are current.
+    /// A tracked checkpoint is then reloaded from its new file, which may
+    /// hold another batch merged in after its own jobs; its own jobs keep
+    /// their positions, so the job-id map stays valid.
+    pub(super) fn move_checkpoints(&mut self, old: &str, new: &str, origin: &str) {
+        self.flush_checkpoints();
+        for failure in crate::checkpoint::rename_session(old, new, origin) {
+            self.push_log(LogLevel::Warn, failure);
+        }
+        let kinds: Vec<CheckpointKind> = self.active_checkpoints.keys().copied().collect();
+        for kind in kinds {
+            // Not moved, the warning above says why: it keeps writing under
+            // the old name, where it can at least be found.
+            if let Ok(Some(moved)) = Checkpoint::load(new, origin, kind) {
+                self.active_checkpoints.insert(kind, moved);
+            }
+        }
+    }
+
     /// The session name and origin the connected session's checkpoints are
     /// keyed by — see [`crate::checkpoint`].
     fn checkpoint_key(&self) -> (String, String) {
@@ -205,10 +227,38 @@ impl App {
         // the queue cap wait in the checkpoint, so running the plan without
         // it isn't possible, and saving it anyway would leave a file that
         // won't load.
-        let cp = self
-            .active_checkpoints
-            .entry(ck_kind)
-            .or_insert_with(|| Checkpoint::new(&session_name, &origin, ck_kind, Vec::new()));
+        //
+        // With nothing tracked in memory — the first batch since connecting,
+        // or since a retry — the file on disk may still hold a batch the
+        // user deferred at the resume offer, or one a quit interrupted.
+        // Starting from an empty checkpoint wrote over it, losing that batch
+        // and the record of its partial downloads.
+        if !self.active_checkpoints.contains_key(&ck_kind) {
+            let existing = match Checkpoint::load(&session_name, &origin, ck_kind) {
+                Ok(existing) => existing,
+                // Unreadable, so nothing in it can be resumed anyway; say so
+                // before it is replaced.
+                Err(e) => {
+                    self.push_log(
+                        LogLevel::Warn,
+                        format!(
+                            "replacing an unreadable {} checkpoint: {e}",
+                            ck_kind.as_str()
+                        ),
+                    );
+                    None
+                }
+            };
+            self.active_checkpoints.insert(
+                ck_kind,
+                existing.unwrap_or_else(|| {
+                    Checkpoint::new(&session_name, &origin, ck_kind, Vec::new())
+                }),
+            );
+        }
+        let Some(cp) = self.active_checkpoints.get_mut(&ck_kind) else {
+            return;
+        };
         let base = match cp.append(ck_jobs) {
             Ok(base) => base,
             Err(e) => {
@@ -660,10 +710,25 @@ impl App {
             })
             .collect();
 
-        // dispatch_plan overwrites the checkpoint with a fresh plan covering
-        // only the re-queued jobs, all starting as `pending`. They will
-        // transition through `in_progress` → `done` as they run.
+        // The resumed jobs get a fresh record, all `pending`, which replaces
+        // the file they were read from once `dispatch_plan` writes it.
+        // Without this, `dispatch_plan` would load that file and append the
+        // same jobs to it a second time.
+        self.active_checkpoints.insert(
+            ck_kind,
+            Checkpoint::new(&session_name, &origin, ck_kind, Vec::new()),
+        );
         self.dispatch_plan(resume_plan, ck_kind);
+        // A plan that queued nothing (every job already running elsewhere)
+        // wrote nothing; leave the file as it was rather than tracking an
+        // empty record that a later batch would write over it.
+        if self
+            .active_checkpoints
+            .get(&ck_kind)
+            .is_some_and(|cp| cp.jobs.is_empty())
+        {
+            self.active_checkpoints.remove(&ck_kind);
+        }
     }
 }
 
