@@ -78,6 +78,33 @@ the git history for those.
 
 ### Fixed
 
+- **Photos are shown the right way up.** Phone photos store their pixels
+  unrotated and record the rotation in EXIF, which the viewer ignored, so
+  portrait shots came out sideways.
+- **Image previews work out of the box in WezTerm and foot.** WezTerm was
+  sent kitty graphics, which it only accepts when configured to; it now
+  gets iTerm2 images. foot wasn't recognised at all.
+- **No blank image viewer inside tmux or screen, or in xterm.** Auto mode
+  guessed a protocol from the outer terminal's variables, which tmux and
+  screen don't pass images through, and guessed sixel for every xterm,
+  though only one started with `-ti vt340` draws it. It now picks none
+  there and says why; set `image_preview` to use one anyway.
+- **Small images are no longer stretched in kitty and iTerm2.** Both were
+  told a box of whole cells to fill, so a 12×8 icon became a 20×20 square.
+  Where the terminal reports its cell size, images are now shown at their
+  own size.
+- **Sixel images stay inside the viewer.** Where the terminal doesn't
+  report its cell size, as on Windows, a guess larger than the real cells
+  drew images past the viewer's edge; the guess now errs small. And the
+  last six-pixel band of a sixel image no longer runs past the panel.
+- **Previewing a large image takes far less memory.** Scaling one down
+  could briefly take 256 MiB on top of the decode limit.
+- **UTF-8 `.nfo` files read correctly.** Every `.nfo` was decoded as DOS
+  CP437, which mangled the accented letters in the UTF-8 XML that Kodi and
+  other media managers write.
+- **Every file the highlighter knows opens in the viewer**, including
+  `.bashrc`, `.zshrc`, `.profile`, `justfile`, `GNUmakefile`, `.pyi`,
+  `.pyw` and `.jsonc`.
 - **Starting a batch no longer wipes out one waiting to be resumed.**
   After pressing esc at the resume offer, or after restarting blink, the
   first new batch in that direction replaced the interrupted batch's

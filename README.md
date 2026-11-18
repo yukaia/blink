@@ -49,7 +49,8 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   for the recognised extensions
 - **View** images via [kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/),
   [sixel](https://en.wikipedia.org/wiki/Sixel), and iTerm2 inline images —
-  auto-detected, aspect-preserving, terminal-cell-aware scaling
+  auto-detected, aspect-preserving, terminal-cell-aware scaling, and
+  photos turned the way their EXIF orientation says
 
 ### Transfers
 
@@ -458,6 +459,10 @@ confirm_quit = true
 
 [terminal]
 ; auto | kitty | sixel | iterm2 | none
+; auto: kitty for kitty and ghostty; iterm2 for iTerm2 and WezTerm; sixel for
+; Konsole, foot, mlterm and Windows Terminal. Inside tmux or screen, which
+; don't pass images on, auto picks none. xterm draws sixel only when started
+; for it (-ti vt340), so it is never guessed: set sixel for one that does.
 image_preview = auto
 ; false: no mouse capture — the terminal's own text selection works, and
 ; blink ignores the mouse
@@ -619,8 +624,10 @@ limits of its own; see [Resource limits](#resource-limits).
 Display caps at 1 MB.
 
 **Bare filenames recognised without an extension:**
-`README`, `LICENSE` / `LICENCE`, `Makefile`, `Dockerfile`, `CHANGELOG`,
-`AUTHORS`, `CONTRIBUTORS`, `TODO`, `NOTICE`
+`README`, `LICENSE` / `LICENCE`, `Makefile`, `GNUmakefile`, `Dockerfile`,
+`justfile`, `CHANGELOG`, `AUTHORS`, `CONTRIBUTORS`, `TODO`, `NOTICE`, and the
+shell dotfiles `.bashrc`, `.zshrc`, `.profile`, `.bash_profile`,
+`.bash_aliases`
 
 **Recognised extensions, by category:**
 
@@ -628,11 +635,11 @@ Display caps at 1 MB.
 | ----------- | ------------------------------------------------------------- |
 | Generic     | `txt`, `md`, `rst`, `log`                                     |
 | Config      | `ini`, `conf`, `cfg`, `config`, `env`, `gitignore`, `gitattributes`, `editorconfig` |
-| Data        | `json`, `yaml`, `yml`, `toml`, `xml`, `csv`, `tsv`            |
+| Data        | `json`, `jsonc`, `yaml`, `yml`, `toml`, `xml`, `csv`, `tsv`   |
 | Web         | `html`, `htm`, `css`, `scss`, `sass`, `less`                  |
 | JavaScript  | `js`, `mjs`, `cjs`, `ts`, `jsx`, `tsx`                        |
 | Systems     | `rs`, `c`, `h`, `cpp`, `cxx`, `cc`, `hpp`, `go`               |
-| Scripting   | `py`, `rb`, `lua`, `pl`, `r`, `php`                           |
+| Scripting   | `py`, `pyw`, `pyi`, `rb`, `lua`, `pl`, `r`, `php`             |
 | JVM/.NET    | `java`, `kt`, `swift`, `cs`                                   |
 | Shell       | `sh`, `bash`, `zsh`, `fish`, `ps1`, `bat`                     |
 | Database    | `sql`                                                         |
@@ -640,12 +647,15 @@ Display caps at 1 MB.
 | Release     | `nfo`                                                         |
 
 Text decoding: NFO files are decoded as CP437 (DOS codepage 437), preserving
-box-drawing characters. All other text files are decoded as UTF-8 (lossy —
+box-drawing characters — unless they are valid UTF-8, as the `.nfo` files
+media managers such as Kodi write are, in which case they are read as UTF-8.
+All other text files are decoded as UTF-8 (lossy —
 unrecognised byte sequences render as replacement characters rather than
 failing the viewer).
 
 If you'd like another extension recognised, the allowlist is one match arm
-in `src/preview.rs::is_viewable_text`.
+in `src/preview.rs::is_viewable_text`. Anything the syntax highlighter has a
+language for (`src/highlight.rs::lang_for_name`) is recognised too.
 
 ## Architecture
 

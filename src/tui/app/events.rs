@@ -515,7 +515,7 @@ impl App {
                         }
                         FileViewKind::Text => {
                             let text = if preview::is_nfo_file(&name) {
-                                preview::decode_cp437(&bytes)
+                                preview::decode_nfo(&bytes)
                             } else {
                                 String::from_utf8_lossy(&bytes).into_owned()
                             };
@@ -530,17 +530,25 @@ impl App {
                             // Only enter Image state if a graphics backend
                             // is available; otherwise show a useful
                             // explanation in the viewer.
-                            let proto = preview::detect(self.config.terminal.image_preview);
+                            let (proto, why) =
+                                preview::detect_explained(self.config.terminal.image_preview);
                             if matches!(proto, preview::GraphicsProtocol::None)
                                 || preview::backend_for(proto).is_none()
                             {
-                                let term =
-                                    std::env::var("TERM").unwrap_or_else(|_| "<unset>".into());
-                                ViewerKind::Unsupported(format!(
-                                    "no supported graphics protocol \
-                                         (TERM={term}). \
-                                         supported: kitty, sixel, iterm2"
-                                ))
+                                ViewerKind::Unsupported(match why {
+                                    // A multiplexer: the terminal may well
+                                    // draw images, and the fix is the config.
+                                    Some(why) => format!("no image preview: {why}"),
+                                    None => {
+                                        let term = std::env::var("TERM")
+                                            .unwrap_or_else(|_| "<unset>".into());
+                                        format!(
+                                            "no supported graphics protocol \
+                                             (TERM={term}). \
+                                             supported: kitty, sixel, iterm2"
+                                        )
+                                    }
+                                })
                             } else {
                                 needs_redraw = true;
                                 ViewerKind::Image {
