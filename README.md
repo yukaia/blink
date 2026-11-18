@@ -687,6 +687,12 @@ All other text files are decoded as UTF-8 (lossy —
 unrecognised byte sequences render as replacement characters rather than
 failing the viewer).
 
+Syntax highlighting covers Rust, Python, JavaScript/TypeScript, shell,
+Windows batch, PowerShell, JSON, TOML, YAML, INI-style config, and the C
+family (C, C++, Go, Java, C#, Kotlin, Swift, CSS and similar). Anything
+else — plain text, Markdown, logs, `.nfo` — is shown without highlighting:
+an apostrophe or a `#` in prose isn't code.
+
 If you'd like another extension recognised, the allowlist is one match arm
 in `src/preview.rs::is_viewable_text`. Anything the syntax highlighter has a
 language for (`src/highlight.rs::lang_for_name`) is recognised too.

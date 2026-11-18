@@ -10,6 +10,11 @@ the git history for those.
 
 ### Added
 
+- **More languages are highlighted**: Windows batch, PowerShell, INI-style
+  config (`.ini`, `.conf`, `.cfg`, `.properties`), and the C family (C,
+  C++, Go, Java, C#, Kotlin, Swift, CSS and others), each with its own
+  comment and string rules. Files these cover, such as `.scala`, `.cmd`
+  and `.properties`, now open in the viewer.
 - **known_hosts reads hashed names and wildcard patterns**, so an
   OpenSSH `known_hosts` copied in works: `|1|salt|hash` names from
   `HashKnownHosts=yes` (Debian and Ubuntu's default), and patterns such
@@ -35,6 +40,10 @@ the git history for those.
 
 ### Changed
 
+- **Plain text isn't highlighted.** Text, Markdown, logs and `.nfo` files
+  were coloured as code: an apostrophe opened a "string", a URL's `//` or
+  an issue's `#12` a comment, and `/*` in a path turned the rest of the
+  file into one.
 - **Only the TUI reads `config.ini`.** A broken one still stops the TUI,
   but no longer stops `blink sessions`, `themes`, `checkpoints` or
   `known-hosts remove`, which don't use it.
@@ -136,6 +145,22 @@ the git history for those.
 
 ### Fixed
 
+- **Highlighting follows strings across lines**: Rust strings, shell and
+  YAML quotes, JavaScript template literals, Python and TOML triple
+  quotes, and any string continued with a backslash. Their second line
+  was coloured as code, and the closing quote opened a new string.
+- **Highlighting fixes per language**: `#` in the middle of a shell word
+  (`foo#bar`, a URL's `#frag`) or a YAML value isn't a comment; shell's
+  `$#`, `$?` and friends are variables; JavaScript template literals are
+  strings; Rust raw strings (`r#"…"#`) are one string, and nested block
+  comments nest; TOML array elements on their own line aren't section
+  headers, and a header's trailing comment is a comment; YAML keys can
+  hold `-`, `.`, `/` or quotes, and single-quoted values are strings,
+  while an apostrophe inside a plain value isn't; numbers stop at the
+  word they start (`3files`, `1each`).
+- **File names map to the right language**: `.bat`/`.cmd` as batch, not
+  shell; `.ps1` as PowerShell; `prod.env`, `.env.local`, `Dockerfile.dev`
+  and `Containerfile` as shell.
 - **An unreadable known_hosts says why it refused the connection.** Only
   the debug log knew, so every SSH connect just failed. One non-UTF-8 byte
   (a Latin-1 comment) was enough; such a file is now read anyway.
