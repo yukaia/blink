@@ -249,13 +249,22 @@ pub(crate) fn decide_resume(
 ///
 /// Returns the byte offset to start from. On [`ResumeDecision::Fresh`] the
 /// existing `.blink-part` and its sidecar are removed, so the caller can create
-/// the file from scratch.
+/// the file from scratch. A partial that is there and can't be removed fails
+/// the download, naming it: in a sticky folder such as `/tmp`, one another
+/// user left there can't be, and the exclusive create would otherwise fail
+/// with a bare "File exists".
+///
+/// Only a partial and sidecar that are [`ours`] count: in a folder other
+/// users can write to, one of them could plant both, the sidecar naming a
+/// public file's origin, path, size and mtime. Resumed, the download would
+/// append the real file's tail to their bytes and rename the result into
+/// place, still theirs to rewrite.
 pub(crate) async fn resume_offset(
     local_path: &Path,
     remote_path: &str,
     now: RemoteStamp,
     origin: &str,
-) -> u64 {
+) -> crate::error::Result<u64> {
     let part = part_path(local_path);
     let meta_path = part_meta_path(local_path);
 
@@ -265,15 +274,15 @@ pub(crate) async fn resume_offset(
     let part_len = tokio::fs::symlink_metadata(&part)
         .await
         .ok()
-        .filter(|m| m.is_file())
+        .filter(ours)
         .map(|m| m.len());
-    let meta: Option<PartMeta> = match read_no_follow(&meta_path).await {
+    let meta: Option<PartMeta> = match read_sidecar(&meta_path).await {
         Ok(raw) => serde_json::from_slice(&raw).ok(),
         Err(_) => None,
     };
 
     match decide_resume(part_len, meta.as_ref(), remote_path, now, origin) {
-        ResumeDecision::Resume(offset) => offset,
+        ResumeDecision::Resume(offset) => Ok(offset),
         ResumeDecision::Fresh => {
             if part_len.is_some() {
                 tracing::debug!(
@@ -282,10 +291,46 @@ pub(crate) async fn resume_offset(
                     "discarding a partial that cannot be identified as this file",
                 );
             }
-            discard_partial(local_path).await;
-            0
+            if let Err(e) = remove_partial(local_path).await {
+                return Err(crate::error::BlinkError::transport(format!(
+                    "{}: a stale partial download is in the way and can't be removed ({e}); \
+                     delete it, or download somewhere else",
+                    part.display()
+                )));
+            }
+            Ok(0)
         }
     }
+}
+
+/// Whether `m` describes a file blink can take as its own partial or
+/// sidecar: a regular file, and on Unix one the user running blink owns,
+/// with no other name. See [`resume_offset`]. A second name would be a hard
+/// link to some other file, which appending would change too.
+///
+/// Windows has no single owner id to compare, and needs privilege to make
+/// the links, so there only the file type is checked.
+fn ours(m: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        owned_single_file(
+            m.is_file(),
+            m.uid(),
+            m.nlink(),
+            rustix::process::geteuid().as_raw(),
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        m.is_file()
+    }
+}
+
+/// The rule [`ours`] applies on Unix, apart from the lookups.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn owned_single_file(is_file: bool, owner: u32, links: u64, me: u32) -> bool {
+    is_file && owner == me && links == 1
 }
 
 /// Record which remote file the in-flight `.blink-part` belongs to.
@@ -320,7 +365,11 @@ pub(crate) async fn write_part_meta(
             .create_new(true)
             .open(&path)
             .await?;
-        tokio::io::AsyncWriteExt::write_all(&mut f, &raw).await
+        tokio::io::AsyncWriteExt::write_all(&mut f, &raw).await?;
+        // A tokio `File` hands each write to a blocking thread and returns;
+        // without this the write could still be in flight when the file is
+        // dropped, its error lost, and the sidecar read back empty.
+        tokio::io::AsyncWriteExt::flush(&mut f).await
     }
     .await;
     if let Err(e) = written {
@@ -459,15 +508,34 @@ impl PartFile {
     }
 }
 
-/// Read a file, refusing to follow a symlink at `path` on Unix.
-async fn read_no_follow(path: &Path) -> std::io::Result<Vec<u8>> {
+/// Largest sidecar [`read_sidecar`] reads. A real one is a few hundred
+/// bytes; anything near this was not written by blink.
+const MAX_SIDECAR_BYTES: u64 = 64 * 1024;
+
+/// Read a partial's sidecar: refusing to follow a symlink at `path` on Unix,
+/// to read one that isn't [`ours`], or to read more than
+/// [`MAX_SIDECAR_BYTES`], so one planted in a shared folder can't fill
+/// memory. The open doesn't block, so a FIFO planted there can't hang the
+/// download waiting for a writer; it is then refused as not a file.
+async fn read_sidecar(path: &Path) -> std::io::Result<Vec<u8>> {
     let mut opts = tokio::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
-    opts.custom_flags(libc::O_NOFOLLOW);
-    let mut f = opts.open(path).await?;
+    opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    let f = opts.open(path).await?;
+    // Checked on the open file, so what is read is what was checked.
+    if !ours(&f.metadata().await?) {
+        return Err(std::io::Error::other("not a sidecar blink wrote"));
+    }
     let mut raw = Vec::new();
-    tokio::io::AsyncReadExt::read_to_end(&mut f, &mut raw).await?;
+    tokio::io::AsyncReadExt::read_to_end(
+        &mut tokio::io::AsyncReadExt::take(f, MAX_SIDECAR_BYTES + 1),
+        &mut raw,
+    )
+    .await?;
+    if raw.len() as u64 > MAX_SIDECAR_BYTES {
+        return Err(std::io::Error::other("sidecar too large"));
+    }
     Ok(raw)
 }
 
@@ -493,7 +561,18 @@ pub(crate) async fn finish_download(
     local_path: &Path,
     counted: u64,
 ) -> crate::error::Result<()> {
-    let on_disk = tokio::fs::symlink_metadata(part).await?.len();
+    let found = tokio::fs::symlink_metadata(part).await?;
+    // Ours when opened, but in a shared folder without the sticky bit
+    // another user can replace a file they don't own; what goes into place
+    // must still be the user's own. See [`resume_offset`].
+    if !ours(&found) {
+        discard_partial(local_path).await;
+        return Err(crate::error::BlinkError::transport(format!(
+            "{}: the partial was replaced by a file blink didn't write",
+            local_path.display()
+        )));
+    }
+    let on_disk = found.len();
     if on_disk != counted {
         discard_partial(local_path).await;
         return Err(crate::error::BlinkError::transport(format!(
@@ -534,8 +613,18 @@ pub(crate) async fn clear_part_meta(local_path: &Path) {
 /// starts from byte zero. Best-effort: a partial that is already gone is
 /// what this wants.
 pub(crate) async fn discard_partial(local_path: &Path) {
-    let _ = tokio::fs::remove_file(part_path(local_path)).await;
+    let _ = remove_partial(local_path).await;
+}
+
+/// [`discard_partial`], saying whether a partial that was there is still
+/// there. A partial already gone is success.
+async fn remove_partial(local_path: &Path) -> std::io::Result<()> {
+    let removed = match tokio::fs::remove_file(part_path(local_path)).await {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    };
     clear_part_meta(local_path).await;
+    removed
 }
 
 pub(crate) mod error_map;
@@ -654,8 +743,8 @@ pub struct ProgressUpdate {
     pub bytes_total: u64,
 }
 
-/// Maximum time allowed for `transport::open` (TCP connect + SSH handshake +
-/// auth). Shared between the TUI initial-connect path and the dispatcher's
+/// Maximum time allowed for `transport::open`: the TCP connect, then the SSH
+/// handshake, or the FTP greeting and any TLS upgrade, then the login. Shared between the TUI initial-connect path and the dispatcher's
 /// per-job connect path so both enforce the same deadline.
 ///
 /// It bounds the network, not the user: time spent with a host-key prompt
@@ -738,7 +827,7 @@ pub(crate) async fn within_deadline_excluding_waits<F: std::future::Future>(
 /// What every protocol implementation must provide.
 #[async_trait]
 pub trait Transport: Send + Sync {
-    /// Human-readable label, e.g. `Protocol::Sftp`.
+    /// Which protocol this transport speaks. Nothing reads it yet.
     #[allow(dead_code)]
     fn protocol(&self) -> Protocol;
 
@@ -875,10 +964,11 @@ pub async fn open(
 
 /// Join a remote base path and a name, normalising the slash.
 ///
-/// `name` must be a single path component (a filename from a directory
-/// listing). Leading slashes are stripped to prevent a server-controlled name
-/// like `"/etc/shadow"` from producing an absolute remote path via the `//`
-/// resolution most servers apply.
+/// `name` must be a single path component: a filename from a directory
+/// listing, or one the user typed. Anything else, a name containing `/`,
+/// `.`, `..` or the empty name, is refused. A server could otherwise list
+/// `sub/file`, or `/etc/x` (once stripped to `etc/x`), and a delete or
+/// rename of the entry shown would act on another path.
 ///
 /// Returns `None` when `name` cannot be joined safely, and the caller must
 /// skip the entry. It used to return `base` unchanged in that case, which
@@ -887,15 +977,10 @@ pub async fn open(
 /// `remove_file` on the directory being walked rather than skipping the
 /// entry.
 pub(crate) fn join_remote(base: &str, name: &str) -> Option<String> {
-    let name = name.trim_start_matches('/');
-    if name.is_empty() {
-        return None;
-    }
-    // Reject `.` and `..` components: `..` traverses upward; `.` is a no-op
-    // but would produce paths like `/foo/./bar` that some servers don't
-    // normalise, and a server-controlled `.` in a name is almost always
-    // malicious.
-    if name.split('/').any(|c| c == ".." || c == ".") {
+    // `..` traverses upward; `.` is a no-op but would produce paths like
+    // `/foo/./bar` that some servers don't normalise, and a server-controlled
+    // `.` in a name is almost always malicious.
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
         return None;
     }
     Some(if base.ends_with('/') {
@@ -1108,11 +1193,11 @@ pub(crate) mod mock {
         async fn delete_dir(&mut self, remote_path: &str, recursive: bool) -> Result<()> {
             let mut dirs = self.dirs.lock().unwrap();
             if recursive {
-                dirs.retain(|d| !d.starts_with(remote_path));
-                self.files
-                    .lock()
-                    .unwrap()
-                    .retain(|k, _| !k.starts_with(remote_path));
+                // `/a` and what's under `/a/`, not `/ab`.
+                let under = format!("{}/", remote_path.trim_end_matches('/'));
+                let inside = |p: &str| p == remote_path || p.starts_with(&under);
+                dirs.retain(|d| !inside(d));
+                self.files.lock().unwrap().retain(|k, _| !inside(k));
             } else {
                 dirs.retain(|d| d != remote_path);
             }
@@ -1652,10 +1737,163 @@ mod tests {
             size: Some(10),
             mtime: Some(MTIME),
         };
-        let offset = resume_offset(&local, "/r/foo", now, "origin").await;
+        let offset = resume_offset(&local, "/r/foo", now, "origin")
+            .await
+            .unwrap();
 
         assert_eq!(offset, 0);
         assert_eq!(std::fs::read(&lookalike).unwrap(), b"a file of its own");
+    }
+
+    /// Planted in a shared folder, a partial and a sidecar naming a public
+    /// file are enough to have a download resume onto someone else's bytes.
+    /// Only the user's own, single-named files count.
+    #[cfg(unix)]
+    mod planted_partials {
+        use super::*;
+
+        fn stamp() -> RemoteStamp {
+            RemoteStamp {
+                size: Some(10),
+                mtime: Some(MTIME),
+            }
+        }
+
+        #[test]
+        fn only_a_regular_file_the_user_owns_with_one_name_is_ours() {
+            assert!(owned_single_file(true, 1000, 1, 1000));
+            assert!(!owned_single_file(true, 1001, 1, 1000), "another user's");
+            assert!(!owned_single_file(true, 1000, 2, 1000), "hard-linked");
+            assert!(!owned_single_file(false, 1000, 1, 1000), "not a file");
+        }
+
+        /// The positive case the refusals below are measured against.
+        #[tokio::test]
+        async fn the_users_own_partial_with_its_sidecar_resumes() {
+            let home = crate::paths::test_home();
+            let local = home.path().join("foo");
+            std::fs::write(part_path(&local), b"0123").unwrap();
+            write_part_meta(&local, "/r/foo", stamp(), "origin").await;
+
+            let offset = resume_offset(&local, "/r/foo", stamp(), "origin").await;
+
+            assert_eq!(offset.unwrap(), 4);
+        }
+
+        /// Appending to a partial with a second name changes the file under
+        /// that name too.
+        #[tokio::test]
+        async fn a_hard_linked_partial_is_not_resumed() {
+            let home = crate::paths::test_home();
+            let local = home.path().join("foo");
+            let other = home.path().join("other");
+            std::fs::write(&other, b"0123").unwrap();
+            std::fs::hard_link(&other, part_path(&local)).unwrap();
+            write_part_meta(&local, "/r/foo", stamp(), "origin").await;
+
+            let offset = resume_offset(&local, "/r/foo", stamp(), "origin").await;
+
+            assert_eq!(offset.unwrap(), 0);
+            assert_eq!(std::fs::read(&other).unwrap(), b"0123", "left alone");
+            assert!(!part_path(&local).exists(), "the partial's name is freed");
+        }
+
+        #[tokio::test]
+        async fn a_hard_linked_sidecar_is_not_believed() {
+            let home = crate::paths::test_home();
+            let local = home.path().join("foo");
+            std::fs::write(part_path(&local), b"0123").unwrap();
+            write_part_meta(&local, "/r/foo", stamp(), "origin").await;
+            std::fs::hard_link(part_meta_path(&local), home.path().join("copy")).unwrap();
+
+            let offset = resume_offset(&local, "/r/foo", stamp(), "origin").await;
+
+            assert_eq!(offset.unwrap(), 0);
+        }
+
+        #[tokio::test]
+        async fn an_oversized_sidecar_is_not_read() {
+            let home = crate::paths::test_home();
+            let local = home.path().join("foo");
+            std::fs::write(part_path(&local), b"0123").unwrap();
+            write_part_meta(&local, "/r/foo", stamp(), "origin").await;
+            let mut raw = std::fs::read(part_meta_path(&local)).unwrap();
+            raw.resize(MAX_SIDECAR_BYTES as usize + 1, b' ');
+            std::fs::write(part_meta_path(&local), &raw).unwrap();
+            assert!(
+                serde_json::from_slice::<PartMeta>(&raw).is_ok(),
+                "trailing spaces leave it valid JSON, so only the size refuses it"
+            );
+
+            let offset = resume_offset(&local, "/r/foo", stamp(), "origin").await;
+
+            assert_eq!(offset.unwrap(), 0);
+        }
+
+        /// Opening a FIFO for reading waits for a writer, so one planted as
+        /// the sidecar used to hang the download.
+        #[tokio::test]
+        async fn a_fifo_planted_as_the_sidecar_doesnt_hang_the_download() {
+            let home = crate::paths::test_home();
+            let local = home.path().join("foo");
+            std::fs::write(part_path(&local), b"0123").unwrap();
+            let c = std::ffi::CString::new(part_meta_path(&local).as_os_str().as_encoded_bytes())
+                .unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+
+            let offset = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                resume_offset(&local, "/r/foo", stamp(), "origin"),
+            )
+            .await
+            .expect("the FIFO was waited on");
+
+            assert_eq!(offset.unwrap(), 0);
+        }
+
+        /// In `/tmp`, a partial another user left can't be removed; the
+        /// download used to fail on "File exists" with nothing more said.
+        #[tokio::test]
+        async fn a_stale_partial_that_cant_be_removed_is_named() {
+            if rustix::process::geteuid().is_root() {
+                eprintln!("skipped: root can remove anything");
+                return;
+            }
+            use std::os::unix::fs::PermissionsExt as _;
+            let home = crate::paths::test_home();
+            let dir = home.path().join("locked");
+            std::fs::create_dir(&dir).unwrap();
+            let local = dir.join("foo");
+            std::fs::write(part_path(&local), b"stale").unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+            let result = resume_offset(&local, "/r/foo", stamp(), "origin").await;
+
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let err = result.expect_err("the partial is in the way");
+            let msg = err.to_string();
+            assert!(msg.contains("stale partial"), "{msg}");
+            assert!(msg.contains(".blink-part"), "{msg}");
+        }
+
+        /// What goes into place must still be the user's own file, not one
+        /// put under the partial's name since.
+        #[tokio::test]
+        async fn a_partial_replaced_before_the_rename_is_not_put_in_place() {
+            let home = crate::paths::test_home();
+            let local = home.path().join("f.bin");
+            let part = part_path(&local);
+            std::fs::write(&part, b"01234567").unwrap();
+            std::fs::hard_link(&part, home.path().join("second-name")).unwrap();
+
+            let lease = lease_part(&part).await;
+            let err = finish_download(&lease, &part, &local, 8)
+                .await
+                .expect_err("not a file blink can vouch for");
+
+            assert!(err.to_string().contains("replaced"), "{err}");
+            assert!(!local.exists());
+        }
     }
 
     /// A partial's name is predictable, so in a shared download directory
@@ -1682,7 +1920,12 @@ mod tests {
 
             // `resume_offset` removes the link; a link re-planted after it
             // looked still can't be opened through.
-            assert_eq!(resume_offset(&local, "/r/foo", stamp(), "origin").await, 0);
+            assert_eq!(
+                resume_offset(&local, "/r/foo", stamp(), "origin")
+                    .await
+                    .unwrap(),
+                0
+            );
             assert!(std::fs::symlink_metadata(part_path(&local)).is_err());
             symlink(&victim, part_path(&local)).unwrap();
             let lease = lease_part(&part_path(&local)).await;
@@ -1712,7 +1955,12 @@ mod tests {
             symlink(&victim, part_path(&local)).unwrap();
             write_part_meta(&local, "/r/foo", stamp(), "origin").await;
 
-            assert_eq!(resume_offset(&local, "/r/foo", stamp(), "origin").await, 0);
+            assert_eq!(
+                resume_offset(&local, "/r/foo", stamp(), "origin")
+                    .await
+                    .unwrap(),
+                0
+            );
             assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
         }
 
@@ -1790,6 +2038,24 @@ mod tests {
         assert_ne!(remote_part_path("/r/report.pdf"), "/r/report.pdf.part");
     }
 
+    /// The mock's recursive delete matched by prefix, so deleting `/a` took
+    /// `/ab` with it, and a test relying on it could hide that bug in blink.
+    #[tokio::test]
+    async fn the_mocks_recursive_delete_stays_inside_the_folder() {
+        let mut mock = mock::MockTransport::new()
+            .with_file("/a/x", b"1")
+            .with_file("/ab/y", b"2");
+        mock.mkdir("/a").await.unwrap();
+        mock.mkdir("/ab").await.unwrap();
+
+        mock.delete_dir("/a", true).await.unwrap();
+
+        assert!(mock.metadata("/a").await.unwrap().is_none());
+        assert!(mock.metadata("/a/x").await.unwrap().is_none());
+        assert!(mock.metadata("/ab").await.unwrap().is_some());
+        assert!(mock.metadata("/ab/y").await.unwrap().is_some());
+    }
+
     // join_remote
     #[test]
     fn join_appends_name() {
@@ -1807,12 +2073,22 @@ mod tests {
         );
     }
 
+    /// A name with a slash is not one entry: joined, it addressed another
+    /// path than the one listed, `/etc/x` once stripped to `/srv/etc/x`.
     #[test]
-    fn join_strips_leading_slash_from_name() {
-        assert_eq!(
-            join_remote("/srv", "/etc/shadow").as_deref(),
-            Some("/srv/etc/shadow")
-        );
+    fn join_rejects_a_name_with_a_slash() {
+        assert_eq!(join_remote("/srv", "/etc/shadow"), None);
+        assert_eq!(join_remote("/srv", "sub/file"), None);
+        assert_eq!(join_remote("/srv", "file/"), None);
+        assert_eq!(join_remote("/srv", "/"), None);
+        assert_eq!(join_remote("/srv", ""), None);
+    }
+
+    /// Dots inside a name are just characters.
+    #[test]
+    fn join_keeps_names_that_merely_contain_dots() {
+        assert_eq!(join_remote("/srv", "..a").as_deref(), Some("/srv/..a"));
+        assert_eq!(join_remote("/srv", "...").as_deref(), Some("/srv/..."));
     }
 
     // Returning the base unchanged made "rejected" indistinguishable from a

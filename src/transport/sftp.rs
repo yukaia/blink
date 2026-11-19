@@ -1372,7 +1372,7 @@ impl Transport for SftpTransport {
             // name, one from an older blink, or one whose file has since
             // been replaced) is discarded here so the create below starts
             // from a clean state.
-            let offset = super::resume_offset(local_path, remote_path, stamp, &origin).await;
+            let offset = super::resume_offset(local_path, remote_path, stamp, &origin).await?;
 
             if let Some(parent) = local_path.parent() {
                 tokio::fs::create_dir_all(parent).await?;

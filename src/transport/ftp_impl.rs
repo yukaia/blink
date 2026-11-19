@@ -666,7 +666,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     // doesn't answer SIZE skipped the staleness check entirely and resumed
     // whatever happened to be on disk. Now a server that doesn't answer
     // SIZE or MDTM restarts instead.
-    let mut offset = super::resume_offset(local_path, remote_path, stamp, origin).await;
+    let mut offset = super::resume_offset(local_path, remote_path, stamp, origin).await?;
 
     // A server that won't restart (REST refused) can't continue the
     // partial, so start over. Failing instead kept the partial, which the
