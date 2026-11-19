@@ -70,6 +70,10 @@ sha2 = { version = "0.11", default-features = false }
 # the hash is HMAC-SHA1 of the host name keyed by the salt. Both versions
 # are the ones russh already pulls in, so nothing new is compiled.
 hmac = "0.13"
+
+# Display width of a character, for tab stops in the text viewer. The
+# version ratatui already uses.
+unicode-width = "0.2"
 sha1 = { version = "0.11", default-features = false }
 
 # Wipe passwords from memory on drop so a long-lived process doesn't leave

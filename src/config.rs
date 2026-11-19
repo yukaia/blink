@@ -97,7 +97,23 @@ impl Config {
         }
     }
 
+    /// Parse `path`. Any problem with its contents names the file, as
+    /// `config.ini: parallel_downloads must be…` — said without it, the
+    /// message didn't say where to look. A missing file stays an I/O
+    /// `NotFound`, which [`Self::load`] reads as a first run.
     pub fn load_from(path: &Path) -> Result<Self> {
+        Self::parse_file(path).map_err(|e| match e {
+            BlinkError::Config(msg) if !msg.starts_with(&path.display().to_string()) => {
+                BlinkError::config(format!("{}: {msg}", path.display()))
+            }
+            BlinkError::Io(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                BlinkError::other(format!("could not read {}: {e}", path.display()))
+            }
+            other => other,
+        })
+    }
+
+    fn parse_file(path: &Path) -> Result<Self> {
         let raw = read_capped(path, MAX_CONFIG_BYTES)?;
         let ini = Ini::load_from_str(&raw)
             .map_err(|e| BlinkError::config(format!("{}: {e}", path.display())))?;
@@ -499,6 +515,28 @@ pub(crate) mod tests {
         assert!(parse_bool("maybe").is_err());
         assert!(parse_bool("").is_err());
         assert!(parse_bool("2").is_err());
+    }
+
+    /// `config error: parallel_downloads must be…` didn't say which file.
+    #[test]
+    fn a_problem_in_config_ini_names_the_file() {
+        let _home = crate::paths::test_home();
+        let path = crate::paths::config_file().unwrap();
+        for (body, says) in [
+            ("[general]\nparallel_downloads = x\n", "parallel_downloads"),
+            ("[general]\ntheme = ../x\n", "theme name"),
+        ] {
+            fs::write(&path, body).unwrap();
+            let e = Config::load_from(&path).unwrap_err().to_string();
+            assert!(
+                e.starts_with(&format!("config error: {}: ", path.display())),
+                "{e}"
+            );
+            assert!(e.contains(says), "{e}");
+        }
+        // A missing file is still the first run, not an error.
+        fs::remove_file(&path).unwrap();
+        assert!(Config::load().is_ok());
     }
 
     // validate_theme_name

@@ -158,7 +158,8 @@ impl Theme {
         file.take(MAX_THEME_BYTES + 1).read_to_string(&mut raw)?;
         if raw.len() as u64 > MAX_THEME_BYTES {
             return Err(BlinkError::config(format!(
-                "theme file is too large (limit is {MAX_THEME_BYTES} bytes)"
+                "{}: theme file is too large (limit is {MAX_THEME_BYTES} bytes)",
+                path.display()
             )));
         }
 

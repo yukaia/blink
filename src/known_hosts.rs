@@ -199,11 +199,11 @@ fn lock_store() -> Result<fs::File> {
     }
     let file = opts
         .open(&path)
-        .map_err(|e| BlinkError::config(format!("{}: {e}", path.display())))?;
+        .map_err(|e| BlinkError::other(format!("{}: {e}", path.display())))?;
     // Blocks until acquired: the held regions are a read and a small write.
     // `File::lock` is std's (stable since Rust 1.89), released on drop.
     file.lock()
-        .map_err(|e| BlinkError::config(format!("{}: lock: {e}", path.display())))?;
+        .map_err(|e| BlinkError::other(format!("{}: lock: {e}", path.display())))?;
     Ok(file)
 }
 
@@ -211,7 +211,7 @@ fn lock_store() -> Result<fs::File> {
 /// naming the file: "stream did not contain valid UTF-8" alone said
 /// nothing about where to look.
 fn read_error(path: &Path, e: std::io::Error) -> BlinkError {
-    BlinkError::config(format!("could not read {}: {e}", path.display()))
+    BlinkError::other(format!("could not read {}: {e}", path.display()))
 }
 
 // ---------------------------------------------------------------------------
@@ -495,7 +495,7 @@ pub fn append(host: &str, port: u16, key_type: &str, key_b64: &str) -> Result<Sa
     // allow a malicious server to inject trusted entries.
     for (field, value) in [("host", host), ("key_type", key_type), ("key_b64", key_b64)] {
         if value.bytes().any(|b| matches!(b, b'\n' | b'\r' | b'\0')) {
-            return Err(BlinkError::config(format!(
+            return Err(BlinkError::other(format!(
                 "invalid control character in known_hosts field '{field}'"
             )));
         }
@@ -505,7 +505,7 @@ pub fn append(host: &str, port: u16, key_type: &str, key_b64: &str) -> Result<Sa
     // line that reads back as another entry or as none.
     for (field, value) in [("host", host), ("key_type", key_type), ("key_b64", key_b64)] {
         if value.is_empty() || value.contains(char::is_whitespace) {
-            return Err(BlinkError::config(format!(
+            return Err(BlinkError::other(format!(
                 "known_hosts field '{field}' must not be empty or contain whitespace"
             )));
         }
@@ -513,7 +513,7 @@ pub fn append(host: &str, port: u16, key_type: &str, key_b64: &str) -> Result<Sa
     // A comma separates the names of a host list, so a host holding one
     // would be stored as two hosts, neither of them this one.
     if host.contains(',') {
-        return Err(BlinkError::config(
+        return Err(BlinkError::other(
             "comma not allowed in known_hosts field 'host'",
         ));
     }
@@ -522,7 +522,7 @@ pub fn append(host: &str, port: u16, key_type: &str, key_b64: &str) -> Result<Sa
     // wildcard as a pattern for other hosts: never this host, so it would
     // be asked about, and a dead line added, on every connect.
     if host.starts_with(['#', '!', '@', '|']) || host.contains(['*', '?']) {
-        return Err(BlinkError::config(format!(
+        return Err(BlinkError::other(format!(
             "host `{}` can't be stored in known_hosts",
             error::sanitize(host.to_string())
         )));
@@ -1513,6 +1513,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains(&path.display().to_string()), "{e}");
+        assert!(e.starts_with("could not read "), "not a config error: {e}");
     }
 
     /// Removing rewrote every line ending as `\n`.

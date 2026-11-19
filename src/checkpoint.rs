@@ -367,7 +367,7 @@ impl Checkpoint {
         // Compact: indentation doubled the size of a large checkpoint, and
         // with it the time each write holds up the interface.
         let json = serde_json::to_string(self)
-            .map_err(|e| BlinkError::config(format!("checkpoint serialize: {e}")))?;
+            .map_err(|e| BlinkError::other(format!("checkpoint serialize: {e}")))?;
         Self::atomic_write(&path, &json)?;
         self.dirty = false;
         let now = Instant::now();
@@ -460,7 +460,7 @@ impl Checkpoint {
     ) -> Result<usize> {
         let total = self.jobs.len() + jobs.len();
         if total > max_jobs {
-            return Err(BlinkError::config(format!(
+            return Err(BlinkError::other(format!(
                 "a checkpoint holds at most {max_jobs} jobs, and this would make {total}"
             )));
         }
@@ -470,7 +470,7 @@ impl Checkpoint {
         fn encoded_len(v: &impl Serialize) -> Result<u64> {
             serde_json::to_vec(v)
                 .map(|raw| raw.len() as u64)
-                .map_err(|e| BlinkError::config(format!("checkpoint serialize: {e}")))
+                .map_err(|e| BlinkError::other(format!("checkpoint serialize: {e}")))
         }
         let now = encoded_len(self)?;
         let mut added = 0u64;
@@ -479,7 +479,7 @@ impl Checkpoint {
         }
         let bytes = now + added + STATUS_GROWTH * total as u64;
         if bytes > max_bytes {
-            return Err(BlinkError::config(format!(
+            return Err(BlinkError::other(format!(
                 "a checkpoint holds at most {max_bytes} bytes, and this could make {bytes}"
             )));
         }
@@ -566,7 +566,7 @@ impl Checkpoint {
         file.take(MAX_CHECKPOINT_BYTES + 1)
             .read_to_string(&mut raw)?;
         if raw.len() as u64 > MAX_CHECKPOINT_BYTES {
-            return Err(BlinkError::config(format!(
+            return Err(BlinkError::other(format!(
                 "checkpoint file exceeds size limit ({MAX_CHECKPOINT_BYTES} bytes)"
             )));
         }
@@ -582,11 +582,11 @@ impl Checkpoint {
             version: Option<serde_json::Value>,
         }
         let probe: VersionProbe = serde_json::from_str(&raw)
-            .map_err(|e| BlinkError::config(format!("checkpoint parse: {e}")))?;
+            .map_err(|e| BlinkError::other(format!("checkpoint parse: {e}")))?;
         let version = probe.version.and_then(|v| v.as_u64()).unwrap_or(1) as u32;
 
         if version > FORMAT_VERSION {
-            return Err(BlinkError::config(format!(
+            return Err(BlinkError::other(format!(
                 "checkpoint version {version} is newer than supported ({FORMAT_VERSION}); \
                  upgrade blink to resume this batch",
             )));
@@ -598,12 +598,12 @@ impl Checkpoint {
         // `done: false` maps to `pending`.
         if version < 2 {
             let doc = serde_json::from_str(&raw)
-                .map_err(|e| BlinkError::config(format!("checkpoint parse: {e}")))?;
+                .map_err(|e| BlinkError::other(format!("checkpoint parse: {e}")))?;
             return Self::migrate_v1(doc);
         }
 
         let cp: Self = serde_json::from_str(&raw)
-            .map_err(|e| BlinkError::config(format!("checkpoint parse: {e}")))?;
+            .map_err(|e| BlinkError::other(format!("checkpoint parse: {e}")))?;
 
         Self::validate(&cp)?;
         Ok(Some(cp))
@@ -636,7 +636,7 @@ impl Checkpoint {
         }
 
         let cp: Self = serde_json::from_value(doc)
-            .map_err(|e| BlinkError::config(format!("checkpoint migrate parse: {e}")))?;
+            .map_err(|e| BlinkError::other(format!("checkpoint migrate parse: {e}")))?;
 
         Self::validate(&cp)?;
         Ok(Some(cp))
@@ -645,7 +645,7 @@ impl Checkpoint {
     /// Validate a freshly deserialised checkpoint for safety and sanity.
     fn validate(cp: &Checkpoint) -> Result<()> {
         if cp.jobs.len() > MAX_CHECKPOINT_JOBS {
-            return Err(BlinkError::config(format!(
+            return Err(BlinkError::other(format!(
                 "checkpoint has too many jobs ({}, limit is {MAX_CHECKPOINT_JOBS})",
                 cp.jobs.len()
             )));
@@ -658,7 +658,7 @@ impl Checkpoint {
                     // Null bytes are invalid in paths on all supported platforms
                     // and indicate a corrupt or malicious checkpoint.
                     if local_path.as_os_str().as_encoded_bytes().contains(&0u8) {
-                        return Err(BlinkError::config(
+                        return Err(BlinkError::other(
                             "checkpoint contains a path with a null byte",
                         ));
                     }
@@ -1387,7 +1387,7 @@ mod policy_tests {
 
     #[test]
     fn a_listing_that_failed_outright_is_not_complete() {
-        let known = known_sessions(Err(BlinkError::config("sessions dir unreadable")));
+        let known = known_sessions(Err(BlinkError::other("sessions dir unreadable")));
         assert!(!known.complete);
         assert!(known.keys.is_empty());
     }
