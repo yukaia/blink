@@ -40,6 +40,10 @@ the git history for those.
 
 ### Changed
 
+- **`scp://` reads like `sftp://`.** It shares SFTP's colour in the
+  session list, being the same encrypted connection, and the "routed
+  through SFTP" note on connecting is information rather than a warning.
+
 - **FTPS trusts the system's certificate store** as well as the built-in
   Mozilla bundle, so a server whose certificate comes from a CA installed
   on the machine (a company's own, say) verifies without pinning.
@@ -215,6 +219,13 @@ the git history for those.
   before, they were accepted whatever they presented.
 
 ### Fixed
+
+- **A server without SFTP says so, at once.** blink sent the request for
+  the `sftp` subsystem without waiting for the answer, so a refusal showed
+  up only as a failed SFTP start, after a wait, with no reason given. It
+  now fails immediately with "the server refused SFTP"; for an `scp://`
+  session, it adds that blink's SCP runs over SFTP and doesn't speak the
+  legacy protocol such a server may offer.
 
 - **A stale partial that can't be removed is named.** In a sticky folder
   such as `/tmp`, a partial another user left there can't be deleted, and

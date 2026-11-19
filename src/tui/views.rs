@@ -563,10 +563,13 @@ fn cancellation_warning(active: usize, pending: usize) -> Option<String> {
 /// [`Protocol::is_cleartext`] holds. FTPS used to share that arm with FTP,
 /// which told the user the encrypted protocol was as risky as the cleartext
 /// one and left no way to tell them apart in the list.
+///
+/// SCP is SFTP underneath (see `transport/scp.rs`), so it reads as SFTP
+/// does; it used to have a colour of its own, as if it were a different
+/// kind of connection.
 pub(crate) fn protocol_style(protocol: &Protocol, theme: &crate::theme::Theme) -> Style {
     match protocol {
-        Protocol::Sftp | Protocol::Ftps => Style::default().fg(theme.success),
-        Protocol::Scp => Style::default().fg(theme.directory),
+        Protocol::Sftp | Protocol::Scp | Protocol::Ftps => Style::default().fg(theme.success),
         Protocol::Ftp => Style::default().fg(theme.warning),
     }
 }
@@ -590,6 +593,20 @@ mod protocol_style_tests {
             protocol_style(&Protocol::Ftps, &theme),
             "the cleartext protocol must not look like the encrypted one",
         );
+    }
+
+    /// Every encrypted protocol, SCP included, reads like SFTP.
+    #[test]
+    fn the_encrypted_protocols_share_sftps_colour() {
+        let theme = Theme::load("dracula").unwrap();
+        for p in [Protocol::Scp, Protocol::Ftps] {
+            assert_eq!(
+                protocol_style(&p, &theme),
+                protocol_style(&Protocol::Sftp, &theme),
+                "{}",
+                p.as_str()
+            );
+        }
     }
 
     /// The cleartext protocol is the one that gets the caution colour, and
