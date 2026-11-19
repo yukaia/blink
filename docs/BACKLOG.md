@@ -32,6 +32,31 @@ form of the same key loads. Upstream's bug, still there in russh 0.65.1
 (checked 2026-11-13) and not yet reported. There's nothing for blink to do
 beyond, at most, naming the workaround in the error.
 
+## FTP uploads into folders that don't allow renaming
+
+Found in the `ftp_impl.rs` audit (2026-11-19); left as it is for now.
+Every FTP/FTPS upload is stored as `<name>.<hash>.blink-part` and renamed
+into place (`ftp_upload` → `ftp_rename`), so an interrupted upload never
+leaves a truncated file under the real name. Anonymous "incoming" folders
+typically allow `STOR` but refuse `RNFR`/`RNTO` and `DELE`: there every
+upload fails at the rename, and leaves a `.blink-part` the login can't
+remove either.
+
+Options weighed so far:
+
+- **Upload again straight to the final name** when the rename is refused
+  for permission reasons and nothing is in the way. Works, but costs a
+  second full transfer and the truncation protection, and only on servers
+  that leave no other way.
+- **Upload straight to the final name from the start** for a folder known
+  to refuse renames: needs a way to know (a per-connection memory after the
+  first refusal, or a session setting).
+- **Keep refusing**, with an error that says why and names the stranded
+  partial.
+
+Whatever is chosen, the stranded `.blink-part` needs a story too: the
+checkpoint discard tries to delete it, and that `DELE` is refused as well.
+
 ## Features with no tests
 
 From `cargo llvm-cov` on 2026-11-17, after a pass over the previous list
@@ -52,5 +77,3 @@ order of value:
   `viewer::after_draw` (writes to stdout) and `main`'s dispatch. The
   escape sequences for entering and leaving the screen are covered;
   the rest would need a pseudo-terminal harness.
-- **Dead code.** `handle_new_session`'s key/agent arm can't run:
-  `Session::from_url` always gives password auth.

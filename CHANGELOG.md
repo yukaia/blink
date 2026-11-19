@@ -182,6 +182,22 @@ the git history for those.
 
 ### Fixed
 
+- **FTP shows hidden files, and deletes them with their folder.** blink
+  now asks for `LIST -a` (falling back to a plain `LIST` on servers without
+  it): servers such as vsftpd left dotfiles out, so they didn't show, and
+  deleting a folder holding one removed everything else, then failed.
+- **An FTP download whose `SIZE` or `MDTM` goes unanswered is retried**
+  on a fresh connection instead of carrying on out of step with the
+  server, which could throw away a partial download that should have
+  resumed.
+- **A dropped FTP data connection is retried** like any other dropped
+  connection, rather than failing the transfer.
+- **FTP uploads are checked against what the server stored.** Where the
+  server answers `SIZE`, a short upload is an error instead of being put
+  in place.
+- **Creating an FTP folder where a symlink to a folder already is
+  succeeds**, as on SFTP.
+- **A failed FTP download no longer leaves an empty folder behind.**
 - **FTP and FTPS work with IPv6 servers.** Data connections used PASV,
   which can't describe an IPv6 address and which IPv6 servers commonly
   refuse, so every listing and transfer failed after a good login. Over
