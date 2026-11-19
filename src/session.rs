@@ -657,6 +657,16 @@ impl Session {
     /// Auth defaults to [`AuthMethod::Password`] — the password is prompted at
     /// connect time. The session is not persisted; call [`Self::save`] to do that.
     pub fn from_url(url: &str) -> Result<Self> {
+        // Reported as a bad URL, not a "config error": nothing here came
+        // from a file. The checks shared with `validate` build `Config`
+        // errors, so they're relabelled too.
+        Self::parse_url(url).map_err(|e| match e {
+            BlinkError::Config(msg) => BlinkError::InvalidUrl(msg),
+            other => other,
+        })
+    }
+
+    fn parse_url(url: &str) -> Result<Self> {
         let s = url.trim();
         if s.is_empty() {
             return Err(BlinkError::config("empty URL"));
@@ -1023,6 +1033,21 @@ mod tests {
     #[test]
     fn from_url_null_in_host_rejected() {
         assert!(Session::from_url("sftp://evil\x00host/").is_err());
+    }
+
+    /// Nothing in a URL comes from a file: a bad one said "config error".
+    #[test]
+    fn a_bad_url_is_called_a_bad_url() {
+        for url in [
+            "",
+            "host-only",
+            "sftp://u:pw@h",
+            "sftp://u@h:0",
+            "gopher://h",
+        ] {
+            let e = Session::from_url(url).unwrap_err().to_string();
+            assert!(e.starts_with("invalid URL: "), "{url}: {e}");
+        }
     }
 
     #[test]

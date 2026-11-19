@@ -40,6 +40,11 @@ the git history for those.
 
 ### Changed
 
+- **Only configuration problems are called "config error".** An
+  unreadable `known_hosts`, a checkpoint problem or a missing `$HOME`
+  now say what went wrong without that label, and a bad URL to `blink
+  connect` reads `invalid URL: …`. A problem in `config.ini` names the
+  file.
 - **Plain text isn't highlighted.** Text, Markdown, logs and `.nfo` files
   were coloured as code: an apostrophe opened a "string", a URL's `//` or
   an issue's `#12` a comment, and `/*` in a path turned the rest of the
@@ -79,6 +84,17 @@ the git history for those.
 
 ### Security
 
+- **A remote file name can't forge a line in the debug log.** A newline
+  in a name logged through a `%` field started a new line, so a server
+  could plant a convincing fake entry in `BLINK_LOG_FILE`. It's now
+  written as `\n`.
+- **More invisible characters are shown as spaces**: the combining
+  grapheme joiner, the Khmer inherent vowels, the line and paragraph
+  separators, the Braille blank (the usual "invisible name" trick) and
+  the shorthand format controls. A variation selector is kept only where
+  it changes how something is drawn (an emoji, a keycap, a symbol or
+  ideograph variant): after a plain letter it draws as nothing, so `a`
+  with one looked exactly like `a`.
 - **"Accept and save" no longer trusts two keys for one host.** If
   another blink saved a different key for the host while the prompt was
   open, both were kept and both trusted. The connection is now refused,
@@ -145,6 +161,11 @@ the git history for those.
 
 ### Fixed
 
+- **Long messages keep their end.** Every log line and error was cut to
+  its first 512 characters, so a long path pushed out the reason
+  (`…: permission denied`). They now lose their middle instead.
+- **Tab stops in the viewer count wide characters as two columns**, so a
+  line with CJK text before a tab lines up.
 - **Highlighting follows strings across lines**: Rust strings, shell and
   YAML quotes, JavaScript template literals, Python and TOML triple
   quotes, and any string continued with a backslash. Their second line

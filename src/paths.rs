@@ -260,9 +260,7 @@ mod test_home {
 fn require_absolute(value: &str, var: &str) -> Result<PathBuf> {
     let path = PathBuf::from(value);
     if !path.is_absolute() {
-        return Err(BlinkError::config(format!(
-            "{var} must be an absolute path"
-        )));
+        return Err(BlinkError::other(format!("{var} must be an absolute path")));
     }
     Ok(path)
 }
@@ -280,7 +278,7 @@ fn base_dir_from(xdg: Option<&str>, home: Option<&str>) -> Result<PathBuf> {
     if let Some(xdg) = xdg.filter(|v| !v.is_empty()) {
         return Ok(require_absolute(xdg, "XDG_CONFIG_HOME")?.join(APP_DIR_NAME));
     }
-    let home = home.ok_or_else(|| BlinkError::config("$HOME is not set"))?;
+    let home = home.ok_or_else(|| BlinkError::other("$HOME is not set"))?;
     Ok(require_absolute(home, "$HOME")?
         .join(".config")
         .join(APP_DIR_NAME))
@@ -303,7 +301,7 @@ fn base_dir_from(xdg: Option<&str>, home: Option<&str>) -> Result<PathBuf> {
     if let Some(xdg) = xdg.filter(|v| !v.is_empty()) {
         return Ok(require_absolute(xdg, "XDG_CONFIG_HOME")?.join(APP_DIR_NAME));
     }
-    let home = home.ok_or_else(|| BlinkError::config("$HOME is not set"))?;
+    let home = home.ok_or_else(|| BlinkError::other("$HOME is not set"))?;
     Ok(require_absolute(home, "$HOME")?
         .join("Library")
         .join("Application Support")
@@ -324,7 +322,7 @@ fn real_base_dir() -> Result<PathBuf> {
 /// often syncs, carrying `known_hosts` and session files with it.
 #[cfg(target_os = "windows")]
 fn base_dir_from(app_data: Option<&str>) -> Result<PathBuf> {
-    let app_data = app_data.ok_or_else(|| BlinkError::config("%APPDATA% is not set"))?;
+    let app_data = app_data.ok_or_else(|| BlinkError::other("%APPDATA% is not set"))?;
     Ok(require_absolute(app_data, "%APPDATA%")?.join(APP_DIR_NAME))
 }
 
@@ -340,7 +338,7 @@ fn real_base_dir() -> Result<PathBuf> {
 #[cfg(not(any(unix, target_os = "windows")))]
 #[cfg_attr(test, allow(dead_code))]
 fn real_base_dir() -> Result<PathBuf> {
-    Err(BlinkError::config(
+    Err(BlinkError::other(
         "no config directory is known for this platform",
     ))
 }
@@ -422,7 +420,7 @@ fn create_app_dir(path: &Path) -> Result<()> {
         // elsewhere, and only they can write its parent.
         let meta = fs::metadata(path)?;
         if !meta.is_dir() {
-            return Err(BlinkError::config(format!(
+            return Err(BlinkError::other(format!(
                 "{} exists but is not a directory",
                 path.display()
             )));
@@ -448,7 +446,7 @@ fn create_app_dir(path: &Path) -> Result<()> {
     {
         fs::create_dir_all(path)?;
         if !path.is_dir() {
-            return Err(BlinkError::config(format!(
+            return Err(BlinkError::other(format!(
                 "{} exists but is not a directory",
                 path.display()
             )));
@@ -880,7 +878,7 @@ mod tests {
                 use std::io::Write as _;
                 f.write_all(b"new")
             },
-            |_| Err(BlinkError::config("EINVAL")),
+            |_| Err(BlinkError::other("EINVAL")),
         )
         .expect("the file is in place, so the save succeeded");
 
