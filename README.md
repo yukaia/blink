@@ -495,7 +495,16 @@ mouse = true
 ```
 
 Comments go on lines of their own: a `;` after a value is read as part of
-the value.
+the value. The first run writes a commented file like this one.
+
+blink only ever changes the `theme` line (when you press `t`), editing it in
+place: your comments, layout, other settings and anything you changed while
+blink was running are left as they are. A symlinked `config.ini` is written
+through to its target. A file with a byte-order mark is read normally.
+
+Settings blink doesn't recognise — a misspelling, a key in the wrong case
+(`Theme`), an unknown section — and a setting given twice (the first one
+counts) are reported in the log when blink starts, as is a corrected value.
 
 An out-of-range `parallel_downloads` — `0`, or anything above the maximum —
 is clamped into range rather than rejected, in `config.ini` and in the
@@ -503,7 +512,9 @@ per-session `[transfer]` override alike, so a hand-edited or stale file
 never stops blink from starting. A value that is not a number at all has no
 sensible correction, and the two files differ deliberately: `config.ini`
 rejects it outright, while a session file ignores the override and falls
-back to the global setting rather than locking you out of that host.
+back to the global setting rather than locking you out of that host. A
+`theme` that can't be used — missing, or not a valid name — falls back to
+dracula with a warning instead of stopping blink.
 
 ### `sessions/<name>.ini` — per session
 
