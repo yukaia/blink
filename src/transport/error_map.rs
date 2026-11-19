@@ -1,21 +1,17 @@
 //! Map transport-library errors to the typed `BlinkError` surface.
 //!
-//! Previously every SFTP / FTP call site did
-//! `BlinkError::transport(format!("{op} {path}: {err}"))`, which
-//! collapsed every failure — file-not-found, permission-denied,
-//! connection-dropped, protocol-violation — into a single string-only
-//! variant. Callers couldn't distinguish "the file is gone" from
-//! "the server hung up mid-`read_dir`", so e.g. recursive walks
-//! marched on against half a tree instead of bailing.
+//! [`map_sftp`] and [`map_ftp`] classify a library error once, in one
+//! place, so call sites thread only the `op` and `path` context and get
+//! back the variant callers act on: [`BlinkError::NotFound`] (the path
+//! isn't there), [`BlinkError::Permission`], [`BlinkError::Disconnected`]
+//! (the connection is gone or out of step: reconnect, and a transfer gets
+//! one retry), [`BlinkError::AuthFailed`], and [`BlinkError::Transport`]
+//! for the genuinely unclassifiable. A walk can then bail on a dropped
+//! connection rather than march on against half a tree, and an existence
+//! check can tell "not there" from "not allowed to look".
 //!
-//! [`map_sftp`] and [`map_ftp`] do the classification once, in one
-//! place, so call sites just thread the `op` and `path` context and
-//! get back the right `BlinkError` variant.
-//!
-//! Status codes that map outside the three new typed variants
-//! (NotFound / Permission / Disconnected) fall through to the
-//! existing `Transport(...)` string — those are the genuinely
-//! unclassifiable failures.
+//! Every message keeps the server's own words where it gave any: they are
+//! often the only clue to what went wrong.
 
 use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::protocol::StatusCode;
@@ -29,22 +25,29 @@ use crate::error::BlinkError;
 /// - `Status(PermissionDenied)` → [`BlinkError::Permission`]
 /// - `Status(NoConnection | ConnectionLost)`, `IO(_)`, `Timeout` →
 ///   [`BlinkError::Disconnected`]
-/// - Everything else → [`BlinkError::Transport`] with the underlying
-///   message preserved.
+/// - `UnexpectedPacket`, `UnexpectedBehavior(_)` →
+///   [`BlinkError::Disconnected`]: the channel is out of step with the
+///   server, and every request after it is suspect. Reported as a plain
+///   error, the browsing connection carried on using it.
+/// - Everything else → [`BlinkError::Transport`].
+///
+/// The server's message follows `op path` in every case.
 pub fn map_sftp(op: &str, path: &str, err: SftpError) -> BlinkError {
+    let detail = format!("{op} {path}: {err}");
     match &err {
         SftpError::Status(s) => match s.status_code {
-            StatusCode::NoSuchFile => BlinkError::not_found(format!("{op} {path}")),
-            StatusCode::PermissionDenied => BlinkError::permission(format!("{op} {path}")),
+            StatusCode::NoSuchFile => BlinkError::not_found(detail),
+            StatusCode::PermissionDenied => BlinkError::permission(detail),
             StatusCode::NoConnection | StatusCode::ConnectionLost => {
-                BlinkError::disconnected(format!("{op} {path}: {err}"))
+                BlinkError::disconnected(detail)
             }
-            _ => BlinkError::transport(format!("{op} {path}: {err}")),
+            _ => BlinkError::transport(detail),
         },
-        SftpError::IO(_) | SftpError::Timeout => {
-            BlinkError::disconnected(format!("{op} {path}: {err}"))
-        }
-        _ => BlinkError::transport(format!("{op} {path}: {err}")),
+        SftpError::IO(_)
+        | SftpError::Timeout
+        | SftpError::UnexpectedPacket
+        | SftpError::UnexpectedBehavior(_) => BlinkError::disconnected(detail),
+        SftpError::Limited(_) => BlinkError::transport(detail),
     }
 }
 
@@ -58,26 +61,67 @@ pub fn map_sftp(op: &str, path: &str, err: SftpError) -> BlinkError {
 ///   time. (A connection the server closed before replying comes back as
 ///   `ConnectionError`; before suppaftp 12.1.1 it came back as
 ///   `BadResponse`.)
-/// - `UnexpectedResponse(550 FileUnavailable)` → [`BlinkError::NotFound`].
-///   FTP overloads 550 for "file not found" and "no access" — the
-///   former is the dominant interpretation across server
-///   implementations, and the message body that distinguishes them is
-///   server-specific.
-/// - `UnexpectedResponse(530 NotLoggedIn)` → [`BlinkError::AuthFailed`]
-///   so callers see the right state (vs. a generic transport error).
+/// - `425` (can't open data connection) and `426` (connection closed,
+///   transfer aborted) → [`BlinkError::Disconnected`]: a lost data
+///   connection, usually a network blip, which a transfer gets a retry
+///   for. Classed as a plain error, a blip mid-transfer failed the job.
+/// - `550 FileUnavailable` → see [`classify_550`].
+/// - `530 NotLoggedIn` → [`BlinkError::AuthFailed`].
 /// - Everything else → [`BlinkError::Transport`].
+///
+/// The server's reply follows `op path` in every case.
 pub fn map_ftp(op: &str, path: &str, err: FtpError) -> BlinkError {
+    let detail = format!("{op} {path}: {err}");
     match &err {
         FtpError::ConnectionError(_) | FtpError::SecureError(_) | FtpError::BadResponse => {
-            BlinkError::disconnected(format!("{op} {path}: {err}"))
+            BlinkError::disconnected(detail)
         }
         FtpError::UnexpectedResponse(r) => match r.status {
-            FtpStatus::NotAvailable => BlinkError::disconnected(format!("{op} {path}: {err}")),
-            FtpStatus::FileUnavailable => BlinkError::not_found(format!("{op} {path}")),
-            FtpStatus::NotLoggedIn => BlinkError::auth(format!("{op} {path}: {err}")),
-            _ => BlinkError::transport(format!("{op} {path}: {err}")),
+            FtpStatus::NotAvailable
+            | FtpStatus::CannotOpenDataConnection
+            | FtpStatus::TransferAborted => BlinkError::disconnected(detail),
+            FtpStatus::FileUnavailable => classify_550(&r.body, detail),
+            FtpStatus::NotLoggedIn => BlinkError::auth(detail),
+            _ => BlinkError::transport(detail),
         },
-        _ => BlinkError::transport(format!("{op} {path}: {err}")),
+        _ => BlinkError::transport(detail),
+    }
+}
+
+/// A `550`, which FTP uses both for "no such file" and for "no access".
+///
+/// Told apart by the server's reply text, as the servers in use word them
+/// (`Permission denied`, IIS's `Access is denied.`, `Operation not
+/// permitted`) — and it matters: as `NotFound`, a folder blink wasn't
+/// allowed to list read as empty, and the upload overwrite check let
+/// files in it be replaced without asking. Text that says neither (`550
+/// Failed to change directory.`) is taken as not found, so an upload to a
+/// server with terse replies still works.
+///
+/// Not-found wording is looked for first: "access" also turns up in
+/// `Can't access /x: No such file or directory`.
+fn classify_550(body: &[u8], detail: String) -> BlinkError {
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    let has = |words: &[&str]| words.iter().any(|w| text.contains(w));
+    let missing = has(&[
+        "no such",
+        "not found",
+        "cannot find",
+        "can't find",
+        "not exist",
+        "n't exist",
+    ]);
+    let denied = has(&[
+        "denied",
+        "permission",
+        "not permitted",
+        "not allowed",
+        "access",
+    ]);
+    if denied && !missing {
+        BlinkError::permission(detail)
+    } else {
+        BlinkError::not_found(detail)
     }
 }
 
@@ -211,5 +255,95 @@ mod tests {
         let msg = format!("{e}");
         assert!(msg.contains("open"), "{msg}");
         assert!(msg.contains("/etc/secret"), "{msg}");
+    }
+
+    // -- audit fixes ---------------------------------------------------------
+
+    fn ftp_550(body: &str) -> BlinkError {
+        map_ftp(
+            "list",
+            "/x",
+            FtpError::UnexpectedResponse(Response {
+                status: FtpStatus::FileUnavailable,
+                body: format!("550 {body}").into_bytes(),
+            }),
+        )
+    }
+
+    /// Every 550 was "not found", so a folder blink couldn't list read as
+    /// empty.
+    #[test]
+    fn a_550_is_classified_by_what_the_server_says() {
+        for denied in [
+            "Permission denied",
+            "Access is denied.",
+            "Operation not permitted",
+            "Not allowed to list",
+        ] {
+            assert!(
+                matches!(ftp_550(denied), BlinkError::Permission(_)),
+                "{denied}"
+            );
+        }
+        for missing in [
+            "No such file or directory",
+            "File not found",
+            "The system cannot find the file specified.",
+            "Can't access /x: No such file or directory",
+            "Failed to change directory.",
+            "",
+        ] {
+            assert!(
+                matches!(ftp_550(missing), BlinkError::NotFound(_)),
+                "{missing}"
+            );
+        }
+    }
+
+    /// `not found: stor /x` dropped the server's reason, which for a 550
+    /// is often the only way to tell what went wrong.
+    #[test]
+    fn messages_keep_the_servers_words() {
+        let e = ftp_550("Disk quota exceeded").to_string();
+        assert!(
+            e.contains("Disk quota exceeded") && e.contains("list /x"),
+            "{e}"
+        );
+        let e = map_sftp("open", "/x", sftp_status(StatusCode::NoSuchFile)).to_string();
+        assert!(e.contains("open /x") && e.contains("test"), "{e}");
+        let e = map_sftp("open", "/x", sftp_status(StatusCode::PermissionDenied)).to_string();
+        assert!(e.contains("test"), "{e}");
+    }
+
+    /// A lost data connection failed the job; as a dropped connection it
+    /// gets the dispatcher's one retry.
+    #[test]
+    fn a_lost_data_connection_is_a_dropped_connection() {
+        for status in [
+            FtpStatus::CannotOpenDataConnection,
+            FtpStatus::TransferAborted,
+        ] {
+            let e = map_ftp("retr", "/x", ftp_response(status));
+            assert!(matches!(e, BlinkError::Disconnected(_)), "{e:?}");
+        }
+    }
+
+    /// The channel is out of step; carrying on with it means every later
+    /// request is suspect.
+    #[test]
+    fn sftp_protocol_confusion_is_a_dropped_connection() {
+        for err in [
+            SftpError::UnexpectedPacket,
+            SftpError::UnexpectedBehavior("odd".into()),
+        ] {
+            assert!(matches!(
+                map_sftp("read", "/x", err),
+                BlinkError::Disconnected(_)
+            ));
+        }
+        assert!(matches!(
+            map_sftp("write", "/x", SftpError::Limited("too big".into())),
+            BlinkError::Transport(_)
+        ));
     }
 }

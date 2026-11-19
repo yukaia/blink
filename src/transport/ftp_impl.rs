@@ -676,7 +676,10 @@ pub async fn ftp_upload<T: TokioTlsStream + Send>(
         _ => {
             match timed_ftp("dele", remote_path, stream.rm(remote_path)).await {
                 Ok(()) => {}
-                Err(BlinkError::NotFound(_)) => {}
+                // Nothing there, or nothing this login may delete (a
+                // write-only upload folder): either way the retried rename
+                // below says what really stands in the way.
+                Err(BlinkError::NotFound(_) | BlinkError::Permission(_)) => {}
                 Err(e) => return Err(e),
             }
             ftp_rename(stream, &part, remote_path).await
@@ -1045,6 +1048,11 @@ mod integration {
         pub foreign_pasv_ip: bool,
         /// A LIST body no parser can turn into entries.
         pub unparsable_list_line: bool,
+        /// Answer LIST with `550 Permission denied`: a folder this login
+        /// may write to but not list.
+        pub deny_list: bool,
+        /// Answer DELE with `550 Permission denied`.
+        pub deny_dele: bool,
         /// Close control and data connections after `150`, sending no `226`.
         pub abrupt_close: bool,
         /// Extra LIST lines carrying names a walk must refuse to act on:
@@ -1298,6 +1306,11 @@ mod integration {
                         w.write_all(b"425 use PASV first\r\n").await?;
                         continue;
                     };
+                    if faults.deny_list {
+                        drop(data_listener);
+                        w.write_all(b"550 Permission denied\r\n").await?;
+                        continue;
+                    }
                     let mut body = if faults.unparsable_list_line {
                         "!! this is not a listing line !!\r\n".to_string()
                     } else {
@@ -1519,6 +1532,9 @@ mod integration {
                     } else {
                         w.write_all(b"550 no such directory\r\n").await?;
                     }
+                }
+                "DELE" if faults.deny_dele => {
+                    w.write_all(b"550 Permission denied\r\n").await?;
                 }
                 "DELE" => {
                     let removed = store.lock().await.remove(&arg).is_some();
@@ -1774,6 +1790,25 @@ mod integration {
             "the old file is put back, not left aside: {:?}",
             files.keys()
         );
+    }
+
+    /// A 550 on DELE now reads as a permission problem, not "no such
+    /// file", when the server says so. Making room for a refused rename
+    /// still goes on to retry it, so the error is the rename's, as before:
+    /// a write-only upload folder can refuse deletes and still take files.
+    #[tokio::test]
+    async fn a_refused_delete_still_lets_the_rename_say_whats_wrong() {
+        let faults = Faults {
+            refuse_part_rnto: true,
+            deny_list: true,
+            deny_dele: true,
+            ..Faults::default()
+        };
+        let (result, files) = upload_over_existing("deny-dele", faults).await;
+
+        let err = result.expect_err("the rename is refused").to_string();
+        assert!(err.contains("rename refused"), "{err}");
+        assert_eq!(files.get("/up.bin").map(Vec::as_slice), Some(&b"old"[..]));
     }
 
     /// A folder where the upload is going is not the upload's to replace.
@@ -2744,6 +2779,35 @@ mod integration {
     /// LIST parsers directly instead, and an unparsable line is skipped.
     /// Skipping a line it cannot parse is right; saying nothing about it was
     /// not. The listing carries the count so the caller can tell the user.
+    /// A 550 that says "permission denied" read as "no such file", so a
+    /// file in a folder blink couldn't list was reported absent — and the
+    /// upload overwrite check let it be replaced without asking.
+    #[tokio::test]
+    async fn a_folder_that_cant_be_listed_is_not_taken_for_empty() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/in/a.txt".to_string(), b"x".to_vec());
+        let faults = Faults {
+            deny_list: true,
+            ..Faults::default()
+        };
+        let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let err = transport
+            .metadata("/in/a.txt")
+            .await
+            .expect_err("not knowing is not \"absent\"");
+        assert!(
+            matches!(err, crate::error::BlinkError::Permission(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("Permission denied"), "{err}");
+    }
+
     #[tokio::test]
     async fn an_unparsable_listing_line_is_counted() {
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
