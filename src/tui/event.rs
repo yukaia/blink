@@ -224,6 +224,13 @@ pub enum AppEvent {
         host: String,
     },
 
+    /// Discarding an upload checkpoint removed its unfinished uploads'
+    /// partial files from the server: how many, and what couldn't be.
+    RemotePartsRemoved {
+        removed: usize,
+        failures: Vec<String>,
+    },
+
     /// Something went wrong with the known_hosts file itself while checking
     /// or saving a host key. Carried to the TUI because the alternative,
     /// the debug log, is a sink unless `BLINK_LOG_FILE` is set: a file that

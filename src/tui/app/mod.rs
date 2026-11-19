@@ -2439,6 +2439,79 @@ mod tests {
         );
     }
 
+    /// Two blinks on one session each wrote their own copy of the
+    /// checkpoint, and the last to save wiped the other's batch. The
+    /// second now runs its batch unsaved, and leaves the file alone.
+    #[tokio::test]
+    async fn a_second_blink_runs_its_batch_without_touching_the_checkpoint() {
+        use crate::checkpoint::{Checkpoint, StoreLock};
+        let (mut a, _cleanup) = checkpoint_app("second-blink");
+        let s = a.current_session.as_ref().unwrap().clone();
+        let origin = crate::transport::origin_of(&s);
+        // The first blink: its batch on disk, its lock held.
+        let mut theirs = Checkpoint::new(
+            &s.name,
+            &origin,
+            CheckpointKind::Download,
+            vec![crate::checkpoint::CheckpointJob::Download {
+                remote_path: "/r/theirs".into(),
+                local_path: "/l/theirs".into(),
+                status: crate::checkpoint::JobStatus::Pending,
+            }],
+        );
+        theirs.flush().unwrap();
+        let held = StoreLock::try_take(&s.name, &origin, CheckpointKind::Download)
+            .unwrap()
+            .unwrap();
+
+        a.dispatch_plan(vec![download(0)], CheckpointKind::Download);
+
+        assert!(logged(
+            &a,
+            "another blink is using this session's download checkpoint"
+        ));
+        assert!(a.active_checkpoints[&CheckpointKind::Download].is_unsaved());
+        assert_eq!(
+            on_disk_jobs(&a, CheckpointKind::Download),
+            vec!["/r/theirs".to_string()],
+            "the other blink's batch is untouched",
+        );
+        // Finishing this batch doesn't remove their file either.
+        finish_next(&mut a, crate::transfer::TransferState::Complete).unwrap();
+        assert!(!a.active_checkpoints.contains_key(&CheckpointKind::Download));
+        assert_eq!(
+            on_disk_jobs(&a, CheckpointKind::Download),
+            vec!["/r/theirs".to_string()]
+        );
+
+        // Nor can it be resumed from here while theirs runs.
+        a.resume_walk(CheckpointKind::Download);
+        assert!(logged(&a, "another blink is using the download checkpoint"));
+        drop(held);
+    }
+
+    /// The lock follows the checkpoint to its new name, so another blink
+    /// can't take it up mid-batch after a rename.
+    #[tokio::test]
+    async fn the_checkpoint_lock_follows_a_rename() {
+        use crate::checkpoint::StoreLock;
+        let (mut a, _cleanup) = checkpoint_app("lock-rename");
+        let origin = crate::transport::origin_of(a.current_session.as_ref().unwrap());
+        a.dispatch_plan(vec![download(0), download(1)], CheckpointKind::Download);
+
+        a.open_save_session();
+        a.save_session_input = "renamed-locked".into();
+        a.handle_save_session(press(KeyCode::Enter));
+
+        assert!(
+            StoreLock::try_take("renamed-locked", &origin, CheckpointKind::Download)
+                .unwrap()
+                .is_none(),
+            "held under the new name",
+        );
+        assert!(!a.active_checkpoints[&CheckpointKind::Download].is_unsaved());
+    }
+
     /// `c` used to leave its job pending in the checkpoint, so the
     /// cancelled file came back on the next connect.
     #[tokio::test]

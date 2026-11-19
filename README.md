@@ -104,9 +104,16 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   without reconnecting.
   Connecting to a session that has an unfinished batch offers to resume it,
   with a summary of what is left. `[r]` resumes, `[d]` discards the
-  checkpoint *and* the partial downloads it is the only record of, and
-  `[esc]` defers — the offer returns on the next connect. Use `blink
+  checkpoint *and* the partial files it is the only record of — local
+  partial downloads, and an upload batch's partial files on the server —
+  and `[esc]` defers — the offer returns on the next connect. Use `blink
   checkpoints` to inspect pending checkpoints from the command line.
+- **One blink per checkpoint.** A running blink holds a lock on each
+  checkpoint it uses (`…-upload.lock` beside it). A second blink connected
+  to the same session runs its batches without saving them for resume,
+  says so in its log, and doesn't offer, resume or discard the checkpoint
+  the first is using; `blink checkpoints` lists it as in use and won't
+  remove it.
 - **Checkpoint keying** — checkpoints are keyed by session *name* and by
   the server and account the session connects to (`user@host:port`). A
   checkpoint is only offered to, resumed by, or extended by a connection
@@ -332,7 +339,10 @@ blink checkpoints --clean
 # be read and temporary files left by an interrupted write
 blink checkpoints --force
 # (both also delete the .blink-part files, and their .meta sidecars, left
-#  by the batches they remove)
+#  by the batches they remove — but not a partial whose sidecar says it
+#  belongs to another transfer, and not partial uploads on the server,
+#  which need a connection: discard from blink for those. A checkpoint a
+#  running blink is using is kept.)
 
 # Forget a stored SSH host key (see "known_hosts" below before running this)
 blink known-hosts remove host.example.com

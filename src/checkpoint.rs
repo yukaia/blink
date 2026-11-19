@@ -7,9 +7,11 @@
 //! it), and the transfer direction:
 //!
 //! ```text
-//! ~/.config/blink/checkpoints/<name>-<hash>-upload.json
-//! ~/.config/blink/checkpoints/<name>-<hash>-download.json
+//! <config dir>/checkpoints/<name>-<hash>-upload.json
+//! <config dir>/checkpoints/<name>-<hash>-download.json
 //! ```
+//!
+//! (`<config dir>` is [`paths::root_dir`]: `~/.config/blink` on Linux.)
 //!
 //! `<name>` is the session name with path-unsafe characters replaced by `_`,
 //! and `<hash>` the first eight hex digits of the SHA-256 of the name and
@@ -28,6 +30,16 @@
 //!
 //! Renaming a session moves its checkpoints to the new name; see
 //! [`rename_session`].
+//!
+//! ## One blink at a time
+//!
+//! Each checkpoint has a lock file beside it (`…-upload.lock`), held by the
+//! blink using it. Every running blink keeps its own copy in memory and
+//! writes the whole file, so two using one checkpoint overwrote each
+//! other's batches. A second blink connected to the same session runs its
+//! batches with a checkpoint that's never written ([`Checkpoint::new_unsaved`]),
+//! isn't offered or able to resume or discard the one in use, and says so;
+//! `blink checkpoints` keeps a checkpoint in use rather than removing it.
 //!
 //! ## Format (version 4)
 //!
@@ -259,8 +271,7 @@ impl CheckpointJob {
         self.set_status(JobStatus::Cancelled);
     }
 
-    /// Returns the remote path for log messages.
-    #[allow(dead_code)]
+    /// The job's remote path.
     pub fn remote_path(&self) -> &str {
         match self {
             Self::Mkdir { remote_path, .. } => remote_path,
@@ -299,6 +310,73 @@ pub struct Checkpoint {
     /// How long the last write took. See [`flush_interval`].
     #[serde(default, skip)]
     last_cost: Duration,
+    /// This blink's hold on the file; see the module docs. Held, never
+    /// read: dropping it is what releases the lock.
+    #[allow(dead_code)]
+    #[serde(default, skip)]
+    lock: Option<StoreLock>,
+    /// Never written: another blink holds this checkpoint. See
+    /// [`Self::new_unsaved`].
+    #[serde(default, skip)]
+    unsaved: bool,
+}
+
+/// An exclusive hold on one checkpoint's file, so two blinks can't both
+/// write it. Released when the last clone is dropped. See the module docs.
+#[derive(Debug, Clone)]
+pub struct StoreLock(#[allow(dead_code)] std::sync::Arc<std::fs::File>);
+
+impl StoreLock {
+    /// Take the lock for `session`'s `kind` checkpoint on `origin`.
+    /// `Ok(None)` when another blink holds it.
+    pub fn try_take(session: &str, origin: &str, kind: CheckpointKind) -> Result<Option<Self>> {
+        Self::try_take_at(
+            &lock_path_for(&Checkpoint::path_for(session, origin, kind)?),
+            true,
+        )
+    }
+
+    /// Take the lock file at `path`, creating it if `create`. `Ok(None)`
+    /// when another blink holds it, and when it doesn't exist and isn't to
+    /// be created — nobody can hold a lock file that isn't there.
+    fn try_take_at(path: &Path, create: bool) -> Result<Option<Self>> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(true).create(create).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = match opts.open(path) {
+            Ok(f) => f,
+            Err(e) if !create && e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(BlinkError::other(format!("{}: {e}", path.display())));
+            }
+        };
+        match file.try_lock() {
+            Ok(()) => Ok(Some(Self(std::sync::Arc::new(file)))),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => {
+                Err(BlinkError::other(format!("{}: lock: {e}", path.display())))
+            }
+        }
+    }
+}
+
+/// The lock file beside the checkpoint at `path`: `…-upload.json` →
+/// `…-upload.lock`, the same length, so it fits wherever the checkpoint's
+/// name does.
+fn lock_path_for(path: &Path) -> PathBuf {
+    path.with_extension("lock")
+}
+
+/// Whether another blink holds the checkpoint at `path`.
+fn in_use_elsewhere(path: &Path) -> bool {
+    let lock = lock_path_for(path);
+    lock.exists() && matches!(StoreLock::try_take_at(&lock, false), Ok(None))
 }
 
 impl Checkpoint {
@@ -319,7 +397,41 @@ impl Checkpoint {
             dirty: true,
             last_save: None,
             last_cost: Duration::ZERO,
+            lock: None,
+            unsaved: false,
         }
+    }
+
+    /// A checkpoint for a batch that another blink's checkpoint would
+    /// collide with: it tracks the batch in memory (jobs waiting for room
+    /// in the queue live here) but is never written, and never removes the
+    /// file the other blink is using.
+    pub fn new_unsaved(session: &str, origin: &str, kind: CheckpointKind) -> Self {
+        Self {
+            unsaved: true,
+            ..Self::new(session, origin, kind, Vec::new())
+        }
+    }
+
+    /// Whether this checkpoint is never written; see [`Self::new_unsaved`].
+    pub fn is_unsaved(&self) -> bool {
+        self.unsaved
+    }
+
+    /// Stop writing this checkpoint: its lock went to another blink.
+    pub fn set_unsaved(&mut self) {
+        self.unsaved = true;
+        self.lock = None;
+    }
+
+    /// Hold `lock` for as long as this checkpoint lives.
+    pub fn hold(&mut self, lock: StoreLock) {
+        self.lock = Some(lock);
+    }
+
+    /// Give up the lock, for a caller about to move the file.
+    pub fn release(&mut self) {
+        self.lock = None;
     }
 
     // -----------------------------------------------------------------------
@@ -362,6 +474,10 @@ impl Checkpoint {
     /// completed, batch failed, app exiting) so the on-disk state is up to
     /// date before the in-memory checkpoint is dropped.
     pub fn flush(&mut self) -> Result<()> {
+        if self.unsaved {
+            self.dirty = false;
+            return Ok(());
+        }
         let started = Instant::now();
         let path = Self::path_for(&self.session, self.origin_key(), self.kind)?;
         // Compact: indentation doubled the size of a large checkpoint, and
@@ -545,9 +661,16 @@ impl Checkpoint {
     ///
     /// A file whose recorded origin is not `origin` reads as absent: it is
     /// not this connection's to resume.
+    ///
+    /// So does one whose own `session` or `kind` isn't what its file name
+    /// says: copied or hand-edited, it's not this batch's either.
     pub fn load(session: &str, origin: &str, kind: CheckpointKind) -> Result<Option<Self>> {
         let path = Self::path_for(session, origin, kind)?;
-        Ok(Self::load_from(&path)?.filter(|cp| cp.origin.as_deref() == Some(origin)))
+        Ok(Self::load_from(&path)?.filter(|cp| cp.belongs_to(session, origin, kind)))
+    }
+
+    fn belongs_to(&self, session: &str, origin: &str, kind: CheckpointKind) -> bool {
+        self.session == session && self.origin.as_deref() == Some(origin) && self.kind == kind
     }
 
     pub fn load_from(path: &Path) -> Result<Option<Self>> {
@@ -578,12 +701,32 @@ impl Checkpoint {
         // alongside it, and a checkpoint can be 256 MiB.
         #[derive(Deserialize)]
         struct VersionProbe {
-            #[serde(default)]
+            // `Some(Null)` for `"version": null`, `None` only when the field
+            // is missing: a plain `Option` reads null as missing, and so as
+            // version 1.
+            #[serde(default, deserialize_with = "present")]
             version: Option<serde_json::Value>,
+        }
+        fn present<'de, D: serde::Deserializer<'de>>(
+            d: D,
+        ) -> std::result::Result<Option<serde_json::Value>, D::Error> {
+            serde_json::Value::deserialize(d).map(Some)
         }
         let probe: VersionProbe = serde_json::from_str(&raw)
             .map_err(|e| BlinkError::other(format!("checkpoint parse: {e}")))?;
-        let version = probe.version.and_then(|v| v.as_u64()).unwrap_or(1) as u32;
+        // Only a missing version means version 1. Anything else that isn't
+        // a version number is an error: read as version 1, `"version": "4"`
+        // went through the version-1 migration, which reset every job to
+        // pending from a `done` field that wasn't there.
+        let version = match probe.version {
+            None => 1,
+            Some(v) => v
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| {
+                    BlinkError::other(format!("checkpoint parse: `version` is not a version: {v}"))
+                })?,
+        };
 
         if version > FORMAT_VERSION {
             return Err(BlinkError::other(format!(
@@ -652,6 +795,27 @@ impl Checkpoint {
         }
 
         for job in &cp.jobs {
+            // A download checkpoint holds downloads; an upload one, uploads
+            // and the remote folders they go into. A job of the other kind
+            // would be queued as the wrong transfer on resume.
+            let fits = matches!(
+                (cp.kind, job),
+                (CheckpointKind::Download, CheckpointJob::Download { .. })
+                    | (CheckpointKind::Upload, CheckpointJob::Upload { .. })
+                    | (CheckpointKind::Upload, CheckpointJob::Mkdir { .. })
+            );
+            if !fits {
+                return Err(BlinkError::other(format!(
+                    "checkpoint holds a job that isn't part of a {} batch",
+                    cp.kind.as_str()
+                )));
+            }
+            let remote = job.remote_path();
+            if remote.is_empty() || remote.contains('\0') {
+                return Err(BlinkError::other(
+                    "checkpoint contains an empty remote path or one with a null byte",
+                ));
+            }
             match job {
                 CheckpointJob::Upload { local_path, .. }
                 | CheckpointJob::Download { local_path, .. } => {
@@ -661,6 +825,17 @@ impl Checkpoint {
                         return Err(BlinkError::other(
                             "checkpoint contains a path with a null byte",
                         ));
+                    }
+                    // Relative, it would be resumed — and its partial
+                    // cleaned up — wherever blink happened to be started.
+                    // blink only ever records absolute ones. (Remote paths
+                    // aren't held to this: an FTP server may not name its
+                    // paths the Unix way.)
+                    if !local_path.is_absolute() {
+                        return Err(BlinkError::other(format!(
+                            "checkpoint contains a relative local path: {}",
+                            crate::error::sanitize_display(&local_path.display().to_string())
+                        )));
                     }
                 }
                 CheckpointJob::Mkdir { .. } => {}
@@ -785,10 +960,12 @@ pub fn offers_for(session: &str, origin: &str) -> Vec<CheckpointOffer> {
         };
         // The key includes the origin, so a mismatch means a file was
         // copied or hand-edited; it is still not this connection's.
-        if cp.origin.as_deref() != Some(origin) {
+        if !cp.belongs_to(session, origin, kind) || cp.pending_count() == 0 {
             continue;
         }
-        if cp.pending_count() == 0 {
+        // Another blink is running this batch: it's not this one's to
+        // resume, and resuming it here would run it twice.
+        if in_use_elsewhere(&path) {
             continue;
         }
         out.push(cp.to_offer(age_of(&path)));
@@ -804,9 +981,35 @@ pub fn offers_for(session: &str, origin: &str) -> Vec<CheckpointOffer> {
 /// so only partials of transfers that never finished are removed.
 ///
 /// Idempotent: a checkpoint that is already gone reports nothing removed.
+///
+/// Refused while another blink holds the checkpoint: its batch may still be
+/// writing those partials.
+///
+/// The outcome lists the remote partials of the batch's unfinished uploads
+/// in `remote_parts`, for a caller with a connection to remove.
 pub fn discard(session: &str, origin: &str, kind: CheckpointKind) -> Result<DiscardOutcome> {
+    // A lock file that can't be made (a read-only folder) can't be held
+    // by anyone either: go ahead without it, and sweep what can be swept.
+    let in_use = || {
+        BlinkError::other(format!(
+            "another blink is using this {} checkpoint",
+            kind.as_str()
+        ))
+    };
+    let _lock = match StoreLock::try_take(session, origin, kind) {
+        Ok(Some(lock)) => Some(lock),
+        Ok(None) => return Err(in_use()),
+        Err(_) if in_use_elsewhere(&Checkpoint::path_for(session, origin, kind)?) => {
+            return Err(in_use());
+        }
+        Err(_) => None,
+    };
     let mut outcome = match Checkpoint::load(session, origin, kind) {
-        Ok(Some(cp)) => remove_orphan_parts(&cp),
+        Ok(Some(cp)) => {
+            let mut outcome = remove_orphan_parts(&cp);
+            outcome.remote_parts = remote_parts_of(&cp);
+            outcome
+        }
         // Absent, or unreadable — either way there is nothing to sweep, but
         // the file (if any) should still go.
         Ok(None) => DiscardOutcome::default(),
@@ -854,7 +1057,13 @@ pub fn rename_session(old: &str, new: &str, origin: &str) -> Vec<String> {
 }
 
 /// [`rename_session`] for one direction.
+///
+/// Both names' locks are held throughout; another blink holding either
+/// means its batch is using that file, and it isn't moved from under it.
 fn rename_one(old: &str, new: &str, origin: &str, kind: CheckpointKind) -> Result<()> {
+    let in_use = || BlinkError::other("another blink is using it");
+    let _old_lock = StoreLock::try_take(old, origin, kind)?.ok_or_else(in_use)?;
+    let _new_lock = StoreLock::try_take(new, origin, kind)?.ok_or_else(in_use)?;
     let Some(mut cp) = Checkpoint::load(old, origin, kind)? else {
         return Ok(());
     };
@@ -914,6 +1123,26 @@ fn flush_interval(last_cost: Duration) -> Duration {
 pub struct DiscardOutcome {
     pub parts_removed: usize,
     pub failures: Vec<String>,
+    /// Where the batch's unfinished uploads left their partials on the
+    /// server. Removing them takes a connection; see [`discard`].
+    pub remote_parts: Vec<String>,
+}
+
+/// The remote partials of `cp`'s unfinished uploads.
+fn remote_parts_of(cp: &Checkpoint) -> Vec<String> {
+    cp.jobs
+        .iter()
+        .filter_map(|job| match job {
+            CheckpointJob::Upload {
+                remote_path,
+                status,
+                ..
+            } if *status != JobStatus::Done => {
+                Some(crate::transport::remote_part_path(remote_path))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Delete the `.blink-part` files belonging to `cp`'s unfinished downloads,
@@ -925,8 +1154,12 @@ pub struct DiscardOutcome {
 /// is the only record of where they are — once it is gone, nothing can
 /// find them again and they sit there forever.
 ///
-/// Only `Done` jobs are skipped: their `.blink-part` was already renamed
-/// away, and a file at that path now would belong to some other transfer.
+/// `Done` jobs are skipped: their `.blink-part` was already renamed away,
+/// and a file at that path now would belong to some other transfer. So is
+/// a partial whose sidecar says it holds another file's bytes, or another
+/// server's — a newer batch downloading into the same place, say. Removed
+/// by path alone, that batch's partials went too. A partial with no
+/// sidecar can't be told apart and goes, as before.
 ///
 /// Called from two places: the `blink checkpoints` CLI and the TUI's
 /// `discard` offer. In the TUI, resume offers are built at connect time,
@@ -956,6 +1189,9 @@ fn remove_orphan_parts(cp: &Checkpoint) -> DiscardOutcome {
         if *status == JobStatus::Done {
             continue;
         }
+        if !partial_is_this_jobs(local_path, job.remote_path(), cp.origin.as_deref()) {
+            continue;
+        }
         let part = crate::transport::part_path(local_path);
         match std::fs::remove_file(&part) {
             Ok(()) => outcome.parts_removed += 1,
@@ -970,6 +1206,27 @@ fn remove_orphan_parts(cp: &Checkpoint) -> DiscardOutcome {
         let _ = std::fs::remove_file(crate::transport::part_meta_path(local_path));
     }
     outcome
+}
+
+/// Whether the partial download for `local_path` holds `remote_path`'s
+/// bytes from `origin`, as far as its sidecar says. No sidecar, or one
+/// from before origins were recorded, can't say otherwise. One that won't
+/// read can't say either way, and is left alone.
+fn partial_is_this_jobs(local_path: &Path, remote_path: &str, origin: Option<&str>) -> bool {
+    let meta_path = crate::transport::part_meta_path(local_path);
+    let raw = match std::fs::read(&meta_path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    };
+    let Ok(meta) = serde_json::from_slice::<crate::transport::PartMeta>(&raw) else {
+        return false;
+    };
+    meta.remote_path == remote_path
+        && match (meta.origin.as_deref(), origin) {
+            (Some(theirs), Some(ours)) => theirs == ours,
+            _ => true,
+        }
 }
 
 /// Why a checkpoint file is being removed.
@@ -1115,8 +1372,27 @@ fn is_leftover_temp(path: &Path) -> bool {
         .is_some_and(paths::is_temp_name)
 }
 
+/// `s` sanitized for the terminal, padded to `width` columns (measured as
+/// the terminal draws them, so wide characters don't push a row out).
+fn column(s: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr as _;
+    let s = crate::error::sanitize_display(s);
+    let pad = width.saturating_sub(s.width());
+    format!("{s}{}", " ".repeat(pad))
+}
+
+/// A path for a `blink checkpoints` message, sanitized.
+fn shown(path: &Path) -> String {
+    crate::error::sanitize_display(&path.display().to_string()).into_owned()
+}
+
 /// Print checkpoint info. Pass `clean` to remove completed/orphaned files,
 /// `force` to remove every file unconditionally.
+///
+/// A checkpoint another blink holds (see the module docs) is listed as in
+/// use and never removed: its batch may be running. Removal holds the
+/// checkpoint's lock, so a blink starting meanwhile doesn't pick it up
+/// half-removed.
 pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
     use crate::session::Session;
     use std::fs;
@@ -1136,7 +1412,19 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
     if force {
         for tmp in all.iter().filter(|p| is_leftover_temp(p)) {
             if let Err(e) = fs::remove_file(tmp) {
-                eprintln!("warning: could not remove {}: {e}", tmp.display());
+                eprintln!("warning: could not remove {}: {e}", shown(tmp));
+            }
+        }
+    }
+    // A lock file whose checkpoint is gone, and that nobody holds.
+    if clean || force {
+        for lock in all
+            .iter()
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("lock"))
+            .filter(|p| !p.with_extension("json").exists())
+        {
+            if let Ok(Some(_held)) = StoreLock::try_take_at(lock, false) {
+                let _ = fs::remove_file(lock);
             }
         }
     }
@@ -1165,25 +1453,28 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
     let mut removed = 0usize;
     let mut kept = 0usize;
     let mut parts_removed = 0usize;
+    let mut remote_parts_left = 0usize;
 
     for path in &entries {
+        let in_use = in_use_elsewhere(path);
         let cp = match Checkpoint::load_from(path) {
             Ok(Some(cp)) => cp,
             Ok(None) => continue,
             // `--force` promises every file. One it can't read names no
             // partials to sweep, so the file is all there is to remove.
-            Err(e) if force => {
+            Err(e) if force && !in_use => {
                 match fs::remove_file(path) {
                     Ok(()) => {
-                        println!("removed  {}  (unreadable: {e})", path.display());
+                        let _ = fs::remove_file(lock_path_for(path));
+                        println!("removed  {}  (unreadable: {e})", shown(path));
                         removed += 1;
                     }
-                    Err(e) => eprintln!("error: could not remove {}: {e}", path.display()),
+                    Err(e) => eprintln!("error: could not remove {}: {e}", shown(path)),
                 }
                 continue;
             }
             Err(e) => {
-                eprintln!("warning: could not read {}: {e}", path.display());
+                eprintln!("warning: could not read {}: {e}", shown(path));
                 continue;
             }
         };
@@ -1192,9 +1483,26 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
         let done = cp.done_count();
         let total = pending + done;
         let orphaned = is_orphaned(&cp, &known);
+        let row = format!(
+            "{}  {}  {:<8}  {}/{} done",
+            column(&cp.session, 20),
+            column(&origin_column(&cp), 28),
+            cp.kind.as_str(),
+            done,
+            total,
+        );
 
-        match disposition(pending, orphaned, clean, force) {
-            Disposition::Remove(reason) => {
+        let disposition = disposition(pending, orphaned, clean, force);
+        // Held for the removal: nobody can take the checkpoint up while
+        // its files go.
+        let held = match disposition {
+            Disposition::Remove(_) if !in_use => StoreLock::try_take_at(&lock_path_for(path), true)
+                .ok()
+                .flatten(),
+            _ => None,
+        };
+        match disposition {
+            Disposition::Remove(reason) if held.is_some() => {
                 // Removing the checkpoint makes the batch unresumable, which
                 // strands the `.blink-part` files its unfinished downloads left
                 // behind — nothing else records where they are. Sweep them
@@ -1202,41 +1510,32 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
                 let swept = remove_orphan_parts(&cp);
                 parts_removed += swept.parts_removed;
                 for failure in swept.failures {
-                    eprintln!("warning: {failure}");
+                    eprintln!("warning: {}", crate::error::sanitize_display(&failure));
                 }
                 match fs::remove_file(path) {
                     Ok(()) => {
-                        println!(
-                            "removed  {:<20}  {:<28}  {:<8}  {}/{} done  ({})",
-                            crate::error::sanitize_display(&cp.session),
-                            origin_column(&cp),
-                            cp.kind.as_str(),
-                            done,
-                            total,
-                            reason.as_str(),
-                        );
+                        let _ = fs::remove_file(lock_path_for(path));
+                        remote_parts_left += remote_parts_of(&cp).len();
+                        println!("removed  {row}  ({})", reason.as_str());
                         removed += 1;
                     }
                     Err(e) => {
-                        eprintln!("error: could not remove {}: {e}", path.display());
+                        eprintln!("error: could not remove {}: {e}", shown(path));
                     }
                 }
             }
+            Disposition::Remove(_) => {
+                println!("kept     {row}  (in use by a running blink)");
+                kept += 1;
+            }
             Disposition::Keep { orphaned } => {
                 let flag = if orphaned { " [orphaned]" } else { "" };
-                println!(
-                    "{:<20}  {:<28}  {:<8}  {}/{} done  ({} remaining){}",
-                    crate::error::sanitize_display(&cp.session),
-                    origin_column(&cp),
-                    cp.kind.as_str(),
-                    done,
-                    total,
-                    pending,
-                    flag,
-                );
+                let busy = if in_use { " [in use]" } else { "" };
+                println!("{row}  ({pending} remaining){flag}{busy}");
                 kept += 1;
             }
         }
+        drop(held);
     }
 
     if clean || force {
@@ -1245,6 +1544,14 @@ pub fn list_and_clean(clean: bool, force: bool) -> Result<()> {
         if parts_removed > 0 {
             let plural = if parts_removed == 1 { "file" } else { "files" };
             println!("{parts_removed} orphaned .blink-part {plural} deleted");
+        }
+        // Removing those takes a connection: blink's discard offer does it.
+        if remote_parts_left > 0 {
+            println!(
+                "{remote_parts_left} unfinished upload(s) may have left a .blink-part \
+                 file on the server, which this can't reach; discarding a checkpoint \
+                 from blink while connected removes them too"
+            );
         }
     } else if kept > 0 {
         println!();
@@ -2078,8 +2385,20 @@ mod rename_tests {
         }
     }
 
+    /// A job of `kind` for `name`: a checkpoint holds only its own kind.
+    fn job_of(kind: CheckpointKind, name: &str) -> CheckpointJob {
+        match kind {
+            CheckpointKind::Download => dl(name),
+            CheckpointKind::Upload => CheckpointJob::Upload {
+                local_path: PathBuf::from(format!("/l/{name}")),
+                remote_path: format!("/r/{name}"),
+                status: JobStatus::Pending,
+            },
+        }
+    }
+
     fn save(session: &str, origin: &str, kind: CheckpointKind, names: &[&str]) {
-        let jobs = names.iter().map(|n| dl(n)).collect();
+        let jobs = names.iter().map(|n| job_of(kind, n)).collect();
         Checkpoint::new(session, origin, kind, jobs)
             .flush()
             .unwrap();
@@ -2190,6 +2509,21 @@ mod offer_tests {
         }
     }
 
+    fn ul(n: usize, status: JobStatus) -> CheckpointJob {
+        CheckpointJob::Upload {
+            local_path: PathBuf::from(format!("/l/file{n}.bin")),
+            remote_path: format!("/srv/file{n}.bin"),
+            status,
+        }
+    }
+
+    fn job_of(kind: CheckpointKind, n: usize, status: JobStatus) -> CheckpointJob {
+        match kind {
+            CheckpointKind::Download => dl(n, status),
+            CheckpointKind::Upload => ul(n, status),
+        }
+    }
+
     #[test]
     fn the_offer_counts_only_outstanding_and_completed_work() {
         // `total` is remaining + done. A cancelled job is work the user
@@ -2224,7 +2558,7 @@ mod offer_tests {
             "host",
             "alice@host:22",
             CheckpointKind::Upload,
-            vec![dl(0, JobStatus::Pending)],
+            vec![ul(0, JobStatus::Pending)],
         );
         cp.flush().unwrap();
 
@@ -2408,7 +2742,12 @@ mod offer_tests {
         let name = format!("blink-test-both-{}", std::process::id());
         let _home = paths::test_home();
         for kind in [CheckpointKind::Download, CheckpointKind::Upload] {
-            let mut cp = Checkpoint::new(&name, TEST_ORIGIN, kind, vec![dl(0, JobStatus::Pending)]);
+            let mut cp = Checkpoint::new(
+                &name,
+                TEST_ORIGIN,
+                kind,
+                vec![job_of(kind, 0, JobStatus::Pending)],
+            );
             cp.flush().expect("write the checkpoint");
         }
 
@@ -2880,5 +3219,337 @@ mod tests {
         // caller's first `flush()` call to actually write.
         let cp = sample(1);
         assert!(cp.dirty);
+    }
+}
+
+#[cfg(test)]
+mod audit2_tests {
+    use super::*;
+
+    fn up(n: usize, status: JobStatus) -> CheckpointJob {
+        CheckpointJob::Upload {
+            local_path: PathBuf::from(format!("/l/{n}")),
+            remote_path: format!("/r/{n}"),
+            status,
+        }
+    }
+
+    fn down(local: &Path, remote: &str, status: JobStatus) -> CheckpointJob {
+        CheckpointJob::Download {
+            remote_path: remote.to_string(),
+            local_path: local.to_path_buf(),
+            status,
+        }
+    }
+
+    fn write_raw(session: &str, kind: CheckpointKind, body: &str) -> PathBuf {
+        let path = Checkpoint::path_for(session, TEST_ORIGIN, kind).unwrap();
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    // -- one blink at a time ------------------------------------------------
+
+    #[test]
+    fn a_checkpoints_lock_is_held_by_one_holder_at_a_time() {
+        let _home = paths::test_home();
+        let first = StoreLock::try_take("s", TEST_ORIGIN, CheckpointKind::Upload).unwrap();
+        assert!(first.is_some());
+        assert!(
+            StoreLock::try_take("s", TEST_ORIGIN, CheckpointKind::Upload)
+                .unwrap()
+                .is_none(),
+            "a second holder is refused"
+        );
+        assert!(
+            StoreLock::try_take("s", TEST_ORIGIN, CheckpointKind::Download)
+                .unwrap()
+                .is_some(),
+            "the other direction is a different lock"
+        );
+        drop(first);
+        assert!(
+            StoreLock::try_take("s", TEST_ORIGIN, CheckpointKind::Upload)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Another blink running the batch: not this one's to offer, discard
+    /// or move.
+    #[test]
+    fn a_checkpoint_in_use_elsewhere_is_not_offered_discarded_or_moved() {
+        let _home = paths::test_home();
+        let kind = CheckpointKind::Upload;
+        Checkpoint::new("s", TEST_ORIGIN, kind, vec![up(0, JobStatus::Pending)])
+            .flush()
+            .unwrap();
+        let held = StoreLock::try_take("s", TEST_ORIGIN, kind)
+            .unwrap()
+            .unwrap();
+
+        assert!(offers_for("s", TEST_ORIGIN).is_empty());
+        let e = discard("s", TEST_ORIGIN, kind).unwrap_err().to_string();
+        assert!(e.contains("another blink"), "{e}");
+        let failures = rename_session("s", "t", TEST_ORIGIN);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            Checkpoint::load("s", TEST_ORIGIN, kind).unwrap().is_some(),
+            "left alone"
+        );
+
+        drop(held);
+        assert_eq!(offers_for("s", TEST_ORIGIN).len(), 1);
+    }
+
+    #[test]
+    fn an_unsaved_checkpoint_is_never_written() {
+        let _home = paths::test_home();
+        let mut cp = Checkpoint::new_unsaved("s", TEST_ORIGIN, CheckpointKind::Upload);
+        cp.append(vec![up(0, JobStatus::Pending)]).unwrap();
+        cp.flush().unwrap();
+        assert!(!cp.is_dirty());
+        assert!(
+            Checkpoint::load("s", TEST_ORIGIN, CheckpointKind::Upload)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // -- what a file may hold -----------------------------------------------
+
+    /// Read as version 1, `"version": "4"` was migrated, resetting every
+    /// finished job to pending.
+    #[test]
+    fn a_version_that_isnt_a_number_is_refused() {
+        let _home = paths::test_home();
+        let job = r#"{"type":"upload","local_path":"/l/a","remote_path":"/r/a","status":"done"}"#;
+        for version in [r#""4""#, "-1", "4.5", "8589934596", "null"] {
+            let path = write_raw(
+                "s",
+                CheckpointKind::Upload,
+                &format!(
+                    r#"{{"version":{version},"session":"s","origin":"{TEST_ORIGIN}","kind":"upload","jobs":[{job}]}}"#
+                ),
+            );
+            let e = Checkpoint::load_from(&path).unwrap_err().to_string();
+            assert!(e.contains("not a version"), "{version}: {e}");
+        }
+        // Missing still means version 1.
+        let path = write_raw(
+            "s",
+            CheckpointKind::Upload,
+            r#"{"session":"s","kind":"upload","jobs":[{"type":"upload","local_path":"/l/a","remote_path":"/r/a","done":true}]}"#,
+        );
+        let cp = Checkpoint::load_from(&path).unwrap().unwrap();
+        assert!(cp.jobs[0].is_done());
+    }
+
+    #[test]
+    fn a_relative_local_path_is_refused() {
+        let _home = paths::test_home();
+        let path = write_raw(
+            "s",
+            CheckpointKind::Download,
+            &format!(
+                r#"{{"version":4,"session":"s","origin":"{TEST_ORIGIN}","kind":"download","jobs":[{{"type":"download","remote_path":"/r/a","local_path":"rel/a","status":"pending"}}]}}"#
+            ),
+        );
+        let e = Checkpoint::load_from(&path).unwrap_err().to_string();
+        assert!(e.contains("relative local path"), "{e}");
+    }
+
+    /// Resumed, an upload checkpoint's download job would be queued as a
+    /// download.
+    #[test]
+    fn a_job_of_the_other_direction_is_refused() {
+        let _home = paths::test_home();
+        let path = write_raw(
+            "s",
+            CheckpointKind::Upload,
+            &format!(
+                r#"{{"version":4,"session":"s","origin":"{TEST_ORIGIN}","kind":"upload","jobs":[{{"type":"download","remote_path":"/r/a","local_path":"/l/a","status":"pending"}}]}}"#
+            ),
+        );
+        let e = Checkpoint::load_from(&path).unwrap_err().to_string();
+        assert!(e.contains("isn't part of a upload batch"), "{e}");
+        let path = write_raw(
+            "s",
+            CheckpointKind::Download,
+            &format!(
+                r#"{{"version":4,"session":"s","origin":"{TEST_ORIGIN}","kind":"download","jobs":[{{"type":"download","remote_path":"","local_path":"/l/a","status":"pending"}}]}}"#
+            ),
+        );
+        assert!(Checkpoint::load_from(&path).is_err(), "empty remote path");
+    }
+
+    /// Only the origin was checked against the file's name.
+    #[test]
+    fn a_file_whose_session_or_kind_doesnt_match_its_name_isnt_loaded() {
+        let _home = paths::test_home();
+        let job =
+            r#"{"type":"upload","local_path":"/l/a","remote_path":"/r/a","status":"pending"}"#;
+        write_raw(
+            "s",
+            CheckpointKind::Upload,
+            &format!(
+                r#"{{"version":4,"session":"other","origin":"{TEST_ORIGIN}","kind":"upload","jobs":[{job}]}}"#
+            ),
+        );
+        assert!(
+            Checkpoint::load("s", TEST_ORIGIN, CheckpointKind::Upload)
+                .unwrap()
+                .is_none()
+        );
+        assert!(offers_for("s", TEST_ORIGIN).is_empty());
+        write_raw(
+            "s",
+            CheckpointKind::Download,
+            &format!(
+                r#"{{"version":4,"session":"s","origin":"{TEST_ORIGIN}","kind":"upload","jobs":[{job}]}}"#
+            ),
+        );
+        assert!(
+            Checkpoint::load("s", TEST_ORIGIN, CheckpointKind::Download)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // -- partials -------------------------------------------------------------
+
+    /// Removed by path alone, a newer batch's partials at the same place
+    /// went with the old checkpoint.
+    #[test]
+    fn only_partials_whose_sidecar_says_theyre_this_jobs_are_removed() {
+        let home = paths::test_home();
+        let dir = home.path().join("dl");
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = |remote: &str, origin: Option<&str>| {
+            serde_json::to_vec(&crate::transport::PartMeta {
+                remote_path: remote.to_string(),
+                size: None,
+                mtime: None,
+                origin: origin.map(str::to_string),
+            })
+            .unwrap()
+        };
+        let cases: [(&str, Option<Vec<u8>>, bool); 6] = [
+            ("mine", Some(meta("/r/mine", Some(TEST_ORIGIN))), true),
+            ("no-sidecar", None, true),
+            ("old-sidecar", Some(meta("/r/old-sidecar", None)), true),
+            (
+                "other-file",
+                Some(meta("/r/elsewhere", Some(TEST_ORIGIN))),
+                false,
+            ),
+            (
+                "other-server",
+                Some(meta("/r/other-server", Some("x@y:22"))),
+                false,
+            ),
+            ("garbled", Some(b"{not json".to_vec()), false),
+        ];
+        let mut jobs = Vec::new();
+        for (name, sidecar, _) in &cases {
+            let local = dir.join(name);
+            std::fs::write(crate::transport::part_path(&local), b"part").unwrap();
+            if let Some(raw) = sidecar {
+                std::fs::write(crate::transport::part_meta_path(&local), raw).unwrap();
+            }
+            jobs.push(down(&local, &format!("/r/{name}"), JobStatus::InProgress));
+        }
+        let cp = Checkpoint::new("s", TEST_ORIGIN, CheckpointKind::Download, jobs);
+
+        let outcome = remove_orphan_parts(&cp);
+
+        assert_eq!(outcome.parts_removed, 3);
+        for (name, _, removed) in cases {
+            let part = crate::transport::part_path(&dir.join(name));
+            assert_eq!(!part.exists(), removed, "{name}");
+        }
+    }
+
+    #[test]
+    fn discarding_an_upload_lists_its_remote_partials() {
+        let _home = paths::test_home();
+        let kind = CheckpointKind::Upload;
+        Checkpoint::new(
+            "s",
+            TEST_ORIGIN,
+            kind,
+            vec![
+                up(0, JobStatus::Pending),
+                up(1, JobStatus::Done),
+                up(2, JobStatus::InProgress),
+                CheckpointJob::Mkdir {
+                    remote_path: "/r".into(),
+                    status: JobStatus::Pending,
+                },
+            ],
+        )
+        .flush()
+        .unwrap();
+
+        let outcome = discard("s", TEST_ORIGIN, kind).unwrap();
+
+        assert_eq!(
+            outcome.remote_parts,
+            [
+                crate::transport::remote_part_path("/r/0"),
+                crate::transport::remote_part_path("/r/2"),
+            ]
+        );
+    }
+
+    // -- `blink checkpoints` ------------------------------------------------
+
+    #[test]
+    fn force_keeps_a_checkpoint_in_use_and_clears_stray_locks() {
+        let _home = paths::test_home();
+        let kind = CheckpointKind::Upload;
+        Checkpoint::new("busy", TEST_ORIGIN, kind, vec![up(0, JobStatus::Pending)])
+            .flush()
+            .unwrap();
+        let held = StoreLock::try_take("busy", TEST_ORIGIN, kind)
+            .unwrap()
+            .unwrap();
+        let stray = StoreLock::try_take("gone", TEST_ORIGIN, kind)
+            .unwrap()
+            .unwrap();
+        drop(stray);
+        let stray_path = lock_path_for(&Checkpoint::path_for("gone", TEST_ORIGIN, kind).unwrap());
+        assert!(stray_path.exists());
+
+        list_and_clean(false, true).unwrap();
+
+        assert!(
+            Checkpoint::load("busy", TEST_ORIGIN, kind)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !stray_path.exists(),
+            "a lock with no checkpoint, held by nobody, goes"
+        );
+        drop(held);
+        list_and_clean(false, true).unwrap();
+        assert!(
+            Checkpoint::load("busy", TEST_ORIGIN, kind)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !lock_path_for(&Checkpoint::path_for("busy", TEST_ORIGIN, kind).unwrap()).exists(),
+            "its lock goes with it"
+        );
+    }
+
+    #[test]
+    fn the_session_column_counts_terminal_columns() {
+        use unicode_width::UnicodeWidthStr as _;
+        assert_eq!(column("日本", 6).width(), 6);
+        assert_eq!(column("ab", 6), "ab    ");
+        assert_eq!(column("a\x1b[2Jb", 6), "a [2Jb");
     }
 }
