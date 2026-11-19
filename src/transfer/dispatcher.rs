@@ -4,18 +4,29 @@
 //! Workers share a pool of idle connections: a job takes a pooled
 //! connection when one is available and opens its own otherwise, and a
 //! successful job returns the connection for the next job to reuse. At
-//! most `parallel_downloads` connections are live at once (one per
-//! concurrently running worker). Without the pool, every job — including
-//! each mkdir of a recursive upload — paid a full TCP + SSH/TLS handshake
-//! and auth round-trip, which dominated batches of small files.
+//! most `parallel_downloads` worker connections are live at once (one per
+//! concurrently running worker), on top of the browsing connection — so a
+//! server's per-user connection limit sees one more than the setting.
+//! Without the pool, every job — including each mkdir of a recursive
+//! upload — paid a full TCP + SSH/TLS handshake and auth round-trip, which
+//! dominated batches of small files.
+//!
+//! A pooled connection idle for [`POOL_IDLE_LIMIT`] is closed, and so are
+//! any beyond a lowered `parallel_downloads`: idle connections held open
+//! counted against servers' per-user limits (often 2–5 on FTP) long after
+//! the batch that opened them.
 //!
 //! A connection is only pooled after a *successful* job. Failures close
 //! it instead: the protocol state after a failed op is uncertain
 //! (especially FTP data channels), and reconnecting is cheap relative to
 //! debugging a desynced session. A job that fails with
-//! [`BlinkError::Disconnected`] on a *reused* connection is retried once
-//! on a fresh one — idle pooled connections can be reaped by server idle
-//! timeouts, and that must not fail the job.
+//! [`BlinkError::Disconnected`] is retried once on a fresh connection:
+//! idle pooled connections can be reaped by server idle timeouts, and a
+//! network blip shouldn't fail a long transfer either — a download picks up
+//! from its partial file.
+//!
+//! Every close here has a deadline ([`CLOSE_TIMEOUT`]): FTP's `QUIT` waits
+//! for a reply, and from a server that went away silently it never comes.
 //!
 //! Pause / resume gates new dispatches; in-flight workers complete naturally.
 
@@ -40,6 +51,24 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Minimum interval between bytes-per-second recalculations, in ms.
 const SPEED_SAMPLE_MS: u128 = 250;
+
+/// How often a transfer's speed is recalculated when no progress arrives,
+/// so a stalled transfer falls to 0 rather than showing its last speed.
+const STALL_TICK: Duration = Duration::from_secs(1);
+
+/// How long a connection may sit idle in the pool before it's closed.
+const POOL_IDLE_LIMIT: Duration = Duration::from_secs(60);
+
+/// How long closing a connection may take before it's abandoned (and
+/// dropped, which closes the socket). Quitting waited on it: an idle FTP
+/// connection to a server that vanished without a reset waited for a
+/// `QUIT` reply until TCP gave up, about 15 minutes on Linux.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Close `transport` politely, but give up after [`CLOSE_TIMEOUT`].
+async fn close_within(mut transport: Box<dyn Transport>) {
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, transport.close()).await;
+}
 
 use crate::transport::CONNECT_TIMEOUT;
 
@@ -151,10 +180,11 @@ impl Dispatcher {
 /// A worker takes a connection when its job starts (opening a fresh one
 /// when the pool is empty) and returns it after a successful job. At most
 /// `parallelism` connections are ever live because at most that many
-/// workers run concurrently; the put-side cap only matters when the user
-/// shrinks parallelism mid-session.
+/// workers run concurrently. [`Pool::evict`] closes what's sat idle too
+/// long, or is beyond a lowered parallelism.
 struct Pool {
-    idle: Mutex<Vec<Box<dyn Transport>>>,
+    /// Idle connections and when each was parked, oldest first.
+    idle: Mutex<Vec<(Instant, Box<dyn Transport>)>>,
     /// Set on dispatcher shutdown: late returns from in-flight workers are
     /// dropped (the socket closes via Drop) instead of stashed forever.
     closed: AtomicBool,
@@ -168,8 +198,10 @@ impl Pool {
         }
     }
 
+    /// The most recently parked connection: the least likely to have been
+    /// reaped by the server.
     fn take(&self) -> Option<Box<dyn Transport>> {
-        self.idle.lock().pop()
+        self.idle.lock().pop().map(|(_, t)| t)
     }
 
     /// Park a healthy connection for the next job. Drops it (closing the
@@ -181,9 +213,27 @@ impl Pool {
         }
         let mut idle = self.idle.lock();
         if idle.len() < cap {
-            idle.push(transport);
+            idle.push((Instant::now(), transport));
         }
         // else dropped: parallelism shrank below the idle count.
+    }
+
+    /// Take out, for closing, every connection parked before
+    /// `now - POOL_IDLE_LIMIT`, and the oldest ones beyond `cap`.
+    fn evict(&self, now: Instant, cap: usize) -> Vec<Box<dyn Transport>> {
+        let mut idle = self.idle.lock();
+        let excess = idle.len().saturating_sub(cap);
+        let mut out = Vec::new();
+        let mut kept = Vec::with_capacity(idle.len());
+        for (i, (parked, t)) in std::mem::take(&mut *idle).into_iter().enumerate() {
+            if i < excess || now.duration_since(parked) >= POOL_IDLE_LIMIT {
+                out.push(t);
+            } else {
+                kept.push((parked, t));
+            }
+        }
+        *idle = kept;
+        out
     }
 
     /// Mark the pool closed and hand back the idle transports so the caller
@@ -191,6 +241,9 @@ impl Pool {
     fn close(&self) -> Vec<Box<dyn Transport>> {
         self.closed.store(true, Ordering::Release);
         std::mem::take(&mut *self.idle.lock())
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect()
     }
 }
 
@@ -218,6 +271,17 @@ async fn run_loop(
     loop {
         if shutdown.load(Ordering::Acquire) {
             break;
+        }
+
+        // Close what has sat idle too long, or is beyond a lowered limit,
+        // off this loop: a close can take up to its deadline.
+        let stale = pool.evict(Instant::now(), usize::from(manager.parallelism()));
+        if !stale.is_empty() {
+            tokio::spawn(async move {
+                for t in stale {
+                    close_within(t).await;
+                }
+            });
         }
 
         // Don't dispatch if paused or already at the concurrency limit.
@@ -294,8 +358,8 @@ async fn run_loop(
     // hold their own transports and close them on their own paths; the
     // pool is marked closed so their late returns are dropped instead of
     // stashed.
-    for mut t in pool.close() {
-        let _ = t.close().await;
+    for t in pool.close() {
+        close_within(t).await;
     }
 }
 
@@ -374,44 +438,48 @@ async fn run_one(
 
     let manager_p = manager.clone();
     let progress_task = tokio::spawn(async move {
-        let mut last_t = Instant::now();
-        let mut last_b: u64 = 0;
-        let mut last_bps: u64 = 0;
+        let mut speed = Speed::default();
+        let mut tick = tokio::time::interval(STALL_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            let Some(p) = prog_rx.recv().await else { break };
-            let now = Instant::now();
-            let elapsed = now.duration_since(last_t);
-            let bps = if elapsed.as_millis() >= SPEED_SAMPLE_MS {
-                let delta = p.bytes_done.saturating_sub(last_b);
-                let v = (delta as f64 / elapsed.as_secs_f64()) as u64;
-                last_t = now;
-                last_b = p.bytes_done;
-                last_bps = v;
-                v
-            } else {
-                last_bps
-            };
-            manager_p.update_progress(id, p.bytes_done, p.bytes_total, bps);
+            tokio::select! {
+                update = prog_rx.recv() => {
+                    let Some(p) = update else { break };
+                    let bps = speed.sample(TokioInstant::now(), p.bytes_done);
+                    manager_p.update_progress(id, p.bytes_done, p.bytes_total, bps);
+                    speed.total = p.bytes_total;
+                }
+                _ = tick.tick() => {
+                    // Nothing new arrived: report the rate as it now stands,
+                    // which falls to 0 for a stalled transfer.
+                    if let Some(done) = speed.last_done
+                        && speed.stale(TokioInstant::now())
+                    {
+                        let bps = speed.sample(TokioInstant::now(), done);
+                        manager_p.update_progress(id, done, speed.total, bps);
+                    }
+                }
+            }
         }
     });
 
     // Acquire a connection, run the job, and pool or close the connection.
     let result: crate::error::Result<()> = async {
         let pw = password.as_ref().map(|s| s.as_str());
-        let pooled = pool.take();
-        let reused = pooled.is_some();
-        let mut transport = match pooled {
+        let mut transport = match pool.take() {
             Some(t) => t,
             None => connect(&session, pw, &app_event_tx, &trust).await?,
         };
 
         let mut outcome = run_job(transport.as_mut(), &job, &prog_tx).await;
 
-        // An idle pooled connection may have died while parked (server idle
-        // timeout, network drop). That must not fail the job: retry once on
-        // a fresh connection. Resume support makes the retry cheap — a
-        // partially written download picks up from its `.blink-part` offset.
-        if reused && matches!(outcome, Err(BlinkError::Disconnected(_))) {
+        // A lost connection gets one more try on a fresh one, whether it
+        // came from the pool (a server idle timeout can reap a parked one)
+        // or was opened for this job (a network blip). Resume makes the
+        // retry cheap: a download picks up from its partial file. Once
+        // only, so a server that drops connections on purpose sees each
+        // job twice, not forever.
+        if matches!(outcome, Err(BlinkError::Disconnected(_))) {
             drop(transport); // dead; Drop tears down the socket
             transport = connect(&session, pw, &app_event_tx, &trust).await?;
             outcome = run_job(transport.as_mut(), &job, &prog_tx).await;
@@ -423,7 +491,9 @@ async fn run_one(
                 Ok(())
             }
             Err(e) => {
-                let _ = transport.close().await;
+                // Bounded: the job isn't marked failed until this returns,
+                // and an unanswered close left it showing as running.
+                close_within(transport).await;
                 Err(e)
             }
         }
@@ -450,6 +520,50 @@ async fn run_one(
         // variant whose Display could pull in unsanitized text would slip past
         // otherwise — and this state string ends up rendered in the TUI.
         Err(e) => manager.mark(id, TransferState::Failed(error::sanitize(e.to_string()))),
+    }
+}
+
+/// Tokio's clock, which a test can pause and move; the same as the system
+/// clock otherwise.
+type TokioInstant = tokio::time::Instant;
+
+/// A transfer's speed, sampled at most every [`SPEED_SAMPLE_MS`].
+#[derive(Default)]
+struct Speed {
+    /// When and at what byte count the last sample was taken. `None` until
+    /// the first progress update, which is the starting point: a resumed
+    /// download reports bytes done from its resume point, and measuring
+    /// from 0 counted everything already on disk as moved in the first
+    /// quarter-second.
+    last: Option<(TokioInstant, u64)>,
+    /// The last byte count reported, for re-sampling when none arrives.
+    last_done: Option<u64>,
+    /// The last total reported.
+    total: u64,
+    /// The last rate computed.
+    bps: u64,
+}
+
+impl Speed {
+    /// The rate at `now` with `done` bytes transferred.
+    fn sample(&mut self, now: TokioInstant, done: u64) -> u64 {
+        self.last_done = Some(done);
+        let Some((t, b)) = self.last else {
+            self.last = Some((now, done));
+            return 0;
+        };
+        let elapsed = now.duration_since(t);
+        if elapsed.as_millis() >= SPEED_SAMPLE_MS {
+            self.bps = (done.saturating_sub(b) as f64 / elapsed.as_secs_f64()) as u64;
+            self.last = Some((now, done));
+        }
+        self.bps
+    }
+
+    /// Whether the rate is due a recalculation for lack of updates.
+    fn stale(&self, now: TokioInstant) -> bool {
+        self.last
+            .is_some_and(|(t, _)| now.duration_since(t).as_millis() >= SPEED_SAMPLE_MS)
     }
 }
 
@@ -701,7 +815,9 @@ mod tests {
     /// `r` was refused for the rest of the session as "still in flight".
     #[tokio::test]
     async fn a_worker_that_panics_fails_its_job() {
-        let (manager, _events_rx) = TransferManager::new(1);
+        // Two slots for the two pooled connections: with one, the second
+        // would be closed as beyond the limit before it was used.
+        let (manager, _events_rx) = TransferManager::new(2);
         let pool = Pool::new();
         pool.put(boxed(), 2);
         pool.put(Box::new(PanickingTransport), 2);
@@ -742,5 +858,257 @@ mod tests {
             "the next job still runs"
         );
         dispatcher.shutdown().await;
+    }
+
+    // -- audit fixes ---------------------------------------------------------
+
+    /// A connection for tests: mkdir answers with `mkdir`, a download sends
+    /// `progress` updates (one per entry, after its delay) and then waits
+    /// for good, and close never returns if `close_hangs`.
+    struct Scripted {
+        mkdir: fn() -> crate::error::Result<()>,
+        progress: Vec<(Duration, u64)>,
+        close_hangs: bool,
+    }
+
+    impl Scripted {
+        fn new() -> Self {
+            Self {
+                mkdir: || Ok(()),
+                progress: Vec::new(),
+                close_hangs: false,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for Scripted {
+        fn protocol(&self) -> crate::session::Protocol {
+            crate::session::Protocol::Ftp
+        }
+        async fn list(&mut self, _: &str) -> crate::error::Result<transport::Listing> {
+            unreachable!()
+        }
+        async fn download(
+            &mut self,
+            _: &str,
+            _: &std::path::Path,
+            progress: Option<mpsc::UnboundedSender<ProgressUpdate>>,
+        ) -> crate::error::Result<()> {
+            let progress = progress.unwrap();
+            for (delay, done) in self.progress.clone() {
+                tokio::time::sleep(delay).await;
+                let _ = progress.send(ProgressUpdate {
+                    bytes_done: done,
+                    bytes_total: 10_000_000_000,
+                });
+            }
+            std::future::pending().await
+        }
+        async fn upload(
+            &mut self,
+            _: &std::path::Path,
+            _: &str,
+            _: Option<mpsc::UnboundedSender<ProgressUpdate>>,
+        ) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        async fn rename(&mut self, _: &str, _: &str) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        async fn rename_over(&mut self, _: &str, _: &str) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        async fn delete_file(&mut self, _: &str) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        async fn delete_dir(&mut self, _: &str, _: bool) -> crate::error::Result<()> {
+            unreachable!()
+        }
+        async fn mkdir(&mut self, _: &str) -> crate::error::Result<()> {
+            (self.mkdir)()
+        }
+        async fn metadata(
+            &mut self,
+            _: &str,
+        ) -> crate::error::Result<Option<transport::RemoteEntry>> {
+            unreachable!()
+        }
+        async fn read_to_bytes(&mut self, _: &str) -> crate::error::Result<bytes::Bytes> {
+            unreachable!()
+        }
+        async fn close(&mut self) -> crate::error::Result<()> {
+            if self.close_hangs {
+                std::future::pending::<()>().await;
+            }
+            Ok(())
+        }
+    }
+
+    fn spawn_with(manager: &TransferManager, pool: Pool) -> Dispatcher {
+        let (ev_tx, _ev_rx) = mpsc::unbounded_channel();
+        Dispatcher::spawn_with_pool(
+            manager.clone(),
+            idle_session(),
+            None,
+            ev_tx,
+            crate::known_hosts::SessionTrust::new(),
+            pool,
+        )
+    }
+
+    /// An FTP `QUIT` to a server that vanished waited for a reply until TCP
+    /// gave up — about 15 minutes, with quitting blink waiting on it.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_doesnt_wait_on_a_connection_that_wont_close() {
+        let (manager, _rx) = TransferManager::new(1);
+        let pool = Pool::new();
+        pool.put(
+            Box::new(Scripted {
+                close_hangs: true,
+                ..Scripted::new()
+            }),
+            1,
+        );
+        let dispatcher = spawn_with(&manager, pool);
+
+        let started = tokio::time::Instant::now();
+        dispatcher.shutdown().await;
+        assert!(started.elapsed() <= CLOSE_TIMEOUT + POLL_INTERVAL * 2);
+    }
+
+    /// The failed job was marked only once its connection had closed, so a
+    /// close that never returned left it showing as running.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_job_is_marked_failed_even_if_its_connection_wont_close() {
+        let (manager, _rx) = TransferManager::new(1);
+        let pool = Pool::new();
+        pool.put(
+            Box::new(Scripted {
+                mkdir: || Err(BlinkError::permission("no")),
+                close_hangs: true,
+                ..Scripted::new()
+            }),
+            1,
+        );
+        let dispatcher = spawn_with(&manager, pool);
+        let id = manager.enqueue_mkdir("/a".into()).unwrap();
+
+        tokio::time::sleep(CLOSE_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(
+            matches!(manager.job(id).unwrap().state, TransferState::Failed(ref m) if m.contains("no")),
+            "{:?}",
+            manager.job(id).unwrap().state
+        );
+        dispatcher.shutdown().await;
+    }
+
+    /// A lost connection gets one more try on a fresh one. (Pooled or
+    /// opened for the job, it's the same path now; here the fresh one
+    /// can't connect, which is how the retry shows.)
+    #[tokio::test]
+    async fn a_lost_connection_is_retried_once_on_a_fresh_one() {
+        let (manager, _rx) = TransferManager::new(1);
+        let pool = Pool::new();
+        pool.put(
+            Box::new(Scripted {
+                mkdir: || Err(BlinkError::disconnected("reset")),
+                ..Scripted::new()
+            }),
+            1,
+        );
+        let dispatcher = spawn_with(&manager, pool);
+        let id = manager.enqueue_mkdir("/a".into()).unwrap();
+
+        let state = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let s = manager.job(id).unwrap().state;
+                if matches!(s, TransferState::Failed(_)) {
+                    return s;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(&state, TransferState::Failed(m) if m.contains("connection failed")),
+            "the retry's connect is what failed: {state:?}"
+        );
+        dispatcher.shutdown().await;
+    }
+
+    // -- speed --------------------------------------------------------------
+
+    /// Measured from 0, a download resumed at 3.9 GB showed ~15 GB/s.
+    #[test]
+    fn a_resumed_transfers_speed_counts_from_where_it_resumed() {
+        let t0 = TokioInstant::now();
+        let mut speed = Speed::default();
+        assert_eq!(speed.sample(t0, 3_900_000_000), 0);
+        let bps = speed.sample(t0 + Duration::from_millis(500), 3_905_000_000);
+        assert_eq!(bps, 10_000_000);
+    }
+
+    /// The speed was recalculated only when progress arrived, so a stalled
+    /// transfer kept showing its last healthy speed.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_transfers_speed_falls_to_zero() {
+        let (manager, _rx) = TransferManager::new(1);
+        let pool = Pool::new();
+        pool.put(
+            Box::new(Scripted {
+                progress: vec![(Duration::ZERO, 0), (Duration::from_millis(500), 5_000_000)],
+                ..Scripted::new()
+            }),
+            1,
+        );
+        let dispatcher = spawn_with(&manager, pool);
+        let id = manager
+            .enqueue_download("/r".into(), std::path::PathBuf::from("/l"))
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert!(manager.job(id).unwrap().bytes_per_sec > 0, "moving");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(manager.job(id).unwrap().bytes_per_sec, 0, "stalled");
+        assert_eq!(manager.job(id).unwrap().bytes_done, 5_000_000);
+
+        manager.cancel(id);
+        dispatcher.shutdown().await;
+    }
+
+    // -- the pool -----------------------------------------------------------
+
+    #[test]
+    fn idle_connections_are_evicted_after_the_limit() {
+        let pool = Pool::new();
+        pool.put(boxed(), 4);
+        let now = Instant::now();
+        assert!(pool.evict(now, 4).is_empty(), "fresh: kept");
+        assert_eq!(
+            pool.evict(now + POOL_IDLE_LIMIT, 4).len(),
+            1,
+            "stale: evicted"
+        );
+        assert!(pool.take().is_none());
+    }
+
+    /// Lowering the limit didn't trim the pool; connections idle above it
+    /// lingered until used.
+    #[test]
+    fn connections_beyond_a_lowered_limit_are_evicted_oldest_first() {
+        let pool = Pool::new();
+        for _ in 0..3 {
+            pool.put(boxed(), 4);
+        }
+        pool.put(Box::new(Scripted::new()), 4);
+        assert_eq!(pool.evict(Instant::now(), 1).len(), 3);
+        let left = pool.take().unwrap();
+        assert_eq!(
+            left.protocol(),
+            crate::session::Protocol::Ftp,
+            "the newest stays"
+        );
     }
 }

@@ -54,7 +54,12 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
 
 ### Transfers
 
-- Parallel slot dispatcher (configurable globally; per-session override)
+- Parallel slot dispatcher (configurable globally; per-session override).
+  Transfers reuse their connections between jobs; a connection idle for a
+  minute is closed, so servers with a per-user connection limit aren't kept
+  at it. A transfer whose connection drops is retried once on a new one,
+  resuming where it stopped. blink holds `parallel_downloads` transfer
+  connections at most, plus the one you browse with.
 - **Pipelined SFTP streams** — each transfer keeps multiple read/write
   requests in flight at once instead of waiting a full round-trip per
   chunk, so a single stream is bandwidth-bound rather than latency-bound
