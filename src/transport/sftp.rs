@@ -783,12 +783,20 @@ fn load_key(path: &Path, passphrase: Option<&str>) -> Result<russh::keys::Privat
     let load_error =
         |e: &dyn std::fmt::Display| BlinkError::auth(format!("load key {}: {e}", path.display()));
     let text = std::fs::read_to_string(path).map_err(|e| load_error(&e))?;
-    russh::keys::decode_secret_key(&text, passphrase).map_err(|e| {
+    russh::keys::decode_secret_key(&text, passphrase).or_else(|e| {
         if key_needs_passphrase(&e, &text, passphrase.is_some()) {
-            BlinkError::KeyNeedsPassphrase
-        } else {
-            load_error(&e)
+            return Err(BlinkError::KeyNeedsPassphrase);
         }
+        // Given a passphrase, russh decodes a plain PKCS#8 key as an
+        // encrypted one and fails on its structure. A passphrase left over
+        // for a key that doesn't need one (replaced since it was asked for)
+        // must not stop it loading, so try once without.
+        if passphrase.is_some()
+            && let Ok(key) = russh::keys::decode_secret_key(&text, None)
+        {
+            return Ok(key);
+        }
+        Err(load_error(&e))
     })
 }
 
@@ -1896,6 +1904,58 @@ mod key_passphrase_tests {
     fn the_right_passphrase_loads_the_key() {
         for (format, key) in ENCRYPTED {
             assert!(load(key, Some(TEST_PASSPHRASE)).is_ok(), "{format}");
+        }
+    }
+
+    /// A plain key in every format, for the cases below.
+    const PLAIN: [(&str, &str); 3] = [
+        ("OpenSSH", ED25519_KEY),
+        ("legacy PEM", RSA_PEM_KEY),
+        ("PKCS#8", ECDSA_PKCS8_KEY),
+    ];
+
+    /// `key_needs_passphrase` reads the PEM label for PKCS#8 and falls back
+    /// on a catch-all otherwise: a plain key in any format must load, and
+    /// never be taken for one that needs a passphrase.
+    #[test]
+    fn a_plain_key_in_any_format_loads_without_a_passphrase() {
+        for (format, key) in PLAIN {
+            assert!(load(key, None).is_ok(), "{format}");
+        }
+    }
+
+    /// The passphrase prompt can leave one behind for a key that turns out
+    /// not to need it; it must not stop a plain key from loading.
+    #[test]
+    fn a_plain_key_loads_with_a_passphrase_given_anyway() {
+        for (format, key) in PLAIN {
+            let loaded = load(key, Some(TEST_PASSPHRASE));
+            assert!(
+                !matches!(loaded, Err(BlinkError::KeyNeedsPassphrase)),
+                "{format}: {loaded:?}"
+            );
+            assert!(loaded.is_ok(), "{format}: {:?}", loaded.err());
+        }
+    }
+
+    /// The encrypted PEM fixture was 1024-bit, below what current tools
+    /// accept, so a library tightening its minimum would have failed the
+    /// passphrase tests for an unrelated reason.
+    #[test]
+    fn the_rsa_fixtures_are_at_least_2048_bits() {
+        for (name, key, passphrase) in [
+            ("RSA_KEY", RSA_KEY, None),
+            ("RSA_PEM_KEY", RSA_PEM_KEY, None),
+            (
+                "RSA_PEM_KEY_ENCRYPTED",
+                RSA_PEM_KEY_ENCRYPTED,
+                Some(TEST_PASSPHRASE),
+            ),
+        ] {
+            let key = load(key, passphrase).unwrap();
+            let rsa = key.key_data().rsa().expect("an RSA key");
+            let bits = rsa.public().n().as_positive_bytes().unwrap().len() * 8;
+            assert!(bits >= 2048, "{name} is {bits}-bit");
         }
     }
 

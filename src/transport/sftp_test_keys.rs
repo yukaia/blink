@@ -1,8 +1,9 @@
 //! Throwaway SSH keys for the SFTP integration tests.
 //!
 //! **These are not secrets.** They were generated once with the commands
-//! below, for a server that only ever listens on 127.0.0.1 inside a test
-//! process, and they are published in this repository. Never use them for
+//! below, for tests against a server that only ever listens on 127.0.0.1
+//! inside a test process: as its host keys, and as the client keys that log
+//! in to it. They are published in this repository. Never use them for
 //! anything.
 //!
 //! ```sh
@@ -16,9 +17,20 @@
 //!
 //! ```sh
 //! ssh-keygen -t ed25519 -N blink-test -C blink-test-ed25519-encrypted -f ed25519_enc
-//! ssh-keygen -t rsa -b 1024 -m PEM -N blink-test -C x -f rsa_pem_enc
-//! ssh-keygen -t ecdsa -b 256 -m PKCS8 -N blink-test -C x -f ecdsa_pkcs8_enc
+//! ssh-keygen -t rsa -b 2048 -m PEM -N blink-test -f rsa_pem_enc
+//! ssh-keygen -t ecdsa -b 256 -m PKCS8 -N blink-test -f ecdsa_pkcs8_enc
 //! ```
+//!
+//! And unencrypted keys in those two other formats, so the tests can show
+//! a plain key in any format is never taken for one that needs a
+//! passphrase:
+//!
+//! ```sh
+//! ssh-keygen -t rsa -b 2048 -m PEM -N '' -f rsa_pem
+//! ssh-keygen -t ecdsa -b 256 -m PKCS8 -N '' -f ecdsa_pkcs8
+//! ```
+//!
+//! Legacy PEM and PKCS#8 keys hold no comment, so those commands give none.
 //!
 //! They are fixtures rather than generated per run because RSA keygen is
 //! ruinously slow: 19.7 s for one 2048-bit key through `PrivateKey::random`,
@@ -93,24 +105,36 @@ ZxelkWu+KjM9PIzH/goFKh8t82ACtQZkMb6aM=
 -----END OPENSSH PRIVATE KEY-----
 "#;
 
-/// RSA private key, legacy PEM (`Proc-Type: 4,ENCRYPTED`), encrypted.
+/// RSA-2048 private key, legacy PEM (`Proc-Type: 4,ENCRYPTED`), encrypted.
 pub(super) const RSA_PEM_KEY_ENCRYPTED: &str = r#"-----BEGIN RSA PRIVATE KEY-----
 Proc-Type: 4,ENCRYPTED
-DEK-Info: AES-128-CBC,57E8943BD9A77FE49E6B933170B902E5
+DEK-Info: AES-128-CBC,0D63889AA258A36A7A34CE6E0D858ECB
 
-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
+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
 -----END RSA PRIVATE KEY-----
 "#;
 
@@ -123,4 +147,42 @@ rLwZDEZH1FDvTBHxUkzbk8m6VGzE4lJpXIPuS2BC0XbWmMffkZyQKLU7Tm8HjDyJ
 CSJrAt5DyJO9eSYngvtFDi/VijHDQM1kLY0Ft++x8Nusjkzftyb4M6E8sMTvyGY8
 BOiOJ/w9YA==
 -----END ENCRYPTED PRIVATE KEY-----
+"#;
+
+/// RSA-2048 private key, legacy PEM (`BEGIN RSA PRIVATE KEY`), unencrypted.
+pub(super) const RSA_PEM_KEY: &str = r#"-----BEGIN RSA PRIVATE KEY-----
+MIIEpQIBAAKCAQEAqzzIeD+BqZ8OsAxkLHRzPB4c837zng+Qr1nKWRpCoL2olBr3
+TgLSpDeZ/LbM99Y6/X9rzu7DLfI2tuaW7GwzZOs8Rwm5Qlz4xrq3+4sTDtdHfPSG
+yTfKDH2ulJkMpY4iEB/o3AW48KdGql9v9n6n3O7hVUHf9UKecxUGdHpDRkDutE5m
+vNiiUtd+RrFgTCjRo/VxCniogPC31+NVv2h0d6awGhz0vbUqJMWtjyMPVydTRC9x
+CwtZ/o8jk74P8/YEUuaKZaClsWvK8ephH1t5pGtAnLaLLRDPS5TYFz7/AMr0bZO+
+ADfvwlwl+WDuRXDHOxqtUSsOiFz8qaTAi05u8wIDAQABAoIBAA5Nl/MktC3Dvu7T
+7M7NH/j+t5gGhnkxP0/I9hQbk5gomhBbm5pKYGeIy2smpm1HLuCQyE5dzDN7dA2H
+/5rvmMVjuW0M8gq0iFp/1dwELGCEzpBbPnedRNpmlHK4wVaCI58+2Gz/FLO+ooea
+9tewkaXsgCmRGeYQcqVrNVb9BWnfNx5k4i3pHglQVK8Tc05pNUX904j4gvaZFgVv
+r1+Co2A6CGcioCdGbm6kkfVDOw0ZYH+ADZssvM/O1hLU/5ibx9NlBSpF0VUiNZdl
+xAAW26E06UvM/YLRH9FJtDsOomQFgXke4x+uhKXFC61qYDXPp6N1CcafSyL8MArC
+WtcWMzECgYEA56f9h7SXLzBgN+k18OTg7MDRcZNThZHFFxYrQVbYr1r4HSv9frap
+7W/o8LYk8N2A/fuoQTd0KOT/kl5PNJkMITKbWXLZh7TnpeZrZymQQ4ZgaYcs89y5
+3OhNLzjo7kFqNae9NBQ7Y+NXOPbu8ujUFkv5e2+IVkmvJfjadsFtm9ECgYEAvTto
+g+2H91nBm61H0d22eib0AgQL0PUrbXJRXnuoJdAhuBu9rWLu8T1el4V0G7tXrW75
+cdEoh9TXIZSQw9HJ2y74NiYibcsXX8bh96LuwhsOJRAVb3KisTWK6i/onTcCBdGV
+JlMS1IPdcWVF5GAyJ6BicdU9WB8o6FTQ2qVwQ4MCgYEAhXt8EC0UDGHgn3bm2QbZ
+QDKevMX6k3V6TqI8jGrBctGFNDH74H7ajXE1lTYvNQc9Y5wVyHZunX3OcgWbuCAU
+KDDj6PfPtm2cKTELZCdD9FTCyyvT0DS4eDz29KXjOh5BV+duk0qxKg5+XNmUuC1G
+wA5JFEIhGi9dGBE7uMAeK3ECgYEAmO0A2tVEM1ZbC5du2iCmTnNacKKadgUcUne3
+YHbofZ6FEYeBszSny1eAMU2Ndrfg9G0hs6SHb7ZHIYExuL66taJwvzn0Sux8+E7+
+4KTQ9RbuSG+GEyn+Zt3RZM7Q2vTQcqlcMruiFRJ4DCL+58AB6FpKFJpy19tesNuS
+aZCXeEcCgYEAshLo/iuJyVm+ypYsLXr9pt7qfW8t8g1pgNQC0Z++v50BCO8DlTef
+PUFmWp634zop+znUUt0SzMgbxuCu1U0Xek8HmplijgLHYwHYvwzvO0dqp5AVe724
+IlhRtrgBGY4X5EE5PyWIzEheFKCtwtWcgyb3lXL9S5A03QM/JBul29s=
+-----END RSA PRIVATE KEY-----
+"#;
+
+/// ECDSA P-256 private key, PKCS#8 (`BEGIN PRIVATE KEY`), unencrypted.
+pub(super) const ECDSA_PKCS8_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgtXO4eG8C89XSlwOZ
+RCGHhVvYafgC+4bkpiblKx++RnShRANCAARFLBGFrYcL/hbgCil26IhSW8DwIXvH
+84Xw8gFEsGmjQMMm5ks7V9yuEuZStsQiC1sWPRYk9ImQ0idcGnCfHHoO
+-----END PRIVATE KEY-----
 "#;
