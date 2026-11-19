@@ -19,11 +19,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use suppaftp::rustls::{ClientConfig, RootCertStore};
 use suppaftp::tokio::{AsyncRustlsConnector, AsyncRustlsFtpStream};
-use suppaftp::types::FileType;
 use zeroize::Zeroizing;
 
 use crate::error::{BlinkError, Result};
-use crate::session::{AuthMethod, Session};
+use crate::session::Session;
 use crate::transport::sftp::{HOST_KEY_DECISION_TIMEOUT, HostKeyDecision};
 use crate::tui::event::{AppEvent, TrustSubject};
 
@@ -57,11 +56,7 @@ async fn ask_to_pin(
     prompt: &CertPrompt<'_>,
 ) -> Result<NewCertPin> {
     let (decision_tx, decision_rx) = oneshot::channel();
-    let host = if session.host.contains(':') {
-        format!("[{}]:{}", session.host, session.port)
-    } else {
-        format!("{}:{}", session.host, session.port)
-    };
+    let host = ftp_impl::host_port(&session.host, session.port);
     let event = AppEvent::HostKeyUnknown {
         subject: TrustSubject::FtpsCertificate,
         host,
@@ -158,30 +153,8 @@ impl FtpsTransport {
         password: Option<&str>,
         prompt: Option<&CertPrompt<'_>>,
     ) -> Result<(AsyncRustlsFtpStream, Option<NewCertPin>)> {
-        if !matches!(session.auth, AuthMethod::Password) {
-            return Err(BlinkError::auth(
-                "FTPS only supports password (or anonymous) auth",
-            ));
-        }
+        let plain: AsyncRustlsFtpStream = ftp_impl::open_control(session, "ftps").await?;
 
-        let addr = format!("{}:{}", session.host, session.port);
-        let mut plain = AsyncRustlsFtpStream::connect(&addr)
-            .await
-            .map_err(|e| BlinkError::connect(format!("ftps connect to {addr}: {e}")))?;
-
-        // Dial the data connection at the control connection's peer, on the
-        // port the PASV reply gives, not at the address the reply names. The
-        // server picks that address, so a hostile one could aim uploads at
-        // any host it likes, such as a service on the user's own network;
-        // NAT'd servers that advertise a private address need this anyway.
-        // curl has ignored the PASV address by default since 7.74. The
-        // setting carries through `into_secure` below.
-        plain.set_passive_nat_workaround(true);
-
-        // The pinning verifier records here the first leaf certificate it
-        // sees when the session has no pin, and holds every later
-        // handshake on this stream (the data connections) to it. On a
-        // connect with a pin it stays None and nothing is asked.
         let captured_pin: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let config = if session.accept_invalid_certs {
@@ -223,22 +196,7 @@ impl FtpsTransport {
             }
         };
 
-        let (user, pw) = if session.username.is_empty() {
-            ("anonymous", "anonymous@")
-        } else {
-            let pw = password.unwrap_or("");
-            (session.username.as_str(), pw)
-        };
-        stream
-            .login(user, pw)
-            .await
-            .map_err(|e| BlinkError::auth(format!("ftps login: {e}")))?;
-
-        stream
-            .transfer_type(FileType::Binary)
-            .await
-            .map_err(|e| BlinkError::transport(format!("set binary: {e}")))?;
-
+        ftp_impl::log_in(&mut stream, session, password, "ftps").await?;
         Ok((stream, new_pin))
     }
 }

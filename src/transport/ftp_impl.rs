@@ -232,9 +232,86 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::error::{BlinkError, Result};
+use crate::session::{AuthMethod, Session};
 use crate::transfer::MAX_QUEUED_JOBS;
 use crate::transport::error_map::map_ftp;
 use crate::transport::{EntryKind, ProgressUpdate, RemoteEntry};
+
+/// `host:port` for messages, an IPv6 host in brackets: `::1:21` reads as
+/// a host `::1:21` with no port.
+pub(crate) fn host_port(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// Open the control connection for `session` (`label` is `ftp` or `ftps`,
+/// for messages), ready to log in.
+///
+/// The TCP connection is made here, rather than by suppaftp, to see which
+/// address family it landed on: over IPv6, data connections use `EPSV`
+/// (RFC 2428), since PASV's reply can only describe an IPv4 address and
+/// IPv6 servers commonly refuse it. IPv4 keeps PASV, which older servers
+/// need. Either way the data connection goes to this connection's peer,
+/// not to an address the server names: a hostile one could otherwise aim
+/// uploads at any host, such as a service on the user's own network, and
+/// NAT'd servers advertising a private address need it anyway. (curl has
+/// ignored the PASV address by default since 7.74.)
+pub(crate) async fn open_control<T: TokioTlsStream + Send>(
+    session: &Session,
+    label: &str,
+) -> Result<ImplAsyncFtpStream<T>> {
+    if !matches!(session.auth, AuthMethod::Password) {
+        return Err(BlinkError::auth(format!(
+            "{} only supports password (or anonymous) auth",
+            label.to_ascii_uppercase()
+        )));
+    }
+    let shown = host_port(&session.host, session.port);
+    let failed =
+        |e: &dyn std::fmt::Display| BlinkError::connect(format!("{label} connect to {shown}: {e}"));
+    let tcp = tokio::net::TcpStream::connect((session.host.as_str(), session.port))
+        .await
+        .map_err(|e| failed(&e))?;
+    let ipv6 = tcp.peer_addr().is_ok_and(|a| a.is_ipv6());
+    let mut stream = ImplAsyncFtpStream::<T>::connect_with_stream(tcp)
+        .await
+        .map_err(|e| failed(&e))?;
+    stream.set_passive_nat_workaround(true);
+    if ipv6 {
+        stream.set_mode(suppaftp::types::Mode::ExtendedPassive);
+    }
+    Ok(stream)
+}
+
+/// Log in as `session`'s user (or `anonymous`, with no username) and
+/// switch to binary transfers.
+///
+/// Failures go through [`map_ftp`]: only a refused login (`530`) is an
+/// authentication failure. Reported as one whatever happened, `421 Too
+/// many connections` or a reset during login read as a wrong password.
+pub(crate) async fn log_in<T: TokioTlsStream + Send>(
+    stream: &mut ImplAsyncFtpStream<T>,
+    session: &Session,
+    password: Option<&str>,
+    label: &str,
+) -> Result<()> {
+    let (user, pw) = if session.is_anonymous_ftp() {
+        ("anonymous", "anonymous@")
+    } else {
+        (session.username.as_str(), password.unwrap_or(""))
+    };
+    stream
+        .login(user, pw)
+        .await
+        .map_err(|e| map_ftp(&format!("{label} login as"), user, e))?;
+    stream
+        .transfer_type(suppaftp::types::FileType::Binary)
+        .await
+        .map_err(|e| map_ftp(&format!("{label} binary mode on"), &session.host, e))
+}
 
 /// Cap on bytes read by `read_to_bytes`. See the equivalent in `sftp.rs`:
 /// derived from the viewer's image limit so the two cannot drift apart.
@@ -1053,6 +1130,11 @@ mod integration {
         pub deny_list: bool,
         /// Answer DELE with `550 Permission denied`.
         pub deny_dele: bool,
+        /// Answer PASS with `421 Too many connections`.
+        pub busy_login: bool,
+        /// Listen on IPv6 loopback, answer `EPSV`, and refuse PASV, as an
+        /// RFC 2428 server on IPv6 does.
+        pub ipv6: bool,
         /// Close control and data connections after `150`, sending no `226`.
         pub abrupt_close: bool,
         /// Extra LIST lines carrying names a walk must refuse to act on:
@@ -1199,7 +1281,13 @@ mod integration {
     /// to assert a single connection; FTP has no equivalent of the SFTP
     /// harness's pool-reuse test, so nothing here asserts reuse.
     pub(super) async fn start_server(store: Store, faults: Faults) -> (u16, Arc<AtomicUsize>, Log) {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let listener = if faults.ipv6 {
+            TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+                .await
+                .unwrap()
+        } else {
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap()
+        };
         let port = listener.local_addr().unwrap().port();
         let connects = Arc::new(AtomicUsize::new(0));
         let connects_l = Arc::clone(&connects);
@@ -1277,7 +1365,27 @@ mod integration {
 
             match cmd.as_str() {
                 "USER" => w.write_all(b"331 password required\r\n").await?,
+                "PASS" if faults.busy_login => {
+                    w.write_all(b"421 Too many connections\r\n").await?;
+                }
                 "PASS" => w.write_all(b"230 logged in\r\n").await?,
+                "PASV" if faults.ipv6 => {
+                    w.write_all(b"500 PASV not supported over IPv6; use EPSV\r\n")
+                        .await?;
+                }
+                "EPSV" => {
+                    let data_listener = if faults.ipv6 {
+                        TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).await?
+                    } else {
+                        TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?
+                    };
+                    let port = data_listener.local_addr()?.port();
+                    pasv = Some(data_listener);
+                    w.write_all(
+                        format!("229 Entering Extended Passive Mode (|||{port}|)\r\n").as_bytes(),
+                    )
+                    .await?;
+                }
                 "TYPE" => w.write_all(b"200 type set\r\n").await?,
                 "PASV" => {
                     let data_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
@@ -2779,6 +2887,85 @@ mod integration {
     /// LIST parsers directly instead, and an unparsable line is skipped.
     /// Skipping a line it cannot parse is right; saying nothing about it was
     /// not. The listing carries the count so the caller can tell the user.
+    /// Over IPv6, PASV can't describe the data address and strict servers
+    /// refuse it: every listing and transfer failed after a good login.
+    #[tokio::test]
+    async fn over_ipv6_data_connections_use_epsv() {
+        if TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+            .await
+            .is_err()
+        {
+            eprintln!("skipped: no IPv6 loopback here");
+            return;
+        }
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/a.txt".to_string(), b"x".to_vec());
+        let faults = Faults {
+            ipv6: true,
+            ..Faults::default()
+        };
+        let (port, _c, log) = start_server(Arc::clone(&store), faults).await;
+        let mut session = test_session(port);
+        session.host = "::1".into();
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let listing = transport.list("/").await.expect("listed over EPSV");
+        assert_eq!(listing.entries.len(), 1);
+        let log = log.lock().await;
+        assert!(log.iter().any(|l| l == "EPSV"), "{log:?}");
+        assert!(!log.iter().any(|l| l == "PASV"), "{log:?}");
+    }
+
+    /// Over IPv4, PASV stays: older servers don't know EPSV.
+    #[tokio::test]
+    async fn over_ipv4_data_connections_keep_pasv() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let mut transport = FtpTransport::connect(&test_session(port), Some("pw"))
+            .await
+            .unwrap();
+        transport.list("/").await.unwrap();
+        let log = log.lock().await;
+        assert!(
+            log.iter().any(|l| l == "PASV") && !log.iter().any(|l| l == "EPSV"),
+            "{log:?}"
+        );
+    }
+
+    /// `421 Too many connections` at login read as "authentication failed",
+    /// a wrong password; it is the server being busy.
+    #[tokio::test]
+    async fn a_busy_server_at_login_is_not_a_wrong_password() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let faults = Faults {
+            busy_login: true,
+            ..Faults::default()
+        };
+        let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
+        let err = match FtpTransport::connect(&test_session(port), Some("pw")).await {
+            Err(e) => e,
+            Ok(_) => panic!("the login is refused"),
+        };
+        assert!(
+            matches!(err, crate::error::BlinkError::Disconnected(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("Too many connections"), "{err}");
+        assert!(err.to_string().contains("ftp login as tester"), "{err}");
+    }
+
+    #[test]
+    fn host_port_brackets_ipv6() {
+        assert_eq!(crate::transport::ftp_impl::host_port("::1", 21), "[::1]:21");
+        assert_eq!(
+            crate::transport::ftp_impl::host_port("ftp.example", 21),
+            "ftp.example:21"
+        );
+    }
+
     /// A 550 that says "permission denied" read as "no such file", so a
     /// file in a folder blink couldn't list was reported absent — and the
     /// upload overwrite check let it be replaced without asking.

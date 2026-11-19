@@ -173,6 +173,18 @@ pub struct Session {
 }
 
 impl Session {
+    /// An FTP or FTPS session with no username: blink logs in as
+    /// `anonymous`, and no password is asked for or sent.
+    pub fn is_anonymous_ftp(&self) -> bool {
+        matches!(self.protocol, Protocol::Ftp | Protocol::Ftps) && self.username.is_empty()
+    }
+
+    /// Whether connecting asks for a password first: password auth,
+    /// except an anonymous FTP login, which would ignore it.
+    pub fn needs_password(&self) -> bool {
+        matches!(self.auth, AuthMethod::Password) && !self.is_anonymous_ftp()
+    }
+
     /// Build the on-disk filename for this session, sanitizing characters that
     /// are unsafe in filesystem paths.
     fn filename(&self) -> String {
@@ -1033,6 +1045,23 @@ mod tests {
     #[test]
     fn from_url_null_in_host_rejected() {
         assert!(Session::from_url("sftp://evil\x00host/").is_err());
+    }
+
+    /// An anonymous FTP login sends `anonymous@`, so asking for a password
+    /// asked for one that was then ignored.
+    #[test]
+    fn only_a_login_that_uses_a_password_asks_for_one() {
+        let needs = |url: &str| Session::from_url(url).unwrap().needs_password();
+        assert!(!needs("ftp://files.example"));
+        assert!(!needs("ftps://files.example"));
+        assert!(needs("ftp://alice@files.example"));
+        assert!(needs("ftps://alice@files.example"));
+        assert!(needs("sftp://alice@files.example"));
+        assert!(
+            Session::from_url("ftp://files.example")
+                .unwrap()
+                .is_anonymous_ftp()
+        );
     }
 
     /// Nothing in a URL comes from a file: a bad one said "config error".
