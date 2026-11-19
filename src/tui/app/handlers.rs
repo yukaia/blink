@@ -782,6 +782,34 @@ impl App {
         }
     }
 
+    /// Remove a discarded upload batch's partial files from the server.
+    /// The checkpoint was their only record: left there, they'd sit on the
+    /// server for good. One already gone is not a failure.
+    pub(super) fn remove_remote_parts(&mut self, paths: Vec<String>) {
+        if paths.is_empty() {
+            return;
+        }
+        let Some(t) = self.transport.clone() else {
+            return;
+        };
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let mut transport = t.lock().await;
+            let mut removed = 0usize;
+            let mut failures = Vec::new();
+            for path in paths {
+                match transport.delete_file(&path).await {
+                    Ok(()) => removed += 1,
+                    Err(crate::error::BlinkError::NotFound(_)) => {}
+                    Err(e) => {
+                        failures.push(format!("could not remove {path} from the server: {e}"))
+                    }
+                }
+            }
+            let _ = tx.send(crate::tui::event::AppEvent::RemotePartsRemoved { removed, failures });
+        });
+    }
+
     /// The offer to resume an interrupted batch, shown once per checkpoint
     /// after a connection comes up.
     ///
@@ -836,6 +864,7 @@ impl App {
                         for failure in outcome.failures {
                             self.push_log(LogLevel::Warn, failure);
                         }
+                        self.remove_remote_parts(outcome.remote_parts);
                     }
                     Err(e) => {
                         self.push_log(

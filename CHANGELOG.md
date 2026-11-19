@@ -168,6 +168,24 @@ the git history for those.
 
 ### Fixed
 
+- **Two blinks on one session no longer wipe each other's batches.** Each
+  wrote its own copy of the checkpoint, and the last to save won. The
+  first now holds a lock; the second runs its batches unsaved, says so,
+  and leaves that checkpoint alone (no offer, resume or discard), as does
+  `blink checkpoints`.
+- **Clearing a checkpoint keeps partial downloads that aren't its own.**
+  Partials were removed by path alone, so a newer batch downloading into
+  the same place lost its partials when the old checkpoint was cleaned
+  up. A partial whose sidecar names another file or server is now kept.
+- **Discarding an upload checkpoint removes its partial files on the
+  server** while connected; they were left there for good.
+- **A checkpoint with a malformed `version`** (a string, `null`) is
+  refused instead of being read as version 1, which reset every finished
+  job to pending.
+- **A checkpoint file is checked against its name and contents**: its
+  session and direction must match the name, every job must belong to
+  its direction, and local paths must be absolute.
+- **`blink checkpoints` prints paths safely and lines up its columns.**
 - **A symlinked `config.ini` stays a symlink** when blink saves; it was
   replaced with a plain file, cut off from your dotfiles.
 - **A `config.ini` with a byte-order mark is read.** Every setting in it was

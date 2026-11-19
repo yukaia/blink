@@ -686,6 +686,17 @@ impl App {
                     ),
                 );
             }
+            AppEvent::RemotePartsRemoved { removed, failures } => {
+                if removed > 0 {
+                    self.push_log(
+                        LogLevel::Info,
+                        format!("removed {removed} partial upload(s) from the server"),
+                    );
+                }
+                for failure in failures {
+                    self.push_log(LogLevel::Warn, failure);
+                }
+            }
             AppEvent::HostKeyStoreProblem { message, refused } => {
                 let level = if refused {
                     LogLevel::Error

@@ -24,7 +24,7 @@
 //! `TransferEvent` stream, not with the modal flow that triggers a
 //! batch.
 
-use crate::checkpoint::{Checkpoint, CheckpointJob, CheckpointKind, JobStatus};
+use crate::checkpoint::{Checkpoint, CheckpointJob, CheckpointKind, JobStatus, StoreLock};
 use crate::transfer::{Direction, EnqueueError, TransferManager, destination_key};
 use crate::tui::plan::PlannedJob;
 
@@ -94,17 +94,52 @@ impl App {
     /// A tracked checkpoint is then reloaded from its new file, which may
     /// hold another batch merged in after its own jobs; its own jobs keep
     /// their positions, so the job-id map stays valid.
+    ///
+    /// This blink's locks are let go for the move, which takes both names'
+    /// locks itself, and taken again under whichever name each checkpoint
+    /// ends up with. One that can't be — another blink took it meanwhile —
+    /// stops being written.
     pub(super) fn move_checkpoints(&mut self, old: &str, new: &str, origin: &str) {
         self.flush_checkpoints();
+        for cp in self.active_checkpoints.values_mut() {
+            cp.release();
+        }
         for failure in crate::checkpoint::rename_session(old, new, origin) {
             self.push_log(LogLevel::Warn, failure);
         }
         let kinds: Vec<CheckpointKind> = self.active_checkpoints.keys().copied().collect();
         for kind in kinds {
+            if self.active_checkpoints[&kind].is_unsaved() {
+                continue;
+            }
             // Not moved, the warning above says why: it keeps writing under
             // the old name, where it can at least be found.
-            if let Ok(Some(moved)) = Checkpoint::load(new, origin, kind) {
-                self.active_checkpoints.insert(kind, moved);
+            let name = match Checkpoint::load(new, origin, kind) {
+                Ok(Some(moved)) => {
+                    self.active_checkpoints.insert(kind, moved);
+                    new
+                }
+                _ => old,
+            };
+            match StoreLock::try_take(name, origin, kind) {
+                Ok(Some(lock)) => {
+                    if let Some(cp) = self.active_checkpoints.get_mut(&kind) {
+                        cp.hold(lock);
+                    }
+                }
+                _ => {
+                    if let Some(cp) = self.active_checkpoints.get_mut(&kind) {
+                        cp.set_unsaved();
+                    }
+                    self.push_log(
+                        LogLevel::Warn,
+                        format!(
+                            "another blink took the {} checkpoint during the rename; \
+                             this batch is no longer saved for resuming",
+                            kind.as_str()
+                        ),
+                    );
+                }
             }
         }
     }
@@ -130,8 +165,14 @@ impl App {
         if cp.pending_count() == 0 {
             let session = cp.session.clone();
             let origin = cp.origin_key().to_string();
+            let unsaved = cp.is_unsaved();
             self.active_checkpoints.remove(&kind);
             self.checkpoint_job_map.retain(|_, (k, _)| *k != kind);
+            // An unsaved checkpoint has no file of its own: the one at its
+            // name is another blink's.
+            if unsaved {
+                return;
+            }
             if let Err(e) = Checkpoint::remove(&session, &origin, kind) {
                 self.push_log(
                     LogLevel::Warn,
@@ -235,28 +276,57 @@ impl App {
         // user deferred at the resume offer, or one a quit interrupted.
         // Starting from an empty checkpoint wrote over it, losing that batch
         // and the record of its partial downloads.
+        //
+        // Another blink using this checkpoint gets it left alone: this batch
+        // is tracked in memory only, and says so.
         if !self.active_checkpoints.contains_key(&ck_kind) {
-            let existing = match Checkpoint::load(&session_name, &origin, ck_kind) {
-                Ok(existing) => existing,
-                // Unreadable, so nothing in it can be resumed anyway; say so
-                // before it is replaced.
+            let cp = match StoreLock::try_take(&session_name, &origin, ck_kind) {
+                Ok(Some(lock)) => {
+                    let existing = match Checkpoint::load(&session_name, &origin, ck_kind) {
+                        Ok(existing) => existing,
+                        // Unreadable, so nothing in it can be resumed anyway;
+                        // say so before it is replaced.
+                        Err(e) => {
+                            self.push_log(
+                                LogLevel::Warn,
+                                format!(
+                                    "replacing an unreadable {} checkpoint: {e}",
+                                    ck_kind.as_str()
+                                ),
+                            );
+                            None
+                        }
+                    };
+                    let mut cp = existing.unwrap_or_else(|| {
+                        Checkpoint::new(&session_name, &origin, ck_kind, Vec::new())
+                    });
+                    cp.hold(lock);
+                    cp
+                }
+                Ok(None) => {
+                    self.push_log(
+                        LogLevel::Warn,
+                        format!(
+                            "another blink is using this session's {} checkpoint, so \
+                             this batch isn't saved: it can't be resumed if interrupted",
+                            ck_kind.as_str()
+                        ),
+                    );
+                    Checkpoint::new_unsaved(&session_name, &origin, ck_kind)
+                }
                 Err(e) => {
                     self.push_log(
                         LogLevel::Warn,
                         format!(
-                            "replacing an unreadable {} checkpoint: {e}",
+                            "{} checkpoint unavailable ({e}), so this batch isn't saved: \
+                             it can't be resumed if interrupted",
                             ck_kind.as_str()
                         ),
                     );
-                    None
+                    Checkpoint::new_unsaved(&session_name, &origin, ck_kind)
                 }
             };
-            self.active_checkpoints.insert(
-                ck_kind,
-                existing.unwrap_or_else(|| {
-                    Checkpoint::new(&session_name, &origin, ck_kind, Vec::new())
-                }),
-            );
+            self.active_checkpoints.insert(ck_kind, cp);
         }
         let Some(cp) = self.active_checkpoints.get_mut(&ck_kind) else {
             return;
@@ -653,6 +723,25 @@ impl App {
             tracing::warn!("checkpoint flush before a retry failed: {e}");
         }
 
+        // The file is another blink's while it holds the lock: resuming it
+        // here would run its batch twice.
+        let lock = match StoreLock::try_take(&session_name, &origin, ck_kind) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => {
+                self.push_log(
+                    LogLevel::Warn,
+                    format!(
+                        "another blink is using the {} checkpoint — resume it there",
+                        ck_kind.as_str()
+                    ),
+                );
+                return;
+            }
+            Err(e) => {
+                self.push_log(LogLevel::Error, format!("checkpoint unavailable: {e}"));
+                return;
+            }
+        };
         let checkpoint = match Checkpoint::load(&session_name, &origin, ck_kind) {
             Ok(Some(cp)) => cp,
             Ok(None) => {
@@ -716,10 +805,9 @@ impl App {
         // the file they were read from once `dispatch_plan` writes it.
         // Without this, `dispatch_plan` would load that file and append the
         // same jobs to it a second time.
-        self.active_checkpoints.insert(
-            ck_kind,
-            Checkpoint::new(&session_name, &origin, ck_kind, Vec::new()),
-        );
+        let mut fresh = Checkpoint::new(&session_name, &origin, ck_kind, Vec::new());
+        fresh.hold(lock);
+        self.active_checkpoints.insert(ck_kind, fresh);
         self.dispatch_plan(resume_plan, ck_kind);
         // A plan that queued nothing (every job already running elsewhere)
         // wrote nothing; leave the file as it was rather than tracking an
