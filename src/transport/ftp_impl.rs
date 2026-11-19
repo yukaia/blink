@@ -435,14 +435,33 @@ where
 /// transfer takes. A stall reads as a disconnect, since the transfer's
 /// state is then unknown; the dispatcher closes the connection after a
 /// failed job, and the browsing connection reopens before its next use.
+///
+/// A data connection that breaks — reset, aborted, closed early — is a
+/// dropped connection too, so a transfer gets the dispatcher's one retry:
+/// as a plain error, a network blip mid-download failed the job. (`426`
+/// covers only the servers that report the abort themselves.)
 async fn data_io<T>(
     op: &str,
     path: &str,
     fut: impl std::future::Future<Output = std::io::Result<T>>,
 ) -> Result<T> {
+    use std::io::ErrorKind::*;
     let idle = op_timeout();
     match tokio::time::timeout(idle, fut).await {
         Ok(Ok(v)) => Ok(v),
+        Ok(Err(e))
+            if matches!(
+                e.kind(),
+                ConnectionReset
+                    | ConnectionAborted
+                    | BrokenPipe
+                    | UnexpectedEof
+                    | NotConnected
+                    | TimedOut
+            ) =>
+        {
+            Err(BlinkError::disconnected(format!("{op} {path}: {e}")))
+        }
         Ok(Err(e)) => Err(BlinkError::transport(format!("{op} {path}: {e}"))),
         Err(_) => Err(BlinkError::disconnected(format!(
             "{op} {path}: no data for {}s",
@@ -451,12 +470,35 @@ async fn data_io<T>(
     }
 }
 
+/// `LIST -a remote_path`, so dotfiles are listed: many servers (vsftpd by
+/// default, ProFTPD) leave them out of a plain `LIST`. Browsing then hid
+/// them, unlike SFTP, and a recursive delete removed what it could see and
+/// failed at `RMD` with "directory not empty", the tree half gone.
+///
+/// `-a` isn't standard. A server that refuses it gets a plain `LIST`. One
+/// that takes `-a` for part of the name lists nothing; so an empty answer
+/// is checked with a plain `LIST` too, which costs a second listing only
+/// for folders that really are empty.
+async fn list_all<T: TokioTlsStream + Send>(
+    stream: &mut ImplAsyncFtpStream<T>,
+    op: &str,
+    remote_path: &str,
+) -> Result<Vec<String>> {
+    let with_a = format!("-a {remote_path}");
+    match timed_ftp(op, remote_path, stream.list(Some(&with_a))).await {
+        Ok(lines) if lines.iter().any(|l| !l.starts_with("total ")) => Ok(lines),
+        // A dead connection won't answer a plain LIST either.
+        Err(e @ BlinkError::Disconnected(_)) => Err(e),
+        _ => timed_ftp(op, remote_path, stream.list(Some(remote_path))).await,
+    }
+}
+
 pub async fn ftp_list<T: TokioTlsStream + Send>(
     stream: &mut ImplAsyncFtpStream<T>,
     remote_path: &str,
 ) -> Result<crate::transport::Listing> {
     check_ftp_path("list", remote_path)?;
-    let lines = timed_ftp("list", remote_path, stream.list(Some(remote_path))).await?;
+    let lines = list_all(stream, "list", remote_path).await?;
 
     let mut out = Vec::with_capacity(lines.len());
     let mut considered = 0usize;
@@ -530,9 +572,6 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     origin: &str,
 ) -> Result<()> {
     check_ftp_path("retr", remote_path)?;
-    if let Some(parent) = local_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
 
     // Stream into the partial and rename on success — see
     // [`crate::transport::part_path`] for the rationale.
@@ -540,23 +579,18 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     // Before anything looks at the partial: see `transport::lease_part`.
     let lease = super::lease_part(&part).await;
 
-    // Wrap size() in a timeout too — a server that hangs on SIZE would
-    // pin the whole download here. On timeout / error the size is simply
-    // unknown; the progress bar just can't show a percentage.
-    let reported_size = tokio::time::timeout(op_timeout(), stream.size(remote_path))
-        .await
-        .ok()
-        .and_then(|r| r.ok())
+    // SIZE and MDTM, each under the op deadline. An error reply (a server
+    // without the command) just leaves the value unknown: the progress bar
+    // can't show a percentage, and without MDTM the file never resumes. A
+    // timeout ends the download as a dropped connection: the call was cut
+    // short, so its late reply would be read as the next command's — SIZE's
+    // as MDTM's, MDTM's as REST's refusal, which threw the partial away.
+    let reported_size = optional_reply("size", remote_path, stream.size(remote_path))
+        .await?
         .map(|n| n as u64);
     let total = reported_size.unwrap_or(0);
-
-    // MDTM, under the same deadline and for the same reason. It is what
-    // tells a replacement of the same size apart; a server that doesn't
-    // answer it can still download, but never resumes.
-    let reported_mtime = tokio::time::timeout(op_timeout(), stream.mdtm(remote_path))
-        .await
-        .ok()
-        .and_then(|r| r.ok())
+    let reported_mtime = optional_reply("mdtm", remote_path, stream.mdtm(remote_path))
+        .await?
         .and_then(|t| u64::try_from(t.and_utc().timestamp()).ok());
     let stamp = super::RemoteStamp {
         size: reported_size,
@@ -586,6 +620,11 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
         Err(e) => return Err(e),
     };
 
+    // Only now, with the transfer open: made first, a download that then
+    // failed (no such file, refused) left an empty folder behind.
+    if let Some(parent) = local_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     let mut local = super::open_part(&lease, &part, offset).await?;
     // Identify the partial before writing to it — see the SFTP path.
     super::write_part_meta(local_path, remote_path, stamp, origin).await;
@@ -653,6 +692,20 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
     Ok(())
 }
 
+/// The answer to a command the transfer can do without (SIZE, MDTM):
+/// `Ok(None)` for an error reply, but a timeout is a dropped connection.
+async fn optional_reply<T>(
+    op: &str,
+    path: &str,
+    fut: impl std::future::Future<Output = std::result::Result<T, FtpError>>,
+) -> Result<Option<T>> {
+    match timed_ftp(op, path, fut).await {
+        Ok(v) => Ok(Some(v)),
+        Err(e @ BlinkError::Disconnected(_)) => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
 /// Open `remote_path` for reading from byte `offset`: REST when it isn't 0,
 /// then RETR.
 async fn open_retr<T: TokioTlsStream + Send + 'static>(
@@ -709,6 +762,18 @@ pub async fn ftp_upload<T: TokioTlsStream + Send>(
     // As in `ftp_download`: early returns above drop `writer` unfinished,
     // which is safe because a failed job's connection is never reused.
     timed_ftp("finalize put", &part, writer.finish()).await?;
+
+    // `226` says the server took the transfer, not that it stored all of
+    // it (a quota cut, a truncating proxy). Where SIZE answers, it must
+    // match, as a download's must; the partial is left for the next
+    // attempt to overwrite.
+    if let Some(stored) = optional_reply("size", &part, stream.size(&part)).await?
+        && stored as u64 != done
+    {
+        return Err(BlinkError::transport(format!(
+            "stor {remote_path}: sent {done} bytes, but the server stored {stored}"
+        )));
+    }
 
     // Move the fully-stored `.blink-part` onto the final name. Whether RNTO
     // replaces an existing target is server-dependent: try the rename
@@ -828,7 +893,7 @@ pub async fn ftp_delete_dir_capped<T: TokioTlsStream + Send>(
         }
         match op {
             Op::Visit(path) => {
-                let lines = timed_ftp("list", &path, stream.list(Some(&path))).await?;
+                let lines = list_all(stream, "list", &path).await?;
                 stack.push(Op::Remove(path.clone()));
                 let mut subdirs: Vec<Op> = Vec::new();
                 for line in lines {
@@ -889,7 +954,10 @@ pub async fn ftp_mkdir<T: TokioTlsStream + Send>(
 ) -> Result<()> {
     check_ftp_path("mkd", remote_path)?;
     if let Ok(Some(existing)) = ftp_metadata(stream, remote_path).await {
-        if existing.is_dir() {
+        // A symlink counts: FTP can't say what it points at, and SFTP,
+        // which can, accepts one to a folder. If it points elsewhere, the
+        // uploads into it fail, saying so.
+        if existing.is_dir() || existing.kind == EntryKind::Symlink {
             return Ok(());
         }
         return Err(BlinkError::transport(format!(
@@ -915,7 +983,7 @@ pub async fn ftp_metadata<T: TokioTlsStream + Send>(
     // (connection drop, secure-channel failure, unexpected response code)
     // is a real failure that needs to propagate. Without this, mid-walk
     // connection drops were being misreported as "the file disappeared".
-    let lines = match timed_ftp("metadata list", &parent, stream.list(Some(&parent))).await {
+    let lines = match list_all(stream, "metadata list", &parent).await {
         Ok(l) => l,
         Err(BlinkError::NotFound(_)) => return Ok(None),
         Err(e) => return Err(e),
@@ -1132,6 +1200,18 @@ mod integration {
         pub deny_dele: bool,
         /// Answer PASS with `421 Too many connections`.
         pub busy_login: bool,
+        /// Leave dotfiles out of a plain `LIST`, as vsftpd does; `LIST -a`
+        /// still shows them.
+        pub hide_dotfiles: bool,
+        /// Refuse `LIST -a` with `501`, as a server without the option does.
+        pub refuse_list_options: bool,
+        /// Take `-a` for part of the name, as some servers do, so `LIST -a
+        /// /dir` lists nothing.
+        pub list_options_as_name: bool,
+        /// Never answer SIZE.
+        pub stall_size: bool,
+        /// Keep only this many bytes of a STOR, and still answer `226`.
+        pub truncate_stor: Option<usize>,
         /// Listen on IPv6 loopback, answer `EPSV`, and refuse PASV, as an
         /// RFC 2428 server on IPv6 does.
         pub ipv6: bool,
@@ -1419,6 +1499,15 @@ mod integration {
                         w.write_all(b"550 Permission denied\r\n").await?;
                         continue;
                     }
+                    let (all, arg) = match arg.strip_prefix("-a ") {
+                        Some(rest) if !faults.list_options_as_name => (true, rest.to_string()),
+                        _ => (false, arg.clone()),
+                    };
+                    if all && faults.refuse_list_options {
+                        drop(data_listener);
+                        w.write_all(b"501 options not supported\r\n").await?;
+                        continue;
+                    }
                     let mut body = if faults.unparsable_list_line {
                         "!! this is not a listing line !!\r\n".to_string()
                     } else {
@@ -1426,6 +1515,13 @@ mod integration {
                         let dir = if arg.is_empty() { "/" } else { arg.as_str() };
                         listing_for(&files, dir)
                     };
+                    if faults.hide_dotfiles && !all {
+                        body = body
+                            .lines()
+                            .filter(|l| !l.rsplit(' ').next().is_some_and(|n| n.starts_with('.')))
+                            .map(|l| format!("{l}\r\n"))
+                            .collect();
+                    }
                     if faults.hostile_listing_names {
                         // Regular files, so a walk that fails to skip one
                         // reaches DELE rather than recursing into it.
@@ -1465,6 +1561,7 @@ mod integration {
                         None => w.write_all(b"550 no such file\r\n").await?,
                     }
                 }
+                "SIZE" if faults.stall_size => {}
                 "SIZE" => {
                     let files = store.lock().await;
                     match files.get(&arg) {
@@ -1568,6 +1665,9 @@ mod integration {
                     let mut buf = Vec::new();
                     data.read_to_end(&mut buf).await?;
                     drop(data);
+                    if let Some(keep) = faults.truncate_stor {
+                        buf.truncate(keep);
+                    }
                     {
                         let mut files = store.lock().await;
                         if cmd == "APPE" {
@@ -2881,12 +2981,225 @@ mod integration {
         assert_eq!(listing.entries.len(), 1, "{:?}", listing.entries);
     }
 
-    /// A garbage body must not become an entry. `File::from_str` would let it:
-    /// it falls through to the MLSX parsers, which split on `;` and name the
-    /// file the last token, so any non-empty line parses. `ftp_list` calls the
-    /// LIST parsers directly instead, and an unparsable line is skipped.
-    /// Skipping a line it cannot parse is right; saying nothing about it was
-    /// not. The listing carries the count so the caller can tell the user.
+    // -- ftp_impl audit -----------------------------------------------------
+
+    fn dotted_store() -> Store {
+        let mut files = HashMap::new();
+        files.insert("/d/".to_string(), Vec::new());
+        files.insert("/d/.hidden".to_string(), b"h".to_vec());
+        files.insert("/d/shown.txt".to_string(), b"s".to_vec());
+        Arc::new(Mutex::new(files))
+    }
+
+    /// A plain LIST hid dotfiles on servers like vsftpd: browsing missed
+    /// them, and a recursive delete failed at RMD with the tree half gone.
+    #[tokio::test]
+    async fn dotfiles_are_listed_and_deleted() {
+        let store = dotted_store();
+        let faults = Faults {
+            hide_dotfiles: true,
+            ..Faults::default()
+        };
+        let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
+        let mut transport = FtpTransport::connect(&test_session(port), Some("pw"))
+            .await
+            .unwrap();
+
+        let names: Vec<String> = transport
+            .list("/d")
+            .await
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.raw_name.clone())
+            .collect();
+        assert!(names.contains(&".hidden".to_string()), "{names:?}");
+
+        transport
+            .delete_dir("/d", true)
+            .await
+            .expect("the whole tree goes");
+        assert!(
+            store.lock().await.is_empty(),
+            "{:?}",
+            store.lock().await.keys()
+        );
+    }
+
+    /// `-a` isn't standard: refused, or taken for part of the name, the
+    /// listing falls back to a plain LIST.
+    #[tokio::test]
+    async fn a_server_without_list_a_still_lists() {
+        for faults in [
+            Faults {
+                refuse_list_options: true,
+                ..Faults::default()
+            },
+            Faults {
+                list_options_as_name: true,
+                ..Faults::default()
+            },
+        ] {
+            let store = dotted_store();
+            let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
+            let mut transport = FtpTransport::connect(&test_session(port), Some("pw"))
+                .await
+                .unwrap();
+            assert_eq!(transport.list("/d").await.unwrap().entries.len(), 2);
+            assert!(transport.metadata("/d/shown.txt").await.unwrap().is_some());
+        }
+    }
+
+    /// A SIZE cut short by its deadline left its reply to be read as the
+    /// next command's: as REST's refusal, which threw the partial away.
+    #[tokio::test]
+    async fn a_size_that_never_answers_drops_the_connection_and_keeps_the_partial() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/f.bin".to_string(), b"0123456789".to_vec());
+        let faults = Faults {
+            stall_size: true,
+            ..Faults::default()
+        };
+        let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
+        let mut transport = FtpTransport::connect(&test_session(port), Some("pw"))
+            .await
+            .unwrap();
+        let dir = tempdir_for_test("stall-size");
+        let local = dir.join("f.bin");
+        let part = crate::transport::part_path(&local);
+        std::fs::write(&part, b"01234").unwrap();
+
+        super::OP_TIMEOUT.set(std::time::Duration::from_millis(300));
+        let err = with_timeout(transport.download("/f.bin", &local, None), "download")
+            .await
+            .expect_err("SIZE never answers");
+        super::OP_TIMEOUT.set(super::FTP_OP_TIMEOUT);
+
+        assert!(
+            matches!(err, crate::error::BlinkError::Disconnected(_)),
+            "{err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&part).unwrap(),
+            b"01234",
+            "the partial is kept"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A data connection reset mid-download failed the job as a plain
+    /// error; as a dropped connection it gets the dispatcher's retry.
+    #[tokio::test]
+    async fn a_data_reset_mid_download_is_a_dropped_connection() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/cut.bin".to_string(), pseudo_random(64 * 1024));
+        let faults = Faults {
+            reset_data_after: Some(8192),
+            ..Faults::default()
+        };
+        let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
+        let mut transport = FtpTransport::connect(&test_session(port), Some("pw"))
+            .await
+            .unwrap();
+        let dir = tempdir_for_test("data-reset");
+
+        let err = with_timeout(
+            transport.download("/cut.bin", &dir.join("cut.bin"), None),
+            "download",
+        )
+        .await
+        .expect_err("the data connection is reset");
+        assert!(
+            matches!(err, crate::error::BlinkError::Disconnected(_)),
+            "{err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FTP lists a symlink as a symlink, and `mkdir` refused one pointing
+    /// at a folder, which SFTP (following it) accepts.
+    #[tokio::test]
+    async fn mkdir_onto_a_symlinked_folder_is_fine() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/www/".to_string(), Vec::new());
+            files.insert(symlink_key("/www"), Vec::new());
+        }
+        let (port, _c, log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let mut transport = FtpTransport::connect(&test_session(port), Some("pw"))
+            .await
+            .unwrap();
+
+        transport
+            .mkdir("/www")
+            .await
+            .expect("the link stands for the folder");
+        assert!(!log.lock().await.iter().any(|c| c.starts_with("MKD")));
+    }
+
+    /// `226` was taken as proof the whole file was stored.
+    #[tokio::test]
+    async fn an_upload_the_server_stored_short_is_not_put_in_place() {
+        let local =
+            std::env::temp_dir().join(format!("blink-ftp-short-{}.bin", std::process::id()));
+        std::fs::write(&local, b"0123456789").unwrap();
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/up.bin".to_string(), b"old".to_vec());
+        let faults = Faults {
+            truncate_stor: Some(4),
+            ..Faults::default()
+        };
+        let (port, _c, _log) = start_server(Arc::clone(&store), faults).await;
+        let mut transport = FtpTransport::connect(&test_session(port), Some("pw"))
+            .await
+            .unwrap();
+
+        let err = transport
+            .upload(&local, "/up.bin", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("sent 10 bytes, but the server stored 4"),
+            "{err}"
+        );
+        assert_eq!(
+            store.lock().await.get("/up.bin").map(Vec::as_slice),
+            Some(&b"old"[..])
+        );
+        let _ = std::fs::remove_file(&local);
+    }
+
+    /// The local folder was made before the server was asked anything, so
+    /// a download that failed left it behind, empty.
+    #[tokio::test]
+    async fn a_failed_download_leaves_no_folder_behind() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let mut transport = FtpTransport::connect(&test_session(port), Some("pw"))
+            .await
+            .unwrap();
+        let dir = tempdir_for_test("no-folder");
+        let local = dir.join("new").join("deeper").join("gone.bin");
+
+        transport
+            .download("/gone.bin", &local, None)
+            .await
+            .unwrap_err();
+        assert!(!dir.join("new").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Over IPv6, PASV can't describe the data address and strict servers
     /// refuse it: every listing and transfer failed after a good login.
     #[tokio::test]
@@ -2995,6 +3308,12 @@ mod integration {
         assert!(err.to_string().contains("Permission denied"), "{err}");
     }
 
+    /// A garbage body must not become an entry. `File::from_str` would let it:
+    /// it falls through to the MLSX parsers, which split on `;` and name the
+    /// file the last token, so any non-empty line parses. `ftp_list` calls the
+    /// LIST parsers directly instead, and an unparsable line is skipped.
+    /// Skipping a line it cannot parse is right; saying nothing about it was
+    /// not. The listing carries the count so the caller can tell the user.
     #[tokio::test]
     async fn an_unparsable_listing_line_is_counted() {
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
@@ -3050,7 +3369,7 @@ mod integration {
         // directory holding it rather than the exchange failing earlier.
         let issued = log.lock().await.clone();
         assert!(
-            issued.iter().any(|c| c == "LIST /"),
+            issued.iter().any(|c| c == "LIST -a /" || c == "LIST /"),
             "LIST / should have been issued; commands issued: {issued:?}",
         );
     }
