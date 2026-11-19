@@ -97,6 +97,11 @@ the git history for those.
 
 ### Security
 
+- **On FTP, a folder blink may not list is no longer taken for empty.**
+  Every `550` reply read as "no such file", including `550 Permission
+  denied`, so the upload overwrite check skipped the prompt and files in
+  such a folder were replaced without asking. A `550` is now read by what
+  the server says; one that says neither is still taken as not found.
 - **A remote file name can't forge a line in the debug log.** A newline
   in a name logged through a `%` field started a new line, so a server
   could plant a convincing fake entry in `BLINK_LOG_FILE`. It's now
@@ -174,6 +179,13 @@ the git history for those.
 
 ### Fixed
 
+- **Transfer errors keep the server's reason.** A refused FTP transfer
+  showed `not found: stor /path` whatever the server said (permission
+  denied, disk quota exceeded); SFTP errors dropped the server's message
+  too.
+- **A lost FTP data connection is retried** (`425`, `426`), and an SFTP
+  channel that's out of step with the server is replaced rather than
+  used on.
 - **Quitting no longer hangs on an FTP server that went away.** Closing
   each idle transfer connection waited for a reply to `QUIT`, which from a
   server that vanished silently took until TCP gave up (about 15 minutes).
