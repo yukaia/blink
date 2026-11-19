@@ -299,7 +299,7 @@ impl Handler for KnownHostsHandler {
                 Ok(d) => d.unwrap_or(HostKeyDecision::Reject),
                 Err(_) => {
                     tracing::warn!(
-                        host = %self.host,
+                        host = %display_host,
                         "host-key decision timed out — rejecting"
                     );
                     HostKeyDecision::Reject
@@ -407,6 +407,114 @@ fn rsa_hash_alg(algorithm: &ssh_key::Algorithm) -> Option<ssh_key::HashAlg> {
     matches!(algorithm, ssh_key::Algorithm::Rsa { .. }).then_some(ssh_key::HashAlg::Sha512)
 }
 
+/// The methods a server listed as still worth trying, for a message:
+/// `publickey, keyboard-interactive`, or `None` when it listed none.
+fn method_list(methods: &russh::MethodSet) -> Option<String> {
+    let names: Vec<&str> = methods.iter().map(<&str>::from).collect();
+    (!names.is_empty()).then(|| names.join(", "))
+}
+
+/// Why a login with `method` failed, from what the server said: that it
+/// wanted another step besides (`partial`), or which methods it would take.
+/// It used to be "rejected by server" whatever happened, so a wrong
+/// password, a server that only takes keys, and one that wants a key *and*
+/// a password all read the same.
+fn auth_failure(method: &str, remaining: &russh::MethodSet, partial: bool) -> BlinkError {
+    let methods = method_list(remaining);
+    BlinkError::auth(match (partial, methods) {
+        (true, Some(m)) => format!(
+            "the server accepted the {method} but wants another step as well ({m}); \
+             blink logs in with one method only"
+        ),
+        (true, None) => format!(
+            "the server accepted the {method} but wants another step as well; \
+             blink logs in with one method only"
+        ),
+        (false, Some(m)) => format!("{method} rejected by server (it accepts: {m})"),
+        (false, None) => format!("{method} rejected by server"),
+    })
+}
+
+/// How many rounds of questions a keyboard-interactive login may take: a
+/// server may send empty rounds before or after the password one.
+const MAX_KBD_ROUNDS: usize = 8;
+
+/// The answers to one keyboard-interactive round, given the password, as
+/// OpenSSH answers PAM's usual single hidden "Password:" prompt.
+///
+/// A round with no prompts gets no answers. One hidden prompt gets the
+/// password, but only once: asked again, the server is saying it was
+/// wrong, and answering again would only spend the server's login attempts.
+/// Anything else (a code, a second factor, a visible question) is a
+/// question blink has no answer for, so it says what was asked.
+fn kbd_answers(
+    prompts: &[russh::client::Prompt],
+    password: &str,
+    answered: bool,
+) -> Result<Vec<String>> {
+    match prompts {
+        [] => Ok(Vec::new()),
+        [only] if !only.echo && !answered => Ok(vec![password.to_string()]),
+        [only] if !only.echo => Err(BlinkError::auth(
+            "keyboard-interactive rejected by server: it asked for the password again",
+        )),
+        _ => {
+            let asked: Vec<String> = prompts
+                .iter()
+                .map(|p| error::sanitize(p.prompt.trim().to_string()))
+                .collect();
+            Err(BlinkError::auth(format!(
+                "the server asks for more than a password ({}); blink can only answer \
+                 a single password prompt",
+                asked.join(" / ")
+            )))
+        }
+    }
+}
+
+/// Log in with `password` by keyboard-interactive, for a server that takes
+/// passwords only that way (PAM, with `PasswordAuthentication no`). See
+/// [`kbd_answers`] for which questions get answered.
+async fn keyboard_interactive<H: Handler>(
+    handle: &mut Handle<H>,
+    username: &str,
+    password: &str,
+) -> Result<()> {
+    use russh::client::KeyboardInteractiveAuthResponse as R;
+    let failed = |e: russh::Error| BlinkError::auth(format!("keyboard-interactive: {e}"));
+    let mut reply = handle
+        .authenticate_keyboard_interactive_start(username, None::<String>)
+        .await
+        .map_err(failed)?;
+    let mut answered = false;
+    for _ in 0..MAX_KBD_ROUNDS {
+        match reply {
+            R::Success => return Ok(()),
+            R::Failure {
+                remaining_methods,
+                partial_success,
+            } => {
+                return Err(auth_failure(
+                    "keyboard-interactive",
+                    &remaining_methods,
+                    partial_success,
+                ));
+            }
+            R::InfoRequest { prompts, .. } => {
+                let answers = kbd_answers(&prompts, password, answered)?;
+                answered |= !answers.is_empty();
+                reply = handle
+                    .authenticate_keyboard_interactive_respond(answers)
+                    .await
+                    .map_err(failed)?;
+            }
+        }
+    }
+    Err(BlinkError::auth(
+        "keyboard-interactive: the server kept asking questions",
+    ))
+}
+
 /// What to suggest when the agent holds no keys.
 #[cfg(windows)]
 const AGENT_EMPTY_HINT: &str = "try `ssh-add` or load keys into Pageant";
@@ -447,6 +555,7 @@ where
     }
 
     let mut last_err: Option<String> = None;
+    let mut last_failure: Option<(russh::MethodSet, bool)> = None;
     for identity in identities {
         // russh 0.60 models agent identities as plain keys OR OpenSSH
         // certificates; `public_key` normalises both.
@@ -456,8 +565,11 @@ where
             .authenticate_publickey_with(username, pubkey, hash_alg, agent)
             .await
         {
-            Ok(r) if r.success() => return Ok(()),
-            Ok(_) => {}
+            Ok(russh::client::AuthResult::Success) => return Ok(()),
+            Ok(russh::client::AuthResult::Failure {
+                remaining_methods,
+                partial_success,
+            }) => last_failure = Some((remaining_methods, partial_success)),
             Err(e) => {
                 tracing::debug!("ssh-agent identity rejected: {e}");
                 last_err = Some(e.to_string());
@@ -469,8 +581,16 @@ where
             break;
         }
     }
+    if let Some((remaining, true)) = &last_failure {
+        return Err(auth_failure("ssh-agent key", remaining, true).to_string());
+    }
+    let accepts = last_failure
+        .as_ref()
+        .and_then(|(remaining, _)| method_list(remaining))
+        .map(|m| format!(" (the server accepts: {m})"))
+        .unwrap_or_default();
     Err(format!(
-        "ssh-agent: no identity accepted{}",
+        "ssh-agent: no identity accepted{accepts}{}",
         last_err
             .map(|e| format!(" (last error: {e})"))
             .unwrap_or_default()
@@ -721,7 +841,7 @@ impl SftpTransport {
             },
             ..client::Config::default()
         });
-        let addr = format!("{}:{}", session.host, session.port);
+        let addr = super::ftp_impl::host_port(&session.host, session.port);
 
         let handler = KnownHostsHandler {
             host: session.host.clone(),
@@ -731,32 +851,58 @@ impl SftpTransport {
             user_wait,
         };
 
-        let mut handle = client::connect(config, addr.clone(), handler)
+        let mut handle = client::connect(config, (session.host.as_str(), session.port), handler)
             .await
             .map_err(|e| BlinkError::connect(format!("ssh connect to {addr}: {e}")))?;
 
         // ---- Authenticate ----
         let username = &session.username;
-        let auth_result = match &session.auth {
+        match &session.auth {
             AuthMethod::Password => {
                 let pw = password
                     .ok_or_else(|| BlinkError::auth("password required but none provided"))?;
-                handle
+                let result = handle
                     .authenticate_password(username, pw)
                     .await
-                    .map_err(|e| BlinkError::auth(e.to_string()))?
-                    .success()
+                    .map_err(|e| BlinkError::auth(e.to_string()))?;
+                match result {
+                    client::AuthResult::Success => {}
+                    // As OpenSSH does: a server taking passwords only
+                    // through keyboard-interactive (PAM) gets it that way.
+                    client::AuthResult::Failure {
+                        remaining_methods,
+                        partial_success: false,
+                    } if remaining_methods.contains(&russh::MethodKind::KeyboardInteractive) => {
+                        keyboard_interactive(&mut handle, username, pw).await?;
+                    }
+                    client::AuthResult::Failure {
+                        remaining_methods,
+                        partial_success,
+                    } => {
+                        return Err(auth_failure(
+                            "password",
+                            &remaining_methods,
+                            partial_success,
+                        ));
+                    }
+                }
             }
             AuthMethod::Key { path } => {
                 let passphrase = password.filter(|p| !p.is_empty());
                 let kp = load_key(path, passphrase)?;
                 let hash_alg = rsa_hash_alg(&kp.algorithm());
                 let kp = PrivateKeyWithHashAlg::new(Arc::new(kp), hash_alg);
-                handle
+                let result = handle
                     .authenticate_publickey(username, kp)
                     .await
-                    .map_err(|e| BlinkError::auth(e.to_string()))?
-                    .success()
+                    .map_err(|e| BlinkError::auth(e.to_string()))?;
+                if let client::AuthResult::Failure {
+                    remaining_methods,
+                    partial_success,
+                } = result
+                {
+                    return Err(auth_failure("key", &remaining_methods, partial_success));
+                }
             }
             AuthMethod::Agent => {
                 #[cfg(unix)]
@@ -767,7 +913,6 @@ impl SftpTransport {
                     try_agent_identities(&mut handle, username, &mut agent)
                         .await
                         .map_err(BlinkError::auth)?;
-                    true
                 }
                 #[cfg(windows)]
                 {
@@ -799,7 +944,6 @@ impl SftpTransport {
                                 })?
                         }
                     }
-                    true
                 }
                 #[cfg(not(any(unix, windows)))]
                 {
@@ -808,10 +952,6 @@ impl SftpTransport {
                     ));
                 }
             }
-        };
-
-        if !auth_result {
-            return Err(BlinkError::auth("rejected by server"));
         }
 
         // ---- Open SFTP subsystem ----
@@ -820,6 +960,11 @@ impl SftpTransport {
         let sftp = SftpSession::new(channel.into_stream())
             .await
             .map_err(|e| BlinkError::transport(format!("init sftp: {e}")))?;
+        // The library's 10 s default gave folder operations (listing, stat,
+        // rename, delete, preview) a sixth of what transfers and FTP get, so
+        // a slow server read as a dropped connection. Set once the session
+        // is up, so the default still bounds the handshake.
+        sftp.set_timeout(idle_timeout().as_secs().max(1));
 
         Ok(Self {
             handle,
@@ -1283,6 +1428,7 @@ async fn finalize_remote_rename_unbounded(
 /// Pipelined upload: read the local file in chunks and keep `concurrency`
 /// writes in flight. Writes carry explicit offsets, so completion order is
 /// irrelevant to correctness; progress reports cumulative acknowledged bytes.
+/// Returns how many bytes were sent.
 #[allow(clippy::too_many_arguments)]
 async fn pipelined_upload(
     raw: &Arc<RawSftpSession>,
@@ -1293,7 +1439,7 @@ async fn pipelined_upload(
     concurrency: usize,
     total: u64,
     progress: &Option<mpsc::UnboundedSender<ProgressUpdate>>,
-) -> Result<()> {
+) -> Result<u64> {
     let chunk = chunk.max(1);
     let mut inflight = FuturesUnordered::new();
     let mut offset = 0u64;
@@ -1332,7 +1478,28 @@ async fn pipelined_upload(
             }
         }
     }
-    Ok(())
+    Ok(offset)
+}
+
+/// Check the server holds the `sent` bytes an upload wrote to `handle`, as
+/// FTP's upload checks `SIZE`. A server that acknowledged a write it then
+/// dropped would otherwise have its short file renamed into place as
+/// complete. A server that can't say how big the file is can't be checked.
+async fn check_stored(raw: &RawSftpSession, handle: &str, label: &str, sent: u64) -> Result<()> {
+    let stored = within_idle("fstat", label, async {
+        raw.fstat(handle)
+            .await
+            .map_err(|e| map_sftp("fstat", label, e))
+    })
+    .await?
+    .attrs
+    .size;
+    match stored {
+        Some(stored) if stored != sent => Err(BlinkError::transport(format!(
+            "{label}: sent {sent} bytes, but the server stored {stored}"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 #[async_trait]
@@ -1486,10 +1653,22 @@ impl Transport for SftpTransport {
         // under the destination name.
         let part = super::remote_part_path(remote_path);
 
+        // The partial's name is predictable, and a server's open follows
+        // symlinks, so in a folder other users can write to someone could
+        // plant one there aimed at any file this account can write. So clear
+        // the name, then create exclusively: `EXCLUDE` doesn't follow a link,
+        // and fails if one is put back in between, rather than writing
+        // through it. Removing a symlink removes the link, not its target.
+        let _ = within_idle("remove", &part, async {
+            raw.remove(&part)
+                .await
+                .map_err(|e| map_sftp("remove", &part, e))
+        })
+        .await;
         let remote_handle = within_idle("open", &part, async {
             raw.open(
                 &part,
-                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+                OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE,
                 FileAttributes::default(),
             )
             .await
@@ -1498,7 +1677,7 @@ impl Transport for SftpTransport {
         .await?
         .handle;
 
-        let result = pipelined_upload(
+        let sent = pipelined_upload(
             &raw,
             &remote_handle,
             remote_path,
@@ -1509,6 +1688,10 @@ impl Transport for SftpTransport {
             &progress,
         )
         .await;
+        let result = match sent {
+            Ok(sent) => check_stored(&raw, &remote_handle, remote_path, sent).await,
+            Err(e) => Err(e),
+        };
 
         // Durably flush before closing, but only when the server advertised
         // fsync support — otherwise the extended request is just rejected.
@@ -1995,6 +2178,36 @@ mod integration {
         /// Refuse the `sftp` subsystem, as a server offering only legacy
         /// SCP does.
         refuse_sftp: bool,
+        /// How a password login goes.
+        login: Login,
+    }
+
+    /// How the test server treats a password login. The password it takes
+    /// is `pw`.
+    #[derive(Clone, Copy, Default, PartialEq, Eq)]
+    enum Login {
+        /// The `password` method, with any password.
+        #[default]
+        AnyPassword,
+        /// Passwords only by keyboard-interactive, one hidden "Password:"
+        /// prompt, as PAM does with `PasswordAuthentication no`. A wrong
+        /// answer is asked again, as PAM does.
+        KbdPassword,
+        /// Keyboard-interactive asking for a password and a visible code.
+        KbdPasswordAndCode,
+        /// No passwords: only keys.
+        KeysOnly,
+        /// The password is right, but a key is wanted as well.
+        PasswordThenKey,
+    }
+
+    /// Each keyboard-interactive answer the test server got, in order.
+    fn kbd_answer_key(n: usize) -> String {
+        format!("\0kbd-answer:{n}")
+    }
+
+    fn methods(kinds: &[russh::MethodKind]) -> Option<russh::MethodSet> {
+        Some(russh::MethodSet::from(kinds))
     }
 
     // Native `async fn` in trait as of russh 0.60 — see the client Handler.
@@ -2002,7 +2215,61 @@ mod integration {
         type Error = russh::Error;
 
         async fn auth_password(&mut self, _u: &str, _p: &str) -> Result<Auth, Self::Error> {
-            Ok(Auth::Accept)
+            use russh::MethodKind as M;
+            Ok(match self.login {
+                Login::AnyPassword => Auth::Accept,
+                Login::KbdPassword | Login::KbdPasswordAndCode => Auth::Reject {
+                    proceed_with_methods: methods(&[M::PublicKey, M::KeyboardInteractive]),
+                    partial_success: false,
+                },
+                Login::KeysOnly => Auth::Reject {
+                    proceed_with_methods: methods(&[M::PublicKey]),
+                    partial_success: false,
+                },
+                Login::PasswordThenKey => Auth::Reject {
+                    proceed_with_methods: methods(&[M::PublicKey]),
+                    partial_success: true,
+                },
+            })
+        }
+
+        async fn auth_keyboard_interactive<'a>(
+            &'a mut self,
+            _user: &str,
+            _submethods: &str,
+            response: Option<russh::server::Response<'a>>,
+        ) -> Result<Auth, Self::Error> {
+            let prompts: &'static [(std::borrow::Cow<'static, str>, bool)] = match self.login {
+                Login::KbdPassword => &[(std::borrow::Cow::Borrowed("Password: "), false)],
+                Login::KbdPasswordAndCode => &[
+                    (std::borrow::Cow::Borrowed("Password: "), false),
+                    (std::borrow::Cow::Borrowed("Verification code: "), true),
+                ],
+                _ => return Ok(Auth::reject()),
+            };
+            let ask = Auth::Partial {
+                name: "".into(),
+                instructions: "".into(),
+                prompts: std::borrow::Cow::Borrowed(prompts),
+            };
+            let Some(response) = response else {
+                return Ok(ask);
+            };
+            let answers: Vec<Vec<u8>> = response.map(|b| b.to_vec()).collect();
+            let mut store = self.store.lock().await;
+            for answer in &answers {
+                let n = (0..)
+                    .find(|n| !store.contains_key(&kbd_answer_key(*n)))
+                    .unwrap();
+                store.insert(kbd_answer_key(n), answer.clone());
+            }
+            Ok(
+                if answers.first().map(Vec::as_slice) == Some(b"pw".as_slice()) {
+                    Auth::Accept
+                } else {
+                    ask
+                },
+            )
         }
 
         /// Accept any key. russh verifies the client's signature against the
@@ -2151,6 +2418,22 @@ mod integration {
         format!("\0symlink:{path}")
     }
 
+    /// Fault: `path` is a symlink to the path stored as its value, as one
+    /// planted in a shared folder would be. Opening it for writing without
+    /// `EXCLUDE` writes the target, as a real server's open follows links;
+    /// `remove` takes away the link alone.
+    fn link_key(path: &str) -> String {
+        format!("\0link:{path}")
+    }
+
+    /// Fault: a link from [`link_key`] can't be removed, as another user's
+    /// can't in a sticky folder such as `/tmp`.
+    const STICKY_LINKS_KEY: &str = "\0sticky-links";
+
+    /// Fault: acknowledge every write past the first, but store nothing,
+    /// as a server that loses data would.
+    const DROP_LATER_WRITES_KEY: &str = "\0drop-later-writes";
+
     /// Present while a file handle on `path` is open: set by `open`, cleared
     /// by `close`, so a test can see a handle left open.
     fn open_handle_key(path: &str) -> String {
@@ -2189,7 +2472,20 @@ mod integration {
             _attrs: FileAttributes,
         ) -> Result<SftpHandle, Self::Error> {
             let mut store = self.store.lock().await;
+            let link = store
+                .get(&link_key(&filename))
+                .map(|t| String::from_utf8_lossy(t).into_owned());
+            let mut filename = filename;
             if pflags.contains(OpenFlags::WRITE) {
+                if pflags.contains(OpenFlags::EXCLUDE) {
+                    // O_EXCL: anything there, a link included, refuses.
+                    if store.contains_key(&filename) || link.is_some() {
+                        return Err(StatusCode::Failure);
+                    }
+                } else if let Some(target) = link {
+                    // Without it, the open follows the link.
+                    filename = target;
+                }
                 // CREATE | TRUNCATE semantics for the upload path.
                 store.insert(filename.clone(), Vec::new());
             } else if !store.contains_key(&filename) {
@@ -2239,6 +2535,9 @@ mod integration {
         ) -> Result<Status, Self::Error> {
             io_delay(&self.store).await;
             let mut store = self.store.lock().await;
+            if offset > 0 && store.contains_key(DROP_LATER_WRITES_KEY) {
+                return Ok(ok_status(id));
+            }
             let content = store.get_mut(&handle).ok_or(StatusCode::NoSuchFile)?;
             let off = offset as usize;
             let end = off + data.len();
@@ -2410,7 +2709,10 @@ mod integration {
 
         async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
             let mut store = self.store.lock().await;
-            if store.remove(&filename).is_some() {
+            if store.contains_key(&link_key(&filename)) && store.contains_key(STICKY_LINKS_KEY) {
+                return Err(StatusCode::PermissionDenied);
+            }
+            if store.remove(&link_key(&filename)).is_some() || store.remove(&filename).is_some() {
                 Ok(ok_status(id))
             } else {
                 Err(StatusCode::NoSuchFile)
@@ -2457,19 +2759,31 @@ mod integration {
         store: Store,
         host_keys: &[&str],
     ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
-        start_server_inner(store, host_keys, false, false).await
+        start_server_inner(store, host_keys, false, false, Login::default()).await
+    }
+
+    /// As [`start_server`], with `login` deciding how passwords are taken.
+    async fn start_server_with_login(store: Store, login: Login) -> u16 {
+        let keys = [super::super::sftp_test_keys::ED25519_KEY];
+        start_server_inner(store, &keys, false, false, login)
+            .await
+            .0
     }
 
     /// As [`start_server`], but refusing every public key.
     async fn start_server_rejecting_keys(store: Store) -> u16 {
         let keys = [super::super::sftp_test_keys::ED25519_KEY];
-        start_server_inner(store, &keys, true, false).await.0
+        start_server_inner(store, &keys, true, false, Login::default())
+            .await
+            .0
     }
 
     /// As [`start_server`], but refusing the `sftp` subsystem.
     async fn start_server_without_sftp(store: Store) -> u16 {
         let keys = [super::super::sftp_test_keys::ED25519_KEY];
-        start_server_inner(store, &keys, false, true).await.0
+        start_server_inner(store, &keys, false, true, Login::default())
+            .await
+            .0
     }
 
     async fn start_server_inner(
@@ -2477,6 +2791,7 @@ mod integration {
         host_keys: &[&str],
         reject_publickeys: bool,
         refuse_sftp: bool,
+        login: Login,
     ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2501,6 +2816,7 @@ mod integration {
                     store: store.clone(),
                     reject_publickeys,
                     refuse_sftp,
+                    login,
                 };
                 tokio::spawn(async move {
                     // RunningSession is dropped here; the session task it spawns
@@ -2895,20 +3211,29 @@ mod integration {
     /// Connect as `session` through [`super::super::open`], accepting the
     /// host key once, and return the error the connect ended in.
     async fn connect_error(session: &Session) -> crate::error::BlinkError {
+        match connect_result(session, "pw").await {
+            Ok(_) => panic!("the connect should fail"),
+            Err(e) => e,
+        }
+    }
+
+    /// Connect as `session` with `password` through [`super::super::open`],
+    /// accepting the host key once.
+    async fn connect_result(
+        session: &Session,
+        password: &str,
+    ) -> crate::error::Result<crate::transport::Connected> {
         let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
         let mut fut = Box::pin(super::super::open(
             session,
-            Some("pw"),
+            Some(password),
             ev_tx,
             crate::known_hosts::SessionTrust::new(),
             crate::transport::UserWait::new().0,
         ));
         loop {
             tokio::select! {
-                res = &mut fut => match res {
-                    Ok(_) => panic!("the connect should fail"),
-                    Err(e) => return e,
-                },
+                res = &mut fut => return res,
                 Some(ev) = ev_rx.recv() => {
                     if let AppEvent::HostKeyUnknown { decision_tx, .. } = ev {
                         let _ = decision_tx.send(HostKeyDecision::AcceptOnce);
@@ -3954,6 +4279,262 @@ mod integration {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = transport.close().await;
+    }
+
+    // ---- logins --------------------------------------------------------
+
+    async fn kbd_answers_seen(store: &Store) -> Vec<String> {
+        let store = store.lock().await;
+        (0..)
+            .map_while(|n| store.get(&kbd_answer_key(n)))
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect()
+    }
+
+    /// A server taking passwords only by keyboard-interactive (PAM, with
+    /// `PasswordAuthentication no`) gets the password that way, as OpenSSH
+    /// does. blink tried only the `password` method and failed.
+    #[tokio::test]
+    async fn a_password_is_given_by_keyboard_interactive_when_thats_the_only_way() {
+        let _home = crate::paths::test_home();
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let port = start_server_with_login(store.clone(), Login::KbdPassword).await;
+
+        connect_result(&test_session(port), "pw")
+            .await
+            .expect("logged in by keyboard-interactive");
+
+        assert_eq!(kbd_answers_seen(&store).await, ["pw"]);
+    }
+
+    /// Asked again, the server is saying the password was wrong; answering
+    /// again would only spend its login attempts.
+    #[tokio::test]
+    async fn a_wrong_password_is_given_to_keyboard_interactive_once() {
+        let _home = crate::paths::test_home();
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let port = start_server_with_login(store.clone(), Login::KbdPassword).await;
+
+        let err = connect_result(&test_session(port), "wrong")
+            .await
+            .err()
+            .expect("the password is wrong");
+
+        assert!(
+            matches!(err, crate::error::BlinkError::AuthFailed(_)),
+            "{err:?}"
+        );
+        assert!(
+            err.to_string().contains("asked for the password again"),
+            "{err}"
+        );
+        assert_eq!(kbd_answers_seen(&store).await, ["wrong"]);
+    }
+
+    /// A second factor is a question blink has no answer for: it says what
+    /// was asked, and gives the password to nothing.
+    #[tokio::test]
+    async fn keyboard_interactive_asking_for_more_than_a_password_says_what() {
+        let _home = crate::paths::test_home();
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let port = start_server_with_login(store.clone(), Login::KbdPasswordAndCode).await;
+
+        let err = connect_result(&test_session(port), "pw")
+            .await
+            .err()
+            .expect("blink can't answer a code");
+
+        let msg = err.to_string();
+        assert!(msg.contains("Verification code"), "{msg}");
+        assert!(
+            kbd_answers_seen(&store).await.is_empty(),
+            "nothing answered"
+        );
+    }
+
+    /// "rejected by server" was all a failed login said.
+    #[tokio::test]
+    async fn a_refused_password_says_which_methods_the_server_takes() {
+        let _home = crate::paths::test_home();
+        let port =
+            start_server_with_login(Arc::new(Mutex::new(HashMap::new())), Login::KeysOnly).await;
+
+        let err = connect_result(&test_session(port), "pw")
+            .await
+            .err()
+            .expect("the server takes keys only");
+
+        assert!(
+            matches!(err, crate::error::BlinkError::AuthFailed(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("it accepts: publickey"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_password_that_needs_a_key_as_well_says_so() {
+        let _home = crate::paths::test_home();
+        let port =
+            start_server_with_login(Arc::new(Mutex::new(HashMap::new())), Login::PasswordThenKey)
+                .await;
+
+        let err = connect_result(&test_session(port), "pw")
+            .await
+            .err()
+            .expect("one method isn't enough here");
+
+        let msg = err.to_string();
+        assert!(msg.contains("wants another step as well"), "{msg}");
+        assert!(msg.contains("publickey"), "{msg}");
+    }
+
+    #[test]
+    fn keyboard_interactive_answers_one_hidden_prompt_once() {
+        use russh::client::Prompt;
+        let hidden = || Prompt {
+            prompt: "Password: ".into(),
+            echo: false,
+        };
+        assert!(super::kbd_answers(&[], "pw", false).unwrap().is_empty());
+        assert!(super::kbd_answers(&[], "pw", true).unwrap().is_empty());
+        assert_eq!(
+            super::kbd_answers(&[hidden()], "pw", false).unwrap(),
+            ["pw"]
+        );
+        assert!(super::kbd_answers(&[hidden()], "pw", true).is_err());
+        let visible = Prompt {
+            prompt: "Username: ".into(),
+            echo: true,
+        };
+        assert!(super::kbd_answers(&[visible], "pw", false).is_err());
+    }
+
+    // ---- uploads ------------------------------------------------------
+
+    /// The partial's name is predictable, and a server's open follows a
+    /// symlink: one planted there wrote the upload into its target.
+    #[tokio::test]
+    async fn an_upload_doesnt_write_through_a_symlink_planted_as_its_partial() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let part = crate::transport::remote_part_path("/drop/data.csv");
+        {
+            let mut files = store.lock().await;
+            files.insert("/drop/".to_string(), Vec::new());
+            files.insert("/home/victim".to_string(), b"precious".to_vec());
+            files.insert(link_key(&part), b"/home/victim".to_vec());
+        }
+        let (port, _c) = start_server(store.clone()).await;
+        let mut transport = connect(port).await;
+        let home = crate::paths::test_home();
+        let src = home.path().join("data.csv");
+        std::fs::write(&src, b"a,b\n").unwrap();
+
+        transport
+            .upload(&src, "/drop/data.csv", None)
+            .await
+            .unwrap();
+
+        let files = store.lock().await;
+        assert_eq!(
+            files.get("/home/victim").map(Vec::as_slice),
+            Some(&b"precious"[..]),
+            "the link's target is untouched"
+        );
+        assert_eq!(
+            files.get("/drop/data.csv").map(Vec::as_slice),
+            Some(&b"a,b\n"[..])
+        );
+        assert!(!files.contains_key(&link_key(&part)), "the link is gone");
+    }
+
+    /// In a sticky folder another user's link can't be removed, so only the
+    /// exclusive create stands between the upload and the link's target.
+    #[tokio::test]
+    async fn an_upload_fails_rather_than_write_through_a_link_it_cant_remove() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        let part = crate::transport::remote_part_path("/tmp/data.csv");
+        {
+            let mut files = store.lock().await;
+            files.insert("/tmp/".to_string(), Vec::new());
+            files.insert("/home/victim".to_string(), b"precious".to_vec());
+            files.insert(link_key(&part), b"/home/victim".to_vec());
+            files.insert(STICKY_LINKS_KEY.to_string(), Vec::new());
+        }
+        let (port, _c) = start_server(store.clone()).await;
+        let mut transport = connect(port).await;
+        let home = crate::paths::test_home();
+        let src = home.path().join("data.csv");
+        std::fs::write(&src, b"a,b\n").unwrap();
+
+        transport
+            .upload(&src, "/tmp/data.csv", None)
+            .await
+            .expect_err("the partial's name is taken");
+
+        let files = store.lock().await;
+        assert_eq!(
+            files.get("/home/victim").map(Vec::as_slice),
+            Some(&b"precious"[..])
+        );
+        assert!(!files.contains_key("/tmp/data.csv"));
+    }
+
+    /// A server that acknowledges writes it then drops: FTP checks `SIZE`
+    /// after an upload, and SFTP renamed the short file into place.
+    #[tokio::test]
+    async fn an_upload_the_server_stored_short_is_not_put_in_place() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert(DROP_LATER_WRITES_KEY.to_string(), Vec::new());
+        let (port, _c) = start_server(store.clone()).await;
+        let mut transport = connect(port).await;
+        let home = crate::paths::test_home();
+        let src = home.path().join("big.bin");
+        let payload = pseudo_random(3 * super::TRANSFER_CHUNK);
+        std::fs::write(&src, &payload).unwrap();
+
+        let err = transport
+            .upload(&src, "/big.bin", None)
+            .await
+            .expect_err("the server kept less than was sent");
+
+        assert!(err.to_string().contains("but the server stored"), "{err}");
+        let files = store.lock().await;
+        assert!(!files.contains_key("/big.bin"), "nothing in place");
+        assert!(
+            !files.contains_key(&crate::transport::remote_part_path("/big.bin")),
+            "and the partial is cleared"
+        );
+    }
+
+    /// Folder operations had russh-sftp's 10 s limit while transfers had the
+    /// idle deadline; now they share it. A 1 s deadline here, and a reply
+    /// taking 3 s, fails in about a second rather than waiting ten.
+    #[tokio::test]
+    async fn folder_operations_share_the_transfers_deadline() {
+        super::IDLE_TIMEOUT.set(std::time::Duration::from_secs(1));
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut files = store.lock().await;
+            files.insert("/a.txt".to_string(), b"x".to_vec());
+            files.insert(IO_DELAY_KEY.to_string(), b"3000".to_vec());
+        }
+        let (port, _c) = start_server(store).await;
+        let mut transport = connect(port).await;
+
+        let started = std::time::Instant::now();
+        let err = transport
+            .read_to_bytes("/a.txt")
+            .await
+            .expect_err("the server took too long");
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "took {:?}: {err}",
+            started.elapsed()
+        );
     }
 
     /// The remote mirror: an upload of `x` opened `x.part` with TRUNCATE and

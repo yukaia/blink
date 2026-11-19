@@ -13,7 +13,10 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
 
 ### Connectivity
 
-- **SFTP** with password, SSH key, and encrypted-key (passphrase prompt) auth
+- **SFTP** with password, SSH key, and encrypted-key (passphrase prompt) auth.
+  A server that takes passwords only through keyboard-interactive (PAM) gets
+  the password that way, as OpenSSH does; a failed login says which methods
+  the server would take
 - **SCP** as transparent SFTP — matches OpenSSH 9.0+ behavior, full feature parity
 - **FTP** with anonymous and password auth — *unencrypted*, and blink says
   so on every connect (see [Security](#protocol)). Prefer FTPS or SFTP
@@ -1033,7 +1036,10 @@ declaring huge dimensions is still rejected.
   `.blink-part`", but never a truncated file under the final name. An
   upload interrupted by a hard kill or dropped connection
   can leave a stale `<remote>.<hash>.blink-part` behind; re-running the upload
-  reuses (truncates) it.
+  removes it and creates a fresh one. Over SFTP the partial is created
+  exclusively, so a symlink someone planted under its name in a shared
+  folder is never written through, and the server's stored size is checked
+  against the bytes sent before the rename, as FTP's is.
 - On Unix, config directories are kept at mode 0700 and the files blink
   writes in them at 0600. A config directory found open to other users
   (made by hand, say, or restored from a backup) is tightened to 0700,

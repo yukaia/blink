@@ -10,6 +10,12 @@ the git history for those.
 
 ### Added
 
+- **SFTP logs in by keyboard-interactive** when a server takes passwords
+  only that way (PAM with `PasswordAuthentication no`), answering its single
+  hidden password prompt with the session's password, as OpenSSH does. The
+  password is given once; a second factor or any other question fails with
+  what was asked.
+
 - **More languages are highlighted**: Windows batch, PowerShell, INI-style
   config (`.ini`, `.conf`, `.cfg`, `.properties`), and the C family (C,
   C++, Go, Java, C#, Kotlin, Swift, CSS and others), each with its own
@@ -119,6 +125,13 @@ the git history for those.
 
 ### Security
 
+- **An SFTP upload no longer writes through a symlink planted as its
+  partial.** The partial's name is predictable and a server's open follows
+  links, so in a shared remote folder someone could aim one at any file
+  your account can write, and the upload overwrote it. The name is now
+  cleared and the partial created exclusively, which fails rather than
+  follows a link that can't be removed.
+
 - **A download no longer resumes onto a partial someone else planted.** In
   a folder other users can write to, such as `/tmp`, the partial's name is
   predictable, and a sidecar naming a public file's server, path, size and
@@ -219,6 +232,20 @@ the git history for those.
   before, they were accepted whatever they presented.
 
 ### Fixed
+
+- **A failed SFTP login says why.** It read "rejected by server" whatever
+  happened; it now names the methods the server would take, or says it
+  accepted the credential but wants another step as well.
+- **SFTP uploads check what the server stored**, as FTP's do, before the
+  rename: a server that acknowledged writes it dropped had its short file
+  put in place as complete.
+- **SFTP folder operations wait as long as transfers do.** Listing, stat,
+  rename, delete and preview had russh-sftp's 10 s limit per request, so a
+  slow server read as a dropped connection; they now get the same 60 s as
+  transfers and FTP.
+- An SFTP connect error puts an IPv6 address in brackets
+  (`[::1]:22`), and the host-key timeout log line names the host as
+  known_hosts does.
 
 - **A server without SFTP says so, at once.** blink sent the request for
   the `sftp` subsystem without waiting for the answer, so a refusal showed
