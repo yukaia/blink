@@ -487,6 +487,71 @@ pub struct SftpTransport {
     /// Where downloads' bytes come from, recorded in their resume sidecars.
     /// See [`super::origin_of`].
     origin: String,
+    /// The session asked for `scp://`, which this transport serves; see
+    /// `scp.rs`. Only changes what a refused SFTP subsystem says.
+    scp: bool,
+}
+
+/// How long the server may take to answer the `sftp` subsystem request.
+const SUBSYSTEM_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Open a session channel and start the `sftp` subsystem on it, once the
+/// server has said yes. `what` names the channel in errors.
+///
+/// russh's `request_subsystem` only sends the request, so a server without
+/// SFTP (one offering only legacy SCP, say) used to surface as a failed or
+/// timed-out SFTP `init` that said nothing of why. The answer is read here
+/// instead; the server sends it before any data, so nothing is lost by
+/// reading the channel before handing it over as a stream.
+async fn open_sftp_channel(
+    handle: &Handle<KnownHostsHandler>,
+    what: &str,
+    scp: bool,
+) -> Result<russh::Channel<client::Msg>> {
+    let mut channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| BlinkError::transport(format!("open {what}: {e}")))?;
+    channel
+        .request_subsystem(true, "sftp")
+        .await
+        .map_err(|e| BlinkError::transport(format!("request sftp: {e}")))?;
+    let answer = tokio::time::timeout(SUBSYSTEM_REPLY_TIMEOUT, async {
+        loop {
+            match channel.wait().await {
+                Some(russh::ChannelMsg::Success) => return true,
+                Some(
+                    russh::ChannelMsg::Failure | russh::ChannelMsg::Close | russh::ChannelMsg::Eof,
+                )
+                | None => return false,
+                // Window adjustments and the like, before the answer.
+                Some(_) => {}
+            }
+        }
+    })
+    .await;
+    match answer {
+        Ok(true) => Ok(channel),
+        Ok(false) => Err(BlinkError::connect(sftp_refused(scp))),
+        Err(_) => Err(BlinkError::connect(format!(
+            "the server didn't answer the SFTP request within {} s",
+            SUBSYSTEM_REPLY_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
+/// What a refused `sftp` subsystem means, for an `sftp://` or `scp://`
+/// session.
+fn sftp_refused(scp: bool) -> String {
+    let refused = "the server refused SFTP (its sftp subsystem is off or missing)";
+    if scp {
+        format!(
+            "{refused}; blink's scp:// runs over SFTP, as OpenSSH's scp has since 9.0, \
+             and doesn't speak the legacy SCP protocol this server may offer instead"
+        )
+    } else {
+        refused.to_string()
+    }
 }
 
 /// A dedicated SFTP session for bulk transfers, plus the per-direction request
@@ -750,14 +815,8 @@ impl SftpTransport {
         }
 
         // ---- Open SFTP subsystem ----
-        let channel = handle
-            .channel_open_session()
-            .await
-            .map_err(|e| BlinkError::transport(format!("open session: {e}")))?;
-        channel
-            .request_subsystem(true, "sftp")
-            .await
-            .map_err(|e| BlinkError::transport(format!("request sftp: {e}")))?;
+        let scp = session.protocol == Protocol::Scp;
+        let channel = open_sftp_channel(&handle, "session", scp).await?;
         let sftp = SftpSession::new(channel.into_stream())
             .await
             .map_err(|e| BlinkError::transport(format!("init sftp: {e}")))?;
@@ -767,6 +826,7 @@ impl SftpTransport {
             sftp,
             transfer: None,
             origin: super::origin_of(session),
+            scp,
         })
     }
 
@@ -777,15 +837,7 @@ impl SftpTransport {
     /// a single stream fast.
     async fn transfer_session(&mut self) -> Result<&Transfer> {
         if self.transfer.is_none() {
-            let channel = self
-                .handle
-                .channel_open_session()
-                .await
-                .map_err(|e| BlinkError::transport(format!("open transfer session: {e}")))?;
-            channel
-                .request_subsystem(true, "sftp")
-                .await
-                .map_err(|e| BlinkError::transport(format!("request sftp: {e}")))?;
+            let channel = open_sftp_channel(&self.handle, "transfer session", self.scp).await?;
             let mut raw = RawSftpSession::new(channel.into_stream());
             let version = raw
                 .init()
@@ -1940,6 +1992,9 @@ mod integration {
         /// Refuse every public key, as a server would whose
         /// `authorized_keys` holds none of the client's.
         reject_publickeys: bool,
+        /// Refuse the `sftp` subsystem, as a server offering only legacy
+        /// SCP does.
+        refuse_sftp: bool,
     }
 
     // Native `async fn` in trait as of russh 0.60 — see the client Handler.
@@ -1987,7 +2042,7 @@ mod integration {
             name: &str,
             session: &mut ServerSession,
         ) -> Result<(), Self::Error> {
-            if name == "sftp" {
+            if name == "sftp" && !self.refuse_sftp {
                 let channel = self
                     .channels
                     .lock()
@@ -2402,19 +2457,26 @@ mod integration {
         store: Store,
         host_keys: &[&str],
     ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
-        start_server_inner(store, host_keys, false).await
+        start_server_inner(store, host_keys, false, false).await
     }
 
     /// As [`start_server`], but refusing every public key.
     async fn start_server_rejecting_keys(store: Store) -> u16 {
         let keys = [super::super::sftp_test_keys::ED25519_KEY];
-        start_server_inner(store, &keys, true).await.0
+        start_server_inner(store, &keys, true, false).await.0
+    }
+
+    /// As [`start_server`], but refusing the `sftp` subsystem.
+    async fn start_server_without_sftp(store: Store) -> u16 {
+        let keys = [super::super::sftp_test_keys::ED25519_KEY];
+        start_server_inner(store, &keys, false, true).await.0
     }
 
     async fn start_server_inner(
         store: Store,
         host_keys: &[&str],
         reject_publickeys: bool,
+        refuse_sftp: bool,
     ) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2438,6 +2500,7 @@ mod integration {
                     channels: Arc::new(Mutex::new(HashMap::new())),
                     store: store.clone(),
                     reject_publickeys,
+                    refuse_sftp,
                 };
                 tokio::spawn(async move {
                     // RunningSession is dropped here; the session task it spawns
@@ -2829,6 +2892,69 @@ mod integration {
     /// host-key algorithm is observable from outside — `SessionTrust` keeps
     /// the decision in memory, so nothing reaches a `known_hosts` file to
     /// read back, and test isolation would forbid touching the real one.
+    /// Connect as `session` through [`super::super::open`], accepting the
+    /// host key once, and return the error the connect ended in.
+    async fn connect_error(session: &Session) -> crate::error::BlinkError {
+        let (ev_tx, mut ev_rx) = tokio::sync::mpsc::unbounded_channel::<AppEvent>();
+        let mut fut = Box::pin(super::super::open(
+            session,
+            Some("pw"),
+            ev_tx,
+            crate::known_hosts::SessionTrust::new(),
+            crate::transport::UserWait::new().0,
+        ));
+        loop {
+            tokio::select! {
+                res = &mut fut => match res {
+                    Ok(_) => panic!("the connect should fail"),
+                    Err(e) => return e,
+                },
+                Some(ev) = ev_rx.recv() => {
+                    if let AppEvent::HostKeyUnknown { decision_tx, .. } = ev {
+                        let _ = decision_tx.send(HostKeyDecision::AcceptOnce);
+                    }
+                }
+            }
+        }
+    }
+
+    /// A refused subsystem used to show only as a failed or timed-out SFTP
+    /// `init`, since russh doesn't wait for the server's answer to the
+    /// request. It now fails at once, saying why.
+    #[tokio::test]
+    async fn a_server_without_sftp_says_so() {
+        let _home = crate::paths::test_home();
+        let port = start_server_without_sftp(Arc::new(Mutex::new(HashMap::new()))).await;
+
+        let started = std::time::Instant::now();
+        let err = connect_error(&test_session(port)).await;
+
+        let msg = err.to_string();
+        assert!(msg.contains("refused SFTP"), "{msg}");
+        assert!(
+            !msg.contains("scp://"),
+            "nothing about SCP for sftp://: {msg}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    /// The legacy-SCP-only server is the one case where blink's `scp://`,
+    /// which is SFTP underneath, differs from what the user asked for.
+    #[tokio::test]
+    async fn an_scp_session_to_a_server_without_sftp_explains_why() {
+        let _home = crate::paths::test_home();
+        let port = start_server_without_sftp(Arc::new(Mutex::new(HashMap::new()))).await;
+        let session = Session {
+            protocol: Protocol::Scp,
+            ..test_session(port)
+        };
+
+        let msg = connect_error(&session).await.to_string();
+
+        assert!(msg.contains("refused SFTP"), "{msg}");
+        assert!(msg.contains("legacy SCP"), "{msg}");
+    }
+
     async fn connect_with(port: u16, auth: AuthMethod) -> (SftpTransport, String) {
         let session = Session {
             name: "it".to_string(),

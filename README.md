@@ -1050,6 +1050,10 @@ declaring huge dimensions is still rejected.
 
 A few things worth knowing before you use this in anger:
 
+- **SCP is SFTP underneath.** `scp://` opens an SFTP session, as OpenSSH's
+  own `scp` has since 9.0. A server that offers only the legacy SCP
+  protocol (some embedded systems and old routers) refuses it, and the
+  connect fails at once saying so.
 - **FTPS is explicit-only.** The `AUTH TLS` upgrade path (RFC 4217) is what
   every modern server speaks. Implicit FTPS on the deprecated port 990 is
   not supported. If you have a server that only does implicit-mode, you'd

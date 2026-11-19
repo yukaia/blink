@@ -182,9 +182,11 @@ impl App {
                     LogLevel::Success,
                     format!("connected · {parallelism} parallel slot(s)"),
                 );
+                // News, not a risk: warnings are for what endangers the
+                // user, as the cleartext notice below does.
                 if is_scp {
                     self.push_log(
-                        LogLevel::Warn,
+                        LogLevel::Info,
                         "scp:// is routed through SFTP internally; \
                          full file-manager operations are available"
                             .into(),

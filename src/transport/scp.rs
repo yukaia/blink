@@ -18,11 +18,14 @@
 //! user picks `scp://`, we open an SFTP session and route every operation
 //! through it.
 //!
-//! The user-visible difference from picking `sftp://` directly: none. The
-//! only servers where this would matter are SCP-only legacy boxes (some
-//! embedded systems, ancient routers); for those, a future revision could
-//! add a real wire-protocol implementation gated on a session option, and
-//! it would slot in here without touching anything else.
+//! Picking `scp://` rather than `sftp://` works the same: the session list
+//! colours both alike, and the connect log notes that SCP is served over
+//! SFTP. The only servers where the difference matters are SCP-only legacy
+//! boxes (some embedded systems, ancient routers). A connect to one fails
+//! at once, saying the server refused SFTP and that blink doesn't speak
+//! legacy SCP (see `open_sftp_channel` in `sftp.rs`). A future revision
+//! could add a real wire-protocol implementation gated on a session option,
+//! and it would slot in here without touching anything else.
 //!
 //! ## Why the macro
 //!
@@ -34,6 +37,10 @@
 //! the trait catching it. The `delegate_inner_transport!` macro forces
 //! the body of each method to be exactly `self.inner.METHOD(args).await`
 //! so there is no opportunity for the wrapper to introduce its own logic.
+//!
+//! It forwards the methods it lists, no more. Should [`Transport`] gain a
+//! method with a default body, the macro needs an arm for it too, or SCP
+//! gets the default even where SFTP overrides it.
 
 use async_trait::async_trait;
 
@@ -71,9 +78,10 @@ impl ScpTransport {
 /// [`Protocol`](crate::session::Protocol) variant the wrapper should report
 /// from `protocol()`.
 ///
-/// Behavioural drift is impossible by construction: the macro never inspects
-/// arguments, so any change to the inner type's behaviour propagates through
-/// untouched.
+/// The macro never inspects arguments, so any change to the inner type's
+/// behaviour propagates through untouched. It forwards only the methods it
+/// lists, though: see the module docs for a trait method with a default
+/// body.
 macro_rules! delegate_inner_transport {
     ($ty:ty, $proto_variant:ident) => {
         #[async_trait]

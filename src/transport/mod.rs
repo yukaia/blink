@@ -825,6 +825,11 @@ pub(crate) async fn within_deadline_excluding_waits<F: std::future::Future>(
 }
 
 /// What every protocol implementation must provide.
+///
+/// No method has a default body. One that did would need adding to the
+/// forwarding macros by hand (`delegate_inner_transport!` in `scp.rs` and
+/// `delegate_ftp_transport!` in `ftp_impl.rs`), or a wrapped transport's
+/// override would be silently skipped.
 #[async_trait]
 pub trait Transport: Send + Sync {
     /// Which protocol this transport speaks. Nothing reads it yet.

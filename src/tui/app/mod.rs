@@ -4998,6 +4998,24 @@ mod session_and_prompt_tests {
         s
     }
 
+    /// That SCP is served over SFTP is news, not a risk: it was logged as a
+    /// warning on every connect.
+    #[tokio::test]
+    async fn the_scp_over_sftp_notice_is_not_a_warning() {
+        let _home = crate::paths::test_home();
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        let mut s = Session::from_url("scp://me@h.example").unwrap();
+        s.name = "scp".into();
+        connect(&mut a, s, false);
+
+        let notice = a
+            .log
+            .iter()
+            .find(|l| l.message.contains("routed through SFTP"))
+            .expect("the notice is logged");
+        assert!(matches!(notice.level, LogLevel::Info));
+    }
+
     // -- per-session themes ------------------------------------------------------
 
     #[tokio::test]
