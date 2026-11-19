@@ -40,6 +40,12 @@ the git history for those.
 
 ### Changed
 
+- **A transfer whose connection drops is retried once**, on a fresh
+  connection, whichever connection it was using; a download resumes from
+  its partial file. Only connections reused between jobs got the retry.
+- **Idle transfer connections close after a minute**, and when
+  `parallel_downloads` is lowered. They stayed open until disconnect,
+  counting against servers' per-user connection limits.
 - **`t` changes only the `theme` line of `config.ini`.** Saving rewrote
   the whole file from the settings blink had loaded, so every `t` dropped
   your comments and blank lines, undid anything you'd changed in the file
@@ -168,6 +174,17 @@ the git history for those.
 
 ### Fixed
 
+- **Quitting no longer hangs on an FTP server that went away.** Closing
+  each idle transfer connection waited for a reply to `QUIT`, which from a
+  server that vanished silently took until TCP gave up (about 15 minutes).
+  Closes now give up after 3 seconds, and a failed transfer is marked
+  failed without waiting on its connection.
+- **A resumed download's speed starts from where it resumed**, not from 0,
+  which showed a speed of many GB/s for its first moment.
+- **A stalled transfer's speed falls to 0** instead of showing its last
+  speed for as long as it stalls.
+- **A host-key prompt whose transfer was cancelled closes itself.** It
+  stayed up, and answering it did nothing.
 - **Two blinks on one session no longer wipe each other's batches.** Each
   wrote its own copy of the checkpoint, and the last to save won. The
   first now holds a lock; the second runs its batches unsaved, says so,

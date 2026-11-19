@@ -651,6 +651,7 @@ impl App {
             // A folder made private by whatever that event touched — the
             // first `t` creating `themes/`, say — is said now, not next launch.
             self.drain_path_notices();
+            self.close_answerless_prompt();
 
             if self.should_quit {
                 break;
@@ -667,6 +668,32 @@ impl App {
         self.pending_password = None;
 
         Ok(())
+    }
+
+    /// Close a host-key prompt on screen whose connection is gone — its
+    /// transfer cancelled, or the prompt timed out — and say so. Answering
+    /// it did nothing ("accept and save" saved nothing), and it stayed up
+    /// until answered.
+    fn close_answerless_prompt(&mut self) {
+        if self.screen != Screen::ConfirmHostKey {
+            return;
+        }
+        let Some(prompt) = self.pending_host_key.as_ref() else {
+            return;
+        };
+        if !prompt.decision_tx.as_ref().is_none_or(|tx| tx.is_closed()) {
+            return;
+        }
+        let host = prompt.host.clone();
+        self.pending_host_key = None;
+        self.screen = self.previous_screen.clone();
+        self.push_log(
+            LogLevel::Warn,
+            format!(
+                "closed the prompt about {host}'s key: the connection that asked \
+                 is gone (its transfer was cancelled, or the prompt timed out)"
+            ),
+        );
     }
 
     /// Move [`crate::paths::take_notices`] into the log: a config folder
@@ -1601,6 +1628,42 @@ mod tests {
             decision_tx: Some(tx),
             opened_at: std::time::Instant::now(),
         }
+    }
+
+    /// A transfer cancelled while its connection waited on the prompt left
+    /// the prompt up, answering nothing ("accept and save" saved nothing).
+    #[test]
+    fn a_prompt_whose_connection_is_gone_closes_itself() {
+        let mut a = app();
+        a.previous_screen = Screen::Main;
+        a.screen = Screen::ConfirmHostKey;
+        a.pending_host_key = Some(pending_host_key()); // its receiver is gone
+
+        a.close_answerless_prompt();
+
+        assert!(a.pending_host_key.is_none());
+        assert_eq!(a.screen, Screen::Main, "back to what it interrupted");
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.message.contains("closed the prompt about h's key"))
+        );
+    }
+
+    #[test]
+    fn a_prompt_still_awaited_stays_up() {
+        let mut a = app();
+        a.previous_screen = Screen::Main;
+        a.screen = Screen::ConfirmHostKey;
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let mut prompt = pending_host_key();
+        prompt.decision_tx = Some(tx);
+        a.pending_host_key = Some(prompt);
+
+        a.close_answerless_prompt();
+
+        assert!(a.pending_host_key.is_some());
+        assert_eq!(a.screen, Screen::ConfirmHostKey);
     }
 
     /// A connect that fails with the host-key prompt still open — the prompt
