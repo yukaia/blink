@@ -156,7 +156,11 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   sidecar identifies the same remote file on the same server with the same
   reported size and modification time; anything unproven, including a
   missing sidecar or a server that doesn't report both, restarts from byte
-  zero instead of risking a silently corrupt file.
+  zero instead of risking a silently corrupt file. On Unix the partial and
+  its sidecar must also be your own files with no other name (no hard
+  links), so in a folder other users can write to, such as `/tmp`, no one
+  can plant a partial for a download to finish. A stale partial blink
+  can't remove fails the download with its name.
 
 ### Sessions
 

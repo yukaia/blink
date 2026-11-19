@@ -115,6 +115,20 @@ the git history for those.
 
 ### Security
 
+- **A download no longer resumes onto a partial someone else planted.** In
+  a folder other users can write to, such as `/tmp`, the partial's name is
+  predictable, and a sidecar naming a public file's server, path, size and
+  modification time was enough for blink to append the real file's tail to
+  another user's bytes and rename the result into place, still theirs to
+  rewrite. On Unix the partial and its sidecar must now be your own files
+  with a single name, and the partial is checked again just before the
+  rename. The sidecar is opened without blocking, so a FIFO planted in its
+  place can't hang the download, and only 64 KiB of it is read.
+- **A remote entry whose name contains `/` is no longer acted on.** A
+  server could list `sub/file`, or `/etc/x`, and a delete, rename or view
+  of the entry shown went to another path. Such names are skipped, as `.`
+  and `..` already were.
+
 - **An FTPS first connect refuses a certificate it failed to record.**
   When the session had no pin, unreadable verifier state read as "no
   certificate to ask about", and the connection would have carried on
@@ -201,6 +215,14 @@ the git history for those.
   before, they were accepted whatever they presented.
 
 ### Fixed
+
+- **A stale partial that can't be removed is named.** In a sticky folder
+  such as `/tmp`, a partial another user left there can't be deleted, and
+  the download failed with a bare "File exists". It now says which file is
+  in the way.
+- **A partial's sidecar is flushed when written.** It went through a tokio
+  file that was dropped without a flush, so the write could still be in
+  flight, with any error lost.
 
 - **FTP shows hidden files, and deletes them with their folder.** blink
   now asks for `LIST -a` (falling back to a plain `LIST` on servers without
