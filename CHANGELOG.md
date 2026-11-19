@@ -233,6 +233,11 @@ the git history for those.
 
 ### Fixed
 
+- **A plain PKCS#8 key loads even with a passphrase given.** russh decodes
+  it as an encrypted one when handed a passphrase, and failed on its
+  structure. A passphrase left over for a key that no longer needs one (the
+  file replaced since it was asked for) no longer stops it loading.
+
 - **A failed SFTP login says why.** It read "rejected by server" whatever
   happened; it now names the methods the server would take, or says it
   accepted the credential but wants another step as well.
