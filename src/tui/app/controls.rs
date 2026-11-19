@@ -129,7 +129,7 @@ impl App {
                     // Persist as a best-effort. A save failure here shouldn't
                     // refuse the in-memory swap (the user can see the new
                     // theme already), so we log and move on.
-                    if let Err(e) = self.config.save() {
+                    if let Err(e) = crate::config::save_setting("general", "theme", next_name) {
                         self.push_log(
                             LogLevel::Warn,
                             format!("could not save theme preference: {e}"),

@@ -169,7 +169,8 @@ async fn run(cli: Cli, log_warnings: Vec<String>) -> Result<()> {
 /// broken one does stop the TUI, rather than run it on settings you didn't
 /// choose.
 fn tui_setup(mut warnings: Vec<String>) -> Result<(Config, Theme, Vec<String>)> {
-    let config = Config::load()?;
+    let (config, config_warnings) = Config::load()?;
+    warnings.extend(config_warnings);
     let (theme, theme_warning) = Theme::load_or_fallback(&config.general.theme);
     warnings.extend(theme_warning);
     // Temp files a crash left behind. Long-dead ones only; see the fn.
@@ -613,6 +614,26 @@ mod tests {
             let e = run(cli(args), vec![]).expect_err("refused").to_string();
             assert!(e.contains("parallel_downloads"), "{args:?}: {e}");
         }
+    }
+
+    /// What `config.ini` had ignored or corrected went to the debug log
+    /// only, so a mistyped setting just didn't work.
+    #[test]
+    fn config_warnings_open_the_tuis_log() {
+        let _home = crate::paths::test_home();
+        std::fs::write(
+            crate::paths::config_file().unwrap(),
+            "[general]\nconfim_quit = false\n",
+        )
+        .unwrap();
+        let (_, _, warnings) = tui_setup(vec!["from logging".into()]).unwrap();
+        assert_eq!(warnings[0], "from logging");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("unknown setting `confim_quit`")),
+            "{warnings:?}"
+        );
     }
 
     /// Listing only reads: on a fresh machine it left a config.ini and

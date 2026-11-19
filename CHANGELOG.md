@@ -40,6 +40,13 @@ the git history for those.
 
 ### Changed
 
+- **`t` changes only the `theme` line of `config.ini`.** Saving rewrote
+  the whole file from the settings blink had loaded, so every `t` dropped
+  your comments and blank lines, undid anything you'd changed in the file
+  since blink started, and replaced a file it couldn't parse with the
+  defaults. The first run now writes a commented `config.ini`.
+- **An unusable `theme` name falls back to dracula** with a warning, as a
+  missing theme does, instead of stopping blink.
 - **Only configuration problems are called "config error".** An
   unreadable `known_hosts`, a checkpoint problem or a missing `$HOME`
   now say what went wrong without that label, and a bad URL to `blink
@@ -161,6 +168,16 @@ the git history for those.
 
 ### Fixed
 
+- **A symlinked `config.ini` stays a symlink** when blink saves; it was
+  replaced with a plain file, cut off from your dotfiles.
+- **A `config.ini` with a byte-order mark is read.** Every setting in it was
+  silently ignored.
+- **`config.ini` says what it ignored**: unknown settings and sections,
+  keys in the wrong case, a setting given twice, and a clamped
+  `parallel_downloads` are reported in the log. A second `[general]`
+  section is read rather than skipped.
+- **Config errors name the setting and the value**: `mouse must be true or
+  false …, not \`sometimes\``.
 - **Long messages keep their end.** Every log line and error was cut to
   its first 512 characters, so a long path pushed out the reason
   (`…: permission denied`). They now lose their middle instead.
