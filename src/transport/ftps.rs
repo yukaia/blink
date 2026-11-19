@@ -2,21 +2,24 @@
 //!
 //! ## Trust model
 //!
-//! - `accept_invalid_certs = false` (default): standard CA chain
-//!   verification via webpki-roots. No pinning involved.
-//! - `accept_invalid_certs = true`: CA chain trust is bypassed, but the
-//!   server's certificate must still match the configured hostname
-//!   (SAN/CN), and the handshake signature must verify against the
-//!   cert's public key. On the first connect the user is shown the leaf
-//!   certificate's SHA-256 and asked, before the password is sent, whether
-//!   to trust it; accepted, it is pinned in the session, and later
-//!   connects (data connections included) must present the same cert.
-//!   This mirrors how SSH host-key trust works for SFTP.
+//! - `accept_invalid_certs = false` (default): standard CA chain and
+//!   hostname verification, against webpki-roots plus the system's trust
+//!   store (see [`trusted_roots`]). No pinning involved.
+//! - `accept_invalid_certs = true`: the certificate itself is the identity.
+//!   Neither the CA chain nor the names in it are checked, but the
+//!   handshake signature must verify against the cert's public key, so the
+//!   server holds the certificate's key. On the first connect the user is
+//!   shown the leaf certificate's SHA-256 and asked, before the password is
+//!   sent, whether to trust it; accepted, it is pinned in the session, and
+//!   later connects (data connections included) must present the same
+//!   cert. This mirrors how SSH host-key trust works for SFTP, where the
+//!   key is not tied to a name either.
 
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, oneshot};
 
+use suppaftp::rustls::pki_types::CertificateDer;
 use suppaftp::rustls::{ClientConfig, RootCertStore};
 use suppaftp::tokio::{AsyncRustlsConnector, AsyncRustlsFtpStream};
 use zeroize::Zeroizing;
@@ -43,6 +46,47 @@ pub(crate) fn colon_hex(hex: &str) -> String {
         .map(|pair| String::from_utf8_lossy(pair).to_ascii_uppercase())
         .collect::<Vec<_>>()
         .join(":")
+}
+
+/// webpki-roots, plus `system`: the certificates of the system's trust store.
+/// A system certificate rustls can't use as a trust anchor is skipped.
+fn root_store(system: Vec<CertificateDer<'static>>) -> RootCertStore {
+    let mut store = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let (_, skipped) = store.add_parsable_certificates(system);
+    if skipped > 0 {
+        tracing::debug!("skipped {skipped} unusable certificate(s) in the system trust store");
+    }
+    store
+}
+
+/// The CAs a chain-checked connection trusts: webpki-roots and the system's
+/// trust store, so a server whose certificate comes from a CA installed on
+/// the machine (a company's own, say) verifies as it does in other clients.
+/// Read once per run: the store is a few hundred certificates to parse.
+#[cfg(not(test))]
+fn trusted_roots() -> Arc<RootCertStore> {
+    static ROOTS: std::sync::OnceLock<Arc<RootCertStore>> = std::sync::OnceLock::new();
+    Arc::clone(ROOTS.get_or_init(|| {
+        let system = rustls_native_certs::load_native_certs();
+        for e in &system.errors {
+            tracing::warn!("system trust store: {e}");
+        }
+        Arc::new(root_store(system.certs))
+    }))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// What a test's "system trust store" holds, for its own thread.
+    pub(super) static SYSTEM_ROOTS: std::cell::RefCell<Vec<CertificateDer<'static>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// [`trusted_roots`] with the system store a test set in [`SYSTEM_ROOTS`],
+/// so the tests depend neither on nor for the machine's own store.
+#[cfg(test)]
+fn trusted_roots() -> Arc<RootCertStore> {
+    Arc::new(root_store(SYSTEM_ROOTS.with_borrow(|c| c.clone())))
 }
 
 /// Ask the user whether to trust the certificate `sha256` for `session`.
@@ -83,6 +127,18 @@ async fn ask_to_pin(
     Ok(NewCertPin {
         sha256: sha256.to_string(),
         save,
+    })
+}
+
+/// The certificate the pinning verifier recorded during a handshake made
+/// with no pin. It records one on every handshake it passes, so none, or
+/// state that can't be read, means something went wrong, and must refuse
+/// the connection rather than read as "nothing to ask about".
+fn recorded_certificate(captured: &Mutex<Option<String>>) -> Result<String> {
+    captured.lock().ok().and_then(|g| g.clone()).ok_or_else(|| {
+        BlinkError::connect(
+            "ftps: the server's certificate was not recorded, so it can't be checked",
+        )
     })
 }
 
@@ -167,10 +223,8 @@ impl FtpsTransport {
                 .with_custom_certificate_verifier(Arc::new(verifier))
                 .with_no_client_auth()
         } else {
-            let root_store =
-                RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             ClientConfig::builder()
-                .with_root_certificates(root_store)
+                .with_root_certificates(trusted_roots())
                 .with_no_client_auth()
         };
 
@@ -185,15 +239,16 @@ impl FtpsTransport {
         // Handshake succeeded. A certificate the session had no pin for
         // is the user's call, and must be made before the password goes
         // to whoever holds it.
-        let captured = captured_pin.lock().ok().and_then(|g| g.clone());
-        let new_pin = match (captured, prompt) {
-            (None, _) => None,
-            (Some(sha256), Some(prompt)) => Some(ask_to_pin(session, &sha256, prompt).await?),
-            (Some(_), None) => {
+        let new_pin = if session.accept_invalid_certs && session.cert_sha256.is_none() {
+            let sha256 = recorded_certificate(&captured_pin)?;
+            let Some(prompt) = prompt else {
                 return Err(BlinkError::connect(
                     "the FTPS server presented a certificate the session has no pin for",
                 ));
-            }
+            };
+            Some(ask_to_pin(session, &sha256, prompt).await?)
+        } else {
+            None
         };
 
         ftp_impl::log_in(&mut stream, session, password, "ftps").await?;
@@ -206,9 +261,14 @@ ftp_impl::delegate_ftp_transport!(FtpsTransport, Ftps);
 /// Certificate verifier used when `accept_invalid_certs = true`.
 ///
 /// Always:
-/// - Verifies the server's hostname against the cert SAN/CN.
 /// - Verifies handshake signatures against the cert's public key, using
 ///   the ring crypto provider already pulled in by rustls-ring.
+///
+/// Never checks the names in the certificate: the pin is the identity, as
+/// an SSH host key is, and the signature check proves the server holds its
+/// key. Requiring a name refused the self-signed certificates pinning is
+/// for: those with only a common name (rustls reads only the SANs), and any
+/// server reached by an address its certificate doesn't list.
 ///
 /// For the leaf cert:
 /// - If a pin is stored: requires an exact SHA-256 match (hex,
@@ -224,7 +284,6 @@ mod pinning {
     use suppaftp::rustls::client::danger::{
         HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
     };
-    use suppaftp::rustls::client::verify_server_name;
     use suppaftp::rustls::crypto::{
         self, WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature,
     };
@@ -262,14 +321,14 @@ mod pinning {
             &self,
             end_entity: &CertificateDer<'_>,
             _intermediates: &[CertificateDer<'_>],
-            server_name: &ServerName<'_>,
+            _server_name: &ServerName<'_>,
             _ocsp_response: &[u8],
             _now: UnixTime,
         ) -> Result<ServerCertVerified, TlsError> {
-            // Hostname binding is mandatory regardless of trust mode —
-            // bypassing chain validation must not bypass the SAN check.
-            let cert = ParsedCertificate::try_from(end_entity)?;
-            verify_server_name(&cert, server_name)?;
+            // No name check: see the module docs. Parsing still refuses
+            // something that isn't a certificate before it is offered for
+            // trust.
+            ParsedCertificate::try_from(end_entity)?;
 
             // Compute leaf cert SHA-256, hex-encoded lowercase.
             let mut hasher = Sha256::new();
@@ -562,7 +621,10 @@ mod integration {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
     use suppaftp::rustls::ServerConfig;
+    use suppaftp::rustls::crypto::ring::sign::any_supported_type;
     use suppaftp::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use suppaftp::rustls::server::{ClientHello, ResolvesServerCert};
+    use suppaftp::rustls::sign::CertifiedKey;
     use suppaftp::tokio_rustls::TlsAcceptor;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream};
@@ -580,6 +642,12 @@ mod integration {
     const A: Identity = (certs::A_CERT, certs::A_KEY);
     const B: Identity = (certs::B_CERT, certs::B_KEY);
     const OTHER_NAME: Identity = (certs::OTHER_NAME_CERT, certs::OTHER_NAME_KEY);
+    const CN_ONLY: Identity = (certs::CN_ONLY_CERT, certs::CN_ONLY_KEY);
+    const CA_SIGNED: Identity = (certs::CA_SIGNED_CERT, certs::CA_SIGNED_KEY);
+    const CA_SIGNED_OTHER_NAME: Identity = (
+        certs::CA_SIGNED_OTHER_NAME_CERT,
+        certs::CA_SIGNED_OTHER_NAME_KEY,
+    );
 
     fn der(b64: &str) -> Vec<u8> {
         base64::engine::general_purpose::STANDARD
@@ -595,13 +663,28 @@ mod integration {
             .collect()
     }
 
+    /// Always serves one certificate and key. Unlike `with_single_cert`, it
+    /// doesn't check that the two belong together, so a test can serve a
+    /// certificate with another one's key, as an impostor would have to.
+    #[derive(Debug)]
+    struct Serve(Arc<CertifiedKey>);
+
+    impl ResolvesServerCert for Serve {
+        fn resolve(&self, _: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+            Some(Arc::clone(&self.0))
+        }
+    }
+
     fn acceptor(identity: Identity) -> TlsAcceptor {
         let cert = CertificateDer::from(der(identity.0));
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(der(identity.1)));
+        let key = any_supported_type(&key).expect("fixture key should load");
         let config = ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(vec![cert], key)
-            .expect("fixture certificate should load");
+            .with_cert_resolver(Arc::new(Serve(Arc::new(CertifiedKey::new(
+                vec![cert],
+                key,
+            )))));
         TlsAcceptor::from(Arc::new(config))
     }
 
@@ -636,7 +719,15 @@ mod integration {
     /// Serve FTPS with `control` on the control connection and `data` on
     /// the data connections.
     async fn start_server(control: Identity, data: Identity) -> Server {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        start_server_on(
+            TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap(),
+            control,
+            data,
+        )
+    }
+
+    /// [`start_server`], accepting on `listener`.
+    fn start_server_on(listener: TcpListener, control: Identity, data: Identity) -> Server {
         let port = listener.local_addr().unwrap().port();
         let identities = Identities {
             control: Arc::new(Mutex::new(control)),
@@ -851,32 +942,62 @@ mod integration {
         assert_eq!(server.passwords().await, 0);
     }
 
-    /// Turning chain validation off must not turn the name check off: a
-    /// certificate for another host is not this host's, whoever signed it.
+    /// When pinning, the certificate is the identity and the names in it
+    /// don't matter: a server reached by an address its certificate doesn't
+    /// list is still offered for trust, as an SSH host key would be.
     #[tokio::test]
-    async fn a_certificate_for_another_name_is_refused_without_asking() {
+    async fn a_certificate_for_another_name_is_offered_for_trust() {
         let server = start_server(OTHER_NAME, OTHER_NAME).await;
         let session = pinning_session(server.port, None);
 
         let attempt = connect(&server, &session, HostKeyDecision::AcceptAndSave).await;
 
-        assert!(attempt.result.is_err());
-        assert!(
-            attempt.prompts.is_empty(),
-            "there is nothing to offer to trust"
-        );
-        assert_eq!(server.passwords().await, 0);
+        let (_transport, new_pin) = attempt.result.expect("an accepted certificate connects");
+        assert_eq!(new_pin.map(|p| p.sha256), Some(pin_of(OTHER_NAME)));
+        assert_eq!(attempt.prompts, [colon_hex(&pin_of(OTHER_NAME))]);
+        assert_eq!(attempt.passwords_at_prompt, [0]);
     }
 
-    /// Pinning its own certificate doesn't rescue it either.
     #[tokio::test]
-    async fn a_certificate_for_another_name_is_refused_even_when_pinned() {
+    async fn a_pinned_certificate_for_another_name_connects() {
         let server = start_server(OTHER_NAME, OTHER_NAME).await;
         let session = pinning_session(server.port, Some(pin_of(OTHER_NAME)));
 
+        let attempt = connect(&server, &session, HostKeyDecision::Reject).await;
+
+        let (mut transport, _) = attempt.result.expect("the pin is what's checked");
+        assert!(attempt.prompts.is_empty());
+        transport.list("/").await.expect("the data connection too");
+    }
+
+    /// A bare `openssl req -x509` certificate names its host only in the
+    /// common name, which rustls doesn't read: as far as it is concerned the
+    /// certificate names nothing. It used to be refused outright.
+    #[tokio::test]
+    async fn a_certificate_with_only_a_common_name_can_be_pinned() {
+        let server = start_server(CN_ONLY, CN_ONLY).await;
+        let session = pinning_session(server.port, None);
+
+        let attempt = connect(&server, &session, HostKeyDecision::AcceptOnce).await;
+
+        let (mut transport, _) = attempt.result.expect("an accepted certificate connects");
+        assert_eq!(attempt.prompts, [colon_hex(&pin_of(CN_ONLY))]);
+        transport.list("/").await.expect("the data connection too");
+    }
+
+    /// Without the name check, the pin and the handshake signature are all
+    /// that stand between the user and a stranger: a server presenting
+    /// someone else's certificate, without its key, must still fail.
+    #[tokio::test]
+    async fn a_certificate_presented_without_its_key_is_refused() {
+        // B's certificate, served with A's key.
+        let server = start_server((certs::B_CERT, certs::A_KEY), A).await;
+        let session = pinning_session(server.port, Some(pin_of(B)));
+
         let attempt = connect(&server, &session, HostKeyDecision::AcceptAndSave).await;
 
-        assert!(attempt.result.is_err());
+        let err = attempt.result.err().expect("the signature can't verify");
+        assert!(err.to_string().contains("tls upgrade"), "{err}");
         assert_eq!(server.passwords().await, 0);
     }
 
@@ -1006,9 +1127,96 @@ mod integration {
 
         let attempt = connect(&server, &session, HostKeyDecision::AcceptAndSave).await;
 
-        assert!(attempt.result.is_err());
+        let err = attempt.result.err().expect("no CA vouches for it");
+        assert!(err.to_string().contains("UnknownIssuer"), "{err}");
         assert!(attempt.prompts.is_empty());
         assert_eq!(server.passwords().await, 0);
+    }
+
+    /// A session that checks the chain, against a test "system trust store"
+    /// holding [`certs::CA_CERT`].
+    fn chain_checked_session(host: &str, port: u16) -> Session {
+        super::SYSTEM_ROOTS.set(vec![CertificateDer::from(der(certs::CA_CERT))]);
+        Session {
+            host: host.to_string(),
+            accept_invalid_certs: false,
+            ..pinning_session(port, None)
+        }
+    }
+
+    /// A company's own CA, installed on the machine, is trusted as the
+    /// built-in ones are.
+    #[tokio::test]
+    async fn a_certificate_from_a_ca_in_the_system_store_verifies() {
+        let server = start_server(CA_SIGNED, CA_SIGNED).await;
+        let session = chain_checked_session("127.0.0.1", server.port);
+
+        let attempt = connect(&server, &session, HostKeyDecision::Reject).await;
+
+        let (mut transport, new_pin) = attempt.result.expect("the system's CA vouches for it");
+        assert_eq!(new_pin, None);
+        assert!(attempt.prompts.is_empty());
+        transport.list("/").await.expect("the data connection too");
+    }
+
+    /// Checking the chain still checks the name: a certificate the trusted
+    /// CA issued for another host is not this one's.
+    #[tokio::test]
+    async fn a_ca_issued_certificate_for_another_name_is_refused() {
+        let server = start_server(CA_SIGNED_OTHER_NAME, CA_SIGNED_OTHER_NAME).await;
+        let session = chain_checked_session("127.0.0.1", server.port);
+
+        let attempt = connect(&server, &session, HostKeyDecision::AcceptAndSave).await;
+
+        let err = attempt.result.err().expect("the name doesn't match");
+        assert!(err.to_string().contains("not valid for name"), "{err}");
+        assert!(attempt.prompts.is_empty());
+        assert_eq!(server.passwords().await, 0);
+    }
+
+    /// Over IPv6 the address checked is `::1`, which the fixtures name.
+    #[tokio::test]
+    async fn a_chain_checked_connection_over_ipv6_verifies() {
+        let Ok(listener) = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).await else {
+            eprintln!("skipped: no IPv6 loopback here");
+            return;
+        };
+        let server = start_server_on(listener, CA_SIGNED, CA_SIGNED);
+        let session = chain_checked_session("::1", server.port);
+
+        let attempt = connect(&server, &session, HostKeyDecision::Reject).await;
+
+        attempt.result.expect("::1 is a name the certificate lists");
+        assert_eq!(server.passwords().await, 1);
+    }
+
+    #[test]
+    fn a_certificate_that_was_not_recorded_refuses_the_connection() {
+        assert!(super::recorded_certificate(&std::sync::Mutex::new(None)).is_err());
+
+        let poisoned = std::sync::Mutex::new(Some("ab".to_string()));
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison it");
+        });
+        assert!(poisoned.is_poisoned());
+        assert!(super::recorded_certificate(&poisoned).is_err());
+
+        let recorded = std::sync::Mutex::new(Some("ab".to_string()));
+        assert_eq!(super::recorded_certificate(&recorded).unwrap(), "ab");
+    }
+
+    #[test]
+    fn the_trusted_roots_are_the_built_in_ones_and_the_system_ones() {
+        let ca = CertificateDer::from(der(certs::CA_CERT));
+        let built_in = webpki_roots::TLS_SERVER_ROOTS.len();
+
+        assert_eq!(super::root_store(vec![ca]).len(), built_in + 1);
+        assert_eq!(
+            super::root_store(vec![CertificateDer::from(b"not a cert".to_vec())]).len(),
+            built_in,
+            "an unusable system certificate is skipped"
+        );
     }
 
     #[tokio::test]

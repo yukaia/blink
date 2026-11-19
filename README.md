@@ -745,7 +745,7 @@ src/
 │   ├── sftp_test_keys.rs  test-only: published throwaway host/client keys for the in-process SFTP server — not secrets
 │   ├── scp.rs           transparent SFTP wrapper (matches OpenSSH 9.0+); delegates via the delegate_inner_transport! macro
 │   ├── ftp.rs           FTP via suppaftp tokio backend
-│   ├── ftps.rs          FTPS via suppaftp + rustls; pinning verifier (hostname + signature + cert pin)
+│   ├── ftps.rs          FTPS via suppaftp + rustls; pinning verifier (signature + cert pin)
 │   ├── ftp_impl.rs      shared macro that generates the Transport impl for FTP and FTPS; per-call deadline, reconnect after a broken call
 │   └── error_map.rs     maps russh-sftp / suppaftp errors to typed BlinkError variants (NotFound / Permission / Disconnected)
 ├── transfer.rs          TransferManager: queue, state, progress events; MAX_QUEUED_JOBS cap
@@ -837,19 +837,23 @@ terminal. The following properties are enforced in the current codebase.
   `aws-lc-rs`. With both compiled in, rustls refuses to choose between them
   and every FTPS connect panics, so the manifest pins one and a test fails
   if the other returns through feature unification.
-- **FTPS hostname + signature verification are mandatory.** Trust anchors
-  are the embedded Mozilla bundle (`webpki-roots`), not the system store,
-  so self-signed and privately-rooted certificates aren't trusted by
-  default. Even when the per-session
-  `accept_invalid_certs = true` bypasses CA-chain trust, the cert's SAN
-  must still match the configured hostname and the handshake signature
-  must still verify against the cert's public key. The flag also enables
-  TOFU pinning: on the first connect blink shows the leaf cert's SHA-256
-  (as `openssl x509 -fingerprint -sha256` prints it) and asks, before
-  sending the password, whether to trust it. Accepted, it's recorded in the
+- **FTPS checks the CA chain and hostname by default.** Trust anchors are
+  the embedded Mozilla bundle (`webpki-roots`) plus the system's trust
+  store, so a certificate from a CA installed on the machine (a company's
+  own, say) verifies as it does in other clients. Self-signed certificates
+  aren't trusted by default.
+- **Or pins the certificate itself.** The per-session
+  `accept_invalid_certs = true` swaps the CA chain for TOFU pinning: on the
+  first connect blink shows the leaf cert's SHA-256 (as
+  `openssl x509 -fingerprint -sha256` prints it) and asks, before sending
+  the password, whether to trust it. Accepted, it's recorded in the
   session, and subsequent connects require an exact match. The data
   connections are held to the same certificate, during the first connect
-  too.
+  too. The handshake signature must still verify against the cert's public
+  key, so the server must hold the certificate's key. The names in the
+  certificate aren't checked: the pin is the identity, as an SSH host key
+  is, so a self-signed certificate with only a common name, or a server
+  reached by an IP address its certificate doesn't list, can be pinned.
 - **30-second connect timeout** — applied to both the primary connection
   and every parallel worker connection. A server that accepts the TCP
   socket but stalls the handshake cannot pin connections indefinitely.
@@ -1046,6 +1050,8 @@ A few things worth knowing before you use this in anger:
   every modern server speaks. Implicit FTPS on the deprecated port 990 is
   not supported. If you have a server that only does implicit-mode, you'd
   need a different connect path; the `transport/ftps.rs` seam is small.
+  Connecting to one fails after 15 s with a note saying so, since such a
+  server never sends the greeting blink waits for.
 - **FTP directory listings are parsed as POSIX (`ls -l`) or DOS, nothing
   else.** blink issues `LIST` and never `MLSD`/`MLST`, so it parses with
   those two parsers only. Lines in neither format are skipped, and the log
@@ -1057,11 +1063,11 @@ A few things worth knowing before you use this in anger:
   used: it would put entries in the pane that address nothing.
   Real-world dialect coverage is untested: the FTP test suite runs against
   an in-process server, not vsftpd or IIS.
-- **No custom CA roots for FTPS.** Trust anchors are the embedded Mozilla
-  bundle, and there is no option to add a root without recompiling. For a
-  self-signed or privately-rooted server, the per-session
-  `accept_invalid_certs` toggle pins the certificate instead (see
-  [Security](#protocol)).
+- **No per-session CA roots for FTPS.** Trust anchors are the embedded
+  Mozilla bundle and the system's trust store; to trust a private CA,
+  install it in the system store. For a self-signed server, the
+  per-session `accept_invalid_certs` toggle pins the certificate instead
+  (see [Security](#protocol)).
 - **Passwords are held in memory** for the duration of the connected
   session; see [Credential handling](#credential-handling) for why, and
   for the alternative.
@@ -1142,6 +1148,12 @@ and do not affect blink's MIT license except where noted.
 | Crate | Author(s) | Use in blink |
 | ----- | --------- | ------------ |
 | [webpki-roots](https://github.com/rustls/webpki-roots) | Mozilla / rustls contributors | Mozilla CA root certificates for FTPS |
+
+### Apache-2.0 OR ISC OR MIT
+
+| Crate | Author(s) | Use in blink |
+| ----- | --------- | ------------ |
+| [rustls-native-certs](https://github.com/rustls/rustls-native-certs) | rustls contributors | The system's trust store for FTPS |
 
 ### Apache-2.0 AND ISC
 

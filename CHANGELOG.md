@@ -40,6 +40,21 @@ the git history for those.
 
 ### Changed
 
+- **FTPS trusts the system's certificate store** as well as the built-in
+  Mozilla bundle, so a server whose certificate comes from a CA installed
+  on the machine (a company's own, say) verifies without pinning.
+- **A pinned FTPS certificate no longer has to name the host.** With
+  `accept_invalid_certs`, the certificate is the identity and the
+  handshake signature proves the server holds its key, so the hostname
+  check added nothing but refused the certificates pinning is for:
+  self-signed ones with only a common name (rustls reads only the subject
+  alternative names), and servers reached by an address their certificate
+  doesn't list. They are now offered for trust like any other.
+- **A server that never greets is reported within 15 s,** as such rather
+  than as the whole connect timing out, with a hint that it may be an
+  implicit FTPS port, which blink doesn't speak. A failed connect to port
+  990 says the same.
+
 - **Anonymous FTP and FTPS don't ask for a password.** A session with no
   username logs in as `anonymous`, which ignored whatever password was
   typed into the prompt.
@@ -99,6 +114,11 @@ the git history for those.
   yourself to keep them.
 
 ### Security
+
+- **An FTPS first connect refuses a certificate it failed to record.**
+  When the session had no pin, unreadable verifier state read as "no
+  certificate to ask about", and the connection would have carried on
+  with no prompt and no pin. Nothing reached that path in practice.
 
 - **On FTP, a folder blink may not list is no longer taken for empty.**
   Every `550` reply read as "no such file", including `550 Permission
@@ -615,6 +635,9 @@ the git history for those.
   tells these apart by russh's error type rather than its message text.
 
 ### Dependencies
+
+- Added `rustls-native-certs` 0.8, to read the system's trust store for
+  FTPS. It brings no crypto backend of its own.
 
 - `russh` 0.64 -> 0.65, for RUSTSEC-2026-0495 (russh's agent server, which
   blink does not run). No changes outside the test server. It still pins

@@ -259,6 +259,11 @@ pub(crate) fn host_port(host: &str, port: u16) -> String {
 /// uploads at any host, such as a service on the user's own network, and
 /// NAT'd servers advertising a private address need it anyway. (curl has
 /// ignored the PASV address by default since 7.74.)
+///
+/// The server's greeting must come within [`GREETING_TIMEOUT`]. An implicit
+/// FTPS server (usually port 990), which blink doesn't speak, says nothing
+/// until a TLS handshake starts, and used to show only as the whole connect
+/// timing out. See [`implicit_ftps_hint`].
 pub(crate) async fn open_control<T: TokioTlsStream + Send>(
     session: &Session,
     label: &str,
@@ -276,9 +281,18 @@ pub(crate) async fn open_control<T: TokioTlsStream + Send>(
         .await
         .map_err(|e| failed(&e))?;
     let ipv6 = tcp.peer_addr().is_ok_and(|a| a.is_ipv6());
-    let mut stream = ImplAsyncFtpStream::<T>::connect_with_stream(tcp)
-        .await
-        .map_err(|e| failed(&e))?;
+    let limit = greeting_timeout();
+    let mut stream = match tokio::time::timeout(
+        limit,
+        ImplAsyncFtpStream::<T>::connect_with_stream(tcp),
+    )
+    .await
+    {
+        Ok(greeted) => {
+            greeted.map_err(|e| failed(&format!("{e}{}", implicit_ftps_hint(session.port))))?
+        }
+        Err(_) => return Err(failed(&no_greeting(session.port, limit))),
+    };
     stream.set_passive_nat_workaround(true);
     if ipv6 {
         stream.set_mode(suppaftp::types::Mode::ExtendedPassive);
@@ -351,6 +365,55 @@ thread_local! {
 #[cfg(test)]
 fn op_timeout() -> Duration {
     OP_TIMEOUT.get()
+}
+
+/// What to add to a failed connect to `port`: port 990 is implicit FTPS's,
+/// where TLS starts before the server says anything, and blink speaks only
+/// explicit FTPS (`AUTH TLS` after the greeting) and plain FTP.
+fn implicit_ftps_hint(port: u16) -> &'static str {
+    if port == 990 {
+        "; port 990 is usually implicit FTPS, which blink doesn't support: \
+         use the server's explicit FTPS (AUTH TLS) port instead, usually 21"
+    } else {
+        ""
+    }
+}
+
+/// Why a connect to `port` failed when no greeting came within `limit`.
+/// Whatever the port, implicit FTPS is the likeliest reason a server that
+/// accepted the connection says nothing.
+fn no_greeting(port: u16, limit: Duration) -> String {
+    let hint = match implicit_ftps_hint(port) {
+        "" => {
+            "; if this is an implicit FTPS port, use the server's explicit \
+             FTPS (AUTH TLS) port instead, usually 21: blink only speaks that"
+        }
+        hint => hint,
+    };
+    format!(
+        "the server sent no greeting within {} s{hint}",
+        limit.as_secs()
+    )
+}
+
+/// How long a server may take to greet a new control connection, well inside
+/// [`crate::transport::CONNECT_TIMEOUT`] so the reason gets reported.
+pub(crate) const GREETING_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[cfg(not(test))]
+fn greeting_timeout() -> Duration {
+    GREETING_TIMEOUT
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static GREETING_TIMEOUT_FOR_TEST: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(GREETING_TIMEOUT) };
+}
+
+#[cfg(test)]
+fn greeting_timeout() -> Duration {
+    GREETING_TIMEOUT_FOR_TEST.get()
 }
 
 /// How long [`delegate_ftp_transport!`]'s reconnect may take:
@@ -3268,6 +3331,51 @@ mod integration {
         );
         assert!(err.to_string().contains("Too many connections"), "{err}");
         assert!(err.to_string().contains("ftp login as tester"), "{err}");
+    }
+
+    /// An implicit FTPS server waits for a TLS handshake and never greets.
+    /// That used to show only as the whole connect timing out.
+    #[tokio::test]
+    async fn a_server_that_never_greets_says_why() {
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // Accept and hold each connection, saying nothing.
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = listener.accept().await {
+                held.push(sock);
+            }
+        });
+        super::GREETING_TIMEOUT_FOR_TEST.set(std::time::Duration::from_millis(200));
+
+        let err = FtpTransport::connect(&test_session(port), Some("pw"))
+            .await
+            .err()
+            .expect("no greeting, no connection");
+
+        let msg = err.to_string();
+        assert!(msg.contains("no greeting"), "{msg}");
+        assert!(msg.contains("implicit FTPS"), "{msg}");
+    }
+
+    #[test]
+    fn port_990_failures_mention_implicit_ftps() {
+        assert!(super::implicit_ftps_hint(990).contains("port 990 is usually implicit FTPS"));
+        assert_eq!(super::implicit_ftps_hint(21), "");
+
+        let at_990 = super::no_greeting(990, std::time::Duration::from_secs(15));
+        assert!(at_990.contains("within 15 s"), "{at_990}");
+        assert!(
+            at_990.contains("port 990 is usually implicit FTPS"),
+            "{at_990}"
+        );
+        let at_2121 = super::no_greeting(2121, std::time::Duration::from_secs(15));
+        assert!(
+            at_2121.contains("if this is an implicit FTPS port"),
+            "{at_2121}"
+        );
     }
 
     #[test]

@@ -153,11 +153,12 @@ pub struct Session {
     /// file for host-key trust and do not use this flag. Defaults to false;
     /// the user has to opt in per session.
     ///
-    /// When this is enabled, blink still verifies the cert's hostname (SAN /
-    /// CN must match `host`) and the handshake signature, and it pins the
-    /// leaf cert SHA-256 in [`Session::cert_sha256`] on the first connect — so future
-    /// connections to the same host must present the same cert. Disabling
-    /// chain trust only removes the CA-authority requirement.
+    /// When this is enabled, the certificate itself is the identity: blink
+    /// asks the user to trust its SHA-256 on the first connect and pins it
+    /// in [`Session::cert_sha256`], so future connections must present the
+    /// same cert. The handshake signature is still verified, so the server
+    /// must hold the cert's key; the CA chain and the names in the cert are
+    /// not checked.
     pub accept_invalid_certs: bool,
 
     /// Pinned leaf-certificate SHA-256, hex-encoded (lowercase).
