@@ -1,11 +1,13 @@
 //! FTP transport via `suppaftp::AsyncFtpStream` (tokio backend).
+//!
+//! Connecting and logging in are shared with FTPS: see
+//! [`ftp_impl::open_control`] and [`ftp_impl::log_in`].
 
 use suppaftp::tokio::AsyncFtpStream;
-use suppaftp::types::FileType;
 use zeroize::Zeroizing;
 
-use crate::error::{BlinkError, Result};
-use crate::session::{AuthMethod, Session};
+use crate::error::Result;
+use crate::session::Session;
 
 use super::ftp_impl;
 
@@ -37,41 +39,8 @@ impl FtpTransport {
     }
 
     async fn open(session: &Session, password: Option<&str>) -> Result<AsyncFtpStream> {
-        if !matches!(session.auth, AuthMethod::Password) {
-            return Err(BlinkError::auth(
-                "FTP only supports password (or anonymous) auth",
-            ));
-        }
-
-        let addr = format!("{}:{}", session.host, session.port);
-        let mut stream = AsyncFtpStream::connect(&addr)
-            .await
-            .map_err(|e| BlinkError::connect(format!("ftp connect to {addr}: {e}")))?;
-
-        // Dial the data connection at the control connection's peer, on the
-        // port the PASV reply gives, not at the address the reply names. The
-        // server picks that address, so a hostile one could aim uploads at
-        // any host it likes, such as a service on the user's own network;
-        // NAT'd servers that advertise a private address need this anyway.
-        // curl has ignored the PASV address by default since 7.74.
-        stream.set_passive_nat_workaround(true);
-
-        let (user, pw) = if session.username.is_empty() {
-            ("anonymous", "anonymous@")
-        } else {
-            let pw = password.unwrap_or("");
-            (session.username.as_str(), pw)
-        };
-        stream
-            .login(user, pw)
-            .await
-            .map_err(|e| BlinkError::auth(format!("ftp login: {e}")))?;
-
-        stream
-            .transfer_type(FileType::Binary)
-            .await
-            .map_err(|e| BlinkError::transport(format!("set binary: {e}")))?;
-
+        let mut stream: AsyncFtpStream = ftp_impl::open_control(session, "ftp").await?;
+        ftp_impl::log_in(&mut stream, session, password, "ftp").await?;
         Ok(stream)
     }
 }

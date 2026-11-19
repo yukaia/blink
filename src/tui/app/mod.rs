@@ -16,7 +16,7 @@ use crate::checkpoint::{Checkpoint, CheckpointKind};
 use crate::config::Config;
 use crate::error::Result;
 use crate::preview;
-use crate::session::{AuthMethod, Session};
+use crate::session::Session;
 use crate::theme::Theme;
 use crate::transfer::{Dispatcher, TransferJob, TransferManager};
 use crate::transport::{self, RemoteEntry, Transport};
@@ -616,18 +616,7 @@ impl App {
         // in the right context.
         if let Some(session) = self.autoconnect.take() {
             self.pending_session_unsaved = self.autoconnect_unsaved;
-            match &session.auth {
-                AuthMethod::Password => {
-                    self.pending_session = Some(session);
-                    self.password_input.zeroize();
-                    self.screen = Screen::PasswordPrompt;
-                }
-                AuthMethod::Key { .. } | AuthMethod::Agent => {
-                    self.pending_session = Some(session.clone());
-                    self.pending_password = None;
-                    self.start_connect(session, None);
-                }
-            }
+            self.begin_connect(session);
         }
 
         loop {
@@ -1155,6 +1144,22 @@ impl App {
     /// Spawn a connect task. The result lands as `AppEvent::Connected` /
     /// `AppEvent::ConnectFailed` / `AppEvent::ConnectKeyNeedsPassphrase` and
     /// is processed by [`Self::handle_app_event`].
+    /// Start connecting to `session`: ask for its password first if it
+    /// needs one, otherwise connect now. An anonymous FTP or FTPS login
+    /// needs none — blink sends `anonymous@`, so a password typed in was
+    /// asked for and then ignored.
+    pub(super) fn begin_connect(&mut self, session: Session) {
+        if session.needs_password() {
+            self.pending_session = Some(session);
+            self.password_input.zeroize();
+            self.screen = Screen::PasswordPrompt;
+        } else {
+            self.pending_session = Some(session.clone());
+            self.pending_password = None;
+            self.start_connect(session, None);
+        }
+    }
+
     fn start_connect(&mut self, session: Session, password: Option<zeroize::Zeroizing<String>>) {
         self.push_log(
             LogLevel::Info,
@@ -2500,6 +2505,21 @@ mod tests {
             vec!["/r/0".to_string()],
             "the failed job is resumed under the new name",
         );
+    }
+
+    /// An anonymous FTP or FTPS session connects without the password
+    /// prompt; a named one still asks.
+    #[tokio::test]
+    async fn an_anonymous_ftp_session_connects_without_asking_for_a_password() {
+        for url in ["ftp://127.0.0.1:1", "ftps://127.0.0.1:1"] {
+            let mut a = app();
+            a.begin_connect(Session::from_url(url).unwrap());
+            assert_ne!(a.screen, Screen::PasswordPrompt, "{url}");
+            assert!(a.pending_password.is_none());
+        }
+        let mut a = app();
+        a.begin_connect(Session::from_url("ftp://alice@127.0.0.1:1").unwrap());
+        assert_eq!(a.screen, Screen::PasswordPrompt);
     }
 
     /// Two blinks on one session each wrote their own copy of the

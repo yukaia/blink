@@ -20,6 +20,9 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
   where the server offers them.
 - **FTPS** with explicit TLS (RFC 4217) via rustls — pure Rust, no system
   TLS library needed
+- For FTP and FTPS, a session with no username logs in anonymously, without
+  asking for a password. Over IPv6, data connections use `EPSV` (RFC 2428),
+  which IPv6 servers expect; over IPv4, PASV.
 - **ssh-agent** auth on Unix (uses `$SSH_AUTH_SOCK`); on Windows, the
   built-in OpenSSH agent (`\\.\pipe\openssh-ssh-agent`) is tried first,
   falling back to Pageant

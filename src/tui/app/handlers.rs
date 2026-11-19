@@ -15,7 +15,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use zeroize::Zeroize;
 
 use crate::checkpoint::CheckpointKind;
-use crate::session::{AuthMethod, Session};
+use crate::session::Session;
 use crate::transport;
 use crate::tui::state::{EditField, PendingCancel, PostConnectOffer, ViewerKind};
 
@@ -67,18 +67,7 @@ impl App {
                 };
                 // Came from the saved-sessions list, so it is already on disk.
                 self.pending_session_unsaved = false;
-                match &s.auth {
-                    AuthMethod::Password => {
-                        self.pending_session = Some(s);
-                        self.password_input.zeroize();
-                        self.screen = Screen::PasswordPrompt;
-                    }
-                    AuthMethod::Key { .. } | AuthMethod::Agent => {
-                        self.pending_session = Some(s.clone());
-                        self.pending_password = None;
-                        self.start_connect(s, None);
-                    }
-                }
+                self.begin_connect(s);
             }
             KeyCode::Char('n') => {
                 self.new_session_input.clear();
@@ -116,18 +105,7 @@ impl App {
                         // Built from a URL — `from_url` persists nothing, so
                         // the connect flow will offer to save it.
                         self.pending_session_unsaved = true;
-                        match &session.auth {
-                            AuthMethod::Password => {
-                                self.pending_session = Some(session);
-                                self.password_input.zeroize();
-                                self.screen = Screen::PasswordPrompt;
-                            }
-                            AuthMethod::Key { .. } | AuthMethod::Agent => {
-                                self.pending_session = Some(session.clone());
-                                self.pending_password = None;
-                                self.start_connect(session, None);
-                            }
-                        }
+                        self.begin_connect(session);
                     }
                     Err(e) => {
                         self.new_session_error = Some(e.to_string());

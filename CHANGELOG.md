@@ -40,6 +40,9 @@ the git history for those.
 
 ### Changed
 
+- **Anonymous FTP and FTPS don't ask for a password.** A session with no
+  username logs in as `anonymous`, which ignored whatever password was
+  typed into the prompt.
 - **A transfer whose connection drops is retried once**, on a fresh
   connection, whichever connection it was using; a download resumes from
   its partial file. Only connections reused between jobs got the retry.
@@ -179,6 +182,15 @@ the git history for those.
 
 ### Fixed
 
+- **FTP and FTPS work with IPv6 servers.** Data connections used PASV,
+  which can't describe an IPv6 address and which IPv6 servers commonly
+  refuse, so every listing and transfer failed after a good login. Over
+  IPv6 they now use `EPSV`.
+- **A busy FTP server isn't reported as a wrong password.** Every login
+  failure read `authentication failed`, including `421 Too many
+  connections` and a reset mid-login; only a refused login (`530`) does
+  now, and the rest are treated like any other dropped connection.
+- **FTP connect errors bracket an IPv6 address** (`[::1]:21`).
 - **Transfer errors keep the server's reason.** A refused FTP transfer
   showed `not found: stor /path` whatever the server said (permission
   denied, disk quota exceeded); SFTP errors dropped the server's message
