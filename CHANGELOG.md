@@ -46,6 +46,14 @@ the git history for those.
 
 ### Changed
 
+- **Long log lines wrap.** A message wider than the log pane ran off its
+  edge, and for some errors the log is the only place the reason is
+  given. Each entry now wraps under its timestamp, breaking at spaces;
+  scrolling moves by rows, and "↓ N newer" still counts entries.
+- **The status bar shows the keys for the focused pane.** It showed the
+  file keys everywhere, `[space] select` over the Transfers pane
+  included, and never the keys that act there. It also names `^u` upload
+  beside `^d` download.
 - **The FTPS toggle in the session editor says what it does.** It was
   labelled `tls verify:`, where a tick meant the chain was *not* checked,
   and ticked it warned that it "disables TLS protections". Since pinning,
@@ -253,6 +261,20 @@ the git history for those.
 
 ### Fixed
 
+- **Queued transfers show in the Transfers pane.** Only running jobs had
+  rows, so a batch waiting behind the parallel limit or a pause was
+  invisible: paused before anything started, the pane said "no active
+  transfers". The pane's corner now reads "+N queued", and with nothing
+  running it says how many wait.
+- **A long file name keeps its size and extension on screen.** The name
+  was never shortened, so it pushed the size off the pane; it now loses
+  its middle, as a transfer's does.
+- **Wide characters no longer push text off the panes.** Shortened paths,
+  the filter and transfer names were measured in characters, so CJK or
+  emoji names came out wider than their room: a path lost the tail that
+  says where the pane is, and a transfer row lost its speed.
+- **The file pane footer says "1 item"**, and "3 of 400 items" while a
+  filter hides some.
 - **The viewer's line number matches the text after a resize.** Making
   the terminal taller at the end of a file showed an earlier page while
   the hint still named the old top line.
