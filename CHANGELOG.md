@@ -233,6 +233,18 @@ the git history for those.
 
 ### Fixed
 
+- **A failed start no longer leaves the terminal in raw mode.** Raw mode
+  went on first, and if switching to the alternate screen failed after it,
+  blink exited with it still on: a shell with no echo and no line editing.
+- **Leaving the TUI undoes everything it can.** A failure to turn raw mode
+  off stopped the rest, leaving the alternate screen up and the cursor
+  hidden; and a failure to restore the terminal was dropped silently. Each
+  step now runs regardless, and a failure is reported.
+- **A background task's crash is shown in the log.** It went only to the
+  debug log, which goes nowhere unless `BLINK_LOG_FILE` is set, and the
+  task never sent the answer the screen was waiting for, so a connect or a
+  listing could wait forever with no reason given.
+
 - **The bottom pane's tabs answer only where they're drawn.** In a terminal
   too narrow for the title, the labels are cut short, but their click areas
   ran on past them, so a click on the pane's corner switched to a tab
