@@ -1601,6 +1601,7 @@ impl Transport for SftpTransport {
             // from a clean state.
             let offset = super::resume_offset(local_path, remote_path, stamp, &origin).await?;
 
+            super::refuse_foreign_symlinks_above(local_path).await?;
             if let Some(parent) = local_path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
@@ -4467,6 +4468,36 @@ mod integration {
             echo: true,
         };
         assert!(super::kbd_answers(&[visible], "pw", false).is_err());
+    }
+
+    /// A folder above the download swapped for a planted symlink after the
+    /// walk checked it, while the overwrite prompt was up, say: the download
+    /// refuses before making anything.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_download_refuses_a_symlink_planted_above_it_since_the_walk() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/a.txt".to_string(), b"data".to_vec());
+        let (port, _c) = start_server(store).await;
+        let mut transport = connect(port).await;
+        let home = crate::paths::test_home();
+        let target = home.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, home.path().join("dl")).unwrap();
+
+        // The test's own link stands in for another user's.
+        crate::transport::EFFECTIVE_UID.set(Some(rustix::process::geteuid().as_raw() + 1));
+        let result = transport
+            .download("/a.txt", &home.path().join("dl/sub/a.txt"), None)
+            .await;
+        crate::transport::EFFECTIVE_UID.set(None);
+
+        let err = result.expect_err("planted link above the file");
+        assert!(err.to_string().contains("owned by another user"), "{err}");
+        assert!(!target.join("sub").exists(), "nothing made through it");
     }
 
     // ---- uploads ------------------------------------------------------

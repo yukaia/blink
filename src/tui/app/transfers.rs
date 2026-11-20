@@ -145,6 +145,7 @@ impl App {
             let mut plan: Vec<PlannedJob> = Vec::new();
             let mut symlinks_skipped: usize = 0;
             let mut unencodable_skipped: usize = 0;
+            let mut unreadable_skipped: usize = 0;
             for (local, remote, is_dir) in roots {
                 let chunk = if is_dir {
                     let walk = walk_local(&local, &remote).await;
@@ -152,6 +153,7 @@ impl App {
                         Ok(r) => {
                             symlinks_skipped += r.symlinks_skipped;
                             unencodable_skipped += r.unencodable_skipped;
+                            unreadable_skipped += r.unreadable_skipped;
                             r.plan
                         }
                         Err(e) => {
@@ -193,7 +195,7 @@ impl App {
                 conflict_indices: conflicts.indices,
                 symlinks_skipped,
                 unencodable_skipped,
-                unreadable_skipped: 0,
+                unreadable_skipped,
                 unsafe_skipped: 0,
                 unverifiable_uploads: conflicts.unverifiable,
                 local_dirs: Vec::new(),
