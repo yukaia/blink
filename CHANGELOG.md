@@ -233,6 +233,11 @@ the git history for those.
 
 ### Fixed
 
+- **A stall no longer sets off a burst of redraws.** The redraw tick made up
+  every tick it missed, so a one-second stall (a large image rendering)
+  was followed by ten full redraws back to back. Missed ticks are now
+  skipped.
+
 - **A plain PKCS#8 key loads even with a passphrase given.** russh decodes
   it as an encrypted one when handed a passphrase, and failed on its
   structure. A passphrase left over for a key that no longer needs one (the
