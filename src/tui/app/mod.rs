@@ -1248,8 +1248,8 @@ impl App {
     /// Lines of log the pane showed when last drawn; one before then.
     pub(super) fn log_rows(&self) -> usize {
         self.hit
-            .log_body
             .get()
+            .log_body
             .map_or(1, |r| usize::from(r.height).max(1))
     }
 
@@ -1273,8 +1273,8 @@ impl App {
     fn handle_help(&mut self, key: KeyEvent) {
         let page = self
             .hit
-            .help_body
             .get()
+            .help_body
             .map_or(1, |r| usize::from(r.height).max(1));
         match key.code {
             KeyCode::Char('?') | KeyCode::Esc => self.screen = self.help_return.clone(),
@@ -3469,7 +3469,7 @@ mod tests {
     #[test]
     fn help_pages_by_its_visible_height() {
         let mut a = help_on_80x24();
-        let page = usize::from(a.hit.help_body.get().unwrap().height);
+        let page = usize::from(a.hit.get().help_body.unwrap().height);
         let max = crate::tui::views::help::max_scroll(&a);
 
         a.dispatch_key(press(KeyCode::PageDown));
@@ -3494,7 +3494,7 @@ mod tests {
     fn the_wheel_scrolls_help_only_over_its_body() {
         use crossterm::event::{MouseEvent, MouseEventKind};
         let mut a = help_on_80x24();
-        let body = a.hit.help_body.get().unwrap();
+        let body = a.hit.get().help_body.unwrap();
         let wheel = |column, row| MouseEvent {
             kind: MouseEventKind::ScrollDown,
             column,
@@ -3525,7 +3525,7 @@ mod tests {
     // draw into a TestBackend and read the recorded areas back, checking
     // each against the text the renderer actually put there.
 
-    use super::tests_support::{app_on_main, draw};
+    use super::tests_support::{app_on_main, draw, draw_sized};
 
     fn text_at(buf: &ratatui::buffer::Buffer, r: ratatui::layout::Rect) -> String {
         (r.x..r.x + r.width)
@@ -3537,14 +3537,14 @@ mod tests {
     fn the_file_list_area_is_recorded_where_its_rows_are_drawn() {
         let a = app_on_main(5);
         let buf = draw(&a);
-        let list = a.hit.local_list.get().expect("recorded");
+        let list = a.hit.get().local_list.expect("recorded");
         let first = ratatui::layout::Rect { height: 1, ..list };
         assert!(
             text_at(&buf, first).contains("file000"),
             "{:?}",
             text_at(&buf, first)
         );
-        assert!(a.hit.local_pane.get().unwrap().width > list.width);
+        assert!(a.hit.get().local_pane.unwrap().width > list.width);
     }
 
     #[test]
@@ -3552,10 +3552,34 @@ mod tests {
         let a = app_on_main(0);
         let buf = draw(&a);
         assert_eq!(
-            text_at(&buf, a.hit.transfers_tab.get().unwrap()),
+            text_at(&buf, a.hit.get().transfers_tab.unwrap()),
             " TRANSFERS "
         );
-        assert_eq!(text_at(&buf, a.hit.log_tab.get().unwrap()), " LOG ");
+        assert_eq!(text_at(&buf, a.hit.get().log_tab.unwrap()), " LOG ");
+    }
+
+    /// Too narrow for the title, ratatui cuts the labels short; their
+    /// areas must not run on past what is drawn, or a click on the pane's
+    /// corner switches to a tab nobody can see.
+    #[test]
+    fn the_bottom_tabs_answer_only_where_the_title_is_drawn() {
+        let a = app_on_main(0);
+        let buf = draw_sized(&a, 16, 24);
+        let pane = a.hit.get().bottom_pane.expect("recorded");
+        for (label, tab) in [
+            (" TRANSFERS ", a.hit.get().transfers_tab),
+            (" LOG ", a.hit.get().log_tab),
+        ] {
+            let Some(tab) = tab else { continue };
+            assert!(
+                tab.right() < pane.right(),
+                "{label:?} reaches the pane's corner: {tab:?} in {pane:?}"
+            );
+            // What it covers is the part of its label that is drawn.
+            assert_eq!(text_at(&buf, tab), label[..usize::from(tab.width)]);
+        }
+        // Unclipped, LOG's area ran three columns past the 16-column screen.
+        assert!(a.hit.get().log_tab.unwrap().width < 5);
     }
 
     #[test]
@@ -3563,7 +3587,7 @@ mod tests {
         let mut a = app();
         a.sessions = vec![Session::from_url("sftp://me@alpha.example").unwrap()];
         let buf = draw(&a);
-        let rows = a.hit.session_list.get().expect("recorded");
+        let rows = a.hit.get().session_list.expect("recorded");
         assert!(
             text_at(&buf, ratatui::layout::Rect { height: 1, ..rows }).contains("alpha.example")
         );
@@ -3674,11 +3698,11 @@ mod tests {
     fn a_new_draw_forgets_areas_no_longer_drawn() {
         let mut a = app_on_main(1);
         draw(&a);
-        assert!(a.hit.local_list.get().is_some());
+        assert!(a.hit.get().local_list.is_some());
         a.screen = Screen::SessionSelect;
         draw(&a);
         assert!(
-            a.hit.local_list.get().is_none(),
+            a.hit.get().local_list.is_none(),
             "the session selector draws no panes"
         );
     }
