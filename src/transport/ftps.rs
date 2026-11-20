@@ -1206,6 +1206,16 @@ mod integration {
         assert_eq!(super::recorded_certificate(&recorded).unwrap(), "ab");
     }
 
+    /// The machine's real store, as `trusted_roots` reads it outside tests:
+    /// whatever it holds, loading it never fails the connect, and the
+    /// built-in roots are there either way.
+    #[test]
+    fn the_systems_own_store_loads_alongside_the_built_in_roots() {
+        let system = rustls_native_certs::load_native_certs();
+        let store = super::root_store(system.certs);
+        assert!(store.len() >= webpki_roots::TLS_SERVER_ROOTS.len());
+    }
+
     #[test]
     fn the_trusted_roots_are_the_built_in_ones_and_the_system_ones() {
         let ca = CertificateDer::from(der(certs::CA_CERT));

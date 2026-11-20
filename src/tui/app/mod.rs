@@ -686,10 +686,14 @@ impl App {
     }
 
     /// Move [`crate::paths::take_notices`] into the log: a config folder
-    /// found open to other users, and made private.
+    /// found open to other users, and made private. And a background
+    /// task's panic, from [`crate::tui::take_background_panics`].
     fn drain_path_notices(&mut self) {
         for note in crate::paths::take_notices() {
             self.push_log(LogLevel::Warn, note);
+        }
+        for panic in crate::tui::take_background_panics() {
+            self.push_log(LogLevel::Error, panic);
         }
     }
 
@@ -5449,6 +5453,24 @@ mod pane_audit_tests {
                 assert!(row.trim_end().ends_with(&version), "width {width}: {row}");
             }
         }
+    }
+
+    /// A background task's panic, queued by the panic hook, reaches the log
+    /// pane as an error; it used to go only to `tracing`.
+    #[test]
+    fn a_background_panic_is_shown_in_the_log() {
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        crate::tui::note_background_panic("a background task failed: boom".into());
+
+        a.drain_path_notices();
+
+        assert!(
+            a.log
+                .iter()
+                .any(|l| l.message.contains("boom") && l.level == LogLevel::Error),
+            "{:?}",
+            a.log.iter().map(|l| &l.message).collect::<Vec<_>>()
+        );
     }
 
     /// A folder tightened mid-session (here, the first batch's checkpoint
