@@ -6,28 +6,108 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
 use crate::tui::app::{App, Pane};
 
-/// Truncate `s` to `max` chars by replacing the middle with `…`, so both
-/// the head and the tail of a long path stay readable.
+/// Columns `s` takes in the terminal.
+fn columns(s: &str) -> usize {
+    UnicodeWidthStr::width(s)
+}
+
+/// Columns `c` takes in the terminal.
+fn char_columns(c: char) -> usize {
+    UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// Truncate `s` to `max` terminal columns by replacing the middle with `…`,
+/// so both the head and the tail of a long path stay readable.
+///
+/// Measured in columns, not characters: a CJK or emoji character takes
+/// two, and counting it as one left a "shortened" path still wider than
+/// its room, for ratatui to cut at the right — losing the tail this keeps.
 pub(crate) fn truncate_middle(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
-    let n = s.chars().count();
-    if n <= max {
+    if columns(s) <= max {
         return s.to_string();
     }
     if max == 1 {
         return "…".into();
     }
     let keep = max - 1;
-    let head = keep / 2;
-    let tail = keep - head;
-    let chars: Vec<char> = s.chars().collect();
-    let head_part: String = chars[..head].iter().collect();
-    let tail_part: String = chars[n - tail..].iter().collect();
-    format!("{head_part}…{tail_part}")
+    let mut head = String::new();
+    let mut head_w = 0;
+    for c in s.chars() {
+        let w = char_columns(c);
+        if head_w + w > keep / 2 {
+            break;
+        }
+        head.push(c);
+        head_w += w;
+    }
+    // Whatever the head left over, a wide character not fitting, goes to
+    // the tail.
+    let mut tail = Vec::new();
+    let mut tail_w = 0;
+    for c in s.chars().rev() {
+        let w = char_columns(c);
+        if tail_w + w > keep - head_w {
+            break;
+        }
+        tail.push(c);
+        tail_w += w;
+    }
+    let tail: String = tail.into_iter().rev().collect();
+    format!("{head}…{tail}")
+}
+
+/// Columns the timestamp takes before a log message: `" [HH:MM:SS] "`.
+pub(crate) const LOG_PREFIX_W: usize = 12;
+
+/// `message` broken into the rows the log pane draws it on, in a pane
+/// `width` columns wide: each at most the width less the timestamp, broken
+/// after a space where one falls in the row, and mid-word where none does.
+///
+/// The log is the only place some errors are given in full, and a line
+/// running past the pane used to be cut off there. The app counts rows
+/// with this too, to scroll by them, so the two can't disagree.
+pub(crate) fn log_message_rows(message: &str, width: usize) -> Vec<String> {
+    let room = width.saturating_sub(LOG_PREFIX_W).max(1);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_w = 0;
+    // The byte just past the last space in `row`, and the columns up to it.
+    let mut after_space: Option<(usize, usize)> = None;
+    for c in message.chars() {
+        let w = char_columns(c);
+        if row_w + w > room && !row.is_empty() {
+            match after_space.take() {
+                Some((at, at_w)) if at < row.len() => {
+                    let rest = row.split_off(at);
+                    rows.push(row.trim_end().to_string());
+                    row = rest;
+                    row_w -= at_w;
+                }
+                _ => {
+                    rows.push(std::mem::take(&mut row).trim_end().to_string());
+                    row_w = 0;
+                }
+            }
+        }
+        // A row broken off just before a space doesn't open with it.
+        if c == ' ' && row.is_empty() && !rows.is_empty() {
+            continue;
+        }
+        row.push(c);
+        row_w += w;
+        if c == ' ' {
+            after_space = Some((row.len(), row_w));
+        }
+    }
+    rows.push(row);
+    rows
 }
 
 // ---------------------------------------------------------------------------
@@ -85,7 +165,7 @@ pub mod file_pane {
             .filter
             .as_ref()
             .map(|q| format!("  /{}", crate::error::sanitize(q.clone())));
-        let filter_w = filter.as_ref().map_or(0, |q| q.chars().count());
+        let filter_w = filter.as_deref().map_or(0, columns);
         let path_room = usize::from(inner.width).saturating_sub(1 + filter_w);
         let mut path_spans = vec![Span::styled(
             format!(
@@ -118,9 +198,9 @@ pub mod file_pane {
         });
         let h = list_area.height as usize;
         let len = state.entries.len();
+        // One cursor for both the highlight and the scrolling.
         let cursor = state.cursor.min(len.saturating_sub(1));
-        let window =
-            crate::tui::state::scrolled_window(state.view_offset.get(), state.cursor, len, h);
+        let window = crate::tui::state::scrolled_window(state.view_offset.get(), cursor, len, h);
         state.view_offset.set(window.start);
 
         let mut lines = Vec::with_capacity(window.len());
@@ -146,28 +226,30 @@ pub mod file_pane {
             };
             let sel_marker = if is_selected { "☑ " } else { "" };
 
-            let mut row = vec![
-                Span::raw(" "),
-                Span::raw(icon),
-                Span::styled(sel_marker.to_string(), row_style),
-                Span::styled(e.display_name.clone(), row_style),
-            ];
-
             // Right-align the size column.
             let size_str = if e.is_dir {
                 "—".to_string()
             } else {
                 crate::transfer::format_bytes(e.size)
             };
-            // `Span::width()` returns the *display* width via
-            // `unicode-width`, so a CJK / emoji name in the file pane is
-            // padded based on cells it actually occupies, not on character
-            // count. The previous `chars().count()` re-counted on every
-            // frame for every visible row; this is the cached
-            // unicode-width sum the rest of ratatui already uses.
-            let used: usize = row.iter().map(|s| s.width()).sum();
+            // The name gets what the row has left after the lead, icon,
+            // marker, a gap, the size and the two columns after it, losing
+            // its middle past that as a transfer's does. Uncut, a long name
+            // pushed the size off the pane and its extension with it.
             let avail = list_area.width as usize;
-            let pad = avail.saturating_sub(used + size_str.chars().count() + 2);
+            let fixed = 1 + columns(icon) + columns(sel_marker) + 1 + columns(&size_str) + 2;
+            let name = truncate_middle(&e.display_name, avail.saturating_sub(fixed));
+
+            let mut row = vec![
+                Span::raw(" "),
+                Span::raw(icon),
+                Span::styled(sel_marker.to_string(), row_style),
+                Span::styled(name, row_style),
+            ];
+            // Display width, so a CJK or emoji name is padded by the cells
+            // it occupies.
+            let used: usize = row.iter().map(|s| s.width()).sum();
+            let pad = avail.saturating_sub(used + columns(&size_str) + 2);
             row.push(Span::raw(" ".repeat(pad)));
             row.push(Span::styled(size_str, Style::default().fg(app.theme.dim)));
             row.push(Span::raw(" "));
@@ -185,18 +267,29 @@ pub mod file_pane {
         // hiding — the footer should report what a transfer would act on.
         let selected_count = state.selected_count();
         let selected_size: u64 = state.selected_size();
-        // `..` is a way out, not an item.
+        // `..` is a way out, not an item. With a filter on, the rows shown
+        // are counted against the folder's, so "3 items" doesn't read as the
+        // whole of a folder of 400.
         let items = state.entries.iter().filter(|e| !e.is_parent()).count();
-        let footer_text = if selected_count == 0 {
-            format!(" {items} items")
-        } else {
-            format!(
-                " {} items · {} selected ({})",
+        let footer_text = format!(
+            " {}{}",
+            item_count(
                 items,
-                selected_count,
-                crate::transfer::format_bytes(selected_size),
-            )
-        };
+                state
+                    .filter
+                    .is_some()
+                    .then(|| { state.all_rows().iter().filter(|e| !e.is_parent()).count() })
+            ),
+            if selected_count == 0 {
+                String::new()
+            } else {
+                format!(
+                    " · {} selected ({})",
+                    selected_count,
+                    crate::transfer::format_bytes(selected_size),
+                )
+            }
+        );
         f.render_widget(
             Paragraph::new(Span::styled(
                 footer_text,
@@ -204,6 +297,17 @@ pub mod file_pane {
             )),
             inner_layout[2],
         );
+    }
+
+    /// `shown` items, or `shown of total` while a filter hides some, in the
+    /// singular for one.
+    pub(crate) fn item_count(shown: usize, total: Option<usize>) -> String {
+        let of = total.unwrap_or(shown);
+        let noun = if of == 1 { "item" } else { "items" };
+        match total {
+            Some(total) => format!("{shown} of {total} {noun}"),
+            None => format!("{shown} {noun}"),
+        }
     }
 }
 
@@ -228,16 +332,24 @@ pub mod bottom_pane {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color))
             .title(tab_title(app));
-        // Scrolled back, say so: new lines arrive out of sight.
-        let rows = usize::from(area.height.saturating_sub(2));
-        let newer = app.log_scroll.min(app.log.len().saturating_sub(rows));
-        if app.bottom_pane == BottomPane::Log && newer > 0 {
+        let body = Block::default().borders(Borders::ALL).inner(area);
+        let log = (app.bottom_pane == BottomPane::Log).then(|| log_window(app, body));
+        let corner = match &log {
+            // Scrolled back, say so: new lines arrive out of sight.
+            Some(w) if w.newer > 0 => Some(format!(" ↓ {} newer ", w.newer)),
+            Some(_) => None,
+            // Only running jobs have rows; the queue behind them, which
+            // quitting would discard too, is counted here, so a batch
+            // waiting behind the limit or a pause isn't invisible.
+            None => match app.queue_counts() {
+                (_, 0) => None,
+                (_, pending) => Some(format!(" +{pending} queued ")),
+            },
+        };
+        if let Some(text) = corner {
             block = block.title_top(
-                Line::from(Span::styled(
-                    format!(" ↓ {newer} newer "),
-                    Style::default().fg(app.theme.accent),
-                ))
-                .right_aligned(),
+                Line::from(Span::styled(text, Style::default().fg(app.theme.accent)))
+                    .right_aligned(),
             );
         }
         let inner = block.inner(area);
@@ -260,9 +372,12 @@ pub mod bottom_pane {
             a.log_tab = tab(log_x, LOG_TAB);
         });
 
-        match app.bottom_pane {
-            BottomPane::Transfers => render_transfers(f, app, inner),
-            BottomPane::Log => render_log(f, app, inner),
+        match log {
+            None => render_transfers(f, app, inner),
+            Some(w) => {
+                app.hit.set(|a| a.log_body = Some(inner));
+                f.render_widget(Paragraph::new(w.lines), inner);
+            }
         }
     }
 
@@ -316,9 +431,19 @@ pub mod bottom_pane {
     fn render_transfers(f: &mut Frame, app: &App, area: Rect) {
         app.hit.set(|a| a.transfer_list = Some(area));
         let jobs = app.active_jobs();
+        let paused = app
+            .transfer_manager
+            .as_ref()
+            .map(|m| m.is_paused())
+            .unwrap_or(false);
         if jobs.is_empty() {
+            let text = match (app.queue_counts().1, paused) {
+                (0, _) => " no active transfers".to_string(),
+                (n, true) => format!(" none running · {n} queued, paused"),
+                (n, false) => format!(" none running · {n} queued"),
+            };
             let p = Paragraph::new(Line::from(Span::styled(
-                " no active transfers",
+                text,
                 Style::default().fg(app.theme.dim),
             )));
             f.render_widget(p, area);
@@ -327,11 +452,6 @@ pub mod bottom_pane {
 
         let focused = app.active_pane == Pane::Transfers;
         let cursor = app.transfer_cursor.min(jobs.len().saturating_sub(1));
-        let paused = app
-            .transfer_manager
-            .as_ref()
-            .map(|m| m.is_paused())
-            .unwrap_or(false);
 
         // Up to MAX_PARALLEL jobs run at once, more than the pane has rows:
         // the list scrolls to keep the cursor, and what `c` cancels, in view.
@@ -396,14 +516,17 @@ pub mod bottom_pane {
         };
 
         let percent_str = format!("{percent:3}%");
-        let prefix_w = 4; // " ↓ " plus a leading space
-        let right_w =
-            percent_str.chars().count() + 1 + BAR_WIDTH + 1 + speed_str.chars().count() + 1;
+        // The leading space and the arrow's two columns before the name,
+        // and the one space after it before the percent.
+        let prefix_w = 1 + 2 + 1;
+        let right_w = columns(&percent_str) + 1 + BAR_WIDTH + 1 + columns(&speed_str) + 1;
         let avail_for_name = width.saturating_sub(prefix_w + right_w);
 
+        // Padded by columns: a wide name counted by characters pushed the
+        // percent, bar and speed off the row.
         let display_name = crate::tui::app::name_for_job(job);
         let name_str = super::truncate_middle(&display_name, avail_for_name);
-        let name_pad = avail_for_name.saturating_sub(name_str.chars().count());
+        let name_pad = avail_for_name.saturating_sub(columns(&name_str));
 
         let percent_color = if paused {
             app.theme.dim
@@ -456,33 +579,78 @@ pub mod bottom_pane {
         }
     }
 
+    /// [`render_transfer_line`] for a job, unpaused and off the cursor.
+    #[cfg(test)]
+    pub(crate) fn transfer_line_for_test(
+        app: &App,
+        width: usize,
+        job: &crate::transfer::TransferJob,
+    ) -> Line<'static> {
+        render_transfer_line(app, width, job, false, false)
+    }
+
     // ----- Log page -------------------------------------------------------
 
-    fn render_log(f: &mut Frame, app: &App, area: Rect) {
-        app.hit.set(|a| a.log_body = Some(area));
-        let h = area.height as usize;
-        let total = app.log.len();
-        let scroll = app.log_scroll.min(total.saturating_sub(h));
-        let end = total - scroll;
-        let start = end.saturating_sub(h);
+    /// What the log page draws in `area`, and how many entries lie wholly
+    /// below it.
+    struct LogWindow {
+        lines: Vec<Line<'static>>,
+        newer: usize,
+    }
 
-        let mut lines = Vec::with_capacity(area.height as usize);
-        for entry in app.log.range(start..end) {
-            let ts = entry.time.format("%H:%M:%S").to_string();
+    /// The rows of the log that fit `area`, scrolled back
+    /// [`App::log_scroll`] rows from the newest.
+    ///
+    /// Each entry wraps onto as many rows as its message takes (see
+    /// [`super::log_message_rows`]), continuation rows indented under the
+    /// message rather than the timestamp. A long error used to run off the
+    /// pane's edge with nothing to show the rest.
+    fn log_window(app: &App, area: Rect) -> LogWindow {
+        let h = usize::from(area.height);
+        let width = usize::from(area.width);
+        // Rows newest first, walked back only as far as the window needs;
+        // `ends[i]` is where the `i`th-newest entry's rows stop.
+        let mut rev: Vec<Line<'static>> = Vec::new();
+        let mut ends = Vec::new();
+        for entry in app.log.iter().rev() {
             let level_color = match entry.level {
                 LogLevel::Info => app.theme.dim,
                 LogLevel::Success => app.theme.success,
                 LogLevel::Warn => app.theme.warning,
                 LogLevel::Error => app.theme.error,
             };
-            lines.push(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(format!("[{ts}]"), Style::default().fg(app.theme.dim)),
-                Span::raw(" "),
-                Span::styled(entry.message.clone(), Style::default().fg(level_color)),
-            ]));
+            let ts = entry.time.format("%H:%M:%S").to_string();
+            let rows = super::log_message_rows(&entry.message, width);
+            let mut lines: Vec<Line<'static>> = rows
+                .into_iter()
+                .enumerate()
+                .map(|(i, text)| {
+                    let lead = if i == 0 {
+                        Span::styled(format!(" [{ts}] "), Style::default().fg(app.theme.dim))
+                    } else {
+                        Span::raw(" ".repeat(super::LOG_PREFIX_W))
+                    };
+                    Line::from(vec![
+                        lead,
+                        Span::styled(text, Style::default().fg(level_color)),
+                    ])
+                })
+                .collect();
+            while let Some(line) = lines.pop() {
+                rev.push(line);
+            }
+            ends.push(rev.len());
+            if rev.len() >= app.log_scroll.saturating_add(h) {
+                break;
+            }
         }
-        f.render_widget(Paragraph::new(lines), area);
+        // Stopped early, the window is exactly `log_scroll` rows back;
+        // having run out, it is held with the first entry at the top.
+        let skip = app.log_scroll.min(rev.len().saturating_sub(h));
+        let newer = ends.iter().filter(|&&end| end <= skip).count();
+        let mut lines: Vec<Line<'static>> = rev.drain(skip..).take(h).collect();
+        lines.reverse();
+        LogWindow { lines, newer }
     }
 
     #[cfg(test)]
@@ -577,33 +745,17 @@ pub mod status_bar {
         let dim_style = Style::default().fg(app.theme.dim);
         let bg = Style::default().bg(app.theme.cursor_bg).fg(app.theme.fg);
 
-        let mut spans: Vec<Span<'static>> = vec![
-            Span::raw(" "),
-            Span::styled("[?]", key_style),
-            Span::raw(" help  "),
-            Span::styled("[↵]", key_style),
-            Span::raw(" open  "),
-            Span::styled("[⌫]", key_style),
-            Span::raw(" up  "),
-            Span::styled("[space]", key_style),
-            Span::raw(" select  "),
-            Span::styled("[^d]", key_style),
-            Span::raw(" download  "),
-            Span::styled("[v]", key_style),
-            Span::raw(" view  "),
-            Span::styled("[^s]", key_style),
-            Span::raw(" save  "),
-            Span::styled("[tab]", key_style),
-            Span::raw(" switch  "),
-            Span::styled("[q]", key_style),
-            Span::raw(" quit"),
-        ];
+        let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+        for (key, what) in main_hints(app.active_pane) {
+            spans.push(Span::styled(*key, key_style));
+            spans.push(Span::raw(format!(" {what}  ")));
+        }
 
         // Right-align the version. Drop it silently if the terminal is too
         // narrow for both halves to fit (matches the session-select bar).
         let version_label = format!("v{} ", env!("CARGO_PKG_VERSION"));
-        let left_w: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-        let ver_w = version_label.chars().count();
+        let left_w: usize = spans.iter().map(Span::width).sum();
+        let ver_w = Span::raw(version_label.as_str()).width();
         let total_w = area.width as usize;
         if left_w + ver_w + 2 <= total_w {
             let pad = total_w - left_w - ver_w;
@@ -611,6 +763,45 @@ pub mod status_bar {
             spans.push(Span::styled(version_label, dim_style));
         }
         f.render_widget(Paragraph::new(Line::from(spans)).style(bg), area);
+    }
+
+    /// The keys the main view's bar names for the focused pane, as
+    /// `(key, what it does)`.
+    ///
+    /// The same file-pane keys used to show whatever had focus: `[space]
+    /// select` over the Transfers pane, where it does nothing, and never
+    /// the keys that act there. Download was named but not upload.
+    pub(crate) fn main_hints(pane: Pane) -> &'static [(&'static str, &'static str)] {
+        match pane {
+            Pane::Local | Pane::Remote => &[
+                ("[?]", "help"),
+                ("[↵]", "open"),
+                ("[⌫]", "up"),
+                ("[space]", "select"),
+                ("[^d]", "download"),
+                ("[^u]", "upload"),
+                ("[v]", "view"),
+                ("[^s]", "save"),
+                ("[tab]", "switch"),
+                ("[q]", "quit"),
+            ],
+            Pane::Transfers => &[
+                ("[?]", "help"),
+                ("[c]", "cancel"),
+                ("[C]", "cancel batch"),
+                ("[r/R]", "resume download/upload"),
+                ("[p]", "pause"),
+                ("[tab]", "switch"),
+                ("[q]", "quit"),
+            ],
+            Pane::Log => &[
+                ("[?]", "help"),
+                ("[↑↓]", "scroll"),
+                ("[pgup/pgdn]", "page"),
+                ("[tab]", "switch"),
+                ("[q]", "quit"),
+            ],
+        }
     }
 
     pub fn render_session_select(f: &mut Frame, app: &App, area: Rect) {
@@ -662,5 +853,335 @@ pub mod status_bar {
             left_spans.push(Span::styled(version_label, dim_style));
         }
         f.render_widget(Paragraph::new(Line::from(left_spans)).style(bg), area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LOG_PREFIX_W, log_message_rows, truncate_middle};
+    use crate::tui::app::tests_support::{app_on_main, draw, draw_sized, press_key};
+    use crate::tui::app::{App, BottomPane, LogLevel, Pane};
+    use crate::tui::state::PaneEntry;
+
+    fn text(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area;
+        (area.y..area.bottom())
+            .map(|y| {
+                (area.x..area.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn cols(s: &str) -> usize {
+        unicode_width::UnicodeWidthStr::width(s)
+    }
+
+    // --- widths ---
+
+    #[test]
+    fn truncate_middle_keeps_head_and_tail_of_ascii() {
+        assert_eq!(truncate_middle("abcdefghij", 5), "ab…ij");
+        assert_eq!(truncate_middle("abc", 5), "abc");
+        assert_eq!(truncate_middle("abc", 1), "…");
+        assert_eq!(truncate_middle("abc", 0), "");
+    }
+
+    /// Counted in characters, nine CJK characters "fit" in nine columns and
+    /// came back unshortened, eighteen wide.
+    #[test]
+    fn truncate_middle_counts_terminal_columns() {
+        let s = "日本語日本語日本語";
+        for max in 1..=18 {
+            let out = truncate_middle(s, max);
+            assert!(cols(&out) <= max, "{max}: {out:?} is {} wide", cols(&out));
+        }
+        let out = truncate_middle(s, 9);
+        assert!(out.starts_with('日') && out.ends_with('語'), "{out:?}");
+        assert_eq!(truncate_middle(s, 18), s);
+    }
+
+    /// A wide path was "shortened" to more than its room, and ratatui cut
+    /// the right end: the part that says where the pane is.
+    #[test]
+    fn a_wide_path_keeps_its_tail_on_screen() {
+        let mut a = app_on_main(1);
+        a.local.path = format!("/{}TAIL-END", "写真/".repeat(40));
+        let shown = text(&draw(&a));
+        assert!(shown.contains("TAIL-END"), "{shown}");
+    }
+
+    /// An uncut long name pushed the size off the pane, and the extension
+    /// with it.
+    #[test]
+    fn a_long_name_keeps_its_extension_and_size() {
+        let mut a = app_on_main(0);
+        a.local.set_entries(vec![PaneEntry::new(
+            format!("{}.tar.gz", "long-name-".repeat(20)),
+            false,
+            123_456,
+        )]);
+        let shown = text(&draw(&a));
+        let size = crate::transfer::format_bytes(123_456);
+        let row = shown
+            .lines()
+            .find(|l| l.contains(".tar.gz"))
+            .unwrap_or_else(|| panic!("the extension is cut:\n{shown}"));
+        assert!(row.contains(&size), "{row}");
+        assert!(row.contains('…'), "{row}");
+    }
+
+    /// The filter is measured in columns too, so a wide one doesn't push
+    /// the path's tail out.
+    #[test]
+    fn a_wide_filter_leaves_room_for_the_path_tail() {
+        let mut a = app_on_main(1);
+        a.local.path = format!("/{}TAIL-END", "dir/".repeat(30));
+        a.local.set_filter("検索検索検索検索".into());
+        let shown = text(&draw(&a));
+        assert!(shown.contains("TAIL-END"), "{shown}");
+        // The whole filter fits beside the path's tail: measured in
+        // characters, the path took the columns the filter's second half
+        // needed, and that half was cut at the border.
+        let row = shown.lines().find(|l| l.contains("TAIL-END")).unwrap();
+        assert_eq!(row.matches('索').count(), 4, "{row}");
+    }
+
+    #[test]
+    fn a_wide_transfer_name_leaves_the_speed_on_the_row() {
+        let job = crate::transfer::TransferJob {
+            id: 1,
+            direction: crate::transfer::Direction::Download,
+            remote_path: format!("/srv/{}", "日本語".repeat(20)),
+            local_path: std::path::PathBuf::from("/tmp/x"),
+            bytes_total: 1000,
+            bytes_done: 500,
+            bytes_per_sec: 100,
+            state: crate::transfer::TransferState::Active,
+            batch_id: None,
+        };
+        let a = app_on_main(0);
+        let line = super::bottom_pane::transfer_line_for_test(&a, 60, &job);
+        assert!(line.width() <= 60, "{} wide", line.width());
+        let speed = crate::transfer::format_bytes_per_sec(100);
+        let last = line
+            .spans
+            .iter()
+            .rev()
+            .find(|s| !s.content.trim().is_empty())
+            .unwrap();
+        assert!(last.content.contains(&speed), "{:?}", last.content);
+    }
+
+    // --- footer ---
+
+    #[test]
+    fn the_footer_counts_one_item_in_the_singular() {
+        let a = app_on_main(1);
+        let shown = text(&draw(&a));
+        assert!(shown.contains(" 1 item"), "{shown}");
+        assert!(!shown.contains("1 items"), "{shown}");
+    }
+
+    /// With a filter on, "3 items" read as the whole folder.
+    #[test]
+    fn a_filtered_footer_counts_against_the_folder() {
+        let mut a = app_on_main(40);
+        a.local.set_filter("file00".into());
+        let shown = text(&draw(&a));
+        assert!(shown.contains("10 of 40 items"), "{shown}");
+    }
+
+    // --- queued transfers ---
+
+    fn with_queued(a: &mut App, n: usize) -> crate::transfer::TransferManager {
+        let (m, _events) = crate::transfer::TransferManager::new(1);
+        for i in 0..n {
+            m.enqueue_download(format!("/r/f{i}"), format!("/l/f{i}").into())
+                .unwrap();
+        }
+        a.transfer_manager = Some(m.clone());
+        a.bottom_pane = BottomPane::Transfers;
+        m
+    }
+
+    /// Only running jobs have rows, and nothing said a queue stood behind
+    /// them: paused before anything started, the pane read "no active
+    /// transfers" with work waiting.
+    #[test]
+    fn the_transfers_pane_counts_the_queue() {
+        let mut a = app_on_main(0);
+        let m = with_queued(&mut a, 3);
+        let shown = text(&draw(&a));
+        assert!(shown.contains("+3 queued"), "{shown}");
+        assert!(shown.contains("none running · 3 queued"), "{shown}");
+        assert!(!shown.contains("no active transfers"), "{shown}");
+
+        m.pause();
+        let shown = text(&draw(&a));
+        assert!(shown.contains("3 queued, paused"), "{shown}");
+    }
+
+    #[test]
+    fn an_empty_queue_says_so() {
+        let mut a = app_on_main(0);
+        a.bottom_pane = BottomPane::Transfers;
+        let shown = text(&draw(&a));
+        assert!(shown.contains("no active transfers"), "{shown}");
+        assert!(!shown.contains("queued"), "{shown}");
+    }
+
+    // --- log wrapping ---
+
+    #[test]
+    fn a_log_message_breaks_after_spaces_within_its_room() {
+        let width = LOG_PREFIX_W + 10;
+        let rows = log_message_rows("one two three four", width);
+        assert_eq!(rows, ["one two", "three four"]);
+        for row in log_message_rows(&"word ".repeat(30), width) {
+            assert!(cols(&row) <= 10, "{row:?}");
+            assert!(!row.starts_with(' '), "{row:?}");
+        }
+    }
+
+    #[test]
+    fn a_word_longer_than_the_room_breaks_mid_word() {
+        let rows = log_message_rows(&"x".repeat(25), LOG_PREFIX_W + 10);
+        assert_eq!(rows, ["x".repeat(10), "x".repeat(10), "x".repeat(5)]);
+    }
+
+    #[test]
+    fn wide_characters_wrap_by_columns() {
+        for row in log_message_rows(&"日本語".repeat(10), LOG_PREFIX_W + 7) {
+            assert!(cols(&row) <= 7, "{row:?}");
+        }
+    }
+
+    #[test]
+    fn an_empty_or_short_message_is_one_row() {
+        assert_eq!(log_message_rows("", 80), [""]);
+        assert_eq!(log_message_rows("short", 80), ["short"]);
+        assert_eq!(log_message_rows("short", usize::MAX), ["short"]);
+    }
+
+    fn on_log(entries: &[String]) -> App {
+        let mut a = app_on_main(0);
+        a.log.clear();
+        for e in entries {
+            a.push_log(LogLevel::Info, e.clone());
+        }
+        a.bottom_pane = BottomPane::Log;
+        a.active_pane = Pane::Log;
+        a
+    }
+
+    /// A message longer than the pane ran off its edge, and the log is the
+    /// only place some errors are given whole.
+    #[test]
+    fn a_long_log_line_wraps_with_its_end_on_screen() {
+        let long = format!("{} THE-REAL-REASON", "upload failed because ".repeat(10));
+        let a = on_log(&[long]);
+        let shown = text(&draw(&a));
+        assert!(shown.contains("THE-REAL-REASON"), "{shown}");
+        let indent = format!("│{}", " ".repeat(LOG_PREFIX_W));
+        let continuation = shown.lines().any(|l| {
+            l.strip_prefix(indent.as_str())
+                .is_some_and(|rest| rest.starts_with(|c: char| c.is_alphabetic()))
+        });
+        assert!(
+            continuation,
+            "continuation rows sit under the message:\n{shown}"
+        );
+    }
+
+    fn long_entries(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| format!("entry {i:02} {}", "padding words ".repeat(10)))
+            .collect()
+    }
+
+    /// Scrolling counts rows: a key moves the view one row even through an
+    /// entry that wraps, and the top is reached with the first entry's
+    /// first row showing.
+    #[test]
+    fn the_log_scrolls_by_wrapped_rows_to_its_first_line() {
+        use crossterm::event::KeyCode;
+        let mut a = on_log(&long_entries(20));
+        draw(&a);
+        for _ in 0..200 {
+            press_key(&mut a, KeyCode::PageUp);
+        }
+        let shown = text(&draw(&a));
+        assert!(shown.contains("entry 00"), "{shown}");
+        press_key(&mut a, KeyCode::Down);
+        let shown = text(&draw(&a));
+        assert!(
+            !shown.contains("entry 00"),
+            "one row down moves at once:\n{shown}"
+        );
+        assert!(shown.contains("padding"), "{shown}");
+    }
+
+    /// Scrolled back, a new entry that wraps onto several rows leaves the
+    /// view exactly where it was.
+    #[test]
+    fn a_wrapped_entry_arriving_holds_a_scrolled_view() {
+        use crossterm::event::KeyCode;
+        let mut a = on_log(&long_entries(20));
+        draw(&a);
+        for _ in 0..5 {
+            press_key(&mut a, KeyCode::Up);
+        }
+        let before = text(&draw_sized(&a, 100, 30));
+        assert!(before.contains("↓ 2 newer"), "{before}");
+        a.push_log(
+            LogLevel::Info,
+            long_entries(1).remove(0).replace("00", "NEW"),
+        );
+        let after = text(&draw_sized(&a, 100, 30));
+        // The same rows, one more entry below them.
+        assert_eq!(before.replace("↓ 2 newer", "↓ 3 newer"), after);
+    }
+
+    /// The corner counts entries below the view, not rows.
+    #[test]
+    fn the_newer_count_counts_entries() {
+        use crossterm::event::KeyCode;
+        let mut a = on_log(&long_entries(20));
+        draw(&a);
+        let rows_per_entry = log_message_rows(&long_entries(1)[0], 98).len();
+        assert!(rows_per_entry > 1, "the test needs entries that wrap");
+        for _ in 0..rows_per_entry * 3 {
+            press_key(&mut a, KeyCode::Up);
+        }
+        let shown = text(&draw(&a));
+        assert!(shown.contains("↓ 3 newer"), "{shown}");
+        assert!(!shown.contains("entry 19"), "{shown}");
+        assert!(shown.contains("entry 16"), "{shown}");
+    }
+
+    // --- status bar ---
+
+    #[test]
+    fn the_status_bar_names_the_keys_of_the_focused_pane() {
+        let mut a = app_on_main(1);
+        let shown = text(&draw_sized(&a, 160, 30));
+        assert!(shown.contains("[^u] upload"), "{shown}");
+        assert!(shown.contains("[space] select"), "{shown}");
+
+        a.active_pane = Pane::Transfers;
+        let shown = text(&draw_sized(&a, 160, 30));
+        assert!(shown.contains("[c] cancel"), "{shown}");
+        assert!(shown.contains("[r/R] resume"), "{shown}");
+        assert!(!shown.contains("[space] select"), "{shown}");
+
+        a.active_pane = Pane::Log;
+        let shown = text(&draw_sized(&a, 160, 30));
+        assert!(shown.contains("[↑↓] scroll"), "{shown}");
+        assert!(!shown.contains("[^d] download"), "{shown}");
     }
 }

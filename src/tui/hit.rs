@@ -9,8 +9,9 @@
 //!
 //! The same records tell the keyboard how far a page is: `log_body`,
 //! `viewer_body` and `help_body` are the rows those bodies showed (see
-//! `App::log_rows` and `App::viewer_rows`). `log_body` serves only that;
-//! the wheel over the log is matched against `bottom_pane`.
+//! `App::log_rows` and `App::viewer_rows`). `log_body` also gives the
+//! width the log wraps at; no click is matched against it, and the wheel
+//! over the log is matched against `bottom_pane`.
 
 use std::cell::Cell;
 
@@ -28,7 +29,8 @@ pub struct Areas {
     pub log_tab: Option<Rect>,
     pub transfer_list: Option<Rect>,
     /// The log's lines, when the bottom pane shows the log. Sizes the
-    /// keyboard's page; no click is matched against it.
+    /// keyboard's page and gives the width the log wraps at; no click is
+    /// matched against it.
     pub log_body: Option<Rect>,
     /// The whole bottom pane, border included, for focus and the log's
     /// wheel.

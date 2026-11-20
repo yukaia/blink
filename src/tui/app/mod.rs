@@ -295,8 +295,9 @@ pub struct App {
     /// The first job the transfer list showed when last drawn, as
     /// [`PaneState::view_offset`] is for a file pane.
     pub transfer_view_offset: std::cell::Cell<usize>,
-    /// Lines the log is scrolled back from its newest. Zero follows new
-    /// lines as they arrive; anything else holds the view where it is.
+    /// Rows the log is scrolled back from its newest, counting each row a
+    /// long entry wraps onto. Zero follows new lines as they arrive;
+    /// anything else holds the view where it is.
     pub log_scroll: usize,
     /// Cancellation in progress: the user has pressed `c` and is being asked
     /// to confirm. Cleared on confirm/cancel.
@@ -1226,30 +1227,60 @@ impl App {
     /// so without this a listing could inject escape sequences into the log
     /// pane. Sanitizing centrally means a new call site cannot forget.
     pub fn push_log(&mut self, level: LogLevel, message: String) {
+        let message = crate::error::sanitize(message);
+        // Scrolled back, the view stays on the lines it shows: it moves back
+        // by every row the new entry wraps onto.
+        let added = if self.log_scroll > 0 {
+            self.log_entry_rows(&message)
+        } else {
+            0
+        };
         self.log.push_back(LogLine {
             time: chrono::Local::now(),
             level,
-            message: crate::error::sanitize(message),
+            message,
         });
-        // Scrolled back, the view stays on the lines it shows.
-        if self.log_scroll > 0 {
-            self.log_scroll = (self.log_scroll + 1).min(self.log.len() - 1);
-        }
         // VecDeque pop_front is O(1); the old Vec drain(0..n) shifted every
         // remaining element down by N on every overflow.
         while self.log.len() > 500 {
             self.log.pop_front();
         }
+        if added > 0 {
+            self.log_scroll =
+                (self.log_scroll + added).min(self.log_total_rows().saturating_sub(1));
+        }
     }
 
-    /// Scroll the log `delta` lines back (negative: toward the newest),
+    /// Scroll the log `delta` rows back (negative: toward the newest),
     /// stopping with its first line at the top of the pane as last drawn.
     pub(super) fn log_scroll_by(&mut self, delta: isize) {
-        let max = self.log.len().saturating_sub(self.log_rows());
+        let max = self.log_total_rows().saturating_sub(self.log_rows());
         self.log_scroll = self.log_scroll.saturating_add_signed(delta).min(max);
     }
 
-    /// Lines of log the pane showed when last drawn; one before then.
+    /// Columns the log pane had when last drawn. Before then, wide enough
+    /// that every entry is one row.
+    fn log_width(&self) -> usize {
+        self.hit
+            .get()
+            .log_body
+            .map_or(usize::MAX, |r| usize::from(r.width))
+    }
+
+    /// Rows `message` wraps onto in the log pane, as the pane draws it.
+    fn log_entry_rows(&self, message: &str) -> usize {
+        crate::tui::widgets::log_message_rows(message, self.log_width()).len()
+    }
+
+    /// Rows the whole log wraps onto.
+    fn log_total_rows(&self) -> usize {
+        self.log
+            .iter()
+            .map(|e| self.log_entry_rows(&e.message))
+            .sum()
+    }
+
+    /// Rows of log the pane showed when last drawn; one before then.
     pub(super) fn log_rows(&self) -> usize {
         self.hit
             .get()
@@ -1415,6 +1446,14 @@ pub(super) mod tests_support {
     /// back what was drawn.
     pub(crate) fn draw(a: &App) -> ratatui::buffer::Buffer {
         draw_sized(a, 100, 30)
+    }
+
+    /// Press `code`, unmodified, as the run loop hands a key over.
+    pub(crate) fn press_key(a: &mut App, code: crossterm::event::KeyCode) {
+        a.handle_key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        ));
     }
 
     /// [`draw`] into a terminal of the given size.
