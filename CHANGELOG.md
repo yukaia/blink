@@ -261,6 +261,20 @@ the git history for those.
 
 ### Fixed
 
+- **Enter on an unchanged name in the rename box renames nothing.** The
+  box was filled with the name as the pane shows it, cut in the middle
+  past 512 characters, and trimmed before the check: F2 then Enter renamed
+  a long name to its shortened form, `…` included, and `notes ` to
+  `notes`. It now offers the whole name and leaves it alone unless you
+  change it. A name shown with control characters replaced still renames
+  on Enter, which is how such a file is cleaned up.
+- **Saving a session can't replace a session file that didn't load.**
+  Renaming in the editor or saving with Ctrl+S checked only the sessions
+  in the list, which leaves out a file that fails to parse, so a save
+  under its name overwrote it, hand edits and all. Both now refuse and
+  say the file can't be read.
+- **A delete confirmed after the connection dropped says it didn't
+  happen**, as rename and new-folder do, rather than nothing at all.
 - **Queued transfers show in the Transfers pane.** Only running jobs had
   rows, so a batch waiting behind the parallel limit or a pause was
   invisible: paused before anything started, the pane said "no active

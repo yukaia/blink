@@ -588,8 +588,9 @@ impl App {
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.pending_overwrite = None;
-                self.rename_input.clear();
-                self.rename_original.clear();
+                // Every field of the rename form, as each other exit does;
+                // this one cleared two by hand and left the rest behind.
+                self.clear_rename_form();
                 self.screen = Screen::Main;
                 self.push_log(LogLevel::Info, "overwrite cancelled".into());
             }
@@ -645,9 +646,8 @@ impl App {
                 // without a word; the edit form refuses the same. This
                 // session's own file is the one to update.
                 let own_file = self.current_session_saved && current.name == name;
-                if !own_file && self.sessions.iter().any(|s| s.name == name) {
-                    self.save_session_error =
-                        Some(format!("a session named `{name}` already exists"));
+                if !own_file && let Some(reason) = self.session_name_taken(&name) {
+                    self.save_session_error = Some(reason);
                     return;
                 }
 

@@ -12,8 +12,8 @@
 //!     posts the result back as an `AppEvent::*`.
 //!
 //! Pulled out of `mod.rs` so the App lifecycle reads as setup + run
-//! loop + helpers, without ~430 lines of "what happens when the user
-//! submits THIS modal" inline.
+//! loop + helpers, without "what happens when the user submits THIS
+//! modal" inline.
 
 use crate::session::Session;
 use crate::transport;
@@ -26,11 +26,11 @@ use super::{App, LogLevel, Pane, Screen};
 /// returning the reason it is unusable.
 ///
 /// Shared by the rename and mkdir modals so the two can't drift. They had:
-/// `submit_mkdir` rejected `.` and `..`, `submit_rename` did not. A rename to
-/// `..` therefore reached [`transport::join_remote`], which rejects the `..`
-/// component by returning the base unchanged — so the app asked the server to
-/// rename the file onto its own parent directory and surfaced whatever opaque
-/// error came back, where the sibling modal gives a clear local one.
+/// `submit_mkdir` rejected `.` and `..`, `submit_rename` did not, and a
+/// rename to `..` reached the server as a rename onto the file's own parent,
+/// coming back as whatever opaque error it chose, where the sibling modal
+/// gave a clear local one. ([`transport::join_remote`] refuses `..` too
+/// now; this gives the reason in the form.)
 ///
 /// Control characters are refused too, and the invisible and reordering
 /// characters with them: the name goes onto the wire as a path component,
@@ -59,6 +59,27 @@ impl App {
     // -------------------------------------------------------------------
     // Edit / delete saved sessions
     // -------------------------------------------------------------------
+
+    /// Why a session can't be saved under `name`, a name it doesn't already
+    /// have: another session uses it, or a file is saved under it that
+    /// didn't load.
+    ///
+    /// Shared by the edit form and Ctrl+S. Both checked only the sessions
+    /// that loaded, and a session file that fails to parse is just logged
+    /// as unreadable and left out of the list — so saving under its name
+    /// replaced it, hand edits and all, without a word.
+    pub(super) fn session_name_taken(&self, name: &str) -> Option<String> {
+        if self.sessions.iter().any(|s| s.name == name) {
+            Some(format!("a session named `{name}` already exists"))
+        } else if Session::file_exists(name) {
+            Some(format!(
+                "a session file for `{name}` exists but can't be read; \
+                 fix or remove it first"
+            ))
+        } else {
+            None
+        }
+    }
 
     pub(super) fn open_edit_session(&mut self) {
         let Some(s) = self.sessions.get(self.session_cursor).cloned() else {
@@ -100,8 +121,10 @@ impl App {
         };
         // Renaming to a name another session already uses would silently
         // clobber the other one — block that explicitly.
-        if name != form.original_name && self.sessions.iter().any(|s| s.name == name) {
-            form.error = Some(format!("a session named `{name}` already exists"));
+        if name != form.original_name
+            && let Some(reason) = self.session_name_taken(&name)
+        {
+            form.error = Some(reason);
             self.edit_session_form = Some(form);
             return;
         }
@@ -127,8 +150,8 @@ impl App {
         };
 
         // Parallel transfers override. Empty -> None (use global default).
-        // Otherwise must be 1..=MAX_PARALLEL; the spec caps at 10. Echo
-        // bad input back without losing the rest of the form.
+        // Otherwise must be 1..=MAX_PARALLEL. Echo bad input back without
+        // losing the rest of the form.
         let parallel_str = form.parallel.trim();
         let parallel_downloads: Option<u8> = if parallel_str.is_empty() {
             None
@@ -254,7 +277,11 @@ impl App {
         // name — `remote_name_error` refuses to send those characters back
         // out — which is a reasonable way to fix such a file rather than a
         // limitation worth working around.
-        self.rename_input = entry.display_name.clone();
+        //
+        // The input starts with the whole name, not the display name: that
+        // one loses its middle past 512 characters, and Enter on it renamed
+        // the file to the shortened form, `…` and all.
+        self.rename_input = crate::error::sanitize_display(&entry.raw_name).into_owned();
         self.rename_original = entry.display_name;
         self.rename_source = entry.raw_name;
         self.rename_error = None;
@@ -262,6 +289,16 @@ impl App {
     }
 
     pub(super) fn submit_rename(&mut self) {
+        // Enter on the name as it was offered, when that is the real name,
+        // changes nothing. Checked before the trim, which would otherwise
+        // rename `notes ` to `notes` unasked. A name offered with control
+        // characters replaced is not the real one, and submitting it is how
+        // such a file is cleaned up, so that still renames.
+        if self.rename_input == self.rename_source {
+            self.clear_rename_form();
+            self.screen = Screen::Main;
+            return;
+        }
         let new_name = self.rename_input.trim().to_string();
         if let Some(reason) = remote_name_error(&new_name) {
             self.rename_error = Some(reason.into());
@@ -443,7 +480,10 @@ impl App {
     }
 
     pub(super) fn start_delete(&mut self, name: String, remote_path: String, is_dir: bool) {
+        // Confirmed just after the connection dropped, say so, as rename and
+        // mkdir do; it used to do nothing without a word.
         let Some(t) = self.transport.clone() else {
+            self.push_log(LogLevel::Warn, format!("not connected: {name} not deleted"));
             return;
         };
         let tx = self.app_event_tx.clone();
@@ -826,6 +866,28 @@ mod tests {
 
         assert!(crate::checkpoint::offers_for("files", &origin).is_empty());
         assert_eq!(crate::checkpoint::offers_for("renamed", &origin).len(), 1);
+    }
+
+    /// The list holds only the sessions that loaded, so renaming onto the
+    /// name of one that didn't replaced its file.
+    #[test]
+    fn renaming_onto_an_unreadable_session_file_is_refused() {
+        let mut broken = Session::from_url("sftp://me@other.example").unwrap();
+        broken.name = "z-broken".into();
+        let (mut a, _home) = editing(&[ftps_session(), broken.clone()]);
+        let path = broken.path().unwrap();
+        std::fs::write(&path, "not a session").unwrap();
+        a.sessions = Session::list_all().unwrap();
+        assert!(a.sessions.iter().all(|s| s.name != "z-broken"));
+
+        form(&mut a).name = "z-broken".into();
+        a.submit_edit_session();
+
+        assert_eq!(a.screen, Screen::EditSession);
+        let error = form(&mut a).error.clone().unwrap();
+        assert!(error.contains("can't be read"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not a session");
+        assert_eq!(on_disk("files").host, "ftp.example", "nothing was moved");
     }
 
     #[test]
@@ -1215,6 +1277,92 @@ mod tests {
         let pd = a.pending_delete.as_ref().unwrap();
         assert_eq!(pd.name, "a b");
         assert_eq!(pd.remote_path, "/srv/a\u{1b}b");
+    }
+
+    // -- remote rename --------------------------------------------------------
+
+    fn open_rename_on(a: &mut App, raw: &str) {
+        a.remote
+            .set_entries(vec![PaneEntry::new(raw.into(), false, 1)]);
+        a.remote.cursor = 0;
+        a.open_rename();
+        assert_eq!(a.screen, Screen::Rename);
+    }
+
+    /// The input was seeded with the display name, cut in the middle past
+    /// 512 characters, so Enter alone renamed the file to that.
+    #[tokio::test]
+    async fn enter_on_an_unchanged_long_name_renames_nothing() {
+        let (mut a, _remote) = connected();
+        let long = format!("{}.txt", "n".repeat(600));
+        open_rename_on(&mut a, &long);
+        assert_eq!(a.rename_input, long, "the whole name is offered");
+
+        a.handle_rename(press(KeyCode::Enter));
+
+        assert_eq!(a.screen, Screen::Main);
+        assert!(!logged(&a, "renaming"), "{:?}", a.log);
+    }
+
+    /// The trim ran first, so `notes ` became `notes` on a bare Enter.
+    #[tokio::test]
+    async fn enter_on_an_unchanged_name_with_edge_spaces_renames_nothing() {
+        let (mut a, _remote) = connected();
+        open_rename_on(&mut a, " notes ");
+
+        a.handle_rename(press(KeyCode::Enter));
+
+        assert_eq!(a.screen, Screen::Main);
+        assert!(!logged(&a, "renaming"), "{:?}", a.log);
+        assert_eq!(a.rename_source, "", "the form is cleared");
+    }
+
+    /// Offered with its control characters replaced, the name isn't the real
+    /// one, and submitting it is still how such a file is cleaned up.
+    #[tokio::test]
+    async fn enter_on_a_name_with_control_characters_cleans_it() {
+        let (mut a, mut remote) = connected();
+        open_rename_on(&mut a, "a\u{1b}b");
+        assert_eq!(a.rename_input, "a b");
+
+        a.handle_rename(press(KeyCode::Enter));
+
+        assert!(logged(&a, "renaming"), "{:?}", a.log);
+        remote.deliver(&mut a).await;
+    }
+
+    /// Declining to rename over an existing file cleared two of the form's
+    /// fields by hand and left the real name and any error behind.
+    #[tokio::test]
+    async fn declining_to_rename_over_a_file_clears_the_whole_form() {
+        let (mut a, _remote) = connected();
+        a.remote.cursor = 2;
+        a.open_rename();
+        a.rename_input = "logs".into();
+        a.handle_rename(press(KeyCode::Enter));
+        assert_eq!(a.screen, Screen::ConfirmOverwrite);
+        a.rename_error = Some("left over".into());
+
+        a.handle_confirm_overwrite(press(KeyCode::Char('n')));
+
+        assert_eq!(a.screen, Screen::Main);
+        assert_eq!(a.rename_input, "");
+        assert_eq!(a.rename_original, "");
+        assert_eq!(a.rename_source, "");
+        assert_eq!(a.rename_error, None);
+    }
+
+    /// Confirmed just after the connection dropped, a delete did nothing and
+    /// said nothing.
+    #[test]
+    fn a_delete_without_a_connection_says_so() {
+        let mut a = app();
+        a.start_delete("old.txt".into(), "/srv/old.txt".into(), false);
+        assert!(
+            logged(&a, "not connected: old.txt not deleted"),
+            "{:?}",
+            a.log
+        );
     }
 
     #[tokio::test]
