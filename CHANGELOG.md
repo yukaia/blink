@@ -241,6 +241,17 @@ the git history for those.
 
 ### Fixed
 
+- **A refresh keeps your selection and your place.** The remote pane
+  refreshes by itself as each upload into it lands, and that cleared every
+  selection and left the cursor at its old position, on another file once
+  new ones sorted in above. A download pressed next fell back to the
+  cursor's file and fetched that one alone. A refresh of the folder shown
+  now keeps the selections still listed and the cursor on the same file; a
+  listing of another folder starts fresh, as before.
+- **The filter finds long names by any part.** It searched the displayed
+  name, which has its middle cut out when very long, so a query in the cut
+  part found nothing.
+
 - **Names Windows can't store are skipped up front.** A remote file whose
   name has `< > " | ? *` or a control character was planned and then failed
   as a job of its own; on Windows it is now counted with the other names
