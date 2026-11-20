@@ -13,7 +13,7 @@ use crossterm::event::{
 };
 use futures::StreamExt;
 use tokio::sync::mpsc;
-use tokio::time::{Interval, interval};
+use tokio::time::{Interval, MissedTickBehavior, interval};
 
 use crate::error::Result;
 use crate::preview::FileViewKind;
@@ -25,8 +25,8 @@ pub enum Event {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Tick,
-    #[allow(dead_code)]
-    Resize(u16, u16),
+    /// The terminal changed size; ratatui reads the new one on the next draw.
+    Resize,
     App(AppEvent),
 }
 
@@ -96,13 +96,8 @@ pub enum AppEvent {
     /// A rename completed successfully.
     Renamed { from: String, to: String },
 
-    /// A rename failed.
-    RenameFailed {
-        from: String,
-        #[allow(dead_code)]
-        to: String,
-        error: String,
-    },
+    /// A rename of `from` failed.
+    RenameFailed { from: String, error: String },
 
     /// A remote mkdir completed successfully.
     MkdirDone { path: String },
@@ -186,11 +181,17 @@ pub enum AppEvent {
     HostKeyUnknown {
         /// What is being trusted, which sets the prompt's wording.
         subject: TrustSubject,
-        /// Display form of the host (bare for the default SSH port,
-        /// `[host]:port` otherwise) — used only for the modal label.
+        /// Display form of the host, for the modal label. For an SSH host
+        /// key, as known_hosts names it: bare for port 22, `[host]:port`
+        /// otherwise. For an FTPS certificate, `host:port`, with the host
+        /// in brackets only when it is an IPv6 address.
         host: String,
+        /// What kind of key: an SSH algorithm such as `ssh-ed25519`, or
+        /// `TLS certificate, SHA-256`.
         key_type: String,
-        /// SHA-256 fingerprint for display (e.g. `SHA256:abc123…`).
+        /// SHA-256 fingerprint for display: `SHA256:abc123…` for an SSH key,
+        /// colon-separated hex (`AB:CD:…`, as `openssl x509 -fingerprint
+        /// -sha256` prints it) for a certificate.
         fingerprint: String,
         decision_tx: tokio::sync::oneshot::Sender<crate::transport::sftp::HostKeyDecision>,
     },
@@ -282,7 +283,7 @@ impl EventStream {
     pub fn new(tick_rate: Duration, app: mpsc::UnboundedReceiver<AppEvent>) -> Self {
         Self {
             crossterm: CrosstermEventStream::new(),
-            tick: interval(tick_rate),
+            tick: tick_interval(tick_rate),
             app,
             deferred: None,
         }
@@ -305,20 +306,29 @@ impl EventStream {
                     ev = self.crossterm.next() => {
                         match ev {
                             Some(Ok(CrosstermEvent::Key(k))) => {
-                                // Filter out key-release / repeat events on Windows.
+                                // Only presses: Windows also reports each
+                                // release. A held key arrives as repeated
+                                // presses, so holding an arrow still moves.
                                 if k.kind == KeyEventKind::Press {
                                     return Ok(Event::Key(k));
                                 }
                             }
-                            Some(Ok(CrosstermEvent::Resize(w, h))) => {
-                                return Ok(Event::Resize(w, h));
+                            Some(Ok(CrosstermEvent::Resize(_, _))) => {
+                                return Ok(Event::Resize);
                             }
                             Some(Ok(CrosstermEvent::Mouse(m))) if wanted_mouse(&m) => {
                                 return Ok(Event::Mouse(m));
                             }
                             Some(Ok(_)) => continue,
                             Some(Err(e)) => return Err(e.into()),
-                            None => return Ok(Event::Tick),
+                            // crossterm 0.29 never ends the stream. Were it
+                            // to, returning a tick would spin: the biased
+                            // select would find it ended again at once on
+                            // every call and never read an app event.
+                            None => return Err(std::io::Error::other(
+                                "the terminal's event stream ended",
+                            )
+                            .into()),
                         }
                     }
                     Some(ev) = self.app.recv() => {
@@ -334,6 +344,24 @@ impl EventStream {
                 }
         }
     }
+}
+
+/// The redraw tick. Missed ticks are skipped rather than made up: each is a
+/// full redraw, and tokio's default bursts them, so a one-second stall (a
+/// large image rendering, say) was followed by ten redraws back to back.
+fn tick_interval(rate: Duration) -> Interval {
+    let mut tick = interval(rate);
+    tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    tick
+}
+
+/// What a [`AppEvent::HostKeyUnknown`] prompt asks the user to trust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustSubject {
+    /// An SSH host key, saved to known_hosts on accept.
+    SshHostKey,
+    /// An FTPS server's leaf certificate, pinned in the session on accept.
+    FtpsCertificate,
 }
 
 /// The mouse events blink acts on: a left press and the wheel. Capture
@@ -496,13 +524,11 @@ mod tests {
         let (_tx, mut rx) = mpsc::unbounded_channel::<AppEvent>();
         assert!(drain_progress(&mut rx).is_none());
     }
-}
 
-/// What a [`AppEvent::HostKeyUnknown`] prompt asks the user to trust.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TrustSubject {
-    /// An SSH host key, saved to known_hosts on accept.
-    SshHostKey,
-    /// An FTPS server's leaf certificate, pinned in the session on accept.
-    FtpsCertificate,
+    /// Each tick is a redraw; a stall must not be followed by a burst.
+    #[tokio::test]
+    async fn missed_ticks_are_skipped_not_made_up() {
+        let tick = tick_interval(Duration::from_millis(100));
+        assert_eq!(tick.missed_tick_behavior(), MissedTickBehavior::Skip);
+    }
 }

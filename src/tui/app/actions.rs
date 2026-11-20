@@ -349,7 +349,6 @@ impl App {
                 Ok(()) => AppEvent::Renamed { from, to },
                 Err(e) => AppEvent::RenameFailed {
                     from,
-                    to,
                     error: e.to_string(),
                 },
             };

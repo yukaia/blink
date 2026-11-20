@@ -632,7 +632,7 @@ impl App {
                 Event::Mouse(m) => self.handle_mouse(m),
                 Event::App(e) => self.handle_app_event(e),
                 Event::Tick => {}
-                Event::Resize(_, _) => {
+                Event::Resize => {
                     self.image_needs_redraw = true;
                 }
             }
@@ -5262,7 +5262,6 @@ mod pane_audit_tests {
         let mut a = app_on_main(0);
         a.handle_app_event(AppEvent::RenameFailed {
             from: "/srv/deep/old.txt".into(),
-            to: "/srv/deep/new.txt".into(),
             error: "nope".into(),
         });
         assert!(logged(&a, "rename old.txt failed: nope"), "{:?}", a.log);

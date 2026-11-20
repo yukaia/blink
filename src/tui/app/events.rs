@@ -330,7 +330,7 @@ impl App {
                 let path = self.remote.path.clone();
                 self.refresh_remote_pane(path);
             }
-            AppEvent::RenameFailed { from, to: _, error } => {
+            AppEvent::RenameFailed { from, error } => {
                 // By name, as the line that says it worked does.
                 let name = from.rsplit('/').find(|s| !s.is_empty()).unwrap_or(&from);
                 self.push_log(LogLevel::Error, format!("rename {name} failed: {error}"));

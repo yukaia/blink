@@ -57,6 +57,34 @@ Options weighed so far:
 Whatever is chosen, the stranded `.blink-part` needs a story too: the
 checkpoint discard tries to delete it, and that `DELE` is refused as well.
 
+## Pasted text is typed as keystrokes
+
+Found in the `tui/event.rs` audit (2026-11-20). blink never enables
+bracketed paste, and `EventStream::next` drops `Event::Paste` anyway, so a
+terminal delivers a paste as one key event per character, a newline as
+Enter. A two-line paste into the rename prompt submits it with the first
+line, and the rest lands on the main view as commands: on the remote pane,
+`D` opens the delete prompt and `y` confirms it, so `report⏎Daily summary`
+renames the file and then deletes it. `q`, `c`, `C` and the rest act too.
+
+Plan: `EnableBracketedPaste` in `tui/mod.rs` beside `EnableMouseCapture`
+(and its `Disable` on every exit path); pass `Event::Paste` through
+`event.rs`; in the App, insert it into whichever text field is open with
+newlines and control characters stripped, and ignore it when none is.
+crossterm has no bracketed paste for the Windows console, so a paste there
+still arrives as keys; Windows Terminal delivers it that way regardless.
+
+## A terminal error skips the run loop's cleanup
+
+Found in the `tui/event.rs` audit (2026-11-20). `events.next().await?` in
+`App::run` (`tui/app/mod.rs`), like `terminal.draw()?` beside it, returns
+straight out of `run`, past the dispatcher shutdown and
+`flush_checkpoints()` after the loop. crossterm reports a failed terminal
+read (the terminal going away) as an error. Checkpoint marks are batched,
+so the jobs finished since the last flush are lost and transferred again on
+resume: repeated work, not corruption. Fix: break out of the loop with the
+error, run the cleanup, then return it.
+
 ## Features with no tests
 
 From `cargo llvm-cov` on 2026-11-17, after a pass over the previous list
