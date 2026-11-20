@@ -126,8 +126,9 @@ pub enum AppEvent {
         /// Local entries skipped because their names are not valid UTF-8 and
         /// so have no faithful remote form.
         unencodable_skipped: usize,
-        /// Remote entries skipped because their listing lines could not be
-        /// read. Always zero for an upload walk.
+        /// Entries skipped because they could not be read: remote listing
+        /// lines in no known format for a download, local entries whose type
+        /// couldn't be read for an upload.
         unreadable_skipped: usize,
         /// Remote entries skipped because their names can't be used as local
         /// file names. Always zero for an upload walk.

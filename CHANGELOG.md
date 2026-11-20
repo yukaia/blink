@@ -125,6 +125,14 @@ the git history for those.
 
 ### Security
 
+- **A download checks for planted symlinks as it starts, not only when it
+  was planned.** A recursive download refused a folder that was another
+  user's symlink, but only while walking the tree; the downloads ran after
+  the overwrite prompt, which can stay open indefinitely, and a symlink
+  planted in between was followed. Each download now checks every folder
+  above its file first. Symlinks root owns are trusted, as only root can
+  make them and some systems' own paths are them (macOS's `/tmp`).
+
 - **An SFTP upload no longer writes through a symlink planted as its
   partial.** The partial's name is predictable and a server's open follows
   links, so in a shared remote folder someone could aim one at any file
@@ -232,6 +240,17 @@ the git history for those.
   before, they were accepted whatever they presented.
 
 ### Fixed
+
+- **Names Windows can't store are skipped up front.** A remote file whose
+  name has `< > " | ? *` or a control character was planned and then failed
+  as a job of its own; on Windows it is now counted with the other names
+  that can't be used locally.
+- **A broken symlink at a download's destination asks first.** The conflict
+  check followed links, so one pointing nowhere read as nothing there, and
+  the download replaced it without asking.
+- **An upload walk counts local entries it couldn't read.** One whose type
+  couldn't be read was skipped without a word; it is now counted and
+  reported like the rest.
 
 - **A failed start no longer leaves the terminal in raw mode.** Raw mode
   went on first, and if switching to the alternate screen failed after it,

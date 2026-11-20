@@ -604,6 +604,80 @@ pub(crate) async fn finish_download(
     Ok(())
 }
 
+/// Whether `path` is a symlink that neither the user running blink nor root
+/// owns: one someone else could have planted, in a folder other users can
+/// write to, to send a download somewhere else. The user's own symlinks are
+/// left alone (pointing a folder at another disk is a reasonable thing to
+/// do), and so are root's: only root can make those, and some systems' own
+/// paths are them, macOS's `/tmp` and `/var` among them.
+///
+/// Windows needs privilege to create symlinks, so there it is never one.
+pub(crate) async fn foreign_symlink(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        tokio::fs::symlink_metadata(path)
+            .await
+            .is_ok_and(|m| planted_symlink(m.file_type().is_symlink(), m.uid(), effective_uid()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// The user blink runs as, for [`foreign_symlink`].
+#[cfg(all(unix, not(test)))]
+fn effective_uid() -> u32 {
+    rustix::process::geteuid().as_raw()
+}
+
+#[cfg(all(unix, test))]
+thread_local! {
+    /// Who a test's thread runs as, for [`foreign_symlink`]: set to another
+    /// id, the test's own symlinks look planted, since a test can't make
+    /// one for another user.
+    pub(crate) static EFFECTIVE_UID: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(unix, test))]
+fn effective_uid() -> u32 {
+    EFFECTIVE_UID
+        .get()
+        .unwrap_or_else(|| rustix::process::geteuid().as_raw())
+}
+
+/// The rule [`foreign_symlink`] applies, apart from the lookups.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn planted_symlink(is_symlink: bool, owner: u32, me: u32) -> bool {
+    is_symlink && owner != me && owner != 0
+}
+
+/// Refuse a download to `local_path` when a folder above it is a
+/// [`foreign_symlink`], checked just before the download makes its folders
+/// and opens its partial.
+///
+/// The recursive walk checks each folder as it plans, but the downloads run
+/// later: after an overwrite prompt that can stay open indefinitely, and
+/// behind every job queued ahead. A symlink planted under a folder's name in
+/// between was followed, `O_NOFOLLOW` guarding only the last component.
+pub(crate) async fn refuse_foreign_symlinks_above(local_path: &Path) -> crate::error::Result<()> {
+    for dir in local_path.ancestors().skip(1) {
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
+        if foreign_symlink(dir).await {
+            return Err(crate::error::BlinkError::transport(format!(
+                "{} is a symlink owned by another user — not downloading into it",
+                dir.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Drop the sidecar once the download has been renamed into place.
 pub(crate) async fn clear_part_meta(local_path: &Path) {
     let _ = tokio::fs::remove_file(part_meta_path(local_path)).await;
@@ -2059,6 +2133,39 @@ mod tests {
         assert!(mock.metadata("/a/x").await.unwrap().is_none());
         assert!(mock.metadata("/ab").await.unwrap().is_some());
         assert!(mock.metadata("/ab/y").await.unwrap().is_some());
+    }
+
+    #[test]
+    fn only_a_symlink_neither_the_user_nor_root_owns_is_planted() {
+        assert!(planted_symlink(true, 1001, 1000), "another user's link");
+        assert!(!planted_symlink(true, 1000, 1000), "the user's own link");
+        assert!(
+            !planted_symlink(true, 0, 1000),
+            "root's, as macOS's /tmp is"
+        );
+        assert!(!planted_symlink(false, 1001, 1000), "a real directory");
+    }
+
+    /// A planted link anywhere above the file is refused, not only its
+    /// parent: the test's own link stands in for one, the thread made to
+    /// run as someone else.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_planted_symlink_anywhere_above_a_download_refuses_it() {
+        let home = crate::paths::test_home();
+        let target = home.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, home.path().join("link")).unwrap();
+        let file = home.path().join("link/deep/er/f.txt");
+
+        refuse_foreign_symlinks_above(&file)
+            .await
+            .expect("the user's own link is theirs to use");
+
+        EFFECTIVE_UID.set(Some(rustix::process::geteuid().as_raw() + 1));
+        let err = refuse_foreign_symlinks_above(&file).await.unwrap_err();
+        EFFECTIVE_UID.set(None);
+        assert!(err.to_string().contains("owned by another user"), "{err}");
     }
 
     // join_remote

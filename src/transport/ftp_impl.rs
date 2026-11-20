@@ -685,6 +685,7 @@ pub async fn ftp_download<T: TokioTlsStream + Send + 'static>(
 
     // Only now, with the transfer open: made first, a download that then
     // failed (no such file, refused) left an empty folder behind.
+    super::refuse_foreign_symlinks_above(local_path).await?;
     if let Some(parent) = local_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
@@ -3293,6 +3294,37 @@ mod integration {
         let log = log.lock().await;
         assert!(log.iter().any(|l| l == "EPSV"), "{log:?}");
         assert!(!log.iter().any(|l| l == "PASV"), "{log:?}");
+    }
+
+    /// As over SFTP: a folder above the download swapped for a planted
+    /// symlink since the walk checked it is refused before anything is made.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_download_refuses_a_symlink_planted_above_it_since_the_walk() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/a.txt".to_string(), b"data".to_vec());
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let mut transport = FtpTransport::connect(&test_session(port), Some("pw"))
+            .await
+            .unwrap();
+        let home = crate::paths::test_home();
+        let target = home.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, home.path().join("dl")).unwrap();
+
+        // The test's own link stands in for another user's.
+        crate::transport::EFFECTIVE_UID.set(Some(rustix::process::geteuid().as_raw() + 1));
+        let result = transport
+            .download("/a.txt", &home.path().join("dl/sub/a.txt"), None)
+            .await;
+        crate::transport::EFFECTIVE_UID.set(None);
+
+        let err = result.expect_err("planted link above the file");
+        assert!(err.to_string().contains("owned by another user"), "{err}");
+        assert!(!target.join("sub").exists(), "nothing made through it");
     }
 
     /// Over IPv4, PASV stays: older servers don't know EPSV.

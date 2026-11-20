@@ -419,12 +419,18 @@ impl App {
                     } else {
                         "entries"
                     };
+                    let why = match kind {
+                        crate::checkpoint::CheckpointKind::Download => {
+                            "whose listing lines couldn't be read: the server's listing \
+                             format isn't supported"
+                        }
+                        crate::checkpoint::CheckpointKind::Upload => {
+                            "whose type couldn't be read on this computer"
+                        }
+                    };
                     self.push_log(
                         LogLevel::Warn,
-                        format!(
-                            "skipped {unreadable_skipped} {noun} whose listing lines \
-                             couldn't be read: the server's listing format isn't supported"
-                        ),
+                        format!("skipped {unreadable_skipped} {noun} {why}"),
                     );
                 }
                 self.report_unsafe_names(unsafe_skipped);

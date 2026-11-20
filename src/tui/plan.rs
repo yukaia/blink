@@ -1,15 +1,11 @@
 //! Recursive transfer planning.
 //!
-//! Pure functions that walk a local or remote subtree and produce a flat
-//! [`PlannedJob`] plan for the dispatcher. Conflict-detection helpers and
-//! the path-safety filter live here too. None of these touch the `App`
-//! struct — they take what they need as arguments and return values — so
-//! they're cheap to unit-test and easy to read in isolation.
-//!
-//! Extracted from `app.rs` as the first step of the larger TUI split: the
-//! file had become a god-object holding state, dispatch, async glue, and
-//! walk planning. Walks are the cleanest cut because they share nothing
-//! with the rest of the TUI machinery.
+//! Walks of a local or remote subtree that produce a flat [`PlannedJob`]
+//! plan for the dispatcher, the conflict probes run on a plan, and the
+//! filter that decides which server-supplied names are safe as local file
+//! names. The walks and probes read the local filesystem and talk to the
+//! server; none of them touch the `App` struct, taking what they need as
+//! arguments and returning values, so each can be tested on its own.
 
 use std::path::{Path, PathBuf};
 
@@ -45,16 +41,18 @@ pub enum PlannedJob {
     },
 }
 
-/// Output of a recursive walk: the flat job plan plus a count of symlinks
-/// that were deliberately skipped. The caller surfaces the skip count in
-/// the TUI log so the user knows the plan is shorter than the tree.
+/// Output of a recursive walk: the flat job plan, a count of each kind of
+/// entry left out of it, and (for a download) the local folders to make.
+/// The caller reports every count in the log, so the user knows when the
+/// plan is shorter than the tree.
 #[derive(Debug)]
 pub struct WalkResult {
     pub plan: Vec<PlannedJob>,
     pub symlinks_skipped: usize,
-    /// Remote entries skipped because a listing could not read them — an
-    /// FTP line in no format blink parses. Counted so the batch can say it
-    /// is incomplete; see [`crate::transport::Listing`].
+    /// Entries skipped because they could not be read: for a download, an
+    /// FTP listing line in no format blink parses (see
+    /// [`crate::transport::Listing`]); for an upload, a local entry whose
+    /// type couldn't be read. Counted so the batch can say it is incomplete.
     pub unreadable_skipped: usize,
     /// Local entries whose names are not valid UTF-8 and so cannot be sent
     /// as a remote path. Counted rather than silently dropped — see
@@ -154,6 +152,16 @@ fn safe_local_name_for(name: &str, windows_rules: bool) -> Option<&str> {
         return None;
     }
 
+    // Characters NTFS refuses in a name. A file named with one would be
+    // planned and then fail as a job of its own with an unclear "syntax is
+    // incorrect"; refused here, it is counted with the other unusable names.
+    if name
+        .chars()
+        .any(|c| matches!(c, '<' | '>' | '"' | '|' | '?' | '*') || u32::from(c) < 32)
+    {
+        return None;
+    }
+
     // Windows strips trailing dots and spaces when resolving a path, so
     // "secret. " and "secret" name the same file. A server could use that to
     // overwrite a file the conflict check cleared under its other spelling.
@@ -181,11 +189,10 @@ fn safe_local_name_for(name: &str, windows_rules: bool) -> Option<&str> {
 // ---------------------------------------------------------------------------
 
 /// Walk a remote subtree rooted at `remote_root` and produce a flat plan of
-/// mkdirs + file downloads with destinations rooted at `local_root`. The
-/// plan is iterative-DFS pre-order so directories appear in the plan before
-/// any files under them. The dispatcher will run the plan in queue order;
-/// because each level's mkdir is enqueued before its file children,
-/// `enqueue_mkdir` lands first by virtue of being earlier in the queue.
+/// file downloads with destinations rooted at `local_root`, in iterative-DFS
+/// pre-order. It plans no folder jobs: the local folders to make are listed
+/// in [`WalkResult::local_dirs`], parents first, and each download also
+/// makes its own parent.
 ///
 /// Transport-level errors propagate; partial trees are NOT fixed up here —
 /// the caller surfaces a `WalkFailed` log line and the user can retry.
@@ -236,9 +243,10 @@ pub async fn walk_remote(
         // In a download directory other users can write to (`/tmp`, a
         // shared drop folder), one of them could plant a symlink under the
         // name of a folder this walk creates, and every file below it would
-        // land wherever it points. The user's own symlinks are left alone:
-        // pointing a folder at another disk is a reasonable thing to do.
-        if foreign_symlink(&local_dir).await {
+        // land wherever it points. Refused early here; each download checks
+        // again before it starts (see
+        // `transport::refuse_foreign_symlinks_above`).
+        if transport::foreign_symlink(&local_dir).await {
             return Err(BlinkError::transport(format!(
                 "{} is a symlink owned by another user — not downloading into it",
                 local_dir.display()
@@ -333,34 +341,6 @@ pub async fn walk_remote(
     })
 }
 
-/// Whether `path` is a symlink some other user owns. See [`walk_remote`].
-///
-/// Windows needs privilege to create symlinks, so there it is never one.
-async fn foreign_symlink(path: &Path) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        tokio::fs::symlink_metadata(path).await.is_ok_and(|m| {
-            owned_by_another(
-                m.file_type().is_symlink(),
-                m.uid(),
-                rustix::process::geteuid().as_raw(),
-            )
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        false
-    }
-}
-
-/// The rule [`foreign_symlink`] applies, apart from the lookups.
-#[cfg_attr(not(unix), allow(dead_code))]
-fn owned_by_another(is_symlink: bool, owner: u32, me: u32) -> bool {
-    is_symlink && owner != me
-}
-
 /// Walk a local subtree rooted at `local_root` and produce a flat plan of
 /// remote mkdirs + file uploads with destinations rooted at `remote_root`.
 /// Mirror image of [`walk_remote`].
@@ -368,6 +348,7 @@ pub async fn walk_local(local_root: &Path, remote_root: &str) -> Result<WalkResu
     let mut out: Vec<PlannedJob> = Vec::new();
     let mut symlinks_skipped: usize = 0;
     let mut unencodable_skipped: usize = 0;
+    let mut unreadable_skipped: usize = 0;
 
     // Iterative DFS. Stack holds (local_path_to_visit, remote_path_dest).
     let mut stack: Vec<(PathBuf, String)> =
@@ -377,7 +358,7 @@ pub async fn walk_local(local_root: &Path, remote_root: &str) -> Result<WalkResu
         // Same cap as `walk_remote`: bail before the plan becomes unbounded.
         if out.len() > MAX_QUEUED_JOBS {
             return Err(BlinkError::transport(format!(
-                "recursive walk exceeded {MAX_QUEUED_JOBS} jobs — \
+                "recursive walk exceeded {MAX_QUEUED_JOBS} entries — \
                  narrow the source or run separate transfers",
             )));
         }
@@ -401,9 +382,19 @@ pub async fn walk_local(local_root: &Path, remote_root: &str) -> Result<WalkResu
             // file_type() reports symlinks BEFORE following them; metadata()
             // resolves them and would mask a symlink-to-dir as a regular dir.
             // Read both so we can act on the unfollowed type.
+            // An entry whose type can't be read is skipped rather than
+            // failing the walk, and counted: the batch is then incomplete,
+            // and the user would otherwise believe it whole.
             let file_type = match entry.file_type().await {
                 Ok(t) => t,
-                Err(_) => continue, // unreadable entry; skip rather than fail walk
+                Err(e) => {
+                    unreadable_skipped += 1;
+                    tracing::warn!(
+                        local = %entry.path().display(),
+                        "skipping local entry whose type couldn't be read: {e}",
+                    );
+                    continue;
+                }
             };
             if file_type.is_symlink() {
                 symlinks_skipped += 1;
@@ -447,7 +438,7 @@ pub async fn walk_local(local_root: &Path, remote_root: &str) -> Result<WalkResu
     Ok(WalkResult {
         plan: out,
         symlinks_skipped,
-        unreadable_skipped: 0,
+        unreadable_skipped,
         unencodable_skipped,
         unsafe_skipped: 0,
         local_dirs: Vec::new(),
@@ -459,14 +450,18 @@ pub async fn walk_local(local_root: &Path, remote_root: &str) -> Result<WalkResu
 // ---------------------------------------------------------------------------
 
 /// Local-FS conflict probe for download plans. Iterates every Download job
-/// and stat()s its destination; returns the indices whose destinations
-/// already exist as files. Mkdir entries are silently merged (creating a
-/// dir that exists is a no-op) and don't count as conflicts.
+/// and looks at its destination; returns the indices where something is
+/// already there. Mkdir entries are silently merged (creating a dir that
+/// exists is a no-op) and don't count as conflicts.
+///
+/// By `symlink_metadata`: a symlink is something there, whether or not what
+/// it points at exists. Following it, a broken link read as nothing there,
+/// and the download replaced it without asking.
 pub async fn find_download_conflicts(plan: &[PlannedJob]) -> Vec<usize> {
     let mut conflicts = Vec::new();
     for (i, job) in plan.iter().enumerate() {
         if let PlannedJob::Download { local_path, .. } = job
-            && tokio::fs::metadata(local_path).await.is_ok()
+            && tokio::fs::symlink_metadata(local_path).await.is_ok()
         {
             conflicts.push(i);
         }
@@ -580,6 +575,31 @@ pub fn drop_conflicting(plan: Vec<PlannedJob>, conflicts: &[usize]) -> Vec<Plann
 mod tests {
     use super::*;
     use crate::transport::Transport;
+
+    // -- Download conflicts ------------------------------------------------
+
+    /// A broken symlink at a destination is something there: followed, it
+    /// read as nothing, and the download replaced it without asking.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_broken_symlink_at_a_destination_is_a_conflict() {
+        let home = crate::paths::test_home();
+        let dest = home.path().join("data.csv");
+        std::os::unix::fs::symlink(home.path().join("gone"), &dest).unwrap();
+        let fresh = home.path().join("new.csv");
+        let plan = vec![
+            PlannedJob::Download {
+                remote_path: "/data.csv".into(),
+                local_path: dest,
+            },
+            PlannedJob::Download {
+                remote_path: "/new.csv".into(),
+                local_path: fresh,
+            },
+        ];
+
+        assert_eq!(find_download_conflicts(&plan).await, [0]);
+    }
 
     // -- Walk budget -------------------------------------------------------
 
@@ -871,13 +891,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn only_another_users_symlink_is_refused() {
-        assert!(owned_by_another(true, 1001, 1000));
-        assert!(!owned_by_another(true, 1000, 1000), "the user's own link");
-        assert!(!owned_by_another(false, 1001, 1000), "a real directory");
-    }
-
     /// Pointing a folder at another disk is the user's call: a walk into
     /// their own symlinked folder still works.
     #[cfg(unix)]
@@ -898,25 +911,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&elsewhere);
     }
 
-    /// A symlink someone else owns is refused, before anything is written.
-    /// Uses a link root already owns (`/bin` → `usr/bin` on merged-/usr
-    /// systems), since a test can't make one for another user; skipped
-    /// where there is none, or when run as root.
+    /// Root's symlinks are the system's own (macOS's `/tmp` is one) and
+    /// only root can make them, so a walk into one goes ahead. Uses `/bin`
+    /// (→ `usr/bin` on merged-/usr systems); skipped where it isn't a link
+    /// root owns. Another user's link is refused: see the rule's own test,
+    /// `transport::tests::only_a_symlink_neither_the_user_nor_root_owns_is_planted`,
+    /// since a test can't make a link for another user.
     #[cfg(unix)]
     #[tokio::test]
-    async fn walk_remote_refuses_another_users_symlinked_folder() {
+    async fn walk_remote_goes_through_a_symlink_root_owns() {
         use std::os::unix::fs::MetadataExt as _;
         let link = Path::new("/bin");
-        let me = rustix::process::geteuid().as_raw();
         match std::fs::symlink_metadata(link) {
-            Ok(m) if m.file_type().is_symlink() && m.uid() != me => {}
+            Ok(m) if m.file_type().is_symlink() && m.uid() == 0 => {}
             _ => return,
         }
 
-        let err = walk_remote(&shared(EmptyDirTree { fan_out: 0 }), "/", link)
+        walk_remote(&shared(EmptyDirTree { fan_out: 0 }), "/", link)
             .await
-            .unwrap_err();
-        assert!(err.to_string().contains("owned by another user"), "{err}");
+            .expect("a link root owns is trusted");
     }
 
     // -- raw vs. display names ---------------------------------------------
@@ -1231,6 +1244,31 @@ mod tests {
         assert!(safe_local_name_for("a/b", true).is_none());
         assert!(safe_local_name_for("a\0b", true).is_none());
         assert_eq!(safe_local_name_for("ok.txt", true), Some("ok.txt"));
+    }
+
+    /// Characters NTFS refuses: such a file used to be planned and then
+    /// fail as a job of its own.
+    #[test]
+    fn windows_rejects_characters_ntfs_refuses() {
+        for name in [
+            "a<b",
+            "a>b",
+            "a\"b",
+            "a|b",
+            "what?",
+            "*.txt",
+            "tab\there",
+            "bell\u{7}",
+        ] {
+            assert!(safe_local_name_for(name, true).is_none(), "{name:?}");
+            if !name.contains('\t') && !name.contains('\u{7}') {
+                assert_eq!(
+                    safe_local_name_for(name, false),
+                    Some(name),
+                    "{name:?} is fine on Unix"
+                );
+            }
+        }
     }
 
     // -- F-13: a listing that fails is not "no conflicts" -------------------

@@ -85,6 +85,24 @@ so the jobs finished since the last flush are lost and transferred again on
 resume: repeated work, not corruption. Fix: break out of the loop with the
 error, run the cleanup, then return it.
 
+## Uploads read through a symlink planted after the walk
+
+Found in the `tui/plan.rs` audit (2026-11-20). `walk_local` skips symlinks,
+but only when it looks. Each upload later opens its source with a plain
+`tokio::fs::File::open` (`sftp.rs` `upload`, `ftp_impl.rs` `ftp_upload`),
+which follows one. In a folder other users can write to (`/tmp`, a shared
+project folder), someone can swap a planned file for a symlink to, say,
+`~/.ssh/id_ed25519` between the walk and the upload, a window that includes
+however long the overwrite prompt stays open. blink then uploads the key's
+contents under the planned name, to a server that person may be able to
+read. The download side already refuses other users' symlinks.
+
+Plan: open upload sources with `O_NOFOLLOW` on Unix, as `open_part` opens a
+download's partial, and check the open file is a regular file. Decide what a
+single-file upload of a symlink the user picked does: it is followed today,
+which is reasonable for one they chose. Windows needs privilege to make
+symlinks, so it gets no equivalent.
+
 ## Features with no tests
 
 From `cargo llvm-cov` on 2026-11-17, after a pass over the previous list
