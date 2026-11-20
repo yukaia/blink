@@ -1,14 +1,7 @@
-//! Per-pane, per-modal, and per-form state types used by the TUI.
-//!
-//! These are extracted from `app.rs` so the App struct itself reads as a
-//! flat list of fields instead of being interleaved with ~400 lines of
-//! supporting types. Nothing in here touches the App struct itself — each
-//! type either holds its own data and impls a few small helpers, or is a
-//! pure data carrier the modal renderers consume.
-//!
-//! Grouping is by *use site*: a screen module that's added later (modal
-//! dispatch, input handlers per screen) imports the matching state type
-//! from here.
+//! The state the TUI's panes, viewer, modals and forms hold, separate from
+//! the `App` struct that owns it. Nothing in here touches `App`: each type
+//! holds its own data with a few helpers, or is plain data a renderer or
+//! handler reads. Grouped by where it is used.
 
 use bytes::Bytes;
 
@@ -106,9 +99,13 @@ pub struct PaneState {
     /// active. Keying by name survives every rebuild of the row list.
     ///
     /// A name is unique within a directory on every protocol blink speaks, so
-    /// it identifies a row unambiguously. Cleared by [`Self::set_entries`],
-    /// i.e. whenever a new listing arrives.
+    /// it identifies a row unambiguously. Cleared when a listing of another
+    /// folder arrives; kept, for the names still there, across a refresh of
+    /// the same one. See [`Self::set_entries`].
     selected: std::collections::HashSet<String>,
+    /// The `path` the rows were listed for, telling a refresh of the folder
+    /// shown apart from a listing of a new one.
+    listed: Option<String>,
 }
 
 impl PaneState {
@@ -121,6 +118,7 @@ impl PaneState {
             filter: None,
             all_entries: None,
             selected: std::collections::HashSet::new(),
+            listed: None,
         }
     }
 
@@ -220,12 +218,37 @@ impl PaneState {
 
     /// Replace the underlying entry list. If a filter is active it gets
     /// re-applied against the new list, so refresh-while-filtered keeps the
-    /// view narrow. Cursor is clamped to the new range.
+    /// view narrow.
+    ///
+    /// A listing of another folder starts fresh: no selection, the cursor
+    /// clamped where it was (navigation puts it at the top). A refresh of the
+    /// folder already shown keeps the selections whose names are still
+    /// there and the cursor on the same entry. The remote pane refreshes by
+    /// itself as each upload into it lands, and this used to clear the
+    /// selection and leave the cursor at its old position: a download
+    /// pressed next fell back to the cursor's entry, now perhaps another
+    /// file, and fetched that one alone.
     pub fn set_entries(&mut self, entries: Vec<PaneEntry>) {
-        // A new listing means new rows; carrying selections across a refresh
-        // or a navigation would be surprising. Filtering deliberately does
-        // *not* come through here.
-        self.selected.clear();
+        let refresh = self.listed.as_deref() == Some(self.path.as_str());
+        let at = refresh
+            .then(|| self.entries.get(self.cursor).map(|e| e.raw_name.clone()))
+            .flatten();
+        if refresh {
+            self.selected
+                .retain(|name| entries.iter().any(|e| &e.raw_name == name));
+        } else {
+            self.selected.clear();
+        }
+        self.listed = Some(self.path.clone());
+        self.replace_rows(entries);
+        if let Some(i) = at.and_then(|name| self.entries.iter().position(|e| e.raw_name == name)) {
+            self.cursor = i;
+        }
+        self.clamp_cursor();
+    }
+
+    /// The row-replacing half of [`Self::set_entries`].
+    fn replace_rows(&mut self, entries: Vec<PaneEntry>) {
         if let Some(query) = self.filter.clone() {
             let filtered: Vec<PaneEntry> = entries
                 .iter()
@@ -238,7 +261,6 @@ impl PaneState {
             self.entries = entries;
             self.all_entries = None;
         }
-        self.clamp_cursor();
     }
 
     /// Apply or update the substring filter. Empty `query` clears.
@@ -280,10 +302,13 @@ impl PaneState {
 /// Whether `entry` stays in a pane filtered on `query`: the parent row
 /// always does, and any row whose name contains the query, ignoring case —
 /// in every script, not just ASCII.
+///
+/// Matched against the whole name, made safe as the displayed one is but
+/// not shortened: `display_name` cuts the middle out of a long name, and a
+/// query naming the part cut found nothing, though the file was there.
 fn passes_filter(entry: &PaneEntry, query: &str) -> bool {
     entry.is_parent()
-        || entry
-            .display_name
+        || crate::error::sanitize_display(&entry.raw_name)
             .to_lowercase()
             .contains(&query.to_lowercase())
 }
@@ -452,17 +477,65 @@ mod pane_tests {
         assert_eq!(p.selected_count(), 2, "and the footer must say so");
     }
 
+    /// The remote pane refreshes by itself as each upload into it lands.
+    /// That cleared the selection, so a download pressed next fell back to
+    /// the cursor's entry and fetched that one alone.
     #[test]
-    fn refreshing_the_pane_clears_the_selection() {
-        // Unchanged behaviour: a new listing means new rows, and carrying
-        // selections across a refresh or a navigation would be surprising.
+    fn a_refresh_keeps_the_selections_still_there() {
+        let mut p = pane(vec![file("a.txt"), file("b.txt"), file("c.txt")]);
+        for i in [0, 2] {
+            p.cursor = i;
+            p.toggle_selected();
+        }
+
+        // An upload landed `0new.txt`, sorting first; `c.txt` went.
+        p.set_entries(vec![file("0new.txt"), file("a.txt"), file("b.txt")]);
+
+        assert_eq!(p.selection(), [("a.txt".to_string(), false)]);
+        assert_eq!(p.selected_count(), 1, "a name no longer listed is dropped");
+    }
+
+    /// New rows sorting in above used to leave the cursor at its old index,
+    /// on another file.
+    #[test]
+    fn a_refresh_keeps_the_cursor_on_the_same_entry() {
+        let mut p = pane(vec![file("a.txt"), file("b.txt")]);
+        p.cursor = 1;
+
+        p.set_entries(vec![file("0new.txt"), file("a.txt"), file("b.txt")]);
+
+        assert_eq!(p.entries[p.cursor].raw_name, "b.txt");
+    }
+
+    /// Another folder's listing starts fresh, as it always did.
+    #[test]
+    fn a_listing_of_another_folder_clears_the_selection() {
         let mut p = pane(vec![file("a.txt")]);
         p.cursor = 0;
         p.toggle_selected();
         assert_eq!(p.selected_count(), 1);
 
+        p.path = "/elsewhere".into();
         p.set_entries(vec![file("a.txt"), file("b.txt")]);
-        assert_eq!(p.selected_count(), 0, "a fresh listing starts unselected");
+
+        assert_eq!(p.selected_count(), 0, "a new folder starts unselected");
+    }
+
+    /// `display_name` cuts the middle out of a long name; the filter used to
+    /// search that, and found nothing for a query in the cut part.
+    #[test]
+    fn the_filter_searches_the_whole_name() {
+        let long = format!("{}needle{}.txt", "a".repeat(400), "b".repeat(400));
+        let mut p = pane(vec![file(&long), file("other.txt")]);
+        assert!(
+            !p.entries[0].display_name.contains("needle"),
+            "cut, as shown"
+        );
+
+        p.set_filter("needle".into());
+
+        assert_eq!(p.entries.len(), 1);
+        assert_eq!(p.entries[0].raw_name, long);
     }
 
     #[test]
@@ -655,7 +728,9 @@ pub struct PendingDelete {
 /// State for the host-key confirmation modal.
 ///
 /// Holds everything needed to render the prompt and to send the user's
-/// decision back to the SFTP connect task via the one-shot channel.
+/// decision back, via the one-shot channel, to the connect task that asked:
+/// an SSH one about a host key, or an FTPS one about a certificate (see
+/// `subject`).
 pub struct PendingHostKey {
     pub subject: crate::tui::event::TrustSubject,
     pub host: String,

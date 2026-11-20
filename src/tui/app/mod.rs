@@ -5285,6 +5285,49 @@ mod pane_audit_tests {
         assert_eq!(a.screen, Screen::ConfirmOverwrite);
     }
 
+    /// The listing an upload's landing asks for arrives as any other does;
+    /// it used to clear the remote selection, so the next download fetched
+    /// the cursor's entry alone.
+    #[test]
+    fn a_relisting_of_the_folder_shown_keeps_the_remote_selection() {
+        let entry = |n: &str| {
+            crate::transport::RemoteEntry::new(
+                n.into(),
+                crate::transport::EntryKind::File,
+                1,
+                None,
+                None,
+            )
+        };
+        let mut a = app_on_main(0);
+        a.remote.path = "/srv".into();
+        a.handle_app_event(AppEvent::Listed {
+            connection: a.connection,
+            path: "/srv".into(),
+            entries: vec![entry("a.txt"), entry("b.txt")],
+            unreadable: 0,
+        });
+        let at = |a: &App, n: &str| {
+            a.remote
+                .entries
+                .iter()
+                .position(|e| e.raw_name == n)
+                .unwrap()
+        };
+        a.remote.cursor = at(&a, "b.txt");
+        a.remote.toggle_selected();
+
+        a.handle_app_event(AppEvent::Listed {
+            connection: a.connection,
+            path: "/srv".into(),
+            entries: vec![entry("0new.txt"), entry("a.txt"), entry("b.txt")],
+            unreadable: 0,
+        });
+
+        assert_eq!(a.remote.selection(), [("b.txt".to_string(), false)]);
+        assert_eq!(a.remote.entries[a.remote.cursor].raw_name, "b.txt");
+    }
+
     #[test]
     fn a_failed_rename_names_the_file_not_its_path() {
         let mut a = app_on_main(0);
