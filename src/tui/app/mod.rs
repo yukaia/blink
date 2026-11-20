@@ -5152,6 +5152,33 @@ mod session_and_prompt_tests {
         assert_eq!(saved_host("work"), "other.example");
     }
 
+    /// A session file that doesn't load is kept out of the list, and the
+    /// check against the list alone let Ctrl+S replace it.
+    #[tokio::test]
+    async fn saving_over_an_unreadable_session_file_is_refused() {
+        let _home = crate::paths::test_home();
+        let mut broken = Session::from_url("sftp://me@other.example").unwrap();
+        broken.name = "work".into();
+        broken.save().unwrap();
+        let path = broken.path().unwrap();
+        std::fs::write(&path, "[session\nhand edit gone wrong").unwrap();
+
+        let mut a = App::new(Config::default(), Theme::load("dracula").unwrap());
+        connect(
+            &mut a,
+            Session::from_url("sftp://me@adhoc.example").unwrap(),
+            true,
+        );
+        save_as(&mut a, "work");
+        assert_eq!(a.screen, Screen::SaveSession);
+        let error = a.save_session_error.clone().unwrap();
+        assert!(error.contains("can't be read"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[session\nhand edit gone wrong"
+        );
+    }
+
     #[tokio::test]
     async fn a_saved_session_can_be_saved_again_under_its_own_name() {
         let _home = crate::paths::test_home();

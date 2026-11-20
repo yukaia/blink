@@ -208,6 +208,16 @@ impl Session {
         paths::hashed_file_name(name, &Sha256::digest(name.as_bytes()).into(), ".ini")
     }
 
+    /// Whether a file is already saved under `name`'s filename, whether or
+    /// not it loads. A session file that fails to parse is only logged as
+    /// unreadable and kept out of the list, so checking the list alone let a
+    /// save under its name replace it without a word.
+    pub fn file_exists(name: &str) -> bool {
+        paths::sessions_dir()
+            .map(|dir| dir.join(Self::name_to_filename(name)))
+            .is_ok_and(|path| path.symlink_metadata().is_ok())
+    }
+
     /// Filename written by older blink versions (sanitized stem only, no
     /// hash suffix). Kept around so [`Self::save`] can clean up the legacy file
     /// the first time a pre-existing session is re-saved.
