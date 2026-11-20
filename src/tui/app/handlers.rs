@@ -1719,7 +1719,7 @@ mod tests {
     fn the_viewer_scrolls_no_further_than_its_last_full_page() {
         let mut a = viewing(text_lines(100));
         super::super::tests_support::draw(&a);
-        let rows = usize::from(a.hit.viewer_body.get().unwrap().height);
+        let rows = usize::from(a.hit.get().viewer_body.unwrap().height);
         press(&mut a, KeyCode::End);
         assert_eq!(scroll_of(&a), 100 - rows);
         press(&mut a, KeyCode::Down);

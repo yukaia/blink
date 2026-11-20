@@ -227,11 +227,13 @@ pub mod session_select {
         }
         // Sessions start below the heading and its blank line, one per row;
         // row `r` is session `session_view_offset + r`.
-        app.hit.session_list.set(Some(Rect {
-            y: area.y + 2,
-            height: area.height.saturating_sub(2),
-            ..area
-        }));
+        app.hit.set(|a| {
+            a.session_list = Some(Rect {
+                y: area.y + 2,
+                height: area.height.saturating_sub(2),
+                ..area
+            })
+        });
         f.render_widget(Paragraph::new(lines), area);
     }
 
@@ -407,7 +409,7 @@ pub mod help {
             height: inner.height.min(1),
             ..inner
         };
-        app.hit.help_body.set(Some(body_area));
+        app.hit.set(|a| a.help_body = Some(body_area));
 
         let max = scroll_limit(body.len(), body_area.height);
         let scroll = u16::try_from(app.help_scroll.min(max)).unwrap_or(u16::MAX);
@@ -430,8 +432,8 @@ pub mod help {
     /// The furthest help can scroll, as last drawn. Zero before it has been.
     pub(crate) fn max_scroll(app: &App) -> usize {
         app.hit
-            .help_body
             .get()
+            .help_body
             .map_or(0, |r| scroll_limit(lines(app).len(), r.height))
     }
 
@@ -954,7 +956,7 @@ pub mod viewer {
             inner.width,
             inner.height.saturating_sub(1),
         );
-        app.hit.viewer_body.set(Some(body));
+        app.hit.set(|a| a.viewer_body = Some(body));
         let hint = Rect::new(
             inner.x,
             inner.y.saturating_add(inner.height.saturating_sub(1)),

@@ -78,8 +78,8 @@ impl App {
         let (col, row) = (m.column, m.row);
         for pane in [Pane::Local, Pane::Remote] {
             let (pane_area, list_area) = match pane {
-                Pane::Local => (self.hit.local_pane.get(), self.hit.local_list.get()),
-                _ => (self.hit.remote_pane.get(), self.hit.remote_list.get()),
+                Pane::Local => (self.hit.get().local_pane, self.hit.get().local_list),
+                _ => (self.hit.get().remote_pane, self.hit.get().remote_list),
             };
             if row_in(pane_area, col, row).is_none() {
                 continue;
@@ -96,17 +96,17 @@ impl App {
         }
 
         let left = matches!(m.kind, MouseEventKind::Down(MouseButton::Left));
-        if left && row_in(self.hit.transfers_tab.get(), col, row).is_some() {
+        if left && row_in(self.hit.get().transfers_tab, col, row).is_some() {
             self.bottom_pane = BottomPane::Transfers;
             self.active_pane = Pane::Transfers;
             return;
         }
-        if left && row_in(self.hit.log_tab.get(), col, row).is_some() {
+        if left && row_in(self.hit.get().log_tab, col, row).is_some() {
             self.bottom_pane = BottomPane::Log;
             self.active_pane = Pane::Log;
             return;
         }
-        if let Some(r) = row_in(self.hit.transfer_list.get(), col, row) {
+        if let Some(r) = row_in(self.hit.get().transfer_list, col, row) {
             // Any gesture here focuses the bottom pane, the wheel included:
             // the transfer cursor is only drawn while it is focused, so
             // moving it unfocused would move a highlight nobody can see —
@@ -128,7 +128,7 @@ impl App {
         // The wheel over the log scrolls it, and focuses it as the wheel
         // over the transfer list does.
         if self.bottom_pane == BottomPane::Log
-            && row_in(self.hit.bottom_pane.get(), col, row).is_some()
+            && row_in(self.hit.get().bottom_pane, col, row).is_some()
         {
             let delta = match m.kind {
                 MouseEventKind::ScrollUp => WHEEL_STEP,
@@ -144,7 +144,7 @@ impl App {
         // Anywhere else in the bottom pane — the log, empty space, the
         // border — a click focuses the page it is showing, as a click
         // anywhere in a file pane focuses that pane.
-        if left && row_in(self.hit.bottom_pane.get(), col, row).is_some() {
+        if left && row_in(self.hit.get().bottom_pane, col, row).is_some() {
             self.active_pane = match self.bottom_pane {
                 BottomPane::Transfers => Pane::Transfers,
                 BottomPane::Log => Pane::Log,
@@ -154,7 +154,7 @@ impl App {
 
     /// The wheel over the viewer body scrolls its text. Images don't scroll.
     fn mouse_viewer(&mut self, m: MouseEvent) {
-        if row_in(self.hit.viewer_body.get(), m.column, m.row).is_none() {
+        if row_in(self.hit.get().viewer_body, m.column, m.row).is_none() {
             return;
         }
         match m.kind {
@@ -165,7 +165,7 @@ impl App {
     }
 
     fn mouse_help(&mut self, m: MouseEvent) {
-        if row_in(self.hit.help_body.get(), m.column, m.row).is_none() {
+        if row_in(self.hit.get().help_body, m.column, m.row).is_none() {
             return;
         }
         match m.kind {
@@ -178,7 +178,7 @@ impl App {
     /// A click selects a session; a double-click connects, as Enter does;
     /// the wheel moves the selection.
     fn mouse_session_select(&mut self, m: MouseEvent, now: Instant) {
-        let Some(r) = row_in(self.hit.session_list.get(), m.column, m.row) else {
+        let Some(r) = row_in(self.hit.get().session_list, m.column, m.row) else {
             return;
         };
         let len = self.sessions.len();
@@ -294,7 +294,7 @@ mod tests {
 
     /// The screen cell of row `r` in the local list, as last drawn.
     fn local_row(a: &App, r: u16) -> (u16, u16) {
-        let list = a.hit.local_list.get().unwrap();
+        let list = a.hit.get().local_list.unwrap();
         (list.x + 2, list.y + r)
     }
 
@@ -315,7 +315,7 @@ mod tests {
         a.active_pane = Pane::Remote;
         a.local.cursor = 5;
         draw(&a);
-        let list = a.hit.local_list.get().unwrap();
+        let list = a.hit.get().local_list.unwrap();
         a.handle_mouse_at(press(list.x + 2, list.y - 1), Instant::now());
         assert_eq!(a.active_pane, Pane::Local);
         assert_eq!(a.local.cursor, 5);
@@ -451,8 +451,8 @@ mod tests {
     async fn double_click_and_walk(a: &mut App, pane: Pane, r: u16) -> Vec<String> {
         let mut rx = a.app_event_rx.take().unwrap();
         let list = match pane {
-            Pane::Local => a.hit.local_list.get().unwrap(),
-            _ => a.hit.remote_list.get().unwrap(),
+            Pane::Local => a.hit.get().local_list.unwrap(),
+            _ => a.hit.get().remote_list.unwrap(),
         };
         let t = Instant::now();
         a.handle_mouse_at(press(list.x + 2, list.y + r), t);
@@ -570,11 +570,11 @@ mod tests {
     fn clicking_a_tab_shows_that_page_and_focuses_the_bottom_pane() {
         let mut a = app_on_main(0);
         draw(&a);
-        let (c, r) = centre(a.hit.log_tab.get().unwrap());
+        let (c, r) = centre(a.hit.get().log_tab.unwrap());
         a.handle_mouse_at(press(c, r), Instant::now());
         assert_eq!(a.bottom_pane, BottomPane::Log);
         assert_eq!(a.active_pane, Pane::Log);
-        let (c, r) = centre(a.hit.transfers_tab.get().unwrap());
+        let (c, r) = centre(a.hit.get().transfers_tab.unwrap());
         a.handle_mouse_at(press(c, r), Instant::now());
         assert_eq!(a.bottom_pane, BottomPane::Transfers);
         assert_eq!(a.active_pane, Pane::Transfers);
@@ -592,7 +592,7 @@ mod tests {
         a.transfer_manager = Some(m);
         a.bottom_pane = BottomPane::Transfers;
         draw(&a);
-        let list = a.hit.transfer_list.get().unwrap();
+        let list = a.hit.get().transfer_list.unwrap();
         a.handle_mouse_at(press(list.x + 2, list.y + 2), Instant::now());
         assert_eq!(a.active_pane, Pane::Transfers);
         assert_eq!(a.transfer_cursor, 2);
@@ -613,7 +613,7 @@ mod tests {
         });
         a.screen = Screen::Viewer;
         draw(&a);
-        let body = a.hit.viewer_body.get().unwrap();
+        let body = a.hit.get().viewer_body.unwrap();
         a.handle_mouse_at(wheel(true, body.x + 1, body.y + 1), Instant::now());
         match &a.viewer.as_ref().unwrap().kind {
             crate::tui::state::ViewerKind::Text { scroll, .. } => assert_eq!(*scroll, 3),
@@ -640,7 +640,7 @@ mod tests {
     fn a_click_selects_a_session_and_the_wheel_moves_the_selection() {
         let mut a = selector_with(5);
         draw(&a);
-        let rows = a.hit.session_list.get().unwrap();
+        let rows = a.hit.get().session_list.unwrap();
         a.handle_mouse_at(press(rows.x + 4, rows.y + 3), Instant::now());
         assert_eq!(a.session_cursor, 3);
         a.handle_mouse_at(wheel(false, rows.x + 4, rows.y), Instant::now());
@@ -653,7 +653,7 @@ mod tests {
     fn a_double_click_on_a_session_connects_as_enter_does() {
         let mut a = selector_with(2);
         draw(&a);
-        let rows = a.hit.session_list.get().unwrap();
+        let rows = a.hit.get().session_list.unwrap();
         let t = Instant::now();
         a.handle_mouse_at(press(rows.x + 4, rows.y + 1), t);
         a.handle_mouse_at(
@@ -670,7 +670,7 @@ mod tests {
     fn a_long_session_list_scrolls_to_the_cursor_and_clicks_follow_it() {
         let mut a = selector_with(60);
         draw(&a);
-        let rows = a.hit.session_list.get().unwrap();
+        let rows = a.hit.get().session_list.unwrap();
         assert!(
             (rows.height as usize) < 60,
             "the test needs a list that overflows"
@@ -733,7 +733,7 @@ mod tests {
         a.active_pane = Pane::Remote;
         a.local.cursor = 5;
         draw(&a);
-        let list = a.hit.local_list.get().unwrap();
+        let list = a.hit.get().local_list.unwrap();
         a.handle_mouse_at(press(list.x + 2, list.y + list.height), Instant::now());
         assert_eq!(a.active_pane, Pane::Local);
         assert_eq!(a.local.cursor, 5);
@@ -774,7 +774,7 @@ mod tests {
         a.bottom_pane = BottomPane::Transfers;
         a.active_pane = Pane::Local;
         draw(&a);
-        let list = a.hit.transfer_list.get().unwrap();
+        let list = a.hit.get().transfer_list.unwrap();
         a.handle_mouse_at(wheel(true, list.x + 2, list.y), Instant::now());
         assert_eq!(
             a.active_pane,
@@ -793,7 +793,7 @@ mod tests {
         a.bottom_pane = BottomPane::Log;
         a.active_pane = Pane::Local;
         draw(&a);
-        let pane = a.hit.bottom_pane.get().unwrap();
+        let pane = a.hit.get().bottom_pane.unwrap();
         a.handle_mouse_at(press(pane.x + pane.width / 2, pane.y + 3), Instant::now());
         assert_eq!(a.active_pane, Pane::Log, "a click in the log body");
 
@@ -834,7 +834,7 @@ mod tests {
         assert!(!shown.contains("job00"), "{shown}");
 
         // A click on the top row means the first job shown, not job 0.
-        let list = a.hit.transfer_list.get().unwrap();
+        let list = a.hit.get().transfer_list.unwrap();
         a.handle_mouse_at(press(list.x + 2, list.y), Instant::now());
         let first_shown = 10 - usize::from(list.height);
         assert_eq!(a.transfer_cursor, first_shown);
@@ -919,7 +919,7 @@ mod tests {
         let mut a = with_log(50);
         a.active_pane = Pane::Local;
         draw(&a);
-        let pane = a.hit.bottom_pane.get().unwrap();
+        let pane = a.hit.get().bottom_pane.unwrap();
         a.handle_mouse_at(wheel(false, pane.x + 3, pane.y + 3), Instant::now());
         let shown = text(&draw(&a));
         assert!(!shown.contains("entry 49"), "{shown}");

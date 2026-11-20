@@ -164,8 +164,8 @@ impl App {
     /// Lines of text the viewer showed when last drawn; one before then.
     fn viewer_rows(&self) -> usize {
         self.hit
-            .viewer_body
             .get()
+            .viewer_body
             .map_or(1, |r| usize::from(r.height).max(1))
     }
 
@@ -503,7 +503,7 @@ mod tests {
     fn the_image_area_is_the_viewers_body() {
         let a = viewing_image(ImageRender::default());
         draw(&a);
-        let body = a.hit.viewer_body.get().unwrap();
+        let body = a.hit.get().viewer_body.unwrap();
         let area = image_area(Rect::new(0, 0, 100, 30)).unwrap();
         assert_eq!(
             (area.x, area.y, area.w, area.h),

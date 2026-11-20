@@ -233,6 +233,11 @@ the git history for those.
 
 ### Fixed
 
+- **The bottom pane's tabs answer only where they're drawn.** In a terminal
+  too narrow for the title, the labels are cut short, but their click areas
+  ran on past them, so a click on the pane's corner switched to a tab
+  nobody could see.
+
 - **A stall no longer sets off a burst of redraws.** The redraw tick made up
   every tick it missed, so a one-second stall (a large image rendering)
   was followed by ten full redraws back to back. Missed ticks are now

@@ -106,12 +106,16 @@ pub mod file_pane {
 
         // Entry list, windowed around cursor.
         let list_area = inner_layout[1];
-        let (pane_hit, list_hit) = match which {
-            Pane::Local => (&app.hit.local_pane, &app.hit.local_list),
-            _ => (&app.hit.remote_pane, &app.hit.remote_list),
-        };
-        pane_hit.set(Some(area));
-        list_hit.set(Some(list_area));
+        app.hit.set(|a| match which {
+            Pane::Local => {
+                a.local_pane = Some(area);
+                a.local_list = Some(list_area);
+            }
+            _ => {
+                a.remote_pane = Some(area);
+                a.remote_list = Some(list_area);
+            }
+        });
         let h = list_area.height as usize;
         let len = state.entries.len();
         let cursor = state.cursor.min(len.saturating_sub(1));
@@ -212,7 +216,7 @@ pub mod bottom_pane {
     use crate::tui::app::{BottomPane, LogLevel};
 
     pub fn render(f: &mut Frame, app: &App, area: Rect) {
-        app.hit.bottom_pane.set(Some(area));
+        app.hit.set(|a| a.bottom_pane = Some(area));
         let focused = matches!(app.active_pane, Pane::Transfers | Pane::Log);
         let border_color = if focused {
             app.theme.border_active
@@ -241,22 +245,35 @@ pub mod bottom_pane {
 
         // The tab labels sit in the title row, one cell in from the corner:
         // " " then " TRANSFERS " then "·" then " LOG ", as `tab_title` draws.
-        let transfers_x = area.x + 2;
-        let log_x = transfers_x + TRANSFERS_TAB.len() as u16 + 1;
-        app.hit.transfers_tab.set(Some(Rect::new(
-            transfers_x,
-            area.y,
-            TRANSFERS_TAB.len() as u16,
-            1,
-        )));
-        app.hit
-            .log_tab
-            .set(Some(Rect::new(log_x, area.y, LOG_TAB.len() as u16, 1)));
+        // Clipped to the pane: in a terminal too narrow for the title,
+        // ratatui cuts the labels short, and a label's area ran on past
+        // them, so a click on the pane's corner switched to a tab nobody
+        // could see.
+        let transfers_x = area.x.saturating_add(2);
+        let log_x = transfers_x.saturating_add(TRANSFERS_TAB.len() as u16 + 1);
+        let tab = |x: u16, label: &str| {
+            Some(Rect::new(x, area.y, label.len() as u16, 1).intersection(tab_row(area)))
+                .filter(|r| !r.is_empty())
+        };
+        app.hit.set(|a| {
+            a.transfers_tab = tab(transfers_x, TRANSFERS_TAB);
+            a.log_tab = tab(log_x, LOG_TAB);
+        });
 
         match app.bottom_pane {
             BottomPane::Transfers => render_transfers(f, app, inner),
             BottomPane::Log => render_log(f, app, inner),
         }
+    }
+
+    /// Where a title's text can go: the top row inside the corners.
+    fn tab_row(area: Rect) -> Rect {
+        Rect::new(
+            area.x.saturating_add(1),
+            area.y,
+            area.width.saturating_sub(2),
+            area.height.min(1),
+        )
     }
 
     const TRANSFERS_TAB: &str = " TRANSFERS ";
@@ -297,7 +314,7 @@ pub mod bottom_pane {
     // ----- Transfers page --------------------------------------------------
 
     fn render_transfers(f: &mut Frame, app: &App, area: Rect) {
-        app.hit.transfer_list.set(Some(area));
+        app.hit.set(|a| a.transfer_list = Some(area));
         let jobs = app.active_jobs();
         if jobs.is_empty() {
             let p = Paragraph::new(Line::from(Span::styled(
@@ -442,7 +459,7 @@ pub mod bottom_pane {
     // ----- Log page -------------------------------------------------------
 
     fn render_log(f: &mut Frame, app: &App, area: Rect) {
-        app.hit.log_body.set(Some(area));
+        app.hit.set(|a| a.log_body = Some(area));
         let h = area.height as usize;
         let total = app.log.len();
         let scroll = app.log_scroll.min(total.saturating_sub(h));
