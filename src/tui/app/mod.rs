@@ -5307,14 +5307,12 @@ mod pane_audit_tests {
             entries: vec![entry("a.txt"), entry("b.txt")],
             unreadable: 0,
         });
-        let at = |a: &App, n: &str| {
-            a.remote
-                .entries
-                .iter()
-                .position(|e| e.raw_name == n)
-                .unwrap()
-        };
-        a.remote.cursor = at(&a, "b.txt");
+        a.remote.cursor = a
+            .remote
+            .entries
+            .iter()
+            .position(|e| e.raw_name == "b.txt")
+            .unwrap();
         a.remote.toggle_selected();
 
         a.handle_app_event(AppEvent::Listed {
