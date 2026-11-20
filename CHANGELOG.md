@@ -46,6 +46,12 @@ the git history for those.
 
 ### Changed
 
+- **The FTPS toggle in the session editor says what it does.** It was
+  labelled `tls verify:`, where a tick meant the chain was *not* checked,
+  and ticked it warned that it "disables TLS protections". Since pinning,
+  it pins the server's certificate instead: asked about on the first
+  connect, the handshake still verified, later connects held to it. It now
+  reads `tls trust: [x] pin the certificate, not the CA chain`.
 - **`scp://` reads like `sftp://`.** It shares SFTP's colour in the
   session list, being the same encrypted connection, and the "routed
   through SFTP" note on connecting is information rather than a warning.
@@ -125,6 +131,12 @@ the git history for those.
 
 ### Security
 
+- **Session names and hosts are drawn sanitized everywhere.** Only the
+  save offer cleaned them; the selector, header, prompts, editor and the
+  host-key dialog printed them raw, where a right-to-left override in a
+  hand-written session file or a typed URL vanished, so the host shown
+  above "verify this fingerprint" could read as another one. They are now
+  replaced with a space, as in remote names.
 - **A download checks for planted symlinks as it starts, not only when it
   was planned.** A recursive download refused a folder that was another
   user's symlink, but only while walking the tree; the downloads ran after
@@ -241,6 +253,15 @@ the git history for those.
 
 ### Fixed
 
+- **The viewer's line number matches the text after a resize.** Making
+  the terminal taller at the end of a file showed an earlier page while
+  the hint still named the old top line.
+- **Help says `r` and `R` work in the Transfers pane**, as it did for `c`
+  and `C`; pressed in a file pane they do nothing.
+- **The selector says "(unchanged)", not "(home)", for a session without a
+  local folder**, since connecting leaves the local pane where it is.
+- **Session names with wide characters keep the list's columns lined up.**
+  The name was padded by characters, not terminal columns.
 - **A refresh keeps your selection and your place.** The remote pane
   refreshes by itself as each upload into it lands, and that cleared every
   selection and left the cursor at its old position, on another file once

@@ -85,6 +85,32 @@ pub(crate) fn render_modal(
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// A session field as it is drawn: control characters and the deceptive
+/// formatters replaced, as for a remote name.
+///
+/// [`Session::validate`](crate::session::Session::validate) refuses only NUL,
+/// CR and LF, so a name or host from a hand-written session file or a typed
+/// URL can still carry a bidi override. ratatui drops control characters
+/// but not those, and the host-key prompt prints the host right above
+/// "verify this fingerprint".
+pub(crate) fn shown(s: &str) -> String {
+    crate::error::sanitize_display(s).into_owned()
+}
+
+/// `user@host:port` for `s`, made safe by [`shown`]. Every view that names
+/// a connection goes through this, so none can show it raw.
+pub(crate) fn session_target(s: &crate::session::Session) -> String {
+    shown(&format!("{}@{}:{}", s.username, s.host, s.port))
+}
+
+/// `text` padded with spaces to `width` terminal columns, by display width
+/// rather than character count, so a wide character doesn't push what
+/// follows out of its column.
+fn pad_to(text: &str, width: usize) -> String {
+    let used = unicode_width::UnicodeWidthStr::width(text);
+    format!("{text}{}", " ".repeat(width.saturating_sub(used)))
+}
+
 // ---------------------------------------------------------------------------
 // Session select
 // ---------------------------------------------------------------------------
@@ -206,11 +232,8 @@ pub mod session_select {
 
                 let line_spans = vec![
                     prefix,
-                    Span::styled(format!("{:<14}", s.name), name_style),
-                    Span::styled(
-                        format!("  {}@{}:{}", s.username, s.host, s.port),
-                        host_style,
-                    ),
+                    Span::styled(pad_to(&shown(&s.name), 14), name_style),
+                    Span::styled(format!("  {}", session_target(s)), host_style),
                     Span::raw("   "),
                     Span::styled(
                         format!("[{}]", s.protocol.as_str()),
@@ -247,7 +270,7 @@ pub mod session_select {
             Line::from(vec![
                 Span::raw("  "),
                 Span::styled(
-                    format!("DETAILS · {}", s.name),
+                    format!("DETAILS · {}", shown(&s.name)),
                     Style::default()
                         .fg(app.theme.accent)
                         .add_modifier(Modifier::BOLD),
@@ -259,19 +282,21 @@ pub mod session_select {
                 Span::raw(s.protocol.as_str()),
                 Span::raw("    "),
                 Span::styled("auth      ", Style::default().fg(app.theme.dim)),
-                Span::raw(s.auth.label()),
+                Span::raw(shown(&s.auth.label())),
             ]),
             Line::from(vec![
                 Span::raw("  "),
                 Span::styled("remote    ", Style::default().fg(app.theme.dim)),
-                Span::raw(s.remote_dir.clone()),
+                Span::raw(shown(&s.remote_dir)),
                 Span::raw("    "),
                 Span::styled("local     ", Style::default().fg(app.theme.dim)),
+                // Without a `local_dir`, connecting leaves the local pane
+                // where it is, which is home only until you browse away.
                 Span::raw(
                     s.local_dir
                         .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "(home)".to_string()),
+                        .map(|p| shown(&p.display().to_string()))
+                        .unwrap_or_else(|| "(unchanged)".to_string()),
                 ),
             ]),
             Line::from(vec![
@@ -340,15 +365,7 @@ pub mod main {
         let session_label = app
             .current_session
             .as_ref()
-            .map(|s| {
-                format!(
-                    " {} · {}@{}:{} ",
-                    s.protocol.as_str(),
-                    s.username,
-                    s.host,
-                    s.port
-                )
-            })
+            .map(|s| format!(" {} · {} ", s.protocol.as_str(), super::session_target(s)))
             .unwrap_or_else(|| " not connected ".to_string());
 
         let line = Line::from(vec![
@@ -508,6 +525,7 @@ pub mod help {
                 "resume an interrupted download · upload batch",
                 key_s,
             ),
+            kv("            ", "(Transfers pane)", key_s),
             Line::from(""),
             Line::from(Span::styled("  VIEWER", acc_s)),
             kv("  ↑ ↓ · j k ", "scroll a line", key_s),
@@ -839,15 +857,7 @@ pub mod password_prompt {
         let target = app
             .pending_session
             .as_ref()
-            .map(|s| {
-                format!(
-                    "{}@{}:{} ({})",
-                    s.username,
-                    s.host,
-                    s.port,
-                    s.protocol.as_str()
-                )
-            })
+            .map(|s| format!("{} ({})", super::session_target(s), s.protocol.as_str()))
             .unwrap_or_default();
         let masked: String = "•".repeat(app.password_input.chars().count());
 
@@ -885,15 +895,7 @@ pub mod connection {
             .pending_session
             .as_ref()
             .or(app.current_session.as_ref())
-            .map(|s| {
-                format!(
-                    "{}@{}:{} via {}",
-                    s.username,
-                    s.host,
-                    s.port,
-                    s.protocol.as_str()
-                )
-            })
+            .map(|s| format!("{} via {}", super::session_target(s), s.protocol.as_str()))
             .unwrap_or_else(|| "…".into());
 
         let lines = vec![
@@ -1004,11 +1006,16 @@ pub mod viewer {
             }
         }
 
-        // Hint strip at the bottom.
+        // Hint strip at the bottom. The line it names is the one drawn at the
+        // top, held to the same limit `render_text` uses: the stored scroll
+        // was limited against the height at the last keypress, and a
+        // terminal made taller since then shows an earlier line than that.
         let hint_text = match &viewer.kind {
             ViewerKind::Text { tokens, scroll } => format!(
                 "  line {}/{}    [↑↓] scroll  [pgup/pgdn] page  [g/G] top/bottom  [q/esc] close",
-                scroll.saturating_add(1).min(tokens.len().max(1)),
+                top_line(tokens.len(), *scroll, body.height)
+                    .saturating_add(1)
+                    .min(tokens.len().max(1)),
                 tokens.len(),
             ),
             _ => "  [q/esc] close".to_string(),
@@ -1029,8 +1036,7 @@ pub mod viewer {
             return;
         }
 
-        // One entry per line, so the token count is the line count.
-        let start = scroll.min(crate::tui::app::text_scroll_limit(tokens.len(), h));
+        let start = top_line(tokens.len(), scroll, area.height);
         let end = (start + h).min(tokens.len());
         let lineno_width = end.to_string().len();
 
@@ -1048,6 +1054,13 @@ pub mod viewer {
         }
 
         f.render_widget(Paragraph::new(rendered), area);
+    }
+
+    /// The index of the line drawn at the top of `rows` rows of a
+    /// `lines`-line file scrolled to `scroll`. One entry of `tokens` per
+    /// line, so the token count is the line count.
+    fn top_line(lines: usize, scroll: usize, rows: u16) -> usize {
+        scroll.min(crate::tui::app::text_scroll_limit(lines, usize::from(rows)))
     }
 
     fn token_style(kind: crate::highlight::TokenKind, app: &App) -> Style {
@@ -1136,7 +1149,7 @@ pub mod offer_save_session {
         let target = app
             .current_session
             .as_ref()
-            .map(|s| format!("{}@{}:{}", s.username, s.host, s.port))
+            .map(super::session_target)
             .unwrap_or_else(|| "this connection".into());
 
         let lines = vec![
@@ -1144,11 +1157,8 @@ pub mod offer_save_session {
             Line::from(Span::styled("connected — but this one isn't saved yet", fg))
                 .alignment(Alignment::Center),
             Line::from(""),
-            Line::from(Span::styled(
-                crate::error::sanitize_display(&target).into_owned(),
-                fg.add_modifier(Modifier::BOLD),
-            ))
-            .alignment(Alignment::Center),
+            Line::from(Span::styled(target, fg.add_modifier(Modifier::BOLD)))
+                .alignment(Alignment::Center),
             Line::from(""),
             Line::from(Span::styled(
                 "saving keeps it in the selector for next time.",
@@ -1329,15 +1339,7 @@ pub mod save_session {
         let target = app
             .current_session
             .as_ref()
-            .map(|s| {
-                format!(
-                    "{}@{}:{} ({})",
-                    s.username,
-                    s.host,
-                    s.port,
-                    s.protocol.as_str()
-                )
-            })
+            .map(|s| format!("{} ({})", super::session_target(s), s.protocol.as_str()))
             .unwrap_or_default();
 
         let mut lines = vec![
@@ -1356,7 +1358,7 @@ pub mod save_session {
             Line::from(vec![
                 Span::raw("  "),
                 Span::styled("local: ", dim),
-                Span::raw(app.local.path.clone()),
+                Span::raw(super::shown(&app.local.path)),
             ]),
             Line::from(vec![
                 Span::raw("  "),
@@ -1364,7 +1366,7 @@ pub mod save_session {
                 Span::raw(if app.remote.path.is_empty() {
                     "/".into()
                 } else {
-                    app.remote.path.clone()
+                    super::shown(&app.remote.path)
                 }),
             ]),
         ];
@@ -1444,7 +1446,7 @@ pub mod mkdir {
                     if app.remote.path.is_empty() {
                         "/".to_string()
                     } else {
-                        app.remote.path.clone()
+                        super::shown(&app.remote.path)
                     },
                     dim,
                 ),
@@ -1747,7 +1749,7 @@ pub mod edit_session {
             let mut spans = vec![
                 Span::raw("  "),
                 Span::styled(format!("{label:<12}"), dim),
-                Span::styled(value.to_string(), fg),
+                Span::styled(super::shown(value), fg),
             ];
             if focused {
                 spans.push(Span::styled("█", cursor));
@@ -1797,8 +1799,14 @@ pub mod edit_session {
         }
         lines.push(Line::from(parallel_spans));
 
-        // Accept-invalid-certs toggle. Rendered as a checkbox row; the
-        // dangerous state ([x] true) gets a red warning string trailing.
+        // The `accept_invalid_certs` toggle, as a checkbox row. Ticked, FTPS
+        // pins the server's certificate instead of checking it against the
+        // CA roots (see `transport/ftps.rs`): asked about on the first
+        // connect, the handshake signature still verified, and every later
+        // connect held to the same certificate. It used to be labelled
+        // `tls verify:`, where a tick meant the opposite of what it said,
+        // and to warn that it disabled TLS protections, which it no longer
+        // does.
         let aic_focused = form.focused == EditField::AcceptInvalidCerts;
         let aic_box = if form.accept_invalid_certs {
             "[x]"
@@ -1807,14 +1815,14 @@ pub mod edit_session {
         };
         let aic_box_style = if form.accept_invalid_certs {
             Style::default()
-                .fg(app.theme.error)
+                .fg(app.theme.warning)
                 .add_modifier(Modifier::BOLD)
         } else {
             fg
         };
         let mut aic_spans = vec![
             Span::raw("  "),
-            Span::styled(format!("{:<12}", "tls verify:"), dim),
+            Span::styled(format!("{:<12}", "tls trust:"), dim),
             Span::styled(aic_box.to_string(), aic_box_style),
         ];
         if aic_focused {
@@ -1823,17 +1831,18 @@ pub mod edit_session {
             aic_spans.push(Span::raw(" "));
             aic_spans.push(Span::styled("◀", cursor));
         }
-        aic_spans.push(Span::styled("  accept invalid certs (FTPS only)", dim));
+        aic_spans.push(Span::styled(
+            "  pin the certificate, not the CA chain (FTPS only)",
+            dim,
+        ));
         lines.push(Line::from(aic_spans));
         if form.accept_invalid_certs {
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::raw(" ".repeat(12)),
                 Span::styled(
-                    "    ⚠  this disables TLS protections. use only for self-signed dev servers.",
-                    Style::default()
-                        .fg(app.theme.error)
-                        .add_modifier(Modifier::BOLD),
+                    "the first connect asks to trust it; later ones must match it.",
+                    Style::default().fg(app.theme.warning),
                 ),
             ]));
         }
@@ -1851,7 +1860,7 @@ pub mod edit_session {
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(format!("{:<12}", "auth:"), dim),
-                Span::styled(s.auth.label(), fg),
+                Span::styled(super::shown(&s.auth.label()), fg),
             ]));
         }
 
@@ -1891,20 +1900,14 @@ pub mod confirm_delete_session {
             lines.push(Line::from(""));
             lines.push(
                 Line::from(Span::styled(
-                    s.name.clone(),
+                    super::shown(&s.name),
                     fg.add_modifier(Modifier::BOLD),
                 ))
                 .alignment(Alignment::Center),
             );
             lines.push(
                 Line::from(Span::styled(
-                    format!(
-                        "{}@{}:{}  [{}]",
-                        s.username,
-                        s.host,
-                        s.port,
-                        s.protocol.as_str()
-                    ),
+                    format!("{}  [{}]", super::session_target(s), s.protocol.as_str()),
                     dim,
                 ))
                 .alignment(Alignment::Center),
@@ -1959,7 +1962,7 @@ pub mod key_passphrase_prompt {
             .as_ref()
             .and_then(|s| match &s.auth {
                 crate::session::AuthMethod::Key { path } => {
-                    Some(format!("key: {}", path.display()))
+                    Some(super::shown(&format!("key: {}", path.display())))
                 }
                 _ => None,
             })
@@ -2078,15 +2081,7 @@ pub mod confirm_disconnect {
         let target = app
             .current_session
             .as_ref()
-            .map(|s| {
-                format!(
-                    "{}@{}:{} ({})",
-                    s.username,
-                    s.host,
-                    s.port,
-                    s.protocol.as_str()
-                )
-            })
+            .map(|s| format!("{} ({})", super::session_target(s), s.protocol.as_str()))
             .unwrap_or_else(|| "this session".into());
 
         let mut lines = vec![
@@ -2158,7 +2153,9 @@ pub mod confirm_host_key {
             ),
         };
 
-        let (host, key_type) = (phk.host.as_str(), phk.key_type.as_str());
+        // The host comes from the session as typed or saved, the one value
+        // here not produced by blink itself.
+        let (host, key_type) = (super::shown(&phk.host), phk.key_type.as_str());
 
         // A certificate's fingerprint, `AB:CD:…`, is 95 columns: wider than
         // the modal. Break it, between byte pairs, onto as many lines as it
@@ -2270,12 +2267,13 @@ pub mod host_key_changed {
         // a key that forgets the stored fingerprint from inside it would turn
         // the warning into a dismiss button. Same posture as OpenSSH pointing
         // at `ssh-keygen -R` rather than offering to do it for you.
+        let lookup_host = super::shown(&info.lookup_host);
         let remove_cmd = if info.lookup_port == 22 {
-            format!("blink known-hosts remove {}", info.lookup_host)
+            format!("blink known-hosts remove {lookup_host}")
         } else {
             format!(
-                "blink known-hosts remove {} --port {}",
-                info.lookup_host, info.lookup_port
+                "blink known-hosts remove {lookup_host} --port {}",
+                info.lookup_port
             )
         };
 
@@ -2320,7 +2318,7 @@ pub mod host_key_changed {
             Line::from(vec![
                 Span::styled("  Host:          ", Style::default().fg(app.theme.dim)),
                 Span::styled(
-                    info.host.clone(),
+                    super::shown(&info.host),
                     Style::default()
                         .fg(app.theme.fg)
                         .add_modifier(Modifier::BOLD),
@@ -2462,12 +2460,14 @@ mod render_tests {
     }
 
     #[test]
-    fn the_selector_falls_back_to_home_and_the_global_parallel_count() {
+    fn the_selector_says_the_local_pane_is_left_alone_and_the_global_parallel_count() {
         let mut a = over_selector(Screen::SessionSelect);
         a.sessions = vec![session("sftp://me@h.example")];
 
+        // Without a local_dir the pane stays where it is, which is home
+        // only until you browse away; it used to say "(home)".
         let text = screen(&a);
-        assert!(text.contains("(home)"), "{text}");
+        assert!(text.contains("(unchanged)"), "{text}");
         let global = a.config.general.parallel_downloads;
         assert!(text.contains(&format!("{global} (global)")), "{text}");
     }
@@ -3122,14 +3122,14 @@ mod render_tests {
             text.contains(&format!("blank = use {global} (global)")),
             "{text}"
         );
-        assert!(text.contains("tls verify: [ ]"), "{text}");
-        assert!(!text.contains("disables TLS protections"), "{text}");
+        assert!(text.contains("tls trust:  [ ]"), "{text}");
+        assert!(!text.contains("later ones must match"), "{text}");
         assert!(text.contains("protocol:   ftps"), "{text}");
         assert!(text.contains("auth:       password"), "{text}");
     }
 
     #[test]
-    fn edit_session_warns_when_certificate_checks_are_off() {
+    fn edit_session_says_what_pinning_does_when_it_is_on() {
         let mut a = over_selector(Screen::EditSession);
         let form = edit_form(&mut a);
         form.accept_invalid_certs = true;
@@ -3138,8 +3138,18 @@ mod render_tests {
         form.error = Some("bad port".into());
 
         let text = screen(&a);
-        assert!(text.contains("tls verify: [x] ◀"), "{text}");
-        assert!(text.contains("this disables TLS protections"), "{text}");
+        // Ticked, FTPS pins the certificate rather than switching TLS
+        // checks off, and the form used to say the latter.
+        assert!(text.contains("tls trust:  [x] ◀"), "{text}");
+        assert!(
+            text.contains("pin the certificate, not the CA chain"),
+            "{text}"
+        );
+        assert!(
+            text.contains("the first connect asks to trust it; later ones must match it."),
+            "{text}"
+        );
+        assert!(!text.contains("disables TLS"), "{text}");
         assert!(text.contains("parallel:   3"), "{text}");
         assert!(!text.contains("blank = use"), "{text}");
         assert!(text.contains("✗ bad port"), "{text}");
@@ -3180,5 +3190,181 @@ mod render_tests {
         let text = screen(&a);
         assert!(text.contains("/remote: file█"), "{text}");
         assert!(text.contains("1 match "), "{text}");
+    }
+
+    // --- session fields are sanitized wherever they are drawn ---
+
+    /// A session whose name, user and host each carry a right-to-left
+    /// override, as a hand-written session file or a typed URL can:
+    /// `Session::validate` refuses only NUL, CR and LF.
+    fn deceptive_session() -> Session {
+        let mut s = session("sftp://me@h.example");
+        s.name = "wo\u{202E}rk".into();
+        s.username = "m\u{202E}e".into();
+        s.host = "h\u{202E}.example".into();
+        s
+    }
+
+    /// Every view that names a session shows these characters replaced, as
+    /// a remote name's are. Only the save offer did; the rest printed them
+    /// raw, where ratatui drops them, so `h<RLO>.example` read as
+    /// `h.example`.
+    #[test]
+    fn every_view_naming_a_session_shows_its_fields_sanitized() {
+        let target = "m e@h .example:22";
+        let mut cases: Vec<(&str, App, Vec<&str>)> = Vec::new();
+
+        let mut a = over_selector(Screen::SessionSelect);
+        a.sessions = vec![deceptive_session()];
+        cases.push(("selector", a, vec!["wo rk", target, "DETAILS · wo rk"]));
+
+        let mut a = on(Screen::Main);
+        a.current_session = Some(deceptive_session());
+        cases.push(("header", a, vec![target]));
+
+        let mut a = over_selector(Screen::PasswordPrompt);
+        a.pending_session = Some(deceptive_session());
+        cases.push(("password", a, vec![target]));
+
+        let mut a = on(Screen::Connection);
+        a.pending_session = Some(deceptive_session());
+        cases.push(("connecting", a, vec![target]));
+
+        let mut a = on(Screen::OfferSaveSession);
+        a.current_session = Some(deceptive_session());
+        cases.push(("offer save", a, vec![target]));
+
+        let mut a = on(Screen::SaveSession);
+        a.current_session = Some(deceptive_session());
+        cases.push(("save session", a, vec![target]));
+
+        let mut a = on(Screen::ConfirmDisconnect);
+        a.current_session = Some(deceptive_session());
+        cases.push(("disconnect", a, vec![target]));
+
+        let mut a = over_selector(Screen::ConfirmDeleteSession);
+        a.pending_session_delete = Some(deceptive_session());
+        cases.push(("delete session", a, vec!["wo rk", target]));
+
+        let mut a = over_selector(Screen::EditSession);
+        let s = deceptive_session();
+        a.edit_session_form = Some(EditSessionForm::from_session(&s));
+        a.sessions = vec![s];
+        cases.push(("edit session", a, vec!["wo rk", "h .example", "m e"]));
+
+        let mut a = over_selector(Screen::ConfirmHostKey);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        a.pending_host_key = Some(crate::tui::state::PendingHostKey {
+            subject: crate::tui::event::TrustSubject::SshHostKey,
+            host: "h\u{202E}.example:22".into(),
+            key_type: "ssh-ed25519".into(),
+            fingerprint: "SHA256:abc".into(),
+            decision_tx: Some(tx),
+            opened_at: std::time::Instant::now(),
+        });
+        cases.push(("unknown host key", a, vec!["Host:        h .example:22"]));
+
+        let mut a = over_selector(Screen::HostKeyChanged);
+        a.host_key_changed_info = Some(crate::tui::state::HostKeyChangedInfo {
+            host: "h\u{202E}.example".into(),
+            lookup_host: "h\u{202E}.example".into(),
+            lookup_port: 22,
+            stored_key_type: "ssh-ed25519".into(),
+            presented_key_type: "ssh-rsa".into(),
+            fingerprint: "SHA256:abc".into(),
+            trusted_once: false,
+        });
+        cases.push((
+            "host key changed",
+            a,
+            vec!["Host:          h .example", "known-hosts remove h .example"],
+        ));
+
+        let failures: Vec<String> = cases
+            .into_iter()
+            .filter_map(|(name, a, wanted)| {
+                let text = screen(&a);
+                let missing: Vec<&&str> = wanted.iter().filter(|w| !text.contains(**w)).collect();
+                (!missing.is_empty()).then(|| format!("{name}: missing {missing:?}\n{text}"))
+            })
+            .collect();
+        assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+    }
+
+    /// The name column is padded by display width: a name of wide
+    /// characters used to be padded by character count, two columns short
+    /// per character, pushing its `user@host` out of line with the rest.
+    #[test]
+    fn the_session_list_lines_up_hosts_after_a_wide_name() {
+        let mut a = over_selector(Screen::SessionSelect);
+        let mut wide = session("sftp://me@h.example");
+        wide.name = "日本語".into();
+        let mut narrow = session("sftp://me@h.example");
+        narrow.name = "abc".into();
+        a.sessions = vec![wide, narrow];
+
+        let buf = draw(&a);
+        let at_columns: Vec<u16> = (buf.area.y..buf.area.bottom())
+            .filter_map(|y| {
+                let row: String = (buf.area.x..buf.area.right())
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect();
+                if !row.contains("me@h.example:22") || row.contains("DETAILS") {
+                    return None;
+                }
+                (buf.area.x..buf.area.right()).find(|&x| buf[(x, y)].symbol() == "@")
+            })
+            .collect();
+        assert_eq!(at_columns.len(), 2, "{at_columns:?}");
+        assert_eq!(at_columns[0], at_columns[1], "{}", text_of(&buf));
+    }
+
+    #[test]
+    fn padding_counts_terminal_columns() {
+        assert_eq!(super::pad_to("abc", 6), "abc   ");
+        assert_eq!(super::pad_to("日本", 6), "日本  ");
+        assert_eq!(super::pad_to("toolongname", 4), "toolongname");
+    }
+
+    // --- viewer ---
+
+    /// The hint named the stored scroll, limited against the height at the
+    /// last keypress, while the text drawn is limited against the height
+    /// now: after the terminal grew, the two disagreed.
+    #[test]
+    fn the_viewer_hint_names_the_line_drawn_at_the_top() {
+        use crate::highlight::TokenKind;
+        use crate::tui::state::{Viewer, ViewerKind};
+        let mut a = on(Screen::Viewer);
+        let tokens = (1..=100)
+            .map(|n| vec![(TokenKind::Plain, format!("text {n}"))])
+            .collect();
+        // At the bottom of a shorter terminal's view; on this one the last
+        // page starts earlier.
+        a.viewer = Some(Viewer {
+            name: "f.txt".into(),
+            kind: ViewerKind::Text { tokens, scroll: 95 },
+            id: 1,
+        });
+        let text = screen(&a);
+        let rows = a.hit.get().viewer_body.unwrap().height as usize;
+        let top = 100 - rows + 1;
+        assert!(text.contains(&format!("{top:>3} │ text {top}")), "{text}");
+        assert!(text.contains(&format!("line {top}/100")), "{text}");
+    }
+
+    // --- help ---
+
+    /// `r` and `R` only act in the Transfers pane, as `c` and `C` do, and
+    /// help said so for those two only.
+    #[test]
+    fn help_says_resume_works_in_the_transfers_pane() {
+        let text = text_of(&draw_sized(&on(Screen::Help), 100, 80));
+        let lines: Vec<&str> = text.lines().collect();
+        let at = lines
+            .iter()
+            .position(|l| l.contains("resume an interrupted download"))
+            .expect("the resume line");
+        assert!(lines[at + 1].contains("(Transfers pane)"), "{text}");
     }
 }
