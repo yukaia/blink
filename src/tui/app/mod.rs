@@ -148,6 +148,13 @@ fn credential_buffer() -> zeroize::Zeroizing<String> {
     zeroize::Zeroizing::new(String::with_capacity(CREDENTIAL_CAPACITY))
 }
 
+/// Whether `c` still fits a credential buffer holding `buf` without it
+/// growing. Past that, keys are refused rather than let the buffer
+/// reallocate: see [`CREDENTIAL_CAPACITY`].
+fn fits_credential(buf: &str, c: char) -> bool {
+    buf.len() + c.len_utf8() <= CREDENTIAL_CAPACITY
+}
+
 /// A checkpoint entry that met a full transfer queue and is waiting for
 /// room. See `App::queue_waiting_jobs`.
 struct WaitingJob {
@@ -1292,12 +1299,21 @@ impl App {
     ///
     /// The offer stays at the front of the queue while it is displayed and
     /// is popped by whichever handler answers it.
+    ///
+    /// An offer opens on its own, as a connect comes up or as the one
+    /// before is answered, so it ignores keys for [`PROMPT_ARMING_DELAY`]
+    /// as the other such prompts do. Without that, a key typed as the
+    /// connection came up, or a held or double-tapped `d`, answered it:
+    /// and `d` on the resume offer deletes the batch's partial files.
     pub(super) fn show_next_offer(&mut self) {
         self.screen = match self.pending_offers.front() {
             Some(PostConnectOffer::ResumeCheckpoint(_)) => Screen::OfferResumeCheckpoint,
             Some(PostConnectOffer::SaveSession) => Screen::OfferSaveSession,
             None => Screen::Main,
         };
+        if self.screen != Screen::Main {
+            self.prompt_ready_at = Some(Instant::now() + PROMPT_ARMING_DELAY);
+        }
     }
 
     /// The offer currently being shown, if any. Used by its renderer.
@@ -1552,6 +1568,8 @@ mod tests {
         a.pending_offers = std::collections::VecDeque::from(vec![PostConnectOffer::SaveSession]);
         a.screen = Screen::OfferSaveSession;
 
+        a.prompt_ready_at = None; // past the arming delay
+
         a.handle_offer_save_session(press(KeyCode::Char('n')));
 
         assert_eq!(a.screen, Screen::Main, "declining leaves the connection up");
@@ -1572,6 +1590,8 @@ mod tests {
         a.current_session = Some(Session::from_url("sftp://me@host.example.com").unwrap());
         a.pending_offers = std::collections::VecDeque::from(vec![PostConnectOffer::SaveSession]);
         a.screen = Screen::OfferSaveSession;
+
+        a.prompt_ready_at = None; // past the arming delay
 
         a.handle_offer_save_session(press(KeyCode::Char('y')));
 
@@ -1597,6 +1617,7 @@ mod tests {
         a.screen = Screen::OfferSaveSession;
 
         for code in [KeyCode::Enter, KeyCode::Char('x'), KeyCode::Tab] {
+            a.prompt_ready_at = None; // past the arming delay
             a.handle_offer_save_session(press(code));
             assert_eq!(
                 a.screen,
@@ -1630,12 +1651,15 @@ mod tests {
 
         // Defer the checkpoint offer — the esc arm doesn't touch disk, so
         // this is safe without a real checkpoint file backing it.
+        a.prompt_ready_at = None; // past the arming delay
         a.handle_offer_resume_checkpoint(press(KeyCode::Esc));
         assert_eq!(
             a.screen,
             Screen::OfferSaveSession,
             "answering the first offer must advance to the next queued one",
         );
+
+        a.prompt_ready_at = None; // past the arming delay
 
         a.handle_offer_save_session(press(KeyCode::Char('n')));
 
@@ -2344,6 +2368,8 @@ mod tests {
     async fn resuming_from_the_offer_queues_the_outstanding_work() {
         let (mut a, _cleanup) = app_with_queued_offer("resume");
 
+        a.prompt_ready_at = None; // past the arming delay
+
         a.handle_offer_resume_checkpoint(press(KeyCode::Char('r')));
 
         let queued = a.transfer_manager.as_ref().unwrap().queue_counts();
@@ -2358,11 +2384,57 @@ mod tests {
         );
     }
 
+    /// The offer opens on its own as the connection comes up, and took
+    /// the next key as its answer: a `d` on its way deleted the batch's
+    /// partial files. It waits out the arming delay as the other such
+    /// prompts do.
+    #[tokio::test]
+    async fn a_key_on_its_way_as_the_offer_opens_answers_nothing() {
+        let (mut a, _cleanup) = app_with_queued_offer("offer-arming");
+        let name = a.current_session.as_ref().unwrap().name.clone();
+        let origin = crate::transport::origin_of(a.current_session.as_ref().unwrap());
+
+        a.handle_key(press(KeyCode::Char('d')));
+
+        assert_eq!(a.screen, Screen::OfferResumeCheckpoint);
+        assert_eq!(
+            crate::checkpoint::offers_for(&name, &origin).len(),
+            1,
+            "the checkpoint is still there",
+        );
+    }
+
+    /// Answering one offer opens the next, armed afresh, so a held or
+    /// doubled key doesn't answer both.
+    #[test]
+    fn the_next_offer_is_armed_as_it_opens() {
+        let mut a = app();
+        a.current_session = Some(Session::from_url("sftp://me@host").unwrap());
+        a.pending_offers = std::collections::VecDeque::from(vec![
+            offer(CheckpointKind::Download),
+            PostConnectOffer::SaveSession,
+        ]);
+        a.show_next_offer();
+        a.prompt_ready_at = None;
+        a.handle_key(press(KeyCode::Esc));
+        assert_eq!(a.screen, Screen::OfferSaveSession);
+
+        a.handle_key(press(KeyCode::Esc));
+
+        assert_eq!(
+            a.screen,
+            Screen::OfferSaveSession,
+            "the second Esc came too soon"
+        );
+    }
+
     #[tokio::test]
     async fn discarding_from_the_offer_removes_the_checkpoint() {
         let (mut a, _cleanup) = app_with_queued_offer("discard");
         let name = a.current_session.as_ref().unwrap().name.clone();
         let origin = crate::transport::origin_of(a.current_session.as_ref().unwrap());
+
+        a.prompt_ready_at = None; // past the arming delay
 
         a.handle_offer_resume_checkpoint(press(KeyCode::Char('d')));
 
@@ -2379,6 +2451,8 @@ mod tests {
         let name = a.current_session.as_ref().unwrap().name.clone();
         let origin = crate::transport::origin_of(a.current_session.as_ref().unwrap());
 
+        a.prompt_ready_at = None; // past the arming delay
+
         a.handle_offer_resume_checkpoint(press(KeyCode::Esc));
 
         assert_eq!(
@@ -2394,6 +2468,7 @@ mod tests {
         let (mut a, _cleanup) = app_with_queued_offer("stray");
 
         for code in [KeyCode::Enter, KeyCode::Char('y'), KeyCode::Tab] {
+            a.prompt_ready_at = None; // past the arming delay
             a.handle_offer_resume_checkpoint(press(code));
             assert_eq!(
                 a.screen,
@@ -2466,6 +2541,7 @@ mod tests {
     #[tokio::test]
     async fn a_new_batch_keeps_the_deferred_one_on_disk() {
         let (mut a, _cleanup) = app_with_queued_offer("defer-then-new");
+        a.prompt_ready_at = None; // past the arming delay
         a.handle_offer_resume_checkpoint(press(KeyCode::Esc));
 
         a.dispatch_plan(vec![download(0)], CheckpointKind::Download);
@@ -2480,6 +2556,7 @@ mod tests {
     #[tokio::test]
     async fn the_deferred_batch_resumes_after_the_new_one_finishes() {
         let (mut a, _cleanup) = app_with_queued_offer("defer-then-resume");
+        a.prompt_ready_at = None; // past the arming delay
         a.handle_offer_resume_checkpoint(press(KeyCode::Esc));
         a.dispatch_plan(vec![download(0)], CheckpointKind::Download);
         finish_next(&mut a, crate::transfer::TransferState::Complete).unwrap();
@@ -2499,6 +2576,8 @@ mod tests {
     #[tokio::test]
     async fn resuming_from_the_offer_does_not_duplicate_the_checkpoint() {
         let (mut a, _cleanup) = app_with_queued_offer("resume-once");
+
+        a.prompt_ready_at = None; // past the arming delay
 
         a.handle_offer_resume_checkpoint(press(KeyCode::Char('r')));
 
@@ -5259,6 +5338,44 @@ mod tests {
 
         assert_eq!(a.password_input.capacity(), capacity_before, "buffer grew");
         assert_eq!(a.password_input.as_ptr(), ptr_before, "buffer moved");
+    }
+
+    /// Past the buffer's capacity a key reallocated it, which the pre-sized
+    /// buffer is there to prevent. Such keys are refused instead.
+    #[test]
+    fn a_credential_past_its_capacity_is_refused_not_reallocated() {
+        let mut a = app();
+        a.pending_session = Some(Session::from_url("sftp://me@host").unwrap());
+        a.screen = Screen::PasswordPrompt;
+        let ptr_before = a.password_input.as_ptr();
+        for _ in 0..CREDENTIAL_CAPACITY + 10 {
+            a.handle_password_prompt(press(KeyCode::Char('x')));
+        }
+        assert_eq!(a.password_input.len(), CREDENTIAL_CAPACITY);
+        assert_eq!(a.password_input.as_ptr(), ptr_before, "buffer moved");
+
+        // A wide character that would cross the line is refused too.
+        a.password_input.zeroize();
+        for _ in 0..CREDENTIAL_CAPACITY - 1 {
+            a.password_input.push('x');
+        }
+        a.handle_password_prompt(press(KeyCode::Char('é')));
+        assert_eq!(a.password_input.len(), CREDENTIAL_CAPACITY - 1);
+
+        a.screen = Screen::KeyPassphrasePrompt;
+        for _ in 0..CREDENTIAL_CAPACITY + 10 {
+            a.handle_key_passphrase_prompt(press(KeyCode::Char('x')));
+        }
+        assert_eq!(a.passphrase_input.len(), CREDENTIAL_CAPACITY);
+    }
+
+    #[test]
+    fn escaping_the_password_prompt_says_the_connect_is_cancelled() {
+        let mut a = app();
+        a.pending_session = Some(Session::from_url("sftp://me@host").unwrap());
+        a.screen = Screen::PasswordPrompt;
+        a.handle_password_prompt(press(KeyCode::Esc));
+        assert!(logged(&a, "connect cancelled"), "{:?}", a.log);
     }
 
     #[test]
