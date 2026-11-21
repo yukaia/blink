@@ -312,12 +312,17 @@ impl App {
                 self.finish_remote_listing(&path);
                 self.push_log(LogLevel::Error, format!("list {path} failed: {error}"));
             }
-            AppEvent::LocalListed { path, entries } => {
+            AppEvent::LocalListed {
+                path,
+                entries,
+                unreadable,
+            } => {
                 // Stale guard: user may have navigated again before the
                 // read_dir returned.
                 if path != self.local.path {
                     return;
                 }
+                self.report_unreadable_local(&path, entries.len(), unreadable);
                 self.local.set_entries(entries);
                 self.local_listed = path;
             }
@@ -981,6 +986,26 @@ impl App {
     /// some of its entries, instead of leaving the pane short — or empty —
     /// with no reason. Said once per change: a directory is re-listed on
     /// every refresh, and an upload batch refreshes it repeatedly.
+    /// [`Self::report_unreadable_entries`] for the local pane, with its own
+    /// memory of what was said: entries `read_dir` or `metadata` couldn't
+    /// read, on a flaky network mount say, or removed mid-listing.
+    fn report_unreadable_local(&mut self, path: &str, readable: usize, unreadable: usize) {
+        if unreadable == 0 {
+            self.local_unreadable_warned = None;
+            return;
+        }
+        let key = (path.to_string(), readable, unreadable);
+        if self.local_unreadable_warned.as_ref() == Some(&key) {
+            return;
+        }
+        self.local_unreadable_warned = Some(key);
+        let noun = if unreadable == 1 { "entry" } else { "entries" };
+        self.push_log(
+            LogLevel::Warn,
+            format!("{unreadable} {noun} in {path} couldn't be read and aren't shown"),
+        );
+    }
+
     fn report_unreadable_entries(&mut self, path: &str, readable: usize, unreadable: usize) {
         if unreadable == 0 {
             self.unreadable_warned = None;

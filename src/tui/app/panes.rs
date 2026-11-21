@@ -67,10 +67,10 @@ impl App {
 
     pub(super) fn refresh_active_pane(&mut self) {
         match self.active_pane {
-            Pane::Local => {
-                self.refresh_local_pane();
-                self.push_log(LogLevel::Info, format!("refreshed: {}", self.local.path));
-            }
+            // Neither pane says it refreshed: the local one said so before
+            // listing, whether or not the listing then worked, and the
+            // remote one never did. A failure is still logged.
+            Pane::Local => self.refresh_local_pane(),
             Pane::Remote => {
                 if self.transport.is_some() {
                     let path = self.remote.path.clone();
@@ -275,7 +275,11 @@ impl App {
         let tx = self.app_event_tx.clone();
         tokio::task::spawn_blocking(move || {
             let event = match read_local_entries(std::path::Path::new(&path)) {
-                Ok(entries) => AppEvent::LocalListed { path, entries },
+                Ok((entries, unreadable)) => AppEvent::LocalListed {
+                    path,
+                    entries,
+                    unreadable,
+                },
                 Err(e) => AppEvent::LocalListFailed {
                     path,
                     error: e.to_string(),
@@ -297,15 +301,24 @@ fn parent_row(dir: &std::path::Path) -> Vec<PaneEntry> {
 }
 
 /// The local pane's rows for `dir`: the parent row, then directories, then
-/// files, each group in name order.
-fn read_local_entries(dir: &std::path::Path) -> std::io::Result<Vec<PaneEntry>> {
+/// files, each group in name order. With how many entries couldn't be read
+/// and were left out, which used to be dropped without a word.
+fn read_local_entries(dir: &std::path::Path) -> std::io::Result<(Vec<PaneEntry>, usize)> {
     let mut entries = parent_row(dir);
-    for entry in std::fs::read_dir(dir)?.flatten() {
+    let mut unreadable = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let Ok(entry) = entry else {
+            unreadable += 1;
+            continue;
+        };
         // Through a symlink, so a link to a folder is a folder. A link
         // whose target is gone is still listed, as the link itself.
         let meta = match std::fs::metadata(entry.path()).or_else(|_| entry.metadata()) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
         };
         let is_dir = meta.is_dir();
         entries.push(PaneEntry::local(
@@ -321,17 +334,18 @@ fn read_local_entries(dir: &std::path::Path) -> std::io::Result<Vec<PaneEntry>> 
         (false, true) => std::cmp::Ordering::Greater,
         _ => a.display_name.cmp(&b.display_name),
     });
-    Ok(entries)
+    Ok((entries, unreadable))
 }
 
-#[cfg(test)]
+// Unix only: what they test is symlinks and the `/` root. Gated per test,
+// with the import outside, the Windows build warned of an unused import.
+#[cfg(all(test, unix))]
 mod tests {
     use super::read_local_entries;
 
     /// `DirEntry::metadata` describes a symlink, not what it points at, so
     /// a link to a folder was listed as a file a few bytes long: it could
     /// not be entered, and uploading it tried to read a directory.
-    #[cfg(unix)]
     #[test]
     fn a_symlink_to_a_folder_is_listed_as_a_folder() {
         let home = crate::paths::test_home();
@@ -340,21 +354,20 @@ mod tests {
         std::fs::write(target.join("inside.txt"), b"x").unwrap();
         std::os::unix::fs::symlink(&target, home.path().join("link")).unwrap();
 
-        let entries = read_local_entries(home.path()).unwrap();
+        let (entries, _) = read_local_entries(home.path()).unwrap();
 
         let link = entries.iter().find(|e| e.raw_name == "link").unwrap();
         assert!(link.is_dir);
     }
 
     /// A link to a file reports the file's size, not the link's.
-    #[cfg(unix)]
     #[test]
     fn a_symlink_to_a_file_reports_the_files_size() {
         let home = crate::paths::test_home();
         std::fs::write(home.path().join("real.bin"), vec![0u8; 5000]).unwrap();
         std::os::unix::fs::symlink(home.path().join("real.bin"), home.path().join("link")).unwrap();
 
-        let entries = read_local_entries(home.path()).unwrap();
+        let (entries, _) = read_local_entries(home.path()).unwrap();
 
         let link = entries.iter().find(|e| e.raw_name == "link").unwrap();
         assert_eq!((link.is_dir, link.size), (false, 5000));
@@ -362,21 +375,19 @@ mod tests {
 
     /// A link whose target is gone still shows, so it can be seen and
     /// dealt with, as it did before links were followed.
-    #[cfg(unix)]
     #[test]
     fn a_dangling_symlink_is_still_listed() {
         let home = crate::paths::test_home();
         std::os::unix::fs::symlink(home.path().join("gone"), home.path().join("link")).unwrap();
 
-        let entries = read_local_entries(home.path()).unwrap();
+        let (entries, _) = read_local_entries(home.path()).unwrap();
 
         assert!(entries.iter().any(|e| e.raw_name == "link" && !e.is_dir));
     }
 
-    #[cfg(unix)]
     #[test]
     fn the_root_has_no_parent_row() {
-        let entries = super::read_local_entries(std::path::Path::new("/")).unwrap();
+        let (entries, _) = read_local_entries(std::path::Path::new("/")).unwrap();
         assert!(
             entries.iter().all(|e| !e.is_parent()),
             "the remote pane shows none at /"

@@ -95,6 +95,9 @@ pub enum AppEvent {
     LocalListed {
         path: String,
         entries: Vec<crate::tui::state::PaneEntry>,
+        /// Entries the listing had to leave out, unreadable: said once per
+        /// change, as for the remote pane.
+        unreadable: usize,
     },
 
     /// Local directory enumeration failed (typically permission denied or
