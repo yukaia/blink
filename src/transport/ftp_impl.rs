@@ -194,11 +194,15 @@ macro_rules! delegate_ftp_transport {
             async fn read_to_bytes(
                 &mut self,
                 remote_path: &str,
+                limit: u64,
             ) -> $crate::error::Result<bytes::Bytes> {
                 self.begin_call().await?;
-                let result =
-                    $crate::transport::ftp_impl::ftp_read_to_bytes(&mut self.stream, remote_path)
-                        .await;
+                let result = $crate::transport::ftp_impl::ftp_read_to_bytes(
+                    &mut self.stream,
+                    remote_path,
+                    limit,
+                )
+                .await;
                 self.settle(result)
             }
 
@@ -326,10 +330,6 @@ pub(crate) async fn log_in<T: TokioTlsStream + Send>(
         .await
         .map_err(|e| map_ftp(&format!("{label} binary mode on"), &session.host, e))
 }
-
-/// Cap on bytes read by `read_to_bytes`. See the equivalent in `sftp.rs`:
-/// derived from the viewer's image limit so the two cannot drift apart.
-pub(crate) const MAX_PREVIEW_BYTES: u64 = crate::preview::IMAGE_VIEW_LIMIT;
 
 /// Per-operation timeout on the FTP / FTPS control channel.
 ///
@@ -1108,6 +1108,7 @@ pub async fn ftp_metadata<T: TokioTlsStream + Send>(
 pub async fn ftp_read_to_bytes<T: TokioTlsStream + Send + 'static>(
     stream: &mut ImplAsyncFtpStream<T>,
     remote_path: &str,
+    limit: u64,
 ) -> Result<Bytes> {
     check_ftp_path("retr", remote_path)?;
     // Only the control-channel steps get the op deadline: opening the
@@ -1126,7 +1127,7 @@ pub async fn ftp_read_to_bytes<T: TokioTlsStream + Send + 'static>(
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
-        if buf.len() as u64 > MAX_PREVIEW_BYTES {
+        if buf.len() as u64 > limit {
             // Over the cap: stop reading and drop the transfer unfinished.
             // suppaftp leaves its completion reply — usually `426`, the
             // server having seen us stop — for the next command to drain,
@@ -3556,6 +3557,29 @@ mod integration {
         );
     }
 
+    /// The limit is the caller's: a file one byte over the limit given is
+    /// refused, and one at it is read whole.
+    #[tokio::test]
+    async fn a_preview_obeys_the_limit_it_is_given() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
+            .await
+            .insert("/five.txt".to_string(), b"hello".to_vec());
+        let (port, _c, _log) = start_server(Arc::clone(&store), Faults::default()).await;
+        let session = test_session(port);
+        let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
+
+        let err = with_timeout(transport.read_to_bytes("/five.txt", 4), "over the limit")
+            .await
+            .expect_err("five bytes are over a limit of four");
+        assert!(err.to_string().contains("preview size limit"), "{err}");
+        let got = with_timeout(transport.read_to_bytes("/five.txt", 5), "at the limit")
+            .await
+            .expect("five bytes fit a limit of five");
+        assert_eq!(&got[..], b"hello");
+    }
+
     /// Hitting the preview cap is not a dropped connection. It used to be
     /// reported as one — the cap was raised as `FtpError::ConnectionError`,
     /// which `map_ftp` classifies as `Disconnected` — and raising it from the
@@ -3574,7 +3598,7 @@ mod integration {
             let mut files = store.lock().await;
             files.insert(
                 "/big.bin".to_string(),
-                vec![7u8; super::MAX_PREVIEW_BYTES as usize + 16 * 1024 * 1024],
+                vec![7u8; crate::preview::IMAGE_VIEW_LIMIT as usize + 16 * 1024 * 1024],
             );
             files.insert("/small.txt".to_string(), b"hello".to_vec());
         }
@@ -3582,9 +3606,12 @@ mod integration {
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
-        let err = with_timeout(transport.read_to_bytes("/big.bin"), "oversized preview")
-            .await
-            .expect_err("a file over the cap must not preview");
+        let err = with_timeout(
+            transport.read_to_bytes("/big.bin", crate::preview::IMAGE_VIEW_LIMIT),
+            "oversized preview",
+        )
+        .await
+        .expect_err("a file over the cap must not preview");
         assert!(
             matches!(err, crate::error::BlinkError::Transport(_)),
             "the cap is not a disconnect: {err:?}",
@@ -3596,9 +3623,12 @@ mod integration {
             .expect("the connection must still serve a listing")
             .entries;
         assert_eq!(entries.len(), 2);
-        let small = with_timeout(transport.read_to_bytes("/small.txt"), "second preview")
-            .await
-            .expect("and a preview under the cap");
+        let small = with_timeout(
+            transport.read_to_bytes("/small.txt", crate::preview::IMAGE_VIEW_LIMIT),
+            "second preview",
+        )
+        .await
+        .expect("and a preview under the cap");
         assert_eq!(&small[..], b"hello");
     }
 
@@ -3624,9 +3654,12 @@ mod integration {
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
         let started = std::time::Instant::now();
-        let got = with_timeout(transport.read_to_bytes("/slow.png"), "slow preview")
-            .await
-            .expect("steady data must not time out");
+        let got = with_timeout(
+            transport.read_to_bytes("/slow.png", crate::preview::IMAGE_VIEW_LIMIT),
+            "slow preview",
+        )
+        .await
+        .expect("steady data must not time out");
         assert_eq!(&got[..], &payload[..]);
         assert!(
             started.elapsed() > std::time::Duration::from_millis(1000),
@@ -3696,7 +3729,12 @@ mod integration {
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
         // Break the connection, then make the server go quiet.
-        assert!(transport.read_to_bytes("/small.txt").await.is_err());
+        assert!(
+            transport
+                .read_to_bytes("/small.txt", crate::preview::IMAGE_VIEW_LIMIT)
+                .await
+                .is_err()
+        );
         *silent.lock().unwrap() = Some(2);
 
         let err = with_timeout(transport.list("/"), "the reconnect")
@@ -3723,9 +3761,12 @@ mod integration {
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
-        let err = with_timeout(transport.read_to_bytes("/stall.bin"), "stalled data")
-            .await
-            .expect_err("data that stops must fail the preview");
+        let err = with_timeout(
+            transport.read_to_bytes("/stall.bin", crate::preview::IMAGE_VIEW_LIMIT),
+            "stalled data",
+        )
+        .await
+        .expect_err("data that stops must fail the preview");
         assert!(
             matches!(err, crate::error::BlinkError::Disconnected(_)),
             "a stall leaves the transfer's state unknown: {err:?}",
@@ -3756,9 +3797,12 @@ mod integration {
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
-        with_timeout(transport.read_to_bytes("/cut.bin"), "reset preview")
-            .await
-            .expect_err("a reset data connection must fail the preview");
+        with_timeout(
+            transport.read_to_bytes("/cut.bin", crate::preview::IMAGE_VIEW_LIMIT),
+            "reset preview",
+        )
+        .await
+        .expect_err("a reset data connection must fail the preview");
 
         let entries = with_timeout(transport.list("/"), "list after the reset")
             .await
@@ -3791,9 +3835,12 @@ mod integration {
             .expect("the connection must serve the next listing")
             .entries;
         assert_eq!(entries.len(), 2);
-        let small = with_timeout(transport.read_to_bytes("/small.txt"), "next preview")
-            .await
-            .expect("and the next preview");
+        let small = with_timeout(
+            transport.read_to_bytes("/small.txt", crate::preview::IMAGE_VIEW_LIMIT),
+            "next preview",
+        )
+        .await
+        .expect("and the next preview");
         assert_eq!(&small[..], b"hello");
         assert_eq!(connects.load(Ordering::SeqCst), 2, "one reconnect");
         let logins = log
@@ -3820,9 +3867,12 @@ mod integration {
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
-        let err = with_timeout(transport.read_to_bytes("/stall.bin"), "stalled preview")
-            .await
-            .expect_err("a preview past its deadline must fail");
+        let err = with_timeout(
+            transport.read_to_bytes("/stall.bin", crate::preview::IMAGE_VIEW_LIMIT),
+            "stalled preview",
+        )
+        .await
+        .expect_err("a preview past its deadline must fail");
         assert!(
             matches!(err, crate::error::BlinkError::Disconnected(_)),
             "a deadline reads as a disconnect: {err:?}",
@@ -3843,9 +3893,12 @@ mod integration {
         let session = test_session(port);
         let mut transport = FtpTransport::connect(&session, Some("pw")).await.unwrap();
 
-        let err = with_timeout(transport.read_to_bytes("/stall.bin"), "dropped preview")
-            .await
-            .expect_err("a preview on a closed connection must fail");
+        let err = with_timeout(
+            transport.read_to_bytes("/stall.bin", crate::preview::IMAGE_VIEW_LIMIT),
+            "dropped preview",
+        )
+        .await
+        .expect_err("a preview on a closed connection must fail");
         assert!(
             matches!(err, crate::error::BlinkError::Disconnected(_)),
             "a closed control connection is a disconnect: {err:?}",
@@ -3868,7 +3921,7 @@ mod integration {
 
         let dropped = tokio::time::timeout(
             std::time::Duration::from_millis(300),
-            transport.read_to_bytes("/stall.bin"),
+            transport.read_to_bytes("/stall.bin", crate::preview::IMAGE_VIEW_LIMIT),
         )
         .await;
         assert!(

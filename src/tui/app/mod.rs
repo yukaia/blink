@@ -399,6 +399,10 @@ pub struct App {
     last_click: Option<mouse::LastClick>,
     /// The id the next viewer opened gets. See [`Viewer::id`].
     next_viewer_id: u64,
+    /// The viewer's fetch task, aborted when the viewer closes. A remote
+    /// fetch holds the browsing connection's lock until it ends, and every
+    /// remote action waits on that lock.
+    view_task: Option<tokio::task::AbortHandle>,
     /// Which connect attempt is current, counting each one started. A
     /// connect's result carries its number, and one from an attempt since
     /// cancelled or replaced is dropped.
@@ -545,6 +549,7 @@ impl App {
             next_viewer_id: 1,
             connect_attempt: 0,
             connect_task: None,
+            view_task: None,
             connection: 0,
             prompt_ready_at: None,
             waiting_overwrites: std::collections::VecDeque::new(),
@@ -4826,7 +4831,7 @@ mod tests {
         ) -> crate::error::Result<Option<crate::transport::RemoteEntry>> {
             unimplemented!()
         }
-        async fn read_to_bytes(&mut self, _: &str) -> crate::error::Result<bytes::Bytes> {
+        async fn read_to_bytes(&mut self, _: &str, _: u64) -> crate::error::Result<bytes::Bytes> {
             unimplemented!()
         }
         async fn close(&mut self) -> crate::error::Result<()> {

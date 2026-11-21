@@ -802,7 +802,7 @@ mod tests {
         ) -> crate::error::Result<Option<transport::RemoteEntry>> {
             unreachable!()
         }
-        async fn read_to_bytes(&mut self, _: &str) -> crate::error::Result<bytes::Bytes> {
+        async fn read_to_bytes(&mut self, _: &str, _: u64) -> crate::error::Result<bytes::Bytes> {
             unreachable!()
         }
         async fn close(&mut self) -> crate::error::Result<()> {
@@ -934,7 +934,7 @@ mod tests {
         ) -> crate::error::Result<Option<transport::RemoteEntry>> {
             unreachable!()
         }
-        async fn read_to_bytes(&mut self, _: &str) -> crate::error::Result<bytes::Bytes> {
+        async fn read_to_bytes(&mut self, _: &str, _: u64) -> crate::error::Result<bytes::Bytes> {
             unreachable!()
         }
         async fn close(&mut self) -> crate::error::Result<()> {

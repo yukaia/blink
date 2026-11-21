@@ -295,6 +295,22 @@ the git history for those.
 
 ### Fixed
 
+- **Closing the viewer stops a remote file still loading.** The fetch went
+  on to the end, holding the connection every remote action waits on: Esc
+  on a slow 25 MB image left browsing, refresh, rename and delete stuck
+  until it arrived, and a disconnect meanwhile kept the connection open.
+
+- **A remote text file stops loading at the text limit (1 MB).** It was
+  fetched up to the image limit, 25 MB, and only then refused.
+
+- **Viewing a remote symlink asks what it points at first**, as Enter and
+  downloads do. A link to a folder is refused with that reason, not a bare
+  read error, and one to a file too large to view is refused before its
+  bytes are fetched.
+
+- **Viewing a remote file with no connection says "not connected"**
+  instead of flashing the viewer open and shut.
+
 - **A local folder that couldn't be made is reported in the log.** Only
   the debug log heard of it, so an empty folder in a download could go
   missing without a word.

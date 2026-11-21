@@ -153,8 +153,9 @@ macro_rules! delegate_inner_transport {
             async fn read_to_bytes(
                 &mut self,
                 remote_path: &str,
+                limit: u64,
             ) -> $crate::error::Result<bytes::Bytes> {
-                self.inner.read_to_bytes(remote_path).await
+                self.inner.read_to_bytes(remote_path, limit).await
             }
 
             async fn close(&mut self) -> $crate::error::Result<()> {
