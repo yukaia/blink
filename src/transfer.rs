@@ -614,16 +614,9 @@ impl TransferManager {
             .collect()
     }
 
-    /// Snapshot of only the jobs currently running.
-    ///
-    /// The render path asks for this every frame. `jobs` retains up to
-    /// [`RETAINED_JOBS`] finished jobs besides every live one, so going
-    /// through [`Self::snapshot`] and filtering
-    /// afterwards clones the whole history to keep at most `parallelism`
-    /// entries. After a batch of [`MAX_QUEUED_JOBS`] that is 100k structs
-    /// (two heap `String`s apiece) copied per frame, at a frame rate the
-    /// transfers themselves are driving. Filtering under the lock bounds
-    /// the clone by [`crate::config::MAX_PARALLEL`] instead.
+    /// Snapshot of only the jobs currently running, for tests. The
+    /// Transfers pane lists queued jobs too, through [`Self::listed_jobs`].
+    #[cfg(test)]
     pub fn active_jobs(&self) -> Vec<TransferJob> {
         self.inner
             .lock()
@@ -632,6 +625,50 @@ impl TransferManager {
             .filter(|j| j.state == TransferState::Active)
             .cloned()
             .collect()
+    }
+
+    /// How many rows the Transfers pane lists: every running job and every
+    /// queued one. See [`Self::listed_jobs`].
+    pub fn listed_count(&self) -> usize {
+        let inner = self.inner.lock();
+        let active = inner
+            .jobs
+            .iter()
+            .filter(|j| j.state == TransferState::Active)
+            .count();
+        active + inner.pending.len()
+    }
+
+    /// Rows `start..start + len` of the Transfers pane: the running jobs in
+    /// id order, then the queued ones in the order they will be claimed.
+    ///
+    /// Only the window is cloned. The queue can hold [`MAX_QUEUED_JOBS`], and
+    /// the pane asks every frame, so cloning all of it as `snapshot` does
+    /// would copy 100k jobs to draw a dozen.
+    pub fn listed_jobs(&self, start: usize, len: usize) -> Vec<TransferJob> {
+        let inner = self.inner.lock();
+        let active: Vec<&TransferJob> = inner
+            .jobs
+            .iter()
+            .filter(|j| j.state == TransferState::Active)
+            .collect();
+        let mut out: Vec<TransferJob> = active
+            .iter()
+            .skip(start)
+            .take(len)
+            .map(|j| (*j).clone())
+            .collect();
+        let rest = len - out.len();
+        let queued_start = start.saturating_sub(active.len());
+        out.extend(
+            inner
+                .pending
+                .iter()
+                .skip(queued_start)
+                .take(rest)
+                .filter_map(|&id| inner.index_of(id).map(|i| inner.jobs[i].clone())),
+        );
+        out
     }
 
     /// Count every job that would be abandoned if the session ended now, as
@@ -757,16 +794,21 @@ impl TransferManager {
         self.inner.lock().active.remove(&id).is_some()
     }
 
-    /// Cancel a running transfer by id. Aborts the worker task at its next
-    /// `.await` point and marks the job as failed with a "cancelled" reason.
-    /// No-op if the id isn't currently running.
+    /// Cancel a transfer by id, running or queued. A running one's worker is
+    /// aborted at its next `.await` point; either is marked failed with a
+    /// "cancelled" reason. No-op if the job has already ended.
     ///
     /// Cancellation may leave a partial file on disk for downloads in flight.
     ///
     /// Returns whether it cancelled anything: `false` when the job had
     /// already finished (the user may have confirmed after it did).
+    ///
+    /// Queued jobs are listed in the Transfers pane and can be picked; this
+    /// used to reach running ones only, so a queued job outside a batch
+    /// could not be cancelled at all.
     pub fn cancel(&self, id: u64) -> bool {
-        self.cancel_matching(|j| j.id == id, false).0 > 0
+        let (active, pending) = self.cancel_matching(|j| j.id == id, true);
+        active + pending > 0
     }
 
     /// Cancel every Active and Pending job sharing `batch_id`. Returns

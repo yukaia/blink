@@ -697,8 +697,9 @@ pub enum ViewSource {
 /// Snapshot of the transfer being confirmed for cancellation.
 #[derive(Debug, Clone)]
 pub enum PendingCancel {
-    /// Cancel a single transfer by id.
-    Single { id: u64, name: String },
+    /// Cancel a single transfer by id. `queued` when it hadn't started as
+    /// the question opened, so there is no partial file to warn about.
+    Single { id: u64, name: String, queued: bool },
     /// Cancel every job in a batch. `active` and `pending` are job counts
     /// at the moment the modal opened — the actual cancel re-counts at
     /// confirm time, so a brief race (a job completing between modal-open

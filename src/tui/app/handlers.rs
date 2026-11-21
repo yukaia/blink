@@ -415,7 +415,7 @@ impl App {
                 if let Some(pc) = self.pending_cancel.take() {
                     if let Some(manager) = &self.transfer_manager {
                         match pc {
-                            PendingCancel::Single { id, name } => {
+                            PendingCancel::Single { id, name, .. } => {
                                 // It may have finished while the question
                                 // was open; then there is nothing to cancel,
                                 // and its own events do the bookkeeping.
@@ -438,13 +438,6 @@ impl App {
                                 // tie the batch to its checkpoint entries.
                                 let batch_ids = manager.job_ids_in_batch(batch_id);
                                 let (active_n, pending_n) = manager.cancel_batch(batch_id);
-                                self.push_log(
-                                    LogLevel::Warn,
-                                    format!(
-                                        "cancelled batch: {} active + {} queued",
-                                        active_n, pending_n
-                                    ),
-                                );
                                 // Mark just this batch's checkpoint entries
                                 // cancelled, so a mistaken `r` / `R` doesn't
                                 // re-queue work the user threw away — while
@@ -452,14 +445,24 @@ impl App {
                                 // (which shares the same checkpoint storage)
                                 // intact and still resumable.
                                 self.cancel_batch_in_checkpoint(&batch_ids);
-                                // And the ones that never got a job id.
-                                self.cancel_waiting_in_batch(batch_id);
+                                // And the ones that never got a job id,
+                                // counted with the queued: they are queued
+                                // too, just not yet in the manager's queue.
+                                let waiting_n = self.cancel_waiting_in_batch(batch_id);
+                                self.push_log(
+                                    LogLevel::Warn,
+                                    format!(
+                                        "cancelled batch: {} active + {} queued",
+                                        active_n,
+                                        pending_n + waiting_n
+                                    ),
+                                );
                             }
                         }
                     }
                     // Re-clamp the cursor: cancellation removes jobs from
-                    // the active list, so the cursor may now point off the end.
-                    let new_len = self.active_jobs().len();
+                    // the list, so the cursor may now point off the end.
+                    let new_len = self.transfer_row_count();
                     if new_len == 0 {
                         self.transfer_cursor = 0;
                     } else if self.transfer_cursor >= new_len {
@@ -1466,6 +1469,7 @@ mod tests {
             let mut a = app_on_main(1);
             let ids = with_running(&mut a, 1);
             a.pending_cancel = Some(PendingCancel::Single {
+                queued: false,
                 id: ids[0],
                 name: "f0".into(),
             });
@@ -1476,7 +1480,7 @@ mod tests {
 
             assert_eq!(a.screen, Screen::Main);
             assert!(a.pending_cancel.is_none());
-            assert_eq!(a.active_jobs().len(), 1);
+            assert_eq!(a.transfer_row_count(), 1);
         }
     }
 
@@ -1486,6 +1490,7 @@ mod tests {
         let ids = with_running(&mut a, 2);
         a.transfer_cursor = 1;
         a.pending_cancel = Some(PendingCancel::Single {
+            queued: false,
             id: ids[1],
             name: "f1".into(),
         });
@@ -1494,7 +1499,7 @@ mod tests {
 
         press(&mut a, KeyCode::Char('y'));
 
-        assert_eq!(a.active_jobs().len(), 1);
+        assert_eq!(a.transfer_row_count(), 1);
         assert_eq!(a.transfer_cursor, 0);
     }
 
@@ -1503,6 +1508,7 @@ mod tests {
         let mut a = app_on_main(1);
         let ids = with_running(&mut a, 1);
         a.pending_cancel = Some(PendingCancel::Single {
+            queued: false,
             id: ids[0],
             name: "f0".into(),
         });
@@ -1511,7 +1517,7 @@ mod tests {
 
         press(&mut a, KeyCode::Char('y'));
 
-        assert!(a.active_jobs().is_empty());
+        assert!(a.transfer_row_count() == 0);
         assert_eq!(a.transfer_cursor, 0);
         assert!(logged(&a, "cancelled: f0"));
     }
@@ -1911,6 +1917,7 @@ mod tests {
     fn help_over_the_cancel_prompt_returns_to_it_and_no_still_backs_out() {
         let mut a = app_on_main(1);
         a.pending_cancel = Some(PendingCancel::Single {
+            queued: false,
             id: 1,
             name: "f".into(),
         });

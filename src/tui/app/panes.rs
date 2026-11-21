@@ -41,7 +41,7 @@ impl App {
     }
 
     pub(super) fn move_transfer_cursor(&mut self, delta: isize) {
-        let len = self.active_jobs().len();
+        let len = self.transfer_row_count();
         if len == 0 {
             self.transfer_cursor = 0;
             return;

@@ -8,27 +8,42 @@
 //!   falls through to single if the job isn't part of a batch)
 //! - `p` — `toggle_pause`
 //! - `t` — `cycle_theme`
-//! - `active_jobs` — small read-only helper the Transfers pane and the
-//!   cancel helpers consume; lives here because the cancels are its
-//!   primary callers.
+//!
+//! With the read-only helpers over the transfer queue the Transfers pane,
+//! the cancels and the quit and disconnect questions share:
+//! `transfer_row_count` / `transfer_rows` (the pane's rows, running then
+//! queued) and `queue_counts`.
 
 use crate::theme::Theme;
-use crate::transfer::TransferJob;
+use crate::transfer::{TransferJob, TransferState};
 use crate::tui::state::PendingCancel;
 
 use super::{App, LogLevel, Screen, name_for_job};
 
 impl App {
-    pub(super) fn request_cancel_selected_transfer(&mut self) {
-        let jobs = self.active_jobs();
-        if jobs.is_empty() {
-            return;
+    /// The Transfers pane row under the cursor: a running job or a queued
+    /// one, as the pane lists them.
+    fn transfer_under_cursor(&self) -> Option<TransferJob> {
+        let len = self.transfer_row_count();
+        if len == 0 {
+            return None;
         }
-        let idx = self.transfer_cursor.min(jobs.len() - 1);
-        let job = &jobs[idx];
+        let idx = self.transfer_cursor.min(len - 1);
+        self.transfer_rows(idx, 1).into_iter().next()
+    }
+
+    /// Ask about cancelling the transfer under the cursor, running or
+    /// queued. Only running ones could be picked before, so with nothing
+    /// running a queue could not be touched, and a queued job outside a
+    /// batch not at all.
+    pub(super) fn request_cancel_selected_transfer(&mut self) {
+        let Some(job) = self.transfer_under_cursor() else {
+            return;
+        };
         self.pending_cancel = Some(PendingCancel::Single {
             id: job.id,
-            name: name_for_job(job),
+            name: name_for_job(&job),
+            queued: job.state == TransferState::Pending,
         });
         self.previous_screen = Screen::Main;
         self.screen = Screen::ConfirmCancel;
@@ -42,12 +57,9 @@ impl App {
             Some(m) => m,
             None => return,
         };
-        let active_jobs = self.active_jobs();
-        if active_jobs.is_empty() {
+        let Some(cursor_job) = self.transfer_under_cursor() else {
             return;
-        }
-        let idx = self.transfer_cursor.min(active_jobs.len() - 1);
-        let cursor_job = &active_jobs[idx];
+        };
 
         let Some(batch_id) = cursor_job.batch_id else {
             // Not a batched job — fall through to the single-job modal so
@@ -56,9 +68,11 @@ impl App {
             return;
         };
 
-        // Count siblings in the batch, including pending ones (which the
-        // active-only list above doesn't include).
-        let (active, pending) = manager.batch_counts(batch_id);
+        // Count siblings in the batch, queued ones included, and those
+        // waiting outside the queue for room: confirming cancels them too,
+        // and leaving them out of the question understated it.
+        let (active, queued) = manager.batch_counts(batch_id);
+        let pending = queued + self.waiting_in_batch(batch_id);
         if active == 0 && pending == 0 {
             return;
         }
@@ -67,7 +81,7 @@ impl App {
             batch_id,
             active,
             pending,
-            cursor_name: name_for_job(cursor_job),
+            cursor_name: name_for_job(&cursor_job),
         });
         self.previous_screen = Screen::Main;
         self.screen = Screen::ConfirmCancel;
@@ -89,7 +103,13 @@ impl App {
 
     /// Cycle to the next theme in `Theme::list_all_names`: every key,
     /// built-in or user, sorted together. The new theme is applied
-    /// immediately and persisted to `config.ini` so it survives a restart.
+    /// immediately and saved where the one on screen came from: the
+    /// connected session's file, when that session names its own theme,
+    /// and `config.ini` otherwise.
+    ///
+    /// It always went to `config.ini`. Over a session with its own theme
+    /// that changed the theme everywhere else, and the session's came back
+    /// on the next connect, so the choice never stuck where it was made.
     ///
     /// Both the position lookup and the persisted value use the theme's
     /// *key* (`Theme.key`) — the normalised name `Theme::load` accepts —
@@ -120,20 +140,33 @@ impl App {
             let next_name = &names[idx];
             match Theme::load(next_name) {
                 Ok(theme) => {
-                    self.config.general.theme = next_name.clone();
                     self.theme = theme;
-                    self.push_log(
-                        LogLevel::Info,
-                        format!("theme: {} ({}/{})", next_name, idx + 1, names.len()),
-                    );
+                    let next_name = next_name.clone();
+                    let position = format!("({}/{})", idx + 1, names.len());
                     // Persist as a best-effort. A save failure here shouldn't
                     // refuse the in-memory swap (the user can see the new
                     // theme already), so we log and move on.
-                    if let Err(e) = crate::config::save_setting("general", "theme", next_name) {
+                    if let Some(session) = self.session_with_own_theme() {
                         self.push_log(
-                            LogLevel::Warn,
-                            format!("could not save theme preference: {e}"),
+                            LogLevel::Info,
+                            format!("theme: {next_name} {position}, for session {session}"),
                         );
+                        if let Err(e) = self.save_session_theme(&next_name) {
+                            self.push_log(
+                                LogLevel::Warn,
+                                format!("could not save the session's theme: {e}"),
+                            );
+                        }
+                    } else {
+                        self.config.general.theme = next_name.clone();
+                        self.push_log(LogLevel::Info, format!("theme: {next_name} {position}"));
+                        if let Err(e) = crate::config::save_setting("general", "theme", &next_name)
+                        {
+                            self.push_log(
+                                LogLevel::Warn,
+                                format!("could not save theme preference: {e}"),
+                            );
+                        }
                     }
                     return;
                 }
@@ -147,16 +180,46 @@ impl App {
         }
     }
 
-    /// Snapshot of currently-running jobs, for the transfer strip and the
-    /// cancel helpers above.
-    ///
-    /// Delegates to [`crate::transfer::TransferManager::active_jobs`], which
-    /// filters while it holds the lock. Doing the filter here instead meant
-    /// cloning every job the manager had ever tracked on every frame.
-    pub fn active_jobs(&self) -> Vec<TransferJob> {
+    /// The name of the connected session when it names its own theme and
+    /// has a file to save one to.
+    fn session_with_own_theme(&self) -> Option<String> {
+        self.current_session
+            .as_ref()
+            .filter(|s| s.theme.is_some() && self.current_session_saved)
+            .map(|s| s.name.clone())
+    }
+
+    /// Save `theme` as the connected session's own, in its file as it is
+    /// on disk: only the theme changes, not where the panes have browsed
+    /// to since connecting.
+    fn save_session_theme(&mut self, theme: &str) -> crate::error::Result<()> {
+        let Some(current) = self.current_session.as_mut() else {
+            return Ok(());
+        };
+        current.theme = Some(theme.to_string());
+        let mut on_disk = crate::session::Session::load_from(&current.path()?)?;
+        on_disk.theme = Some(theme.to_string());
+        on_disk.save()?;
+        if let Some(listed) = self.sessions.iter_mut().find(|s| s.name == on_disk.name) {
+            listed.theme = Some(theme.to_string());
+        }
+        Ok(())
+    }
+
+    /// How many rows the Transfers pane lists: running jobs, then queued.
+    pub fn transfer_row_count(&self) -> usize {
         self.transfer_manager
             .as_ref()
-            .map(|m| m.active_jobs())
+            .map_or(0, |m| m.listed_count())
+    }
+
+    /// Rows `start..start + len` of the Transfers pane, as
+    /// [`crate::transfer::TransferManager::listed_jobs`] gives them: only
+    /// the window is cloned.
+    pub fn transfer_rows(&self, start: usize, len: usize) -> Vec<TransferJob> {
+        self.transfer_manager
+            .as_ref()
+            .map(|m| m.listed_jobs(start, len))
             .unwrap_or_default()
     }
 
@@ -225,15 +288,80 @@ mod tests {
     // -- cancel ---------------------------------------------------------------
 
     #[test]
-    fn cancelling_with_nothing_running_asks_nothing() {
+    fn cancelling_with_nothing_listed_asks_nothing() {
         let (mut a, _events) = connected();
-        queue(&a, "waiting.bin", None);
 
         a.request_cancel_selected_transfer();
         a.request_cancel_selected_batch();
 
         assert_eq!(a.screen, Screen::Main);
         assert!(a.pending_cancel.is_none());
+    }
+
+    /// Only running jobs could be picked, so with nothing running a queued
+    /// job couldn't be cancelled, and one outside a batch never could.
+    #[test]
+    fn a_queued_transfer_can_be_cancelled_with_nothing_running() {
+        let (mut a, _events) = connected();
+        queue(&a, "waiting.bin", None);
+
+        a.handle_key(press(KeyCode::Char('c')));
+        match a.pending_cancel.as_ref().unwrap() {
+            PendingCancel::Single { name, queued, .. } => {
+                assert_eq!(name, "waiting.bin");
+                assert!(*queued, "the question knows it hasn't started");
+            }
+            other => panic!("expected a single cancel, got {other:?}"),
+        }
+        a.handle_confirm_cancel(press(KeyCode::Char('y')));
+
+        assert_eq!(a.transfer_row_count(), 0);
+        assert!(logged(&a, "cancelled: waiting.bin"), "{:?}", a.log);
+    }
+
+    /// The cursor reaches past the running jobs onto the queued ones.
+    #[test]
+    fn the_cursor_reaches_the_queued_rows_below_the_running() {
+        let (mut a, _events) = connected();
+        queue(&a, "running.bin", None);
+        queue(&a, "queued.bin", None);
+        start_one(&a);
+        a.transfer_cursor = 1;
+
+        a.handle_key(press(KeyCode::Char('c')));
+
+        match a.pending_cancel.as_ref().unwrap() {
+            PendingCancel::Single { name, queued, .. } => {
+                assert_eq!((name.as_str(), *queued), ("queued.bin", true));
+            }
+            other => panic!("expected a single cancel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_queued_batch_can_be_cancelled_with_nothing_running() {
+        let (mut a, _events) = connected();
+        let b = manager(&a).allocate_batch_id();
+        queue(&a, "one.bin", Some(b));
+        queue(&a, "two.bin", Some(b));
+
+        a.handle_key(press(KeyCode::Char('C')));
+        assert!(matches!(
+            a.pending_cancel,
+            Some(PendingCancel::Batch {
+                active: 0,
+                pending: 2,
+                ..
+            })
+        ));
+        a.handle_confirm_cancel(press(KeyCode::Char('y')));
+
+        assert_eq!(a.transfer_row_count(), 0);
+        assert!(
+            logged(&a, "cancelled batch: 0 active + 2 queued"),
+            "{:?}",
+            a.log
+        );
     }
 
     #[test]
@@ -261,7 +389,7 @@ mod tests {
         assert_eq!(a.screen, Screen::ConfirmCancel);
         assert_eq!(a.previous_screen, Screen::Main);
         match a.pending_cancel.as_ref().unwrap() {
-            PendingCancel::Single { id, name } => {
+            PendingCancel::Single { id, name, .. } => {
                 assert_eq!((*id, name.as_str()), (second, "two.bin"));
             }
             other => panic!("expected a single cancel, got {other:?}"),
@@ -457,6 +585,67 @@ mod tests {
         config.general.theme = name.to_string();
         let (theme, _) = Theme::load_or_fallback(name);
         App::new(config, theme)
+    }
+
+    /// A saved session naming its own theme, connected and showing it.
+    fn connected_with_session_theme(names: &[String]) -> App {
+        let mut s = crate::session::Session::from_url("sftp://me@h.example").unwrap();
+        s.name = "work".into();
+        s.theme = Some(names[0].clone());
+        s.save().unwrap();
+        let mut a = app_with_theme(&names[1]);
+        a.screen = Screen::Main;
+        a.theme = Theme::load(&names[0]).unwrap();
+        a.current_session = Some(s);
+        a.current_session_saved = true;
+        a
+    }
+
+    /// Over a session with its own theme, `t` went to `config.ini`: the
+    /// theme changed everywhere else, and the session's came back on the
+    /// next connect.
+    #[test]
+    fn t_over_a_session_theme_saves_it_to_the_session() {
+        let _home = paths::test_home();
+        let names = Theme::list_all_names();
+        let mut a = connected_with_session_theme(&names);
+        // Browsed since connecting: not something `t` should save.
+        a.remote.path = "/elsewhere".into();
+
+        a.handle_key(press(KeyCode::Char('t')));
+
+        let on_disk = crate::session::Session::list_all()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "work")
+            .unwrap();
+        assert_eq!(on_disk.theme.as_deref(), Some(names[1].as_str()));
+        assert_eq!(on_disk.remote_dir, "/", "only the theme is saved");
+        assert_eq!(a.config.general.theme, names[1], "the default is untouched");
+        assert!(
+            !paths::config_file().unwrap().exists(),
+            "config.ini isn't written"
+        );
+        assert!(logged(&a, "for session work"), "{:?}", a.log);
+    }
+
+    /// A session without its own theme leaves `t` to the default, as on
+    /// the session list.
+    #[test]
+    fn t_over_a_session_without_its_own_theme_saves_the_default() {
+        let _home = paths::test_home();
+        let names = Theme::list_all_names();
+        let mut a = app_with_theme(&names[0]);
+        a.screen = Screen::Main;
+        let mut s = crate::session::Session::from_url("sftp://me@h.example").unwrap();
+        s.name = "work".into();
+        s.save().unwrap();
+        a.current_session = Some(s);
+        a.current_session_saved = true;
+
+        a.handle_key(press(KeyCode::Char('t')));
+
+        assert_eq!(saved_theme(), names[1]);
     }
 
     #[test]

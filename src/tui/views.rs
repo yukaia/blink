@@ -757,7 +757,7 @@ pub mod confirm_cancel {
 
         let mut lines: Vec<Line> = vec![Line::from("")];
         match app.pending_cancel.as_ref() {
-            Some(PendingCancel::Single { name, .. }) => {
+            Some(PendingCancel::Single { name, queued, .. }) => {
                 lines.push(Line::from("  cancel this transfer:").alignment(Alignment::Center));
                 lines.push(
                     Line::from(Span::styled(
@@ -769,9 +769,14 @@ pub mod confirm_cancel {
                     .alignment(Alignment::Center),
                 );
                 lines.push(Line::from(""));
+                // A queued job hasn't started: nothing is left behind.
                 lines.push(
                     Line::from(Span::styled(
-                        "any partial file is left on disk.",
+                        if *queued {
+                            "it hasn't started; nothing is left behind."
+                        } else {
+                            "any partial file is left on disk."
+                        },
                         Style::default().fg(app.theme.dim),
                     ))
                     .alignment(Alignment::Center),
@@ -2536,6 +2541,7 @@ mod render_tests {
 
         let mut a = on(Screen::ConfirmCancel);
         a.pending_cancel = Some(PendingCancel::Single {
+            queued: false,
             id: 1,
             name: "x".into(),
         });
@@ -2759,6 +2765,7 @@ mod render_tests {
     fn cancelling_one_transfer_names_it() {
         let mut a = on(Screen::ConfirmCancel);
         a.pending_cancel = Some(PendingCancel::Single {
+            queued: false,
             id: 1,
             name: "big.iso".into(),
         });
@@ -2766,6 +2773,23 @@ mod render_tests {
         assert!(text.contains("cancel transfer?"), "{text}");
         assert!(text.contains("big.iso"), "{text}");
         assert!(text.contains("any partial file is left on disk."), "{text}");
+    }
+
+    /// A queued job hasn't started, so there is no partial file to warn of.
+    #[test]
+    fn cancelling_a_queued_transfer_says_nothing_is_left_behind() {
+        let mut a = on(Screen::ConfirmCancel);
+        a.pending_cancel = Some(PendingCancel::Single {
+            queued: true,
+            id: 1,
+            name: "big.iso".into(),
+        });
+        let text = screen(&a);
+        assert!(
+            text.contains("it hasn't started; nothing is left behind."),
+            "{text}"
+        );
+        assert!(!text.contains("partial file"), "{text}");
     }
 
     #[test]

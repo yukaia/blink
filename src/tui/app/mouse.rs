@@ -117,7 +117,7 @@ impl App {
                 MouseEventKind::ScrollUp => self.move_transfer_cursor(-WHEEL_STEP),
                 MouseEventKind::ScrollDown => self.move_transfer_cursor(WHEEL_STEP),
                 MouseEventKind::Down(MouseButton::Left)
-                    if self.transfer_view_offset.get() + r < self.active_jobs().len() =>
+                    if self.transfer_view_offset.get() + r < self.transfer_row_count() =>
                 {
                     self.transfer_cursor = self.transfer_view_offset.get() + r;
                 }

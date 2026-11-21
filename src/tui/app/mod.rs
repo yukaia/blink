@@ -2072,6 +2072,7 @@ mod tests {
         a.checkpoint_job_map
             .insert(id, (CheckpointKind::Download, 0));
         a.pending_cancel = Some(crate::tui::state::PendingCancel::Single {
+            queued: false,
             id,
             name: "a.bin".into(),
         });
@@ -2755,6 +2756,7 @@ mod tests {
             .unwrap()
             .id;
         a.pending_cancel = Some(crate::tui::state::PendingCancel::Single {
+            queued: false,
             id,
             name: "0".into(),
         });
@@ -2787,6 +2789,7 @@ mod tests {
             .id;
         let (_, idx) = a.checkpoint_job_map[&id];
         a.pending_cancel = Some(crate::tui::state::PendingCancel::Single {
+            queued: false,
             id,
             name: "1".into(),
         });
@@ -3165,6 +3168,41 @@ mod tests {
         assert!(
             !a.active_checkpoints.contains_key(&CheckpointKind::Download),
             "a fully cancelled batch leaves nothing to resume",
+        );
+    }
+
+    /// Jobs waiting outside the queue for room are cancelled with their
+    /// batch, and the question and the log count them: both counted only
+    /// the manager's queue.
+    #[tokio::test]
+    async fn a_batch_cancel_counts_the_jobs_waiting_for_room() {
+        let (mut a, _cleanup) = capped_app("overflow-count");
+        a.dispatch_plan(
+            vec![download(0), download(1), download(2), download(3)],
+            CheckpointKind::Download,
+        );
+        a.active_pane = Pane::Transfers;
+        a.transfer_cursor = 0;
+
+        a.request_cancel_selected_batch();
+        assert!(
+            matches!(
+                a.pending_cancel,
+                Some(crate::tui::state::PendingCancel::Batch {
+                    active: 0,
+                    pending: 4,
+                    ..
+                })
+            ),
+            "{:?}",
+            a.pending_cancel
+        );
+        a.handle_confirm_cancel(press(KeyCode::Char('y')));
+
+        assert!(
+            logged(&a, "cancelled batch: 0 active + 4 queued"),
+            "{:?}",
+            a.log
         );
     }
 

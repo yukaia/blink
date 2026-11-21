@@ -338,12 +338,19 @@ pub mod bottom_pane {
             // Scrolled back, say so: new lines arrive out of sight.
             Some(w) if w.newer > 0 => Some(format!(" ↓ {} newer ", w.newer)),
             Some(_) => None,
-            // Only running jobs have rows; the queue behind them, which
-            // quitting would discard too, is counted here, so a batch
-            // waiting behind the limit or a pause isn't invisible.
+            // Queued jobs have rows below the running ones, but a long
+            // queue scrolls out of sight: its size is kept here, with
+            // whether a pause is holding it.
             None => match app.queue_counts() {
                 (_, 0) => None,
-                (_, pending) => Some(format!(" +{pending} queued ")),
+                (_, pending) => {
+                    let paused = app.transfer_manager.as_ref().is_some_and(|m| m.is_paused());
+                    Some(if paused {
+                        format!(" +{pending} queued, paused ")
+                    } else {
+                        format!(" +{pending} queued ")
+                    })
+                }
             },
         };
         if let Some(text) = corner {
@@ -430,20 +437,18 @@ pub mod bottom_pane {
 
     fn render_transfers(f: &mut Frame, app: &App, area: Rect) {
         app.hit.set(|a| a.transfer_list = Some(area));
-        let jobs = app.active_jobs();
+        // Running jobs, then queued ones in the order they will start, so
+        // the cursor can reach a queued job for `c` / `C`. Only the window
+        // drawn is fetched: the queue can be 100k long.
+        let len = app.transfer_row_count();
         let paused = app
             .transfer_manager
             .as_ref()
             .map(|m| m.is_paused())
             .unwrap_or(false);
-        if jobs.is_empty() {
-            let text = match (app.queue_counts().1, paused) {
-                (0, _) => " no active transfers".to_string(),
-                (n, true) => format!(" none running · {n} queued, paused"),
-                (n, false) => format!(" none running · {n} queued"),
-            };
+        if len == 0 {
             let p = Paragraph::new(Line::from(Span::styled(
-                text,
+                " no active transfers",
                 Style::default().fg(app.theme.dim),
             )));
             f.render_widget(p, area);
@@ -451,24 +456,19 @@ pub mod bottom_pane {
         }
 
         let focused = app.active_pane == Pane::Transfers;
-        let cursor = app.transfer_cursor.min(jobs.len().saturating_sub(1));
+        let cursor = app.transfer_cursor.min(len - 1);
 
-        // Up to MAX_PARALLEL jobs run at once, more than the pane has rows:
-        // the list scrolls to keep the cursor, and what `c` cancels, in view.
+        // The list scrolls to keep the cursor, and what `c` cancels, in view.
         let window = crate::tui::state::scrolled_window(
             app.transfer_view_offset.get(),
             cursor,
-            jobs.len(),
+            len,
             area.height as usize,
         );
         app.transfer_view_offset.set(window.start);
+        let jobs = app.transfer_rows(window.start, window.len());
         let mut lines = Vec::with_capacity(area.height as usize);
-        for (i, job) in jobs
-            .iter()
-            .enumerate()
-            .skip(window.start)
-            .take(window.len())
-        {
+        for (i, job) in (window.start..).zip(jobs.iter()) {
             let is_cursor = i == cursor && focused;
             lines.push(render_transfer_line(
                 app,
@@ -498,7 +498,11 @@ pub mod bottom_pane {
         } else {
             (((job.bytes_done as f64 / job.bytes_total as f64) * 100.0).clamp(0.0, 100.0)) as u8
         };
-        let speed_str = if paused {
+        // A queued job has nothing to show yet, and is drawn dim.
+        let queued = job.state == crate::transfer::TransferState::Pending;
+        let speed_str = if queued {
+            "queued".to_string()
+        } else if paused {
             "paused".to_string()
         } else if job.bytes_per_sec == 0 {
             "—".to_string()
@@ -528,14 +532,14 @@ pub mod bottom_pane {
         let name_str = super::truncate_middle(&display_name, avail_for_name);
         let name_pad = avail_for_name.saturating_sub(columns(&name_str));
 
-        let percent_color = if paused {
+        let percent_color = if paused || queued {
             app.theme.dim
         } else if percent >= 100 {
             app.theme.success
         } else {
             app.theme.fg
         };
-        let bar_color = if paused {
+        let bar_color = if paused || queued {
             app.theme.dim
         } else {
             app.theme.success
@@ -556,7 +560,10 @@ pub mod bottom_pane {
                     .fg(app.theme.directory)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(name_str, Style::default().fg(app.theme.fg)),
+            Span::styled(
+                name_str,
+                Style::default().fg(if queued { app.theme.dim } else { app.theme.fg }),
+            ),
             Span::raw(" ".repeat(name_pad)),
             Span::raw(" "),
             Span::styled(
@@ -1013,17 +1020,23 @@ mod tests {
     /// them: paused before anything started, the pane read "no active
     /// transfers" with work waiting.
     #[test]
-    fn the_transfers_pane_counts_the_queue() {
+    fn the_transfers_pane_lists_and_counts_the_queue() {
         let mut a = app_on_main(0);
         let m = with_queued(&mut a, 3);
         let shown = text(&draw(&a));
         assert!(shown.contains("+3 queued"), "{shown}");
-        assert!(shown.contains("none running · 3 queued"), "{shown}");
+        for i in 0..3 {
+            let row = shown
+                .lines()
+                .find(|l| l.contains(&format!("f{i} ")))
+                .unwrap_or_else(|| panic!("f{i} has no row:\n{shown}"));
+            assert!(row.contains("queued"), "{row}");
+        }
         assert!(!shown.contains("no active transfers"), "{shown}");
 
         m.pause();
         let shown = text(&draw(&a));
-        assert!(shown.contains("3 queued, paused"), "{shown}");
+        assert!(shown.contains("+3 queued, paused"), "{shown}");
     }
 
     #[test]
