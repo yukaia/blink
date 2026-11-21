@@ -180,6 +180,13 @@ the git history for those.
   above its file first. Symlinks root owns are trusted, as only root can
   make them and some systems' own paths are them (macOS's `/tmp`).
 
+- **A download's empty folders get the same planted-symlink check.** The
+  folders of a tree with no file in them were made directly, following a
+  symlink another user had planted under a folder's name. A download into
+  a shared folder could then create folders in the link's target, such as
+  making `~/.ssh/authorized_keys` a folder. They are now refused and
+  reported, as a file's download is.
+
 - **An SFTP upload no longer writes through a symlink planted as its
   partial.** The partial's name is predictable and a server's open follows
   links, so in a shared remote folder someone could aim one at any file
@@ -287,6 +294,17 @@ the git history for those.
   before, they were accepted whatever they presented.
 
 ### Fixed
+
+- **A local folder that couldn't be made is reported in the log.** Only
+  the debug log heard of it, so an empty folder in a download could go
+  missing without a word.
+
+- **Skipping every conflict says there's nothing left to transfer.**
+  Answering `s` when every file already existed did nothing, silently.
+
+- **An upload name that can't be used on the server is reported**, as a
+  download's is; it was dropped without a word. Entries skipped for a name
+  that isn't valid UTF-8 are counted as "entries", since folders are too.
 
 - **The local pane says when it couldn't read some entries**, once per
   change, as the remote pane does. Entries `read_dir` or their metadata
