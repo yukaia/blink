@@ -534,11 +534,21 @@ impl App {
         }
     }
 
+    /// How many of batch `batch_id`'s jobs wait outside the queue for room.
+    pub(super) fn waiting_in_batch(&self, batch_id: u64) -> usize {
+        self.waiting_jobs
+            .values()
+            .flatten()
+            .filter(|w| w.batch_id == Some(batch_id))
+            .count()
+    }
+
     /// Drop a cancelled batch's waiting jobs and mark their entries
-    /// cancelled. They have no job ids, so the cancel that goes through the
-    /// transfer manager cannot reach them; left alone, they would be queued
-    /// after the rest of their batch was cancelled.
-    pub(super) fn cancel_waiting_in_batch(&mut self, batch_id: u64) {
+    /// cancelled, returning how many there were. They have no job ids, so
+    /// the cancel that goes through the transfer manager cannot reach them;
+    /// left alone, they would be queued after the rest of their batch was
+    /// cancelled.
+    pub(super) fn cancel_waiting_in_batch(&mut self, batch_id: u64) -> usize {
         let mut touched = Vec::new();
         let mut dropped = 0usize;
         for (kind, queue) in self.waiting_jobs.iter_mut() {
@@ -565,6 +575,7 @@ impl App {
         for kind in touched {
             self.settle_checkpoint(kind, CheckpointFlush::Force);
         }
+        dropped
     }
 
     /// Count how one job of batch `batch_id` ended, and report the batch

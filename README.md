@@ -566,7 +566,7 @@ key_path = /home/me/.ssh/id_ed25519
 parallel_downloads = 4
 
 [appearance]
-; optional override
+; optional override; `t` while connected to this session saves here
 theme = tokyo-night
 
 [tls]
@@ -640,8 +640,8 @@ The full list lives in the in-app help overlay (`?`). Highlights:
 | `Shift-Del` / `D` | delete file or folder (remote pane)       |
 | `Ctrl-S`       | save current session                         |
 | `Ctrl-X`       | disconnect (return to selector, with confirmation) |
-| `t`            | cycle theme                                  |
-| `c`            | cancel selected transfer (Transfers pane)    |
+| `t`            | cycle theme (saved to the session if it sets its own) |
+| `c`            | cancel selected transfer, running or queued (Transfers pane) |
 | `C`            | cancel whole batch (Transfers pane)          |
 | `r`            | resume interrupted download batch (Transfers pane) |
 | `R`            | resume interrupted upload batch (Transfers pane)   |

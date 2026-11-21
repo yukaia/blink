@@ -46,6 +46,16 @@ the git history for those.
 
 ### Changed
 
+- **Queued transfers are listed in the Transfers pane**, dimmed and
+  marked "queued", below the running ones, and `c` / `C` act on them.
+  Only running jobs could be picked before, so with nothing running a
+  queue couldn't be cancelled, and a queued job outside a batch never
+  could. The pane's corner reads "+N queued, paused" while a pause holds
+  the queue.
+- **`t` over a session with its own theme saves it to that session.** It
+  always saved to `config.ini`, which changed the theme everywhere else
+  while the session's own came back on the next connect. A session
+  without its own theme, and the session list, still save the default.
 - **Long log lines wrap.** A message wider than the log pane ran off its
   edge, and for some errors the log is the only place the reason is
   given. Each entry now wraps under its timestamp, breaking at spaces;
@@ -261,6 +271,9 @@ the git history for those.
 
 ### Fixed
 
+- **A batch cancel counts the jobs waiting for room in the queue.** Past
+  the 100,000-job queue limit, jobs wait outside it; confirming cancelled
+  them, but the question and the log line left them out.
 - **`r` retries the failures of a batch another blink kept from being
   saved.** With another blink holding the session's checkpoint, a batch
   runs unsaved, its failures held in memory only. `r` threw that record

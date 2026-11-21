@@ -763,7 +763,7 @@ impl App {
             }
             TransferEvent::Progress => {
                 // Deliberately empty. Byte counts live in TransferManager and
-                // the transfers pane reads them from `active_jobs()` as it
+                // the transfers pane reads them from `transfer_rows()` as it
                 // renders; the only job this event has is waking the run loop
                 // for that redraw. Bursts are collapsed upstream by
                 // `event::drain_progress`, so keep this a no-op —
