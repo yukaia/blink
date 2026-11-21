@@ -93,23 +93,41 @@ pub enum AppEvent {
     /// the path was removed). The pane shows just the `..` entry.
     LocalListFailed { path: String, error: String },
 
-    /// A rename completed successfully.
-    Renamed { from: String, to: String },
+    /// A rename completed successfully. Each of these six carries the
+    /// `connection` it ran on, as a listing does: a reply from a server
+    /// since disconnected is not this one's to report or refresh for.
+    Renamed {
+        connection: u64,
+        from: String,
+        to: String,
+    },
 
     /// A rename of `from` failed.
-    RenameFailed { from: String, error: String },
+    RenameFailed {
+        connection: u64,
+        from: String,
+        error: String,
+    },
 
     /// A remote mkdir completed successfully.
-    MkdirDone { path: String },
+    MkdirDone { connection: u64, path: String },
 
     /// A remote mkdir failed.
-    MkdirFailed { path: String, error: String },
+    MkdirFailed {
+        connection: u64,
+        path: String,
+        error: String,
+    },
 
     /// A delete completed successfully.
-    Deleted { name: String },
+    Deleted { connection: u64, name: String },
 
     /// A delete failed.
-    DeleteFailed { name: String, error: String },
+    DeleteFailed {
+        connection: u64,
+        name: String,
+        error: String,
+    },
 
     /// A recursive walk finished. The plan is a flat list of jobs to enqueue
     /// in order: directory creations come before any files inside them.

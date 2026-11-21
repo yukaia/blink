@@ -149,6 +149,11 @@ the git history for those.
 
 ### Security
 
+- **A host-key mismatch during connect drops the password typed for it.**
+  The failed connect that follows the warning does nothing, so the warning
+  can stay up, and with it nothing cleared the password and passphrase
+  state: the password for a server that had just failed to prove its
+  identity stayed in memory until the next connect or quit.
 - **Session names and hosts are drawn sanitized everywhere.** Only the
   save offer cleaned them; the selector, header, prompts, editor and the
   host-key dialog printed them raw, where a right-to-left override in a
@@ -271,6 +276,19 @@ the git history for those.
 
 ### Fixed
 
+- **Cancelled transfers aren't logged as failures.** Each cancelled job
+  logged a red `failed: …: cancelled` line, after the cancel had already
+  said so: a batch cancel buried its own summary under them and read as a
+  run of failures. A cancel is now its own event, so an error that merely
+  reads "cancelled" also counts as the failure it is.
+- **Queuing a batch no longer logs a line per job**, which pushed the
+  "queued downloads: N file(s)" summary and the queue-full notice out of
+  the log as soon as they were written.
+- **An empty folder uploaded into the remote pane shows up** without F5.
+  The pane refreshed when a file landed, never for a folder being made.
+- **Replies to a rename, new folder or delete from a closed connection
+  are dropped**, as a listing's are, rather than logged and refreshed
+  against the server connected since.
 - **A batch cancel counts the jobs waiting for room in the queue.** Past
   the 100,000-job queue limit, jobs wait outside it; confirming cancelled
   them, but the question and the log line left them out.

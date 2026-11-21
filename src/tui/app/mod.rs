@@ -2930,18 +2930,34 @@ mod tests {
         assert!(logged(&a, "1 of 2 failed"), "{}", last_log(&a));
     }
 
-    /// A cancelled job is not a failure: the user asked for it.
+    /// A cancelled job is not a failure: the user asked for it. Nor is
+    /// it a red `failed:` line of its own; the cancel says so once.
     #[tokio::test]
-    async fn a_cancelled_job_is_not_counted_as_a_failure() {
+    async fn a_cancelled_job_is_not_counted_or_logged_as_a_failure() {
         let (mut a, _cleanup) = checkpoint_app("summary-cancel");
         a.dispatch_plan(vec![download(0), download(1)], CheckpointKind::Download);
         let ids = batch_ids(&a);
-        finish(&mut a, ids[0], Some("cancelled"));
+        let m = a.transfer_manager.clone().unwrap();
+        assert!(m.cancel(ids[0]));
+        a.handle_transfer_event(TransferEvent::Cancelled(job_of(&a, ids[0])));
+        assert!(!logged(&a, "failed:"), "{:?}", a.log);
         finish(&mut a, ids[1], None);
         assert_eq!(
             last_log(&a),
             "download batch finished: 1 complete, 1 cancelled"
         );
+    }
+
+    /// A cancel used to be recognised by its error reading "cancelled";
+    /// a transport error saying the same was then counted as a cancel.
+    #[tokio::test]
+    async fn an_error_that_reads_cancelled_is_still_a_failure() {
+        let (mut a, _cleanup) = checkpoint_app("summary-cancel-text");
+        a.dispatch_plan(vec![download(0), download(1)], CheckpointKind::Download);
+        let ids = batch_ids(&a);
+        finish(&mut a, ids[0], Some("cancelled"));
+        finish(&mut a, ids[1], None);
+        assert!(logged(&a, "1 of 2 failed"), "{}", last_log(&a));
     }
 
     /// The failed jobs of a finished batch stay in its checkpoint, to be
@@ -4708,6 +4724,60 @@ mod tests {
         assert_eq!(l.started(), 2, "a file below /srv: its folder may be new");
     }
 
+    /// A folder made by an upload batch counts as landing: an empty one
+    /// never showed, as no file landed in it to trigger the refresh.
+    #[tokio::test]
+    async fn an_empty_folder_made_in_the_pane_refreshes_it() {
+        let (mut a, l) = app_listing(false);
+        let id = a
+            .transfer_manager
+            .as_ref()
+            .unwrap()
+            .enqueue_mkdir("/srv/empty".into())
+            .unwrap();
+        a.handle_transfer_event(TransferEvent::Complete(job_of(&a, id)));
+        Listings::settle().await;
+        assert_eq!(l.started(), 1, "the new folder is shown");
+    }
+
+    /// Replies to a rename, mkdir or delete on a connection since closed
+    /// are dropped, as a listing is: on the server now connected they
+    /// logged what happened elsewhere and refreshed its pane.
+    #[tokio::test]
+    async fn replies_from_a_closed_connection_are_dropped() {
+        let (mut a, l) = app_listing(false);
+        let old = a.connection.wrapping_sub(1);
+        for ev in [
+            AppEvent::Renamed {
+                connection: old,
+                from: "/srv/a".into(),
+                to: "/srv/b".into(),
+            },
+            AppEvent::MkdirDone {
+                connection: old,
+                path: "/srv/d".into(),
+            },
+            AppEvent::Deleted {
+                connection: old,
+                name: "c".into(),
+            },
+            AppEvent::DeleteFailed {
+                connection: old,
+                name: "c".into(),
+                error: "x".into(),
+            },
+        ] {
+            a.handle_app_event(ev);
+        }
+        Listings::settle().await;
+        assert_eq!(l.started(), 0, "no refresh");
+        assert!(
+            !logged(&a, "renamed") && !logged(&a, "created") && !logged(&a, "deleted"),
+            "{:?}",
+            a.log
+        );
+    }
+
     #[tokio::test]
     async fn navigating_the_remote_pane_drops_the_previous_listing() {
         // Navigation is different: the old directory's rows do not belong to
@@ -4817,6 +4887,38 @@ mod tests {
         );
         assert_eq!(info.fingerprint, "SHA256:abc");
         assert!(info.trusted_once);
+    }
+
+    /// The `ConnectFailed` after a mismatch finds no pending session and
+    /// does nothing, so the password typed for that server stayed in
+    /// memory. The mismatch drops it.
+    #[test]
+    fn a_changed_host_key_during_connect_drops_the_password() {
+        let mut a = connecting();
+        a.pending_password = Some(zeroize::Zeroizing::new("hunter2".into()));
+        a.passphrase_input = zeroize::Zeroizing::new("secret".to_string());
+        a.passphrase_attempted = true;
+
+        a.handle_app_event(changed_event("ssh-rsa", false));
+        a.handle_app_event(AppEvent::ConnectFailed("refused".into()));
+
+        assert!(a.pending_password.is_none());
+        assert!(a.passphrase_input.is_empty());
+        assert!(!a.passphrase_attempted);
+        assert_eq!(a.screen, Screen::HostKeyChanged, "the warning stays up");
+    }
+
+    /// Raised by a transfer worker mid-session, the warning leaves the
+    /// session's password alone: dismissing it disconnects, which drops it.
+    #[test]
+    fn a_changed_host_key_mid_session_keeps_the_sessions_password() {
+        let mut a = app();
+        a.screen = Screen::Main;
+        a.pending_password = Some(zeroize::Zeroizing::new("hunter2".into()));
+
+        a.handle_app_event(changed_event("ssh-rsa", false));
+
+        assert!(a.pending_password.is_some());
     }
 
     /// The handler refusing the key makes the connect fail a moment later.
@@ -5536,6 +5638,7 @@ mod pane_audit_tests {
     fn a_failed_rename_names_the_file_not_its_path() {
         let mut a = app_on_main(0);
         a.handle_app_event(AppEvent::RenameFailed {
+            connection: a.connection,
             from: "/srv/deep/old.txt".into(),
             error: "nope".into(),
         });
