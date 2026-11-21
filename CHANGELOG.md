@@ -288,6 +288,13 @@ the git history for those.
 
 ### Fixed
 
+- **A double-click acts on the entry it landed on.** The two presses were
+  matched by row, so a refresh between them, as the remote pane does when
+  each upload lands, could put another entry at that row and open or
+  transfer that one instead.
+- **The wheel over a file pane focuses it**, as over the transfer list. It
+  moved the cursor of an unfocused pane, which isn't drawn there, and
+  Ctrl+D or Ctrl+U then transferred the entry it had moved to, unseen.
 - **The offers after connecting wait before taking a key**, as the other
   prompts that open on their own do. A key typed as the connection came
   up answered the resume offer, and `d` there deletes the batch's partial

@@ -1,8 +1,8 @@
 //! Mouse input: clicks, double-clicks and the wheel.
 //!
 //! Events are matched against the [`crate::tui::hit::HitMap`] the last draw
-//! recorded. Only the main view, the viewer and the session selector take
-//! the mouse; on every other screen — each modal and prompt — it does
+//! recorded. Only the main view, the viewer, help and the session selector
+//! take the mouse; on every other screen — each modal and prompt — it does
 //! nothing, including to the panes drawn behind the modal.
 
 use std::time::{Duration, Instant};
@@ -20,10 +20,18 @@ pub(super) const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 pub(super) const WHEEL_STEP: isize = 3;
 
 /// What a press landed on, as far as a double-click is concerned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// A file pane's entry is named by its folder and real name, not its row:
+/// a listing refreshed between the two presses (the remote pane refreshes
+/// as each upload lands) can put another entry at that row, and a pair
+/// matched by row then opened or transferred that one.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ClickTarget {
-    Local(usize),
-    Remote(usize),
+    Entry {
+        pane: Pane,
+        dir: String,
+        name: String,
+    },
     Session(usize),
 }
 
@@ -85,8 +93,18 @@ impl App {
                 continue;
             }
             match m.kind {
-                MouseEventKind::ScrollUp => self.pane_mut(pane).move_cursor(-WHEEL_STEP),
-                MouseEventKind::ScrollDown => self.pane_mut(pane).move_cursor(WHEEL_STEP),
+                // The wheel focuses the pane, as over the transfer list: the
+                // cursor is only drawn in the focused pane, and Ctrl+D and
+                // Ctrl+U fall back to it whichever has focus, so moving it
+                // unfocused moved what they'd transfer out of sight.
+                MouseEventKind::ScrollUp => {
+                    self.active_pane = pane;
+                    self.pane_mut(pane).move_cursor(-WHEEL_STEP);
+                }
+                MouseEventKind::ScrollDown => {
+                    self.active_pane = pane;
+                    self.pane_mut(pane).move_cursor(WHEEL_STEP);
+                }
                 MouseEventKind::Down(MouseButton::Left) => {
                     self.click_pane(pane, row_in(list_area, col, row), now);
                 }
@@ -215,9 +233,10 @@ impl App {
             return;
         }
         state.cursor = idx;
-        let target = match pane {
-            Pane::Local => ClickTarget::Local(idx),
-            _ => ClickTarget::Remote(idx),
+        let target = ClickTarget::Entry {
+            pane,
+            dir: state.path.clone(),
+            name: state.entries[idx].raw_name.clone(),
         };
         if self.is_double_click(target, now) {
             self.open_or_transfer(pane);
@@ -368,6 +387,28 @@ mod tests {
         assert_eq!(a.local.path, "/tmp/sub");
     }
 
+    /// Matched by row, a pair of presses with a refresh between them
+    /// opened whatever the refresh put at that row: here `0new`, sorting in
+    /// above the folder first clicked.
+    #[tokio::test]
+    async fn a_refresh_between_two_clicks_breaks_the_double_click() {
+        let mut a = app_on_main(0);
+        a.local.path = "/tmp".into();
+        a.local
+            .set_entries(vec![PaneEntry::new("sub".into(), true, 0)]);
+        draw(&a);
+        let (c, r) = local_row(&a, 0);
+        let t = Instant::now();
+        a.handle_mouse_at(press(c, r), t);
+        a.local.set_entries(vec![
+            PaneEntry::new("0new".into(), true, 0),
+            PaneEntry::new("sub".into(), true, 0),
+        ]);
+        draw(&a);
+        a.handle_mouse_at(press(c, r), t + Duration::from_millis(200));
+        assert_eq!(a.local.path, "/tmp", "nothing opened");
+    }
+
     #[tokio::test]
     async fn two_slow_clicks_are_two_single_clicks() {
         let mut a = app_on_main(0);
@@ -420,17 +461,23 @@ mod tests {
         assert_eq!(a.local.path, format!("/tmp/{clicked}"));
     }
 
+    /// The wheel moved an unfocused pane's cursor, which only the focused
+    /// pane draws, while Ctrl+D and Ctrl+U fall back to it whatever has
+    /// focus: they then transferred an entry never shown highlighted. It
+    /// focuses the pane, as over the transfer list.
     #[tokio::test]
-    async fn the_wheel_moves_the_cursor_of_the_pane_under_it_without_focusing_it() {
+    async fn the_wheel_moves_the_cursor_of_the_pane_under_it_and_focuses_it() {
         let mut a = app_on_main(20);
         a.active_pane = Pane::Remote;
         draw(&a);
         let (c, r) = local_row(&a, 0);
         a.handle_mouse_at(wheel(true, c, r), Instant::now());
         assert_eq!(a.local.cursor, 3);
-        assert_eq!(a.active_pane, Pane::Remote);
+        assert_eq!(a.active_pane, Pane::Local);
+        a.active_pane = Pane::Remote;
         a.handle_mouse_at(wheel(false, c, r), Instant::now());
         assert_eq!(a.local.cursor, 0);
+        assert_eq!(a.active_pane, Pane::Local);
     }
 
     #[tokio::test]
