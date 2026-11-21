@@ -578,30 +578,10 @@ pub(crate) const TEXT_VIEW_LIMIT: u64 = 1_000_000; // 1 MB
 /// Largest image accepted for preview, checked against the size the server
 /// reports in its directory listing.
 ///
-/// The transports' `read_to_bytes` caps derive from this rather than
-/// restating it: that cap is the backstop for a server that under-reports a
-/// file's size in its listing, so if it were ever the *smaller* of the two,
-/// every image between the two values would silently truncate instead of
-/// being refused. Keeping one definition makes them impossible to drift.
-///
 /// Note this bounds bytes fetched, not decode memory — [`MAX_IMAGE_ALLOC`]
 /// bounds that independently, and an oversized declaration is refused from
 /// the header before a pixel buffer is allocated.
 pub(crate) const IMAGE_VIEW_LIMIT: u64 = 25_000_000; // 25 MB
-
-/// Compile-time guard on the relationship described above.
-///
-/// Both transports currently *derive* their cap from this constant, so this
-/// holds trivially — the point is that it keeps holding if someone later
-/// writes a literal back into either one. A transport cap below the viewer's
-/// limit wouldn't fail loudly: images between the two values would come back
-/// truncated and fail to decode with a confusing error, instead of being
-/// cleanly refused before the fetch. Failing the build beats a test here,
-/// since there is no runtime state to observe.
-const _: () = {
-    assert!(crate::transport::sftp::MAX_PREVIEW_BYTES >= IMAGE_VIEW_LIMIT);
-    assert!(crate::transport::ftp_impl::MAX_PREVIEW_BYTES >= IMAGE_VIEW_LIMIT);
-};
 
 /// Decide what kind of viewer to open for `name` (with the given `size`).
 pub fn detect_view_kind(name: &str, size: u64) -> FileViewKind {
@@ -630,9 +610,9 @@ pub(crate) fn view_limit(kind: &FileViewKind) -> u64 {
 ///
 /// Checked twice: against the size the listing reports, before fetching,
 /// and against the bytes that actually arrive. The listing can understate a
-/// file, or the file can grow in between, and a remote fetch is capped only
-/// at the image limit — for text, 25 times the limit, all of it sanitized
-/// and tokenized on the UI thread.
+/// file, or the file can grow in between. A local read stops one byte past
+/// the limit and lands here; a remote one, given the same limit, refuses
+/// the file itself.
 pub(crate) fn too_large(kind: &FileViewKind, size: u64) -> Option<String> {
     let what = match kind {
         FileViewKind::Text => "text",

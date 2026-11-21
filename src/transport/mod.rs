@@ -958,9 +958,14 @@ pub trait Transport: Send + Sync {
     /// Used by recursive walks and overwrite checks.
     async fn metadata(&mut self, remote_path: &str) -> Result<Option<RemoteEntry>>;
 
-    /// Read a remote file fully into memory. Used for previewing small text
-    /// files and images.
-    async fn read_to_bytes(&mut self, remote_path: &str) -> Result<Bytes>;
+    /// Read a remote file fully into memory, refusing one over `limit`
+    /// bytes. Used for previewing small text files and images; the viewer
+    /// passes the limit for the kind it opens, so a text file stops at the
+    /// text limit rather than the image one.
+    ///
+    /// Reads one byte past `limit` to tell a file over it from one at it.
+    /// This is the backstop for a server whose listing understates a size.
+    async fn read_to_bytes(&mut self, remote_path: &str, limit: u64) -> Result<Bytes>;
 
     /// Cleanly close the connection.
     async fn close(&mut self) -> Result<()>;
@@ -1322,15 +1327,17 @@ pub(crate) mod mock {
             Ok(None)
         }
 
-        async fn read_to_bytes(&mut self, remote_path: &str) -> Result<Bytes> {
+        async fn read_to_bytes(&mut self, remote_path: &str, limit: u64) -> Result<Bytes> {
             let files = self.files.lock().unwrap();
-            files
-                .get(remote_path)
-                .cloned()
-                .map(Bytes::from)
-                .ok_or_else(|| {
-                    crate::error::BlinkError::transport(format!("file not found: {remote_path}"))
-                })
+            let bytes = files.get(remote_path).cloned().ok_or_else(|| {
+                crate::error::BlinkError::transport(format!("file not found: {remote_path}"))
+            })?;
+            if bytes.len() as u64 > limit {
+                return Err(crate::error::BlinkError::transport(
+                    "file exceeds preview size limit",
+                ));
+            }
+            Ok(Bytes::from(bytes))
         }
 
         async fn close(&mut self) -> Result<()> {
@@ -2345,7 +2352,7 @@ mod tests {
     #[tokio::test]
     async fn mock_read_to_bytes() {
         let mut m = mock::MockTransport::new().with_file("/data.bin", b"\x00\x01\x02");
-        let bytes = m.read_to_bytes("/data.bin").await.unwrap();
+        let bytes = m.read_to_bytes("/data.bin", u64::MAX).await.unwrap();
         assert_eq!(&bytes[..], &[0, 1, 2]);
     }
 

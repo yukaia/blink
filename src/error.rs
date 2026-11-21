@@ -262,7 +262,7 @@ const TAB_WIDTH: usize = 8;
 /// terminal rendering in the text viewer.
 ///
 /// Unlike [`sanitize`], no length cap is applied — line length is bounded by
-/// the caller's `MAX_PREVIEW_BYTES` cap, and Ratatui clips to terminal width.
+/// the viewer's size limit, and Ratatui clips to terminal width.
 /// Newlines/carriage returns never appear here because the caller splits on
 /// `lines()` first.
 ///

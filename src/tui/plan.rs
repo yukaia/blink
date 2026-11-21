@@ -665,7 +665,7 @@ mod tests {
         async fn metadata(&mut self, _: &str) -> Result<Option<transport::RemoteEntry>> {
             unreachable!()
         }
-        async fn read_to_bytes(&mut self, _: &str) -> Result<bytes::Bytes> {
+        async fn read_to_bytes(&mut self, _: &str, _: u64) -> Result<bytes::Bytes> {
             unreachable!()
         }
         async fn close(&mut self) -> Result<()> {
@@ -764,7 +764,7 @@ mod tests {
         async fn metadata(&mut self, _: &str) -> Result<Option<transport::RemoteEntry>> {
             unreachable!()
         }
-        async fn read_to_bytes(&mut self, _: &str) -> Result<bytes::Bytes> {
+        async fn read_to_bytes(&mut self, _: &str, _: u64) -> Result<bytes::Bytes> {
             unreachable!()
         }
         async fn close(&mut self) -> Result<()> {
@@ -997,7 +997,7 @@ mod tests {
         async fn metadata(&mut self, _: &str) -> Result<Option<transport::RemoteEntry>> {
             unreachable!()
         }
-        async fn read_to_bytes(&mut self, _: &str) -> Result<bytes::Bytes> {
+        async fn read_to_bytes(&mut self, _: &str, _: u64) -> Result<bytes::Bytes> {
             unreachable!()
         }
         async fn close(&mut self) -> Result<()> {
@@ -1320,7 +1320,7 @@ mod tests {
         async fn metadata(&mut self, _: &str) -> Result<Option<transport::RemoteEntry>> {
             unreachable!()
         }
-        async fn read_to_bytes(&mut self, _: &str) -> Result<bytes::Bytes> {
+        async fn read_to_bytes(&mut self, _: &str, _: u64) -> Result<bytes::Bytes> {
             unreachable!()
         }
         async fn close(&mut self) -> Result<()> {

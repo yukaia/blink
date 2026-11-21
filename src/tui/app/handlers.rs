@@ -749,6 +749,13 @@ impl App {
             Some(ViewerKind::Image { .. })
         );
         self.viewer = None;
+        // A fetch still running would go on holding the browsing
+        // connection's lock for a file nobody will see. Stopping it is safe
+        // on every protocol: FTP marks a call that never settled broken and
+        // reconnects before the next one; SFTP drops the half-read handle.
+        if let Some(task) = self.view_task.take() {
+            task.abort();
+        }
         self.image_needs_redraw = false;
         if was_image {
             self.needs_terminal_clear = true;

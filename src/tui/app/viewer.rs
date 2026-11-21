@@ -31,7 +31,7 @@ impl App {
         // show. Keeping them apart matters most here: the viewer is the one
         // place a file's own bytes are rendered, so a name that round-tripped
         // through sanitization would open the wrong file (or none).
-        let (raw_name, name, size, source) = match self.active_pane {
+        let (raw_name, name, size, is_link, source) = match self.active_pane {
             Pane::Local => {
                 let entry = match self.local.entries.get(self.local.cursor) {
                     Some(e) if !e.is_dir => e.clone(),
@@ -45,6 +45,7 @@ impl App {
                     entry.raw_name,
                     entry.display_name,
                     entry.size,
+                    false,
                     ViewSource::Local,
                 )
             }
@@ -57,6 +58,7 @@ impl App {
                     entry.raw_name,
                     entry.display_name,
                     entry.size,
+                    entry.is_link,
                     ViewSource::Remote,
                 )
             }
@@ -64,12 +66,36 @@ impl App {
         };
 
         // Classify on the real name: the extension is what decides text vs.
-        // image, and it has to be the extension the file actually has.
+        // image, and it has to be the extension the file actually has. A
+        // link's listed size is the link's own, so for one this checks
+        // nothing; the fetch checks the size of what it points at.
         let kind = preview::detect_view_kind(&raw_name, size);
         if let FileViewKind::Unsupported(reason) = &kind {
             self.push_log(LogLevel::Warn, format!("can't view {name}: {reason}"));
             return;
         }
+        let limit = preview::view_limit(&kind);
+
+        // Everything that can refuse a remote file without asking the server
+        // is checked before the modal opens, so it doesn't flash up and
+        // vanish.
+        let remote = match source {
+            ViewSource::Local => None,
+            ViewSource::Remote => {
+                let Some(t) = self.transport.clone() else {
+                    self.push_log(LogLevel::Warn, "not connected".into());
+                    return;
+                };
+                let Some(remote_path) = transport::join_remote(&self.remote.path, &raw_name) else {
+                    self.push_log(
+                        LogLevel::Warn,
+                        format!("cannot view `{name}`: unusable name"),
+                    );
+                    return;
+                };
+                Some((t, remote_path))
+            }
+        };
 
         // Open the modal in Loading state. Subsequent ViewLoaded / ViewFailed
         // events carrying this `id` populate `kind`.
@@ -84,10 +110,9 @@ impl App {
         self.screen = Screen::Viewer;
 
         let tx = self.app_event_tx.clone();
-        match source {
-            ViewSource::Local => {
+        let task = match remote {
+            None => {
                 let path = std::path::PathBuf::from(&self.local.path).join(&raw_name);
-                let limit = preview::view_limit(&kind);
                 tokio::spawn(async move {
                     let event = match read_local_bounded(&path, limit).await {
                         Ok(buf) => AppEvent::ViewLoaded {
@@ -103,42 +128,37 @@ impl App {
                         },
                     };
                     let _ = tx.send(event);
-                });
+                })
             }
-            ViewSource::Remote => {
-                let Some(t) = self.transport.clone() else {
-                    self.viewer = None;
-                    self.screen = self.previous_screen.clone();
-                    return;
-                };
-                let Some(remote_path) = transport::join_remote(&self.remote.path, &raw_name) else {
-                    self.viewer = None;
-                    self.screen = self.previous_screen.clone();
-                    self.push_log(
-                        LogLevel::Warn,
-                        format!("cannot view `{name}`: unusable name"),
-                    );
-                    return;
-                };
-                tokio::spawn(async move {
-                    let mut transport = t.lock().await;
-                    let event = match transport.read_to_bytes(&remote_path).await {
-                        Ok(bytes) => AppEvent::ViewLoaded {
+            Some((t, remote_path)) => tokio::spawn(async move {
+                let mut transport = t.lock().await;
+                let event =
+                    match remote_view_refusal(&mut **transport, &remote_path, &kind, is_link).await
+                    {
+                        Some(reason) => AppEvent::ViewLoaded {
                             viewer_id: id,
                             name,
-                            kind,
-                            bytes,
+                            kind: FileViewKind::Unsupported(reason),
+                            bytes: Bytes::new(),
                         },
-                        Err(e) => AppEvent::ViewFailed {
-                            viewer_id: id,
-                            name,
-                            error: e.to_string(),
+                        None => match transport.read_to_bytes(&remote_path, limit).await {
+                            Ok(bytes) => AppEvent::ViewLoaded {
+                                viewer_id: id,
+                                name,
+                                kind,
+                                bytes,
+                            },
+                            Err(e) => AppEvent::ViewFailed {
+                                viewer_id: id,
+                                name,
+                                error: e.to_string(),
+                            },
                         },
                     };
-                    let _ = tx.send(event);
-                });
-            }
-        }
+                let _ = tx.send(event);
+            }),
+        };
+        self.view_task = Some(task.abort_handle());
     }
 
     pub(super) fn viewer_scroll(&mut self, delta: isize) {
@@ -299,6 +319,29 @@ fn image_area(full: Rect) -> Option<ImageArea> {
     (area.w > 0 && area.h > 0).then_some(area)
 }
 
+/// Why a remote file shouldn't be fetched for the viewer, if it shouldn't,
+/// found by asking the server what a link points at. A link is listed with
+/// its own size and as not a folder, so the listing can't say: as Enter and
+/// downloads do, ask. A link to a folder is refused, and one to a file too
+/// large for `kind` is refused before its bytes are fetched. Where the
+/// server can't say (FTP), or the question fails, the fetch goes ahead and
+/// its own limit applies.
+async fn remote_view_refusal(
+    transport: &mut dyn transport::Transport,
+    remote_path: &str,
+    kind: &FileViewKind,
+    is_link: bool,
+) -> Option<String> {
+    if !is_link {
+        return None;
+    }
+    match transport.metadata(remote_path).await {
+        Ok(Some(e)) if e.is_dir() => Some("it is a link to a folder".into()),
+        Ok(Some(e)) if e.kind == transport::EntryKind::File => preview::too_large(kind, e.size),
+        _ => None,
+    }
+}
+
 /// Tokenise every line of a file once, at view-load time, so per-frame
 /// rendering becomes an array lookup instead of replaying the highlighter
 /// from line 0. The viewer redraws on the 100 ms TUI tick — without this
@@ -351,6 +394,8 @@ pub(super) async fn read_local_bounded(
 mod tests {
     use super::{image_area, read_local_bounded};
     use crate::config::ImagePreviewMode;
+    use crate::transport::Transport;
+    use crate::transport::mock::MockTransport;
     use crate::tui::app::tests_support::{app_on_main, draw};
     use crate::tui::app::{App, Pane, Screen};
     use crate::tui::state::{ImageArea, ImageRender, PaneEntry, Viewer, ViewerKind};
@@ -461,6 +506,127 @@ mod tests {
         a.handle_view_request();
         assert_eq!(a.screen, Screen::Main);
         assert!(a.viewer.is_none());
+        assert!(logged(&a, "not connected"), "{:?}", a.log);
+    }
+
+    // --- remote files ---
+
+    /// An app on the remote pane `/srv` listing `entry`, served by `mock`.
+    fn remote_app(entry: PaneEntry, mock: MockTransport) -> App {
+        let mut a = app_on_main(0);
+        a.active_pane = Pane::Remote;
+        a.remote.path = "/srv".into();
+        a.remote.set_entries(vec![entry]);
+        a.transport = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            Box::new(mock) as Box<dyn Transport>
+        )));
+        a
+    }
+
+    fn link(name: &str) -> PaneEntry {
+        let mut e = PaneEntry::new(name.into(), false, 12);
+        e.is_link = true;
+        e
+    }
+
+    /// Open the viewer on the cursor entry and hand back what it shows once
+    /// the fetch answers.
+    async fn view(a: &mut App) -> ViewerKind {
+        let mut events = a.app_event_rx.take().unwrap();
+        a.handle_view_request();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("an answer within 5 s")
+            .unwrap();
+        a.handle_app_event(event);
+        a.viewer.take().unwrap().kind
+    }
+
+    /// Closing the viewer stops its fetch, which would otherwise go on
+    /// holding the browsing connection's lock that every remote action
+    /// waits on. Here the lock is held elsewhere, so the fetch waits on it:
+    /// stopped, it lets go of its handle on the connection.
+    #[tokio::test]
+    async fn closing_the_viewer_stops_its_remote_fetch() {
+        let mut a = remote_app(
+            PaneEntry::new("r.txt".into(), false, 2),
+            MockTransport::new().with_file("/srv/r.txt", b"hi"),
+        );
+        let t = a.transport.clone().unwrap();
+        let held = t.lock().await;
+        a.handle_view_request();
+        assert_eq!(a.screen, Screen::Viewer);
+        tokio::task::yield_now().await;
+        assert_eq!(std::sync::Arc::strong_count(&t), 3, "the fetch holds one");
+
+        a.close_viewer();
+        a.transport = None;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while std::sync::Arc::strong_count(&t) > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the fetch let go of the connection");
+        drop(held);
+    }
+
+    /// A remote text file is fetched with the text limit, not the image
+    /// one: a file over it is refused by the read, not fetched whole.
+    #[tokio::test]
+    async fn a_remote_text_file_is_fetched_with_the_text_limit() {
+        let big = vec![b'a'; crate::preview::TEXT_VIEW_LIMIT as usize + 1];
+        let mut a = remote_app(
+            PaneEntry::new("r.txt".into(), false, 10),
+            MockTransport::new().with_file("/srv/r.txt", &big),
+        );
+        let kind = view(&mut a).await;
+        assert!(
+            matches!(&kind, ViewerKind::Unsupported(r) if r.contains("exceeds preview size limit")),
+            "{kind:?}"
+        );
+    }
+
+    /// A link is listed with its own size and as not a folder; the server
+    /// is asked what it points at, as Enter and downloads ask.
+    #[tokio::test]
+    async fn a_remote_link_to_a_folder_is_refused_with_a_reason() {
+        let mut a = remote_app(
+            link("ln.txt"),
+            MockTransport::new().with_file("/srv/ln.txt/inner", b""),
+        );
+        let kind = view(&mut a).await;
+        assert!(
+            matches!(&kind, ViewerKind::Unsupported(r) if r == "it is a link to a folder"),
+            "{kind:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remote_link_to_a_large_file_is_refused_before_fetching() {
+        let big = vec![b'a'; crate::preview::TEXT_VIEW_LIMIT as usize + 1];
+        let mut a = remote_app(
+            link("ln.txt"),
+            MockTransport::new().with_file("/srv/ln.txt", &big),
+        );
+        let kind = view(&mut a).await;
+        assert!(
+            matches!(&kind, ViewerKind::Unsupported(r) if r.starts_with("text too large")),
+            "{kind:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_remote_link_to_a_small_file_opens() {
+        let mut a = remote_app(
+            link("ln.txt"),
+            MockTransport::new().with_file("/srv/ln.txt", b"one\ntwo\n"),
+        );
+        let kind = view(&mut a).await;
+        assert!(
+            matches!(&kind, ViewerKind::Text { tokens, .. } if tokens.len() == 2),
+            "{kind:?}"
+        );
     }
 
     #[test]

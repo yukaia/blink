@@ -56,15 +56,6 @@ use crate::session::{AuthMethod, Protocol, Session};
 use crate::transport::error_map::map_sftp;
 use crate::transport::{EntryKind, ProgressUpdate, RemoteEntry, Transport};
 
-/// Cap on bytes read by `read_to_bytes`.
-///
-/// Derived from the viewer's image limit rather than restating it, so raising
-/// one can't leave the other behind — this is the backstop for a server that
-/// under-reports a file's size in its listing, and if it were the smaller of
-/// the two, images between the two values would truncate instead of being
-/// refused.
-pub(crate) const MAX_PREVIEW_BYTES: u64 = crate::preview::IMAGE_VIEW_LIMIT;
-
 // ---------------------------------------------------------------------------
 // Host-key decision types (shared with the TUI layer via AppEvent)
 // ---------------------------------------------------------------------------
@@ -1807,7 +1798,7 @@ impl Transport for SftpTransport {
         )))
     }
 
-    async fn read_to_bytes(&mut self, remote_path: &str) -> Result<Bytes> {
+    async fn read_to_bytes(&mut self, remote_path: &str, limit: u64) -> Result<Bytes> {
         let remote = self
             .sftp
             .open_with_flags(remote_path, OpenFlags::READ)
@@ -1815,10 +1806,10 @@ impl Transport for SftpTransport {
             .map_err(|e| map_sftp("open", remote_path, e))?;
         let mut buf = Vec::new();
         remote
-            .take(MAX_PREVIEW_BYTES + 1)
+            .take(limit.saturating_add(1))
             .read_to_end(&mut buf)
             .await?;
-        if buf.len() as u64 > MAX_PREVIEW_BYTES {
+        if buf.len() as u64 > limit {
             return Err(BlinkError::transport("file exceeds preview size limit"));
         }
         Ok(Bytes::from(buf))
@@ -3236,7 +3227,12 @@ mod integration {
         assert_eq!(meta.size, 5);
         assert!(t.metadata("/d/none").await.unwrap().is_none());
 
-        assert_eq!(&t.read_to_bytes("/d/a.txt").await.unwrap()[..], b"hello");
+        assert_eq!(
+            &t.read_to_bytes("/d/a.txt", crate::preview::IMAGE_VIEW_LIMIT)
+                .await
+                .unwrap()[..],
+            b"hello"
+        );
 
         let down = home.path().join("down.txt");
         t.download("/d/a.txt", &down, None).await.unwrap();
@@ -3857,9 +3853,12 @@ mod integration {
         let (port, _connects) = start_server(store).await;
         let mut transport = connect(port).await;
 
-        let got = with_timeout(transport.read_to_bytes("/file.bin"), "preview")
-            .await
-            .expect("a file under the cap should preview");
+        let got = with_timeout(
+            transport.read_to_bytes("/file.bin", crate::preview::IMAGE_VIEW_LIMIT),
+            "preview",
+        )
+        .await
+        .expect("a file under the cap should preview");
         assert_eq!(got.len(), payload.len(), "preview size mismatch");
         assert!(got[..] == payload[..], "preview bytes mismatch");
     }
@@ -3871,15 +3870,43 @@ mod integration {
         let store: Store = Arc::new(Mutex::new(HashMap::new()));
         store.lock().await.insert(
             "/full.bin".to_string(),
-            vec![7u8; super::MAX_PREVIEW_BYTES as usize],
+            vec![7u8; crate::preview::IMAGE_VIEW_LIMIT as usize],
         );
         let (port, _connects) = start_server(store).await;
         let mut transport = connect(port).await;
 
-        let got = with_timeout(transport.read_to_bytes("/full.bin"), "preview at the cap")
+        let got = with_timeout(
+            transport.read_to_bytes("/full.bin", crate::preview::IMAGE_VIEW_LIMIT),
+            "preview at the cap",
+        )
+        .await
+        .expect("a file of exactly the cap should preview");
+        assert_eq!(got.len() as u64, crate::preview::IMAGE_VIEW_LIMIT);
+    }
+
+    /// The limit is the caller's: the viewer passes the text limit for a text
+    /// file, and a file one byte over it is refused, not fetched whole.
+    #[tokio::test]
+    async fn a_preview_obeys_the_limit_it_is_given() {
+        let store: Store = Arc::new(Mutex::new(HashMap::new()));
+        store
+            .lock()
             .await
-            .expect("a file of exactly the cap should preview");
-        assert_eq!(got.len() as u64, super::MAX_PREVIEW_BYTES);
+            .insert("/five.txt".to_string(), b"hello".to_vec());
+        let (port, _connects) = start_server(store).await;
+        let mut transport = connect(port).await;
+
+        let err = with_timeout(transport.read_to_bytes("/five.txt", 4), "over the limit")
+            .await
+            .expect_err("five bytes are over a limit of four");
+        assert!(
+            err.to_string().contains("exceeds preview size limit"),
+            "{err}"
+        );
+        let got = with_timeout(transport.read_to_bytes("/five.txt", 5), "at the limit")
+            .await
+            .expect("five bytes fit a limit of five");
+        assert_eq!(&got[..], b"hello");
     }
 
     /// Hitting the cap is not a dropped connection, and it leaves the
@@ -3897,16 +3924,19 @@ mod integration {
             files.insert("/".to_string(), Vec::new());
             files.insert(
                 "/big.bin".to_string(),
-                vec![7u8; super::MAX_PREVIEW_BYTES as usize + 1],
+                vec![7u8; crate::preview::IMAGE_VIEW_LIMIT as usize + 1],
             );
             files.insert("/small.txt".to_string(), b"hello".to_vec());
         }
         let (port, _connects) = start_server(store).await;
         let mut transport = connect(port).await;
 
-        let err = with_timeout(transport.read_to_bytes("/big.bin"), "oversized preview")
-            .await
-            .expect_err("a file one byte over the cap must not preview");
+        let err = with_timeout(
+            transport.read_to_bytes("/big.bin", crate::preview::IMAGE_VIEW_LIMIT),
+            "oversized preview",
+        )
+        .await
+        .expect_err("a file one byte over the cap must not preview");
         assert!(
             matches!(err, crate::error::BlinkError::Transport(_)),
             "the cap is not a disconnect: {err:?}",
@@ -3920,9 +3950,12 @@ mod integration {
         let mut names: Vec<_> = entries.iter().map(|e| e.display_name.as_str()).collect();
         names.sort_unstable();
         assert_eq!(names, ["big.bin", "small.txt"]);
-        let small = with_timeout(transport.read_to_bytes("/small.txt"), "second preview")
-            .await
-            .expect("and a preview under the cap");
+        let small = with_timeout(
+            transport.read_to_bytes("/small.txt", crate::preview::IMAGE_VIEW_LIMIT),
+            "second preview",
+        )
+        .await
+        .expect("and a preview under the cap");
         assert_eq!(&small[..], b"hello");
     }
 
@@ -4617,7 +4650,7 @@ mod integration {
 
         let started = std::time::Instant::now();
         let err = transport
-            .read_to_bytes("/a.txt")
+            .read_to_bytes("/a.txt", crate::preview::IMAGE_VIEW_LIMIT)
             .await
             .expect_err("the server took too long");
 
