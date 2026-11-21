@@ -2616,6 +2616,108 @@ mod tests {
         drop(held);
     }
 
+    /// The other blink's batch on disk with its lock held, and this one's
+    /// batch run unsaved beside it: `/r/0` failed, `/r/1` finished.
+    fn unsaved_batch_with_a_failure(a: &mut App) -> crate::checkpoint::StoreLock {
+        use crate::checkpoint::{Checkpoint, CheckpointJob, JobStatus, StoreLock};
+        let s = a.current_session.as_ref().unwrap().clone();
+        let origin = crate::transport::origin_of(&s);
+        Checkpoint::new(
+            &s.name,
+            &origin,
+            CheckpointKind::Download,
+            vec![CheckpointJob::Download {
+                remote_path: "/r/theirs".into(),
+                local_path: "/l/theirs".into(),
+                status: JobStatus::Pending,
+            }],
+        )
+        .flush()
+        .unwrap();
+        let held = StoreLock::try_take(&s.name, &origin, CheckpointKind::Download)
+            .unwrap()
+            .unwrap();
+        a.dispatch_plan(vec![download(0), download(1)], CheckpointKind::Download);
+        assert!(a.active_checkpoints[&CheckpointKind::Download].is_unsaved());
+        finish_next(a, crate::transfer::TransferState::Failed("boom".into())).unwrap();
+        finish_next(a, crate::transfer::TransferState::Complete).unwrap();
+        held
+    }
+
+    fn queued_paths(a: &App) -> Vec<String> {
+        let m = a.transfer_manager.clone().unwrap();
+        std::iter::from_fn(|| m.take_next_pending())
+            .map(|j| j.remote_path)
+            .collect()
+    }
+
+    /// An unsaved batch's failures were only in memory, and `r` threw them
+    /// away to look at the file, which the other blink still held.
+    #[tokio::test]
+    async fn an_unsaved_batchs_failures_are_retried_from_memory() {
+        let (mut a, _cleanup) = checkpoint_app("unsaved-retry");
+        let held = unsaved_batch_with_a_failure(&mut a);
+
+        a.resume_walk(CheckpointKind::Download);
+
+        assert!(logged(&a, "retrying 1 download"), "{:?}", a.log);
+        assert_eq!(queued_paths(&a), ["/r/0"]);
+        assert_eq!(
+            on_disk_jobs(&a, CheckpointKind::Download),
+            vec!["/r/theirs".to_string()],
+            "the other blink's file is untouched",
+        );
+        drop(held);
+    }
+
+    /// With the other blink gone by the time of `r`, the file was resumed in
+    /// place of this blink's failures: the other's batch ran, its own didn't.
+    #[tokio::test]
+    async fn an_unsaved_batchs_retry_never_resumes_the_file() {
+        let (mut a, _cleanup) = checkpoint_app("unsaved-retry-released");
+        let held = unsaved_batch_with_a_failure(&mut a);
+        drop(held);
+
+        a.resume_walk(CheckpointKind::Download);
+
+        assert_eq!(queued_paths(&a), ["/r/0"]);
+    }
+
+    /// Jobs waiting for queue room weren't counted as live, so queueing the
+    /// same files again put them in the checkpoint and the queue twice.
+    #[tokio::test]
+    async fn a_plan_skips_files_already_waiting_for_room() {
+        let (mut a, _cleanup) = capped_app("overflow-requeue");
+        a.dispatch_plan(
+            vec![download(0), download(1), download(2), download(3)],
+            CheckpointKind::Download,
+        );
+        assert_eq!(a.waiting_jobs[&CheckpointKind::Download].len(), 2);
+
+        a.dispatch_plan(vec![download(2), download(3)], CheckpointKind::Download);
+
+        assert!(
+            logged(&a, "skipped 2 file(s) already queued or running"),
+            "{:?}",
+            a.log
+        );
+        assert_eq!(
+            a.active_checkpoints[&CheckpointKind::Download].jobs.len(),
+            4
+        );
+        assert_eq!(a.waiting_jobs[&CheckpointKind::Download].len(), 2);
+    }
+
+    /// Without a connection, `r` looked for a `default` checkpoint and said
+    /// none was found.
+    #[test]
+    fn resuming_without_a_connection_says_so() {
+        let mut a = app();
+        a.resume_walk(CheckpointKind::Download);
+        assert!(logged(&a, "not connected"), "{:?}", a.log);
+        assert!(!logged(&a, "no checkpoint found"), "{:?}", a.log);
+    }
+
     /// The lock follows the checkpoint to its new name, so another blink
     /// can't take it up mid-batch after a rename.
     #[tokio::test]

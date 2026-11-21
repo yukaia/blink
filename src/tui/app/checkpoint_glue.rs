@@ -190,9 +190,12 @@ impl App {
         }
     }
 
-    /// Convert a [`PlannedJob`] sequence into queued transfer jobs.
-    /// Mkdirs always lead so any file under them lands in an existing
-    /// directory; file jobs follow.
+    /// Convert a [`PlannedJob`] sequence into queued transfer jobs, in plan
+    /// order.
+    ///
+    /// Nothing is reordered here. A folder is made before the files in it
+    /// because the walk emits each mkdir ahead of its files and the manager
+    /// holds a file back while its folder's mkdir is unfinished.
     pub(super) fn dispatch_plan(&mut self, plan: Vec<PlannedJob>, ck_kind: CheckpointKind) {
         let Some(manager) = self.transfer_manager.clone() else {
             return;
@@ -633,6 +636,21 @@ impl App {
         let mut seen = std::collections::HashSet::new();
         let mut already_live = 0usize;
         let mut kept = Vec::with_capacity(plan.len());
+        // Jobs waiting for room in the queue are live too, though the
+        // manager hasn't seen them yet. Missed, the same tree queued again
+        // while part of it waited went into the checkpoint and the queue a
+        // second time, and ran twice.
+        let waiting: std::collections::HashSet<(Direction, String)> = self
+            .waiting_jobs
+            .iter()
+            .flat_map(|(kind, queue)| {
+                let cp = self.active_checkpoints.get(kind);
+                queue.iter().filter_map(move |w| {
+                    cp.and_then(|cp| cp.jobs.get(w.cp_idx))
+                        .and_then(checkpoint_job_destination)
+                })
+            })
+            .collect();
         for job in plan {
             let key = match &job {
                 PlannedJob::Mkdir { .. } => None,
@@ -649,7 +667,7 @@ impl App {
                 kept.push(job);
                 continue;
             };
-            if manager.is_in_flight(&key) {
+            if manager.is_in_flight(&key) || waiting.contains(&key) {
                 already_live += 1;
                 continue;
             }
@@ -684,11 +702,18 @@ impl App {
     }
 
     /// Dispatch a *resumed* plan: load the checkpoint for `kind`, skip jobs
-    /// already marked done, and enqueue only the remaining ones.
+    /// already done or cancelled, and enqueue only the remaining ones.
     ///
     /// Called from `r` / `R` in the Transfers pane, and from the resume
     /// offer after connecting. Logs a message if there is nothing to resume.
     pub fn resume_walk(&mut self, ck_kind: CheckpointKind) {
+        // Without a connection there is no session to key the checkpoint by
+        // and nothing to queue on: say so, rather than look for a
+        // `default` checkpoint and report there is none.
+        if self.transfer_manager.is_none() {
+            self.push_log(LogLevel::Warn, "not connected".into());
+            return;
+        }
         let (session_name, origin) = self.checkpoint_key();
 
         // Refuse while a job of this direction is still queued, running or
@@ -710,6 +735,48 @@ impl App {
                     ck_kind.as_str()
                 ),
             );
+            return;
+        }
+
+        // A batch that couldn't be saved — another blink held the file — has
+        // its failures in memory only. They are retried from there: the file
+        // never held them, and is the other blink's batch, or nothing. The
+        // retry used to throw this record away and go to the file, losing
+        // the failures or resuming the other blink's work in their place.
+        if self
+            .active_checkpoints
+            .get(&ck_kind)
+            .is_some_and(|cp| cp.is_unsaved())
+        {
+            let Some(tracked) = self.active_checkpoints.remove(&ck_kind) else {
+                return;
+            };
+            let plan = resume_plan(&tracked);
+            if plan.is_empty() {
+                self.push_log(LogLevel::Info, "nothing to retry".into());
+                return;
+            }
+            self.push_log(
+                LogLevel::Info,
+                format!(
+                    "retrying {} {}: not saved for resuming, as another blink \
+                     holds the checkpoint",
+                    plan.len(),
+                    ck_kind.as_str()
+                ),
+            );
+            self.active_checkpoints.insert(
+                ck_kind,
+                Checkpoint::new_unsaved(&tracked.session, tracked.origin_key(), ck_kind),
+            );
+            self.dispatch_plan(plan, ck_kind);
+            if self
+                .active_checkpoints
+                .get(&ck_kind)
+                .is_some_and(|cp| cp.jobs.is_empty())
+            {
+                self.active_checkpoints.remove(&ck_kind);
+            }
             return;
         }
 
@@ -761,7 +828,12 @@ impl App {
                 LogLevel::Info,
                 "checkpoint is already complete — nothing to resume".into(),
             );
-            let _ = Checkpoint::remove(&session_name, &origin, ck_kind);
+            if let Err(e) = Checkpoint::remove(&session_name, &origin, ck_kind) {
+                self.push_log(
+                    LogLevel::Warn,
+                    format!("could not remove checkpoint file: {e}"),
+                );
+            }
             return;
         }
 
@@ -773,33 +845,7 @@ impl App {
             ),
         );
 
-        // Rebuild a PlannedJob list from the undone entries only.
-        let resume_plan: Vec<PlannedJob> = checkpoint
-            .jobs
-            .iter()
-            .filter(|j| j.needs_resume())
-            .map(|j| match j {
-                CheckpointJob::Mkdir { remote_path, .. } => PlannedJob::Mkdir {
-                    remote_path: remote_path.clone(),
-                },
-                CheckpointJob::Download {
-                    remote_path,
-                    local_path,
-                    ..
-                } => PlannedJob::Download {
-                    remote_path: remote_path.clone(),
-                    local_path: local_path.clone(),
-                },
-                CheckpointJob::Upload {
-                    local_path,
-                    remote_path,
-                    ..
-                } => PlannedJob::Upload {
-                    local_path: local_path.clone(),
-                    remote_path: remote_path.clone(),
-                },
-            })
-            .collect();
+        let plan = resume_plan(&checkpoint);
 
         // The resumed jobs get a fresh record, all `pending`, which replaces
         // the file they were read from once `dispatch_plan` writes it.
@@ -808,7 +854,7 @@ impl App {
         let mut fresh = Checkpoint::new(&session_name, &origin, ck_kind, Vec::new());
         fresh.hold(lock);
         self.active_checkpoints.insert(ck_kind, fresh);
-        self.dispatch_plan(resume_plan, ck_kind);
+        self.dispatch_plan(plan, ck_kind);
         // A plan that queued nothing (every job already running elsewhere)
         // wrote nothing; leave the file as it was rather than tracking an
         // empty record that a later batch would write over it.
@@ -819,6 +865,54 @@ impl App {
         {
             self.active_checkpoints.remove(&ck_kind);
         }
+    }
+}
+
+/// The undone entries of `cp` — pending, or started and never finished — as
+/// a plan to queue again.
+fn resume_plan(cp: &Checkpoint) -> Vec<PlannedJob> {
+    cp.jobs
+        .iter()
+        .filter(|j| j.needs_resume())
+        .map(|j| match j {
+            CheckpointJob::Mkdir { remote_path, .. } => PlannedJob::Mkdir {
+                remote_path: remote_path.clone(),
+            },
+            CheckpointJob::Download {
+                remote_path,
+                local_path,
+                ..
+            } => PlannedJob::Download {
+                remote_path: remote_path.clone(),
+                local_path: local_path.clone(),
+            },
+            CheckpointJob::Upload {
+                local_path,
+                remote_path,
+                ..
+            } => PlannedJob::Upload {
+                local_path: local_path.clone(),
+                remote_path: remote_path.clone(),
+            },
+        })
+        .collect()
+}
+
+/// The destination a checkpoint entry writes, as
+/// [`destination_key`] names it; none for a mkdir.
+fn checkpoint_job_destination(job: &CheckpointJob) -> Option<(Direction, String)> {
+    match job {
+        CheckpointJob::Mkdir { .. } => None,
+        CheckpointJob::Download {
+            remote_path,
+            local_path,
+            ..
+        } => destination_key(Direction::Download, remote_path, local_path),
+        CheckpointJob::Upload {
+            local_path,
+            remote_path,
+            ..
+        } => destination_key(Direction::Upload, remote_path, local_path),
     }
 }
 
