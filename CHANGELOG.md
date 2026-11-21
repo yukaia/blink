@@ -288,6 +288,12 @@ the git history for those.
 
 ### Fixed
 
+- **The local pane says when it couldn't read some entries**, once per
+  change, as the remote pane does. Entries `read_dir` or their metadata
+  couldn't read, on a flaky network mount say, were left out without a
+  word.
+- **F5 on the local pane no longer logs "refreshed"** before the listing
+  has run, and whether or not it then worked; the remote pane never did.
 - **A double-click acts on the entry it landed on.** The two presses were
   matched by row, so a refresh between them, as the remote pane does when
   each upload lands, could put another entry at that row and open or

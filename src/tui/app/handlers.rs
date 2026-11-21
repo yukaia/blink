@@ -1470,11 +1470,25 @@ mod tests {
         assert_eq!(a.search_target, Pane::Local);
     }
 
+    /// F5 lists the local folder again, showing what arrived since. It
+    /// no longer logs that it did, before the listing had even run.
     #[tokio::test]
     async fn f5_refreshes_the_local_pane() {
-        let mut a = app_on_main(3);
+        let home = crate::paths::test_home();
+        let mut a = app_on_main(0);
+        let mut events = a.app_event_rx.take().unwrap();
+        a.local.path = home.path().display().to_string();
+        std::fs::write(home.path().join("arrived.txt"), b"x").unwrap();
+
         press(&mut a, KeyCode::F(5));
-        assert!(logged(&a, "refreshed: /l"));
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        a.handle_app_event(ev);
+
+        assert!(a.local.entries.iter().any(|e| e.raw_name == "arrived.txt"));
+        assert!(!logged(&a, "refreshed:"), "{:?}", a.log);
     }
 
     #[test]

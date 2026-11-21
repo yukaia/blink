@@ -425,6 +425,8 @@ pub struct App {
     /// unreadable), so an unchanged directory isn't warned about on every
     /// refresh. See `App::report_unreadable_entries`.
     unreadable_warned: Option<(String, usize, usize)>,
+    /// The same, for the local pane. See `App::report_unreadable_local`.
+    local_unreadable_warned: Option<(String, usize, usize)>,
     /// Force a full terminal repaint on the next loop iteration. Used when
     /// closing an image viewer: sixel and kitty graphics live outside
     /// ratatui's cell buffer, so ratatui's diffing renderer doesn't know to
@@ -549,6 +551,7 @@ impl App {
             image_needs_redraw: false,
             remote_listing: None,
             unreadable_warned: None,
+            local_unreadable_warned: None,
             needs_terminal_clear: false,
             should_quit: false,
             autoconnect: None,
@@ -3939,6 +3942,43 @@ mod tests {
             text.contains(&hex.to_ascii_uppercase()),
             "every byte pair is drawn, in order"
         );
+    }
+
+    /// The local pane left out entries it couldn't read without a word;
+    /// it says so once per change, as the remote pane does.
+    #[test]
+    fn unreadable_local_entries_are_reported_once_per_change() {
+        let mut a = app_on_main(0);
+        let listed = |a: &mut App, unreadable: usize| {
+            let path = a.local.path.clone();
+            a.handle_app_event(AppEvent::LocalListed {
+                path,
+                entries: vec![PaneEntry::new("ok.txt".into(), false, 1)],
+                unreadable,
+            });
+        };
+        let warnings = |a: &App| {
+            a.log
+                .iter()
+                .filter(|l| l.message.contains("couldn't be read"))
+                .count()
+        };
+
+        listed(&mut a, 2);
+        assert!(
+            logged(&a, "2 entries in /l couldn't be read"),
+            "{:?}",
+            a.log
+        );
+        listed(&mut a, 2);
+        assert_eq!(
+            warnings(&a),
+            1,
+            "an unchanged folder isn't warned about again"
+        );
+        listed(&mut a, 0);
+        listed(&mut a, 2);
+        assert_eq!(warnings(&a), 2, "said again once it changed");
     }
 
     // -- connect attempts --------------------------------------------------
