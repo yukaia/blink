@@ -261,6 +261,18 @@ the git history for those.
 
 ### Fixed
 
+- **`r` retries the failures of a batch another blink kept from being
+  saved.** With another blink holding the session's checkpoint, a batch
+  runs unsaved, its failures held in memory only. `r` threw that record
+  away and went to the file: while the other blink held it, the failures
+  were lost; once it let go, `r` resumed the other blink's batch instead.
+  They are now retried from memory.
+- **Files waiting for room in the queue aren't queued twice.** Past the
+  100,000-job queue limit, jobs wait outside the queue, and queueing the
+  same files again didn't see them: each went into the checkpoint and the
+  queue a second time, and ran twice once the first copy finished.
+- **`r` without a connection says "not connected"** rather than that no
+  checkpoint was found.
 - **Enter on an unchanged name in the rename box renames nothing.** The
   box was filled with the name as the pane shows it, cut in the middle
   past 512 characters, and trimmed before the check: F2 then Enter renamed
