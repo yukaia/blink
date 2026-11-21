@@ -31,8 +31,15 @@ use super::{App, BatchOutcome, LogLevel, Pane, Screen};
 impl App {
     pub(super) fn handle_app_event(&mut self, event: AppEvent) {
         match event {
-            AppEvent::Connected(connected) => {
-                // Stale guard: user may have cancelled before connect resolved.
+            AppEvent::Connected { attempt, connected } => {
+                // Stale guard: from an attempt since cancelled or replaced,
+                // its transport is to another server than the session now
+                // pending; or the user cancelled before it resolved.
+                if attempt != self.connect_attempt {
+                    drop(connected.transport);
+                    return;
+                }
+                self.connect_task = None;
                 let Some(mut session) = self.pending_session.take() else {
                     drop(connected.transport);
                     return;
@@ -210,7 +217,16 @@ impl App {
                 }
                 self.refresh_remote_pane(remote_dir);
             }
-            AppEvent::ConnectFailed(err) => {
+            AppEvent::ConnectFailed {
+                attempt,
+                error: err,
+            } => {
+                // Not this attempt's: it would end the connect now pending
+                // and blame it for another's failure.
+                if attempt != self.connect_attempt {
+                    return;
+                }
+                self.connect_task = None;
                 if self.pending_session.is_none() {
                     return; // user already moved on
                 }
@@ -246,9 +262,13 @@ impl App {
                     self.push_log(LogLevel::Error, format!("connect failed: {err}"));
                 }
             }
-            AppEvent::ConnectKeyNeedsPassphrase => {
-                // Stale guard: the user may have escaped out before this
-                // result came back.
+            AppEvent::ConnectKeyNeedsPassphrase { attempt } => {
+                // Stale guard: another attempt's, or the user escaped out
+                // before this result came back.
+                if attempt != self.connect_attempt {
+                    return;
+                }
+                self.connect_task = None;
                 if self.pending_session.is_none() {
                     return;
                 }

@@ -39,16 +39,24 @@ pub enum AppEvent {
     /// A connect task completed successfully. The payload carries the freshly
     /// opened transport and, for FTPS with TOFU, the new cert pin the caller
     /// should persist onto the session.
-    Connected(crate::transport::Connected),
+    ///
+    /// Each of the three connect results carries the `attempt` it answers
+    /// (see `App::connect_attempt`). A connect cancelled while slow could
+    /// still finish, and with nothing to tell it apart its result was taken
+    /// for the next connect's: its transport paired with the next session.
+    Connected {
+        attempt: u64,
+        connected: crate::transport::Connected,
+    },
 
     /// A connect task failed.
-    ConnectFailed(String),
+    ConnectFailed { attempt: u64, error: String },
 
     /// A connect task failed because the configured SSH key is encrypted and
     /// no passphrase was supplied (or the supplied one was wrong). The App
     /// transitions to the passphrase prompt; on retry, the cached
     /// `pending_session` is reused.
-    ConnectKeyNeedsPassphrase,
+    ConnectKeyNeedsPassphrase { attempt: u64 },
 
     /// A directory listing completed successfully, on connection
     /// `connection` (see `App::connection`).
@@ -504,12 +512,16 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         tx.send(progress()).unwrap();
         tx.send(progress()).unwrap();
-        tx.send(AppEvent::ConnectFailed("boom".into())).unwrap();
+        tx.send(AppEvent::ConnectFailed {
+            attempt: 0,
+            error: "boom".into(),
+        })
+        .unwrap();
         tx.send(progress()).unwrap();
 
         // The non-progress event is handed back rather than swallowed...
         match drain_progress(&mut rx) {
-            Some(AppEvent::ConnectFailed(msg)) => assert_eq!(msg, "boom"),
+            Some(AppEvent::ConnectFailed { error, .. }) => assert_eq!(error, "boom"),
             _ => panic!("expected the ConnectFailed event to be deferred"),
         }
         // ...and draining stops there, leaving what followed it in order.
@@ -528,11 +540,12 @@ mod tests {
     #[test]
     fn returns_a_leading_non_progress_event_untouched() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        tx.send(AppEvent::ConnectKeyNeedsPassphrase).unwrap();
+        tx.send(AppEvent::ConnectKeyNeedsPassphrase { attempt: 0 })
+            .unwrap();
         assert!(
             matches!(
                 drain_progress(&mut rx),
-                Some(AppEvent::ConnectKeyNeedsPassphrase)
+                Some(AppEvent::ConnectKeyNeedsPassphrase { .. })
             ),
             "a non-progress head must not be dropped",
         );
