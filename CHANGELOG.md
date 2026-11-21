@@ -149,6 +149,14 @@ the git history for those.
 
 ### Security
 
+- **A cancelled connect can't take over the next one.** Esc while
+  connecting left the connect running, and its result had nothing to say
+  which connect it answered. Cancel a slow connect to one server, pick
+  another session, and the first server's late connection was taken as the
+  second's: the screen and the transfer workers said one server while the
+  file pane browsed, renamed and deleted on the other. Its failure ended
+  the new connect, blaming it. A cancelled connect is now stopped, and a
+  result from any but the current attempt is dropped.
 - **A password or passphrase can't outgrow its buffer.** The buffers are
   sized so typing never copies the secret into a new allocation, leaving
   the old one unwiped, but a 257th character, typed or pasted, did just

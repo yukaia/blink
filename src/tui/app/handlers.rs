@@ -217,6 +217,7 @@ impl App {
     pub(super) fn handle_password_prompt(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
+                self.cancel_connect();
                 self.password_input.zeroize();
                 self.pending_session = None;
                 self.pending_password = None;
@@ -251,6 +252,7 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 // Bail on the connect attempt entirely.
+                self.cancel_connect();
                 self.passphrase_input.zeroize();
                 self.passphrase_error = None;
                 self.passphrase_attempted = false;

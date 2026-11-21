@@ -292,12 +292,11 @@ pub struct App {
     local_listed: String,
     pub remote: PaneState,
     pub log: std::collections::VecDeque<LogLine>,
-    #[allow(dead_code)]
-    pub transfers: Vec<TransferJob>,
     /// Which page the bottom panel renders. Auto-updated when the user Tabs
     /// into Transfers or Log; otherwise sticky.
     pub bottom_pane: BottomPane,
-    /// Cursor within the active-jobs list when the Transfers pane is focused.
+    /// Cursor within the Transfers pane's rows, running jobs then queued,
+    /// when it is focused.
     pub transfer_cursor: usize,
     /// The first job the transfer list showed when last drawn, as
     /// [`PaneState::view_offset`] is for a file pane.
@@ -365,12 +364,10 @@ pub struct App {
     pub host_key_changed_info: Option<HostKeyChangedInfo>,
 
     // Walk checkpointing
-    /// The checkpoint being tracked for the current (or most recent) batch.
-    /// `None` when no batch is in flight. Written to disk before the first
-    /// job is enqueued; updated as jobs complete; removed when the batch
-    /// finishes cleanly. Survives app crashes so the batch can be resumed.
     /// The checkpoint being tracked for each direction, at most one per
-    /// direction.
+    /// direction. Written to disk before a batch's first job is queued,
+    /// updated as jobs end, removed once nothing in it is left to resume,
+    /// so a batch interrupted by a crash can be resumed.
     ///
     /// Keyed by kind rather than held as a single slot: a download batch and
     /// an upload batch can be in flight at once, and a single slot meant the
@@ -402,6 +399,13 @@ pub struct App {
     last_click: Option<mouse::LastClick>,
     /// The id the next viewer opened gets. See [`Viewer::id`].
     next_viewer_id: u64,
+    /// Which connect attempt is current, counting each one started. A
+    /// connect's result carries its number, and one from an attempt since
+    /// cancelled or replaced is dropped.
+    connect_attempt: u64,
+    /// The connect task in flight, aborted when the user cancels it or
+    /// starts another, so a cancelled connect sends nothing more.
+    connect_task: Option<tokio::task::AbortHandle>,
     /// Which connection this is, counting disconnects. Walks and listings
     /// keep their own handle on the transport they started with, so they
     /// outlive a disconnect; their results carry this number, and a result
@@ -428,8 +432,6 @@ pub struct App {
     needs_terminal_clear: bool,
 
     // Misc
-    #[allow(dead_code)]
-    pub status_message: Option<(Instant, String)>,
     pub should_quit: bool,
     /// Session to connect to automatically on startup, bypassing the session
     /// selector. Set by `blink open` and `blink connect`; `None` in normal
@@ -509,7 +511,6 @@ impl App {
             local_listed: String::new(),
             remote: PaneState::empty(),
             log: std::collections::VecDeque::new(),
-            transfers: Vec::new(),
             bottom_pane: BottomPane::Log,
             transfer_cursor: 0,
             transfer_view_offset: std::cell::Cell::new(0),
@@ -540,6 +541,8 @@ impl App {
             hit: Default::default(),
             last_click: None,
             next_viewer_id: 1,
+            connect_attempt: 0,
+            connect_task: None,
             connection: 0,
             prompt_ready_at: None,
             waiting_overwrites: std::collections::VecDeque::new(),
@@ -547,7 +550,6 @@ impl App {
             remote_listing: None,
             unreadable_warned: None,
             needs_terminal_clear: false,
-            status_message: None,
             should_quit: false,
             autoconnect: None,
             autoconnect_unsaved: false,
@@ -931,6 +933,7 @@ impl App {
             Screen::KeyPassphrasePrompt => self.handle_key_passphrase_prompt(key),
             Screen::Connection => {
                 if key.code == KeyCode::Esc {
+                    self.cancel_connect();
                     self.pending_session = None;
                     self.pending_password = None;
                     self.screen = Screen::SessionSelect;
@@ -1046,7 +1049,7 @@ impl App {
         //    carry on. Their checkpoint entries stay `in_progress` or
         //    `pending` on disk (the in-memory checkpoints are dropped below
         //    without seeing the cancellations), so the next connect offers to
-        //    resume them, and the `Failed` events this raises arrive tagged
+        //    resume them, and the `Cancelled` events this raises arrive tagged
         //    with the connection number this disconnect retires.
         if let Some(m) = &self.transfer_manager {
             m.cancel_all();
@@ -1153,9 +1156,6 @@ impl App {
     // Connect lifecycle
     // -------------------------------------------------------------------
 
-    /// Spawn a connect task. The result lands as `AppEvent::Connected` /
-    /// `AppEvent::ConnectFailed` / `AppEvent::ConnectKeyNeedsPassphrase` and
-    /// is processed by [`Self::handle_app_event`].
     /// Start connecting to `session`: ask for its password first if it
     /// needs one, otherwise connect now. An anonymous FTP or FTPS login
     /// needs none — blink sends `anonymous@`, so a password typed in was
@@ -1172,7 +1172,22 @@ impl App {
         }
     }
 
+    /// Stop the connect in flight, if any: it sends no result, and a
+    /// host-key prompt it had open finds its answer channel closed.
+    pub(super) fn cancel_connect(&mut self) {
+        if let Some(task) = self.connect_task.take() {
+            task.abort();
+        }
+    }
+
+    /// Spawn a connect task. The result lands as `AppEvent::Connected` /
+    /// `AppEvent::ConnectFailed` / `AppEvent::ConnectKeyNeedsPassphrase`,
+    /// numbered with this attempt, and is processed by
+    /// [`Self::handle_app_event`]. One still in flight is stopped first.
     fn start_connect(&mut self, session: Session, password: Option<zeroize::Zeroizing<String>>) {
+        self.cancel_connect();
+        self.connect_attempt += 1;
+        let attempt = self.connect_attempt;
         self.push_log(
             LogLevel::Info,
             format!(
@@ -1192,7 +1207,7 @@ impl App {
         // must not silently carry into a new one.
         self.pending_trust = crate::known_hosts::SessionTrust::new();
         let trust = self.pending_trust.clone();
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             // Borrow as &str just for the duration of the connect; the
             // Zeroizing<String> is moved into this task and zeroes on drop
             // when the future returns.
@@ -1211,14 +1226,18 @@ impl App {
                 None => Err(crate::error::BlinkError::connect("connection timed out")),
             };
             let event = match result {
-                Ok(t) => AppEvent::Connected(t),
+                Ok(connected) => AppEvent::Connected { attempt, connected },
                 Err(crate::error::BlinkError::KeyNeedsPassphrase) => {
-                    AppEvent::ConnectKeyNeedsPassphrase
+                    AppEvent::ConnectKeyNeedsPassphrase { attempt }
                 }
-                Err(e) => AppEvent::ConnectFailed(e.to_string()),
+                Err(e) => AppEvent::ConnectFailed {
+                    attempt,
+                    error: e.to_string(),
+                },
             };
             let _ = tx.send(event);
         });
+        self.connect_task = Some(task.abort_handle());
     }
 
     // -------------------------------------------------------------------
@@ -1748,7 +1767,10 @@ mod tests {
         a.screen = Screen::ConfirmHostKey;
         a.pending_host_key = Some(pending_host_key());
 
-        a.handle_app_event(AppEvent::ConnectFailed("ssh connect: rejected".into()));
+        a.handle_app_event(AppEvent::ConnectFailed {
+            attempt: a.connect_attempt,
+            error: "ssh connect: rejected".into(),
+        });
 
         assert!(a.pending_host_key.is_none(), "the prompt must be dropped");
         assert_eq!(a.screen, Screen::SessionSelect);
@@ -1773,7 +1795,10 @@ mod tests {
             - std::time::Duration::from_secs(1);
         a.pending_host_key = Some(prompt);
 
-        a.handle_app_event(AppEvent::ConnectFailed("ssh connect: rejected".into()));
+        a.handle_app_event(AppEvent::ConnectFailed {
+            attempt: a.connect_attempt,
+            error: "ssh connect: rejected".into(),
+        });
 
         assert!(a.pending_host_key.is_none());
         assert!(
@@ -3916,19 +3941,141 @@ mod tests {
         );
     }
 
+    // -- connect attempts --------------------------------------------------
+
+    /// Whether `task` ends as cancelled within a few seconds. Bounded, so a
+    /// task left running fails the test rather than hanging it.
+    async fn stopped(task: tokio::task::JoinHandle<()>) -> bool {
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .is_ok_and(|r| r.is_err_and(|e| e.is_cancelled()))
+    }
+
+    /// An app with session B's connect pending as attempt 2, after attempt
+    /// 1 (to A) was cancelled.
+    fn connecting_again() -> App {
+        let mut a = app();
+        let mut b = Session::from_url("sftp://me@b.example").unwrap();
+        b.name = "b".into();
+        a.pending_session = Some(b);
+        a.pending_password = Some(zeroize::Zeroizing::new("b-password".into()));
+        a.connect_attempt = 2;
+        a.screen = Screen::Connection;
+        a
+    }
+
+    /// A cancelled connect that finished anyway was taken for the next
+    /// one: its transport, to the first server, paired with the session
+    /// now pending.
+    #[tokio::test]
+    async fn a_cancelled_attempts_connection_is_not_taken_for_the_next() {
+        let mut a = connecting_again();
+
+        a.handle_app_event(AppEvent::Connected {
+            attempt: 1,
+            connected: crate::transport::Connected {
+                transport: Box::new(crate::transport::mock::MockTransport::new()),
+                new_cert_pin: None,
+            },
+        });
+
+        assert!(a.transport.is_none(), "the stale transport is dropped");
+        assert!(a.current_session.is_none());
+        assert_eq!(
+            a.pending_session.as_ref().unwrap().name,
+            "b",
+            "b still pending"
+        );
+        assert_eq!(a.screen, Screen::Connection);
+    }
+
+    /// Its failure ended the connect now pending, blaming it.
+    #[test]
+    fn a_cancelled_attempts_failure_leaves_the_next_alone() {
+        let mut a = connecting_again();
+
+        a.handle_app_event(AppEvent::ConnectFailed {
+            attempt: 1,
+            error: "a.example: timed out".into(),
+        });
+
+        assert!(a.pending_session.is_some());
+        assert!(a.pending_password.is_some());
+        assert_eq!(a.screen, Screen::Connection);
+        assert!(!logged(&a, "connect failed"), "{:?}", a.log);
+    }
+
+    #[test]
+    fn a_cancelled_attempts_passphrase_request_is_ignored() {
+        let mut a = connecting_again();
+        a.handle_app_event(AppEvent::ConnectKeyNeedsPassphrase { attempt: 1 });
+        assert_eq!(a.screen, Screen::Connection);
+    }
+
+    /// Esc on the connecting screen stops the task, so it sends nothing
+    /// more; it used to run on to its end.
+    #[tokio::test]
+    async fn escaping_a_connect_stops_its_task() {
+        let mut a = connecting_again();
+        let task = tokio::spawn(std::future::pending::<()>());
+        a.connect_task = Some(task.abort_handle());
+
+        a.handle_key(press(KeyCode::Esc));
+
+        assert!(stopped(task).await);
+        assert!(a.pending_session.is_none());
+    }
+
+    /// A new connect stops the one before it and counts a new attempt.
+    #[tokio::test]
+    async fn a_new_connect_stops_the_one_in_flight() {
+        let mut a = app();
+        a.connect_attempt = 1;
+        let task = tokio::spawn(std::future::pending::<()>());
+        a.connect_task = Some(task.abort_handle());
+
+        // Anonymous FTP needs no password, so this connects at once.
+        a.begin_connect(Session::from_url("ftp://127.0.0.1:1").unwrap());
+
+        assert!(stopped(task).await);
+        assert_eq!(a.connect_attempt, 2);
+    }
+
+    #[test]
+    fn escaping_the_password_or_passphrase_prompt_stops_a_connect() {
+        for screen in [Screen::PasswordPrompt, Screen::KeyPassphrasePrompt] {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let mut a = connecting_again();
+                a.screen = screen.clone();
+                let task = tokio::spawn(std::future::pending::<()>());
+                a.connect_task = Some(task.abort_handle());
+                a.handle_key(press(KeyCode::Esc));
+                assert!(stopped(task).await, "{screen:?}");
+            });
+        }
+    }
+
     fn ftps_connected(pin: &str, save: bool) -> App {
         let mut a = app();
         let mut s = Session::from_url("ftps://me@host.example").unwrap();
         s.name = "it".into();
         s.accept_invalid_certs = true;
         a.pending_session = Some(s);
-        a.handle_app_event(AppEvent::Connected(crate::transport::Connected {
-            transport: Box::new(crate::transport::mock::MockTransport::new()),
-            new_cert_pin: Some(crate::transport::NewCertPin {
-                sha256: pin.into(),
-                save,
-            }),
-        }));
+        let attempt = a.connect_attempt;
+        a.handle_app_event(AppEvent::Connected {
+            attempt,
+            connected: crate::transport::Connected {
+                transport: Box::new(crate::transport::mock::MockTransport::new()),
+                new_cert_pin: Some(crate::transport::NewCertPin {
+                    sha256: pin.into(),
+                    save,
+                }),
+            },
+        });
         a
     }
 
@@ -4979,7 +5126,10 @@ mod tests {
         a.passphrase_attempted = true;
 
         a.handle_app_event(changed_event("ssh-rsa", false));
-        a.handle_app_event(AppEvent::ConnectFailed("refused".into()));
+        a.handle_app_event(AppEvent::ConnectFailed {
+            attempt: a.connect_attempt,
+            error: "refused".into(),
+        });
 
         assert!(a.pending_password.is_none());
         assert!(a.passphrase_input.is_empty());
@@ -5008,7 +5158,10 @@ mod tests {
         let mut a = connecting();
         a.handle_app_event(changed_event("ssh-rsa", false));
 
-        a.handle_app_event(AppEvent::ConnectFailed("ssh connect: rejected".into()));
+        a.handle_app_event(AppEvent::ConnectFailed {
+            attempt: a.connect_attempt,
+            error: "ssh connect: rejected".into(),
+        });
 
         assert_eq!(a.screen, Screen::HostKeyChanged);
         assert!(a.host_key_changed_info.is_some());
@@ -5091,7 +5244,10 @@ mod tests {
             let mut a = connecting();
             a.handle_app_event(refusal);
 
-            a.handle_app_event(AppEvent::ConnectFailed("ssh connect: rejected".into()));
+            a.handle_app_event(AppEvent::ConnectFailed {
+                attempt: a.connect_attempt,
+                error: "ssh connect: rejected".into(),
+            });
 
             assert_eq!(a.screen, Screen::SessionSelect);
             assert!(a.pending_session.is_none());
@@ -5411,10 +5567,14 @@ mod session_and_prompt_tests {
     fn connect(a: &mut App, s: Session, unsaved: bool) {
         a.pending_session = Some(s);
         a.pending_session_unsaved = unsaved;
-        a.handle_app_event(AppEvent::Connected(crate::transport::Connected {
-            transport: Box::new(crate::transport::mock::MockTransport::new()),
-            new_cert_pin: None,
-        }));
+        let attempt = a.connect_attempt;
+        a.handle_app_event(AppEvent::Connected {
+            attempt,
+            connected: crate::transport::Connected {
+                transport: Box::new(crate::transport::mock::MockTransport::new()),
+                new_cert_pin: None,
+            },
+        });
     }
 
     fn themed(theme: &str) -> Session {
