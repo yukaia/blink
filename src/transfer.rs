@@ -57,7 +57,6 @@ pub enum TransferState {
 /// interface that fell behind would find nothing there.
 #[derive(Debug, Clone)]
 pub enum TransferEvent {
-    Queued(TransferJob),
     Started(TransferJob),
     /// Progress signal: a transfer made forward progress.
     /// The UI reads actual byte counts from [`TransferManager::snapshot`].
@@ -67,6 +66,11 @@ pub enum TransferEvent {
         job: TransferJob,
         error: String,
     },
+    /// The user cancelled the job, running or queued. Its own event, not a
+    /// `Failed` with a "cancelled" reason: a cancel is told apart by kind,
+    /// not by matching an error string any transport error could share,
+    /// and it isn't reported as a failure.
+    Cancelled(TransferJob),
     Paused,
     Resumed,
 }
@@ -532,11 +536,12 @@ impl TransferManager {
             state: TransferState::Pending,
             batch_id,
         };
-        inner.jobs.push_back(job.clone());
+        inner.jobs.push_back(job);
         inner.pending.insert(id);
         drop(inner);
+        // No event per job: the plan that queued it says how many, and one
+        // per job was a log line apiece that buried that summary.
         self.wake();
-        let _ = self.events.send(TransferEvent::Queued(job));
         Ok(id)
     }
 
@@ -884,10 +889,7 @@ impl TransferManager {
             self.wake();
         }
         for job in ended {
-            let _ = self.events.send(TransferEvent::Failed {
-                job,
-                error: "cancelled".into(),
-            });
+            let _ = self.events.send(TransferEvent::Cancelled(job));
         }
         (active_n, pending_n)
     }
@@ -994,6 +996,18 @@ mod tests {
     /// `take_next_pending` resumes its search where the last one stopped;
     /// it must still find every pending job, in order, and skip ones that
     /// left Pending some other way.
+    /// Each job queued sent an event, logged as a line apiece after the
+    /// plan's own summary, so a big batch pushed that summary out of the
+    /// log. Queuing says nothing; the plan reports how many.
+    #[test]
+    fn queuing_a_job_sends_no_event() {
+        let (m, mut rx) = TransferManager::new(1);
+        for i in 0..5 {
+            m.enqueue_mkdir(format!("/d{i}")).unwrap();
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
     #[test]
     fn pending_jobs_are_claimed_in_order_past_cancelled_ones() {
         let (m, _rx) = TransferManager::new(1);
@@ -1204,13 +1218,13 @@ mod tests {
         m.take_next_pending();
         while rx.try_recv().is_ok() {}
         assert_eq!(m.cancel_all(), (1, 2));
-        let mut failed = 0;
+        let mut cancelled = 0;
         while let Ok(ev) = rx.try_recv() {
-            if matches!(ev, TransferEvent::Failed { .. }) {
-                failed += 1;
+            if matches!(ev, TransferEvent::Cancelled(_)) {
+                cancelled += 1;
             }
         }
-        assert_eq!(failed, 3);
+        assert_eq!(cancelled, 3);
         assert!(m.take_next_pending().is_none(), "nothing left to start");
     }
 

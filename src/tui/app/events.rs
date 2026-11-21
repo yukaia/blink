@@ -7,7 +7,7 @@
 //! per-event handler for the dispatcher's stream.
 //!
 //! Pulled out of `mod.rs` so the App lifecycle (new / run / connect /
-//! disconnect) reads without ~500 lines of `match` arms inline. The
+//! disconnect) reads without the `match` arms inline. The
 //! handlers are `pub(super) fn` because the event-loop dispatcher in
 //! mod.rs is their only caller.
 
@@ -312,7 +312,18 @@ impl App {
                     format!("local list {path} failed: {error}"),
                 );
             }
-            AppEvent::Renamed { from, to } => {
+            // The six replies below are dropped when they come from a
+            // connection since closed, as a listing is: on the server now
+            // connected they would log what happened elsewhere, unnamed, and
+            // refresh a pane that has nothing to do with it.
+            AppEvent::Renamed {
+                connection,
+                from,
+                to,
+            } => {
+                if connection != self.connection {
+                    return;
+                }
                 let from_name = from
                     .rsplit('/')
                     .find(|s| !s.is_empty())
@@ -330,7 +341,14 @@ impl App {
                 let path = self.remote.path.clone();
                 self.refresh_remote_pane(path);
             }
-            AppEvent::RenameFailed { from, error } => {
+            AppEvent::RenameFailed {
+                connection,
+                from,
+                error,
+            } => {
+                if connection != self.connection {
+                    return;
+                }
                 // By name, as the line that says it worked does.
                 let name = from.rsplit('/').find(|s| !s.is_empty()).unwrap_or(&from);
                 self.push_log(LogLevel::Error, format!("rename {name} failed: {error}"));
@@ -355,7 +373,10 @@ impl App {
                     self.enqueue_downloads(vec![(name, false)]);
                 }
             }
-            AppEvent::MkdirDone { path } => {
+            AppEvent::MkdirDone { connection, path } => {
+                if connection != self.connection {
+                    return;
+                }
                 let name = path
                     .rsplit('/')
                     .find(|s| !s.is_empty())
@@ -365,7 +386,14 @@ impl App {
                 let dir = self.remote.path.clone();
                 self.refresh_remote_pane(dir);
             }
-            AppEvent::MkdirFailed { path, error } => {
+            AppEvent::MkdirFailed {
+                connection,
+                path,
+                error,
+            } => {
+                if connection != self.connection {
+                    return;
+                }
                 let name = path
                     .rsplit('/')
                     .find(|s| !s.is_empty())
@@ -373,12 +401,22 @@ impl App {
                     .to_string();
                 self.push_log(LogLevel::Error, format!("mkdir {name} failed: {error}"));
             }
-            AppEvent::Deleted { name } => {
+            AppEvent::Deleted { connection, name } => {
+                if connection != self.connection {
+                    return;
+                }
                 self.push_log(LogLevel::Success, format!("deleted: {name}"));
                 let path = self.remote.path.clone();
                 self.refresh_remote_pane(path);
             }
-            AppEvent::DeleteFailed { name, error } => {
+            AppEvent::DeleteFailed {
+                connection,
+                name,
+                error,
+            } => {
+                if connection != self.connection {
+                    return;
+                }
                 self.push_log(LogLevel::Error, format!("delete {name} failed: {error}"));
             }
             AppEvent::WalkComplete {
@@ -667,7 +705,19 @@ impl App {
                     fingerprint,
                     trusted_once,
                 });
-                self.pending_session = None;
+                // Ending the connect in progress, if it is one: the
+                // `ConnectFailed` that follows finds no pending session and
+                // does nothing, as it must, or it would switch to the
+                // session list over this warning. So the connect's secrets
+                // are dropped here, or the password typed for a server that
+                // just failed to prove its identity stayed in memory.
+                if self.pending_session.take().is_some() {
+                    self.pending_password = None;
+                    self.password_input.zeroize();
+                    self.passphrase_input.zeroize();
+                    self.passphrase_error = None;
+                    self.passphrase_attempted = false;
+                }
                 // Raised by a transfer worker, it waits for the user to be
                 // free, as the other prompts that arrive on their own do:
                 // over a form, a `q` or Enter being typed dismissed it
@@ -733,9 +783,6 @@ impl App {
 
     pub(super) fn handle_transfer_event(&mut self, ev: TransferEvent) {
         match ev {
-            TransferEvent::Queued(job) => {
-                self.push_log(LogLevel::Info, format!("queued: {}", job.remote_path));
-            }
             TransferEvent::Started(j) => {
                 let id = j.id;
                 // Flip the in-memory state to `in_progress`; the actual disk
@@ -805,7 +852,10 @@ impl App {
                 // flight, so a batch costs a listing at a time, not one per
                 // file. Skip for downloads — the local pane doesn't
                 // auto-refresh on its own either.
-                if j.direction == Direction::Upload
+                // Folder creation counts as landing too: a folder with
+                // files appears as its first one lands, but an empty one, or
+                // one whose files all failed, otherwise never did.
+                if matches!(j.direction, Direction::Upload | Direction::CreateDir)
                     && lands_under(&j.remote_path, &self.remote.path)
                 {
                     let path = self.remote.path.clone();
@@ -820,9 +870,7 @@ impl App {
             TransferEvent::Failed { job: j, error } => {
                 let id = j.id;
                 // Evict the job from the checkpoint map regardless of the
-                // failure reason. For a "cancelled" failure the single-cancel
-                // path already removed it above; this is a belt-and-suspenders
-                // guard for transport errors and unexpected failures.
+                // failure reason.
                 //
                 // We do NOT mark the job `done` in the file — a failed job
                 // should be re-queued on resume, not silently skipped.
@@ -832,8 +880,7 @@ impl App {
                 // file (the `Started` write already flipped them from
                 // `pending`). On resume they will be re-queued, which is
                 // safe: partial downloads are overwritten, mkdir is
-                // idempotent. A job the user cancelled had its entry marked
-                // cancelled, and its map entry removed, by the cancel itself.
+                // idempotent.
                 //
                 // Force-flush here so the most recent batch of Done marks
                 // hits disk: the user is likely to react to the failure by
@@ -851,15 +898,21 @@ impl App {
                     format!("failed: {}: {error}", j.remote_path),
                 );
                 if let Some(b) = self.job_batches.remove(&id) {
-                    // The manager's own word for a job the user cancelled.
-                    let outcome = if error == "cancelled" {
-                        BatchOutcome::Cancelled
-                    } else {
-                        BatchOutcome::Failed
-                    };
-                    self.tally_batch(b, outcome);
+                    self.tally_batch(b, BatchOutcome::Failed);
                 }
                 // A finished job leaves room in the queue for one waiting.
+                self.queue_waiting_jobs();
+            }
+            TransferEvent::Cancelled(j) => {
+                // The cancel marked the entry cancelled and removed it from
+                // the map itself; this is a guard for one that didn't.
+                self.checkpoint_job_map.remove(&j.id);
+                // No line per job: the cancel said so, once, and a batch
+                // cancel's red `failed: …: cancelled` apiece buried its own
+                // summary and read as a run of failures.
+                if let Some(b) = self.job_batches.remove(&j.id) {
+                    self.tally_batch(b, BatchOutcome::Cancelled);
+                }
                 self.queue_waiting_jobs();
             }
             TransferEvent::Paused => {

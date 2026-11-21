@@ -375,6 +375,7 @@ impl App {
             .unwrap_or(&from)
             .to_string();
         self.push_log(LogLevel::Info, format!("renaming: {from_label}"));
+        let connection = self.connection;
         tokio::spawn(async move {
             let mut transport = t.lock().await;
             let renamed = if overwrite {
@@ -383,8 +384,13 @@ impl App {
                 transport.rename(&from, &to).await
             };
             let event = match renamed {
-                Ok(()) => AppEvent::Renamed { from, to },
+                Ok(()) => AppEvent::Renamed {
+                    connection,
+                    from,
+                    to,
+                },
                 Err(e) => AppEvent::RenameFailed {
+                    connection,
                     from,
                     error: e.to_string(),
                 },
@@ -435,11 +441,13 @@ impl App {
             .unwrap_or(&path)
             .to_string();
         self.push_log(LogLevel::Info, format!("mkdir: {label}"));
+        let connection = self.connection;
         tokio::spawn(async move {
             let mut transport = t.lock().await;
             let event = match transport.mkdir(&path).await {
-                Ok(()) => AppEvent::MkdirDone { path },
+                Ok(()) => AppEvent::MkdirDone { connection, path },
                 Err(e) => AppEvent::MkdirFailed {
+                    connection,
                     path,
                     error: e.to_string(),
                 },
@@ -493,6 +501,7 @@ impl App {
             "deleting"
         };
         self.push_log(LogLevel::Info, format!("{label}: {name}"));
+        let connection = self.connection;
         tokio::spawn(async move {
             let mut transport = t.lock().await;
             let result = if is_dir {
@@ -504,8 +513,9 @@ impl App {
                 transport.delete_file(&remote_path).await
             };
             let event = match result {
-                Ok(()) => AppEvent::Deleted { name },
+                Ok(()) => AppEvent::Deleted { connection, name },
                 Err(e) => AppEvent::DeleteFailed {
+                    connection,
                     name,
                     error: e.to_string(),
                 },
@@ -1227,6 +1237,7 @@ mod tests {
         let (mut a, _remote) = connected();
 
         a.handle_app_event(AppEvent::MkdirFailed {
+            connection: a.connection,
             path: "/srv/new".into(),
             error: "permission denied".into(),
         });
@@ -1444,6 +1455,7 @@ mod tests {
         let (mut a, _remote) = connected();
 
         a.handle_app_event(AppEvent::DeleteFailed {
+            connection: a.connection,
             name: "old.txt".into(),
             error: "permission denied".into(),
         });
