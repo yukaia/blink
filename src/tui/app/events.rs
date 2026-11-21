@@ -499,9 +499,9 @@ impl App {
                 self.report_unsafe_names(unsafe_skipped);
                 if unencodable_skipped > 0 {
                     let noun = if unencodable_skipped == 1 {
-                        "file"
+                        "entry"
                     } else {
-                        "files"
+                        "entries"
                     };
                     self.push_log(
                         LogLevel::Warn,
@@ -776,6 +776,11 @@ impl App {
                         format!("removed {removed} partial upload(s) from the server"),
                     );
                 }
+                for failure in failures {
+                    self.push_log(LogLevel::Warn, failure);
+                }
+            }
+            AppEvent::LocalDirsFailed { failures } => {
                 for failure in failures {
                     self.push_log(LogLevel::Warn, failure);
                 }

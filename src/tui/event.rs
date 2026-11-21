@@ -262,6 +262,12 @@ pub enum AppEvent {
         failures: Vec<String>,
     },
 
+    /// Folders a download plan records (see `WalkResult::local_dirs`) that
+    /// weren't made: one sanitized line each. An empty folder has no file
+    /// whose download would fail in its place, so without this nothing
+    /// would say it is missing.
+    LocalDirsFailed { failures: Vec<String> },
+
     /// Something went wrong with the known_hosts file itself while checking
     /// or saving a host key. Carried to the TUI because the alternative,
     /// the debug log, is a sink unless `BLINK_LOG_FILE` is set: a file that

@@ -85,7 +85,7 @@ impl App {
     /// Log `count` local entries left out of an upload because their names
     /// are not valid UTF-8 — the same reason a directory upload skips them.
     pub(super) fn report_lossy_names(&mut self, count: usize) {
-        let noun = if count == 1 { "file" } else { "files" };
+        let noun = if count == 1 { "entry" } else { "entries" };
         self.push_log(
             LogLevel::Warn,
             format!(
@@ -118,6 +118,15 @@ impl App {
                 Some((local_base.join(name), remote, *is_dir))
             })
             .collect();
+        let unjoinable = entries.len() - roots.len();
+        if unjoinable > 0 {
+            let what = if unjoinable == 1 {
+                "entry whose name can't be used as a remote file name"
+            } else {
+                "entries whose names can't be used as remote file names"
+            };
+            self.push_log(LogLevel::Warn, format!("skipped {unjoinable} {what}"));
+        }
 
         if roots.is_empty() {
             return;
@@ -373,17 +382,18 @@ impl App {
     /// Create the local folders a download plan records, now that it is going
     /// ahead; see [`crate::tui::plan::WalkResult::local_dirs`]. Off the
     /// interface's thread: a large tree is thousands of folders. A folder
-    /// that can't be made is logged; a download into it fails with its own
-    /// error.
+    /// that can't be made, or sits below a symlink another user planted, is
+    /// reported in the log pane as `AppEvent::LocalDirsFailed`; a download
+    /// into it fails with its own error.
     pub(super) fn create_local_dirs(&mut self, dirs: Vec<PathBuf>) {
         if dirs.is_empty() {
             return;
         }
-        tokio::task::spawn_blocking(move || {
-            for dir in dirs {
-                if let Err(e) = std::fs::create_dir_all(&dir) {
-                    tracing::warn!(dir = %dir.display(), "could not create local folder: {e}");
-                }
+        let tx = self.app_event_tx.clone();
+        tokio::spawn(async move {
+            let failures = make_local_dirs(dirs).await;
+            if !failures.is_empty() {
+                let _ = tx.send(AppEvent::LocalDirsFailed { failures });
             }
         });
     }
@@ -412,6 +422,10 @@ impl App {
                 } else {
                     plan
                 };
+                if final_plan.is_empty() && local_dirs.is_empty() {
+                    self.report_all_skipped(CheckpointKind::Download);
+                    return;
+                }
                 self.create_local_dirs(local_dirs);
                 self.dispatch_plan(final_plan, CheckpointKind::Download);
             }
@@ -424,8 +438,237 @@ impl App {
                 } else {
                     plan
                 };
+                if final_plan.is_empty() {
+                    self.report_all_skipped(CheckpointKind::Upload);
+                    return;
+                }
                 self.dispatch_plan(final_plan, CheckpointKind::Upload);
             }
         }
+    }
+
+    /// Say that skipping conflicts left nothing to transfer. Otherwise the
+    /// user answers the prompt and sees no line at all.
+    fn report_all_skipped(&mut self, kind: CheckpointKind) {
+        let message = match kind {
+            CheckpointKind::Download => "nothing to download: every file already exists here",
+            CheckpointKind::Upload => "nothing to upload: every file already exists on the server",
+        };
+        self.push_log(LogLevel::Info, message.into());
+    }
+}
+
+/// Make each of `dirs`, refusing any whose path runs through a
+/// [`transport::foreign_symlink`], as a download's own folders are refused
+/// ([`transport::refuse_foreign_symlinks_above`]). Hands back one sanitized
+/// line per folder not made.
+///
+/// The check and the creation are separate steps, as they are for a file's
+/// download: this closes the window between planning and dispatch (an
+/// overwrite prompt can stay open indefinitely), not a race with a planter
+/// working in the same instant.
+async fn make_local_dirs(dirs: Vec<PathBuf>) -> Vec<String> {
+    // Folders already found not to be planted links: sibling folders share
+    // every ancestor, and a large tree would otherwise stat each one again
+    // per folder.
+    let mut clear: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut failures = Vec::new();
+    'dirs: for dir in dirs {
+        for at in dir.ancestors() {
+            if at.as_os_str().is_empty() || clear.contains(at) {
+                continue;
+            }
+            if transport::foreign_symlink(at).await {
+                failures.push(crate::error::sanitize(format!(
+                    "not creating local folder {}: {} is a symlink owned by another user",
+                    dir.display(),
+                    at.display()
+                )));
+                continue 'dirs;
+            }
+            clear.insert(at.to_path_buf());
+        }
+        if let Err(e) = tokio::fs::create_dir_all(&dir).await {
+            failures.push(crate::error::sanitize(format!(
+                "could not create local folder {}: {e}",
+                dir.display()
+            )));
+        }
+    }
+    failures
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::app::tests_support::app_on_main;
+    use crate::tui::state::OverwritePending;
+
+    fn logged(a: &App, needle: &str) -> bool {
+        a.log.iter().any(|l| l.message.contains(needle))
+    }
+
+    fn downloads(paths: &[&str]) -> Vec<PlannedJob> {
+        paths
+            .iter()
+            .map(|p| PlannedJob::Download {
+                remote_path: (*p).into(),
+                local_path: format!("/l{p}").into(),
+            })
+            .collect()
+    }
+
+    /// A folder below a link another user planted isn't made — not through
+    /// the link, where it would land in the link's target — and is reported.
+    /// The user's own link is followed, as a download's own folders are.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_planted_symlink_above_an_empty_folder_is_refused() {
+        let home = crate::paths::test_home();
+        let target = home.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, home.path().join("photos")).unwrap();
+        let dir = home.path().join("photos/authorized_keys");
+
+        crate::transport::EFFECTIVE_UID.set(Some(rustix::process::geteuid().as_raw() + 1));
+        let failures = make_local_dirs(vec![dir.clone()]).await;
+        crate::transport::EFFECTIVE_UID.set(None);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("owned by another user"),
+            "{failures:?}"
+        );
+        assert!(!target.join("authorized_keys").exists());
+
+        assert!(make_local_dirs(vec![dir]).await.is_empty());
+        assert!(target.join("authorized_keys").is_dir());
+    }
+
+    /// The link may be the folder itself, not only one above it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_planted_symlink_named_as_the_folder_is_refused() {
+        let home = crate::paths::test_home();
+        let target = home.path().join("elsewhere");
+        std::fs::create_dir(&target).unwrap();
+        let dir = home.path().join("empty");
+        std::os::unix::fs::symlink(&target, &dir).unwrap();
+
+        crate::transport::EFFECTIVE_UID.set(Some(rustix::process::geteuid().as_raw() + 1));
+        let failures = make_local_dirs(vec![dir]).await;
+        crate::transport::EFFECTIVE_UID.set(None);
+        assert_eq!(failures.len(), 1, "{failures:?}");
+    }
+
+    /// A folder that can't be made is said, and the rest are still made.
+    #[tokio::test]
+    async fn a_folder_that_cant_be_made_is_reported() {
+        let home = crate::paths::test_home();
+        std::fs::write(home.path().join("file"), b"x").unwrap();
+        let bad = home.path().join("file/sub");
+        let good = home.path().join("a/b");
+
+        let failures = make_local_dirs(vec![bad, good.clone()]).await;
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(
+            failures[0].contains("could not create local folder"),
+            "{failures:?}"
+        );
+        assert!(good.is_dir());
+    }
+
+    /// The failures reach the log pane; they used to go only to `tracing`.
+    #[test]
+    fn folders_not_made_are_shown_in_the_log() {
+        let mut a = app_on_main(0);
+        a.handle_app_event(AppEvent::LocalDirsFailed {
+            failures: vec!["could not create local folder /x: denied".into()],
+        });
+        assert!(
+            logged(&a, "could not create local folder /x"),
+            "{:?}",
+            a.log
+        );
+    }
+
+    /// `create_local_dirs` sends its failures back as an event.
+    #[tokio::test]
+    async fn create_local_dirs_sends_its_failures_back() {
+        let home = crate::paths::test_home();
+        std::fs::write(home.path().join("file"), b"x").unwrap();
+        let mut a = app_on_main(0);
+        let mut rx = a.app_event_rx.take().unwrap();
+        a.create_local_dirs(vec![home.path().join("file/sub")]);
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("an event within 5 s")
+            .unwrap();
+        let AppEvent::LocalDirsFailed { failures } = event else {
+            panic!("expected LocalDirsFailed");
+        };
+        assert_eq!(failures.len(), 1, "{failures:?}");
+    }
+
+    /// Skipping every conflict of a download leaves nothing, and says so.
+    #[test]
+    fn skipping_every_conflicting_download_says_so() {
+        let mut a = app_on_main(0);
+        let plan = downloads(&["/srv/a", "/srv/b"]);
+        a.pending_overwrite = Some(OverwritePending::DownloadPlan {
+            conflict_indices: (0..plan.len()).collect(),
+            plan,
+            local_dirs: vec![],
+        });
+        a.screen = Screen::ConfirmOverwrite;
+        a.confirm_overwrite_proceed(true);
+        assert!(logged(&a, "nothing to download"), "{:?}", a.log);
+    }
+
+    #[test]
+    fn skipping_every_conflicting_upload_says_so() {
+        let mut a = app_on_main(0);
+        a.pending_overwrite = Some(OverwritePending::UploadPlan {
+            plan: vec![PlannedJob::Upload {
+                local_path: "/l/a".into(),
+                remote_path: "/srv/a".into(),
+            }],
+            conflict_indices: vec![0],
+        });
+        a.screen = Screen::ConfirmOverwrite;
+        a.confirm_overwrite_proceed(true);
+        assert!(logged(&a, "nothing to upload"), "{:?}", a.log);
+    }
+
+    /// Skipping only some conflicts leaves work, and claims none is left.
+    #[test]
+    fn skipping_some_conflicts_is_not_called_nothing() {
+        let mut a = app_on_main(0);
+        let plan = downloads(&["/srv/a", "/srv/b"]);
+        a.pending_overwrite = Some(OverwritePending::DownloadPlan {
+            conflict_indices: vec![0],
+            plan,
+            local_dirs: vec![],
+        });
+        a.confirm_overwrite_proceed(true);
+        assert!(!logged(&a, "nothing to download"), "{:?}", a.log);
+    }
+
+    /// An upload name that can't be joined onto the remote path is said, as
+    /// a download's is.
+    #[tokio::test]
+    async fn an_unjoinable_upload_name_is_reported() {
+        let mut a = app_on_main(0);
+        a.transfer_manager = Some(crate::transfer::TransferManager::new(1).0);
+        a.start_uploads(vec![("a/b".into(), false)]);
+        assert!(logged(&a, "skipped 1 entry whose name"), "{:?}", a.log);
+        assert!(!logged(&a, "preparing"), "{:?}", a.log);
+    }
+
+    /// Folders are skipped for a non-UTF-8 name too: "entries", not "files".
+    #[test]
+    fn lossy_names_are_counted_as_entries() {
+        let mut a = app_on_main(0);
+        a.report_lossy_names(2);
+        assert!(logged(&a, "skipped 2 entries"), "{:?}", a.log);
     }
 }
