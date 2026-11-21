@@ -41,7 +41,8 @@ Release notes live in [CHANGELOG.md](CHANGELOG.md).
 - Three-pane TUI (local / remote, plus a switchable transfers/log panel)
 - Recursive **download** and **upload** with parallel slot dispatch
 - **Rename**, **create directories**, **delete files**, **delete directories** (recursive)
-- **Substring filter** per pane (`/`), persists across refresh — selections
+- **Substring filter** per pane (`/`), persists across refresh and is
+  dropped on moving to another folder — selections
   made while filtered survive clearing or narrowing the filter too; the
   footer's selection count and size cover the whole selection, including
   entries the filter is currently hiding

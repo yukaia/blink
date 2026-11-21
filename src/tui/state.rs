@@ -238,6 +238,13 @@ impl PaneState {
                 .retain(|name| entries.iter().any(|e| &e.raw_name == name));
         } else {
             self.selected.clear();
+            // The filter was for the folder left, as the selection was.
+            // Kept, it filtered the next folder too: into `photos-2024`
+            // under a `photo` filter showed that folder near empty.
+            if self.listed.is_some() {
+                self.filter = None;
+                self.all_entries = None;
+            }
         }
         self.listed = Some(self.path.clone());
         self.replace_rows(entries);
@@ -523,6 +530,47 @@ mod pane_tests {
 
     /// `display_name` cuts the middle out of a long name; the filter used to
     /// search that, and found nothing for a query in the cut part.
+    /// The filter was for the folder it was typed in. Kept, a listing of
+    /// the next folder was filtered by it too, often to nothing.
+    #[test]
+    fn a_listing_of_another_folder_drops_the_filter() {
+        let mut p = PaneState::empty();
+        p.path = "/a".into();
+        p.set_entries(vec![
+            PaneEntry::new("photos-2024".into(), true, 0),
+            PaneEntry::new("notes".into(), false, 1),
+        ]);
+        p.set_filter("photo".into());
+        assert_eq!(p.entries.len(), 1);
+
+        p.path = "/a/photos-2024".into();
+        p.set_entries(vec![
+            PaneEntry::new("img1.jpg".into(), false, 1),
+            PaneEntry::new("img2.jpg".into(), false, 1),
+        ]);
+
+        assert_eq!(p.filter, None);
+        assert_eq!(p.entries.len(), 2);
+    }
+
+    /// A refresh of the same folder keeps it, as the README says.
+    #[test]
+    fn a_refresh_keeps_the_filter() {
+        let mut p = PaneState::empty();
+        p.path = "/a".into();
+        let rows = || {
+            vec![
+                PaneEntry::new("photos".into(), true, 0),
+                PaneEntry::new("notes".into(), false, 1),
+            ]
+        };
+        p.set_entries(rows());
+        p.set_filter("photo".into());
+        p.set_entries(rows());
+        assert_eq!(p.filter.as_deref(), Some("photo"));
+        assert_eq!(p.entries.len(), 1);
+    }
+
     #[test]
     fn the_filter_searches_the_whole_name() {
         let long = format!("{}needle{}.txt", "a".repeat(400), "b".repeat(400));

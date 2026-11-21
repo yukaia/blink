@@ -149,6 +149,10 @@ the git history for those.
 
 ### Security
 
+- **A password or passphrase can't outgrow its buffer.** The buffers are
+  sized so typing never copies the secret into a new allocation, leaving
+  the old one unwiped, but a 257th character, typed or pasted, did just
+  that. Keys past the buffer's size are now refused.
 - **A host-key mismatch during connect drops the password typed for it.**
   The failed connect that follows the warning does nothing, so the warning
   can stay up, and with it nothing cleared the password and passphrase
@@ -276,6 +280,15 @@ the git history for those.
 
 ### Fixed
 
+- **The offers after connecting wait before taking a key**, as the other
+  prompts that open on their own do. A key typed as the connection came
+  up answered the resume offer, and `d` there deletes the batch's partial
+  files; a held or doubled key answered the next offer too.
+- **The filter is dropped on moving to another folder.** It filtered the
+  next folder's listing as well: entering `photos-2024` under a `photo`
+  filter showed it near empty.
+- **Esc at the password prompt logs "connect cancelled"**, as the
+  passphrase prompt and the connecting screen do.
 - **Cancelled transfers aren't logged as failures.** Each cancelled job
   logged a red `failed: …: cancelled` line, after the cancel had already
   said so: a batch cancel buried its own summary under them and read as a

@@ -2,7 +2,7 @@
 //!
 //! Each `handle_*(&mut self, KeyEvent)` lives here so the central
 //! [`super::App::handle_key`] dispatcher in `mod.rs` is left as a flat
-//! routing table without 2000+ lines of match bodies inline. The
+//! routing table without the match bodies inline. The
 //! handlers are `pub(super)` because the dispatcher (in the parent
 //! module) is their only caller — no need to widen them further.
 //!
@@ -47,6 +47,20 @@ fn apply_text_edit(buf: &mut String, key: &KeyEvent) -> bool {
         }
         _ => false,
     }
+}
+
+/// [`apply_text_edit`] for a password or passphrase buffer: a character
+/// that would make it grow is refused. Its capacity is fixed so the secret
+/// is never copied into a new allocation, leaving the old one unwiped; a
+/// 257th character typed or pasted did exactly that.
+fn apply_credential_edit(buf: &mut String, key: &KeyEvent) -> bool {
+    if let KeyCode::Char(c) = key.code
+        && !super::is_chord(key.modifiers)
+        && !super::fits_credential(buf, c)
+    {
+        return false;
+    }
+    apply_text_edit(buf, key)
 }
 
 impl App {
@@ -207,6 +221,8 @@ impl App {
                 self.pending_session = None;
                 self.pending_password = None;
                 self.screen = Screen::SessionSelect;
+                // As the passphrase prompt and the connecting screen say.
+                self.push_log(LogLevel::Info, "connect cancelled".into());
             }
             KeyCode::Enter => {
                 let Some(session) = self.pending_session.clone() else {
@@ -226,7 +242,7 @@ impl App {
                 self.start_connect(session, Some(password));
             }
             _ => {
-                apply_text_edit(&mut self.password_input, &key);
+                apply_credential_edit(&mut self.password_input, &key);
             }
         }
     }
@@ -265,7 +281,7 @@ impl App {
                 self.start_connect(session, Some(passphrase));
             }
             _ => {
-                if apply_text_edit(&mut self.passphrase_input, &key) {
+                if apply_credential_edit(&mut self.passphrase_input, &key) {
                     self.passphrase_error = None;
                 }
             }
@@ -742,6 +758,9 @@ impl App {
     /// naming, validation and write); anything else dismisses and leaves the
     /// connection running unsaved — `ctrl+s` still works later.
     pub(super) fn handle_offer_save_session(&mut self, key: KeyEvent) {
+        if self.prompt_arming() {
+            return;
+        }
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 self.pending_offers.pop_front();
@@ -799,6 +818,9 @@ impl App {
     /// sweeps the batch's orphaned partials because the checkpoint is the
     /// only record of where they are.
     pub(super) fn handle_offer_resume_checkpoint(&mut self, key: KeyEvent) {
+        if self.prompt_arming() {
+            return;
+        }
         let Some(PostConnectOffer::ResumeCheckpoint(offer)) = self.pending_offers.front().cloned()
         else {
             // Nothing queued — shouldn't happen, but don't strand the user.
